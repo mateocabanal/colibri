@@ -1,5 +1,25 @@
 # MetalIO expert streaming — architecture note
 
+## Outcomes (2026-08-15 runs on real Qwen3.6-35B-A3B q8, M2/16GB)
+
+| Variant | Wall | Notes |
+|---|---:|---|
+| pread | 15.0-16.7s | baseline |
+| demand-only MetalIO | ~15.5-16.0s | neutral |
+| + exact-async decode | ~13.2s | no prediction |
+| + async pipelined arena waves | 11.5-11.8s | byte-identical; two multi-wave bugs found+fixed |
+
+T5 (dense startup pipeline): SKIPPED — the probe's startup is page-cache-
+warm (reads at RAM speed), so I/O/copy overlap is not demonstrable on this
+box; the plan's gate says drop the second loader if it cannot be shown.
+T8 (tuning): knobs QWEN_ARENA_WAVE / MTLIO_DEPTH landed with defaults
+64/64; one sweep showed noise (2.4x) exceeding config deltas — defaults
+unchanged per the plan rule; a depth<=16 hint needs a clean interleaved run.
+T9 (speculation): offline cache-aware simulator (route_prefetch_sim.py)
+measures the carryover predictor at 31-39% useful precision — below the
+50% gate (measured on an optimistic union bound; true decode precision is
+lower). GATE FAILS: QWEN_PREFETCH stays off permanently.
+
 Status: subsystem landed (metalio.h/.mm + unit test). Engine wiring in progress.
 
 ## Existing path (CPU-mediated)
