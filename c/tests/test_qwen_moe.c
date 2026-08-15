@@ -264,6 +264,43 @@ static void test_packed_expert_size_math(void){
 	      "i3 group counts (real)");
 }
 
+static void test_arena_plan(void){
+	/* The prefill arena must process the FULL distinct routed set in bounded
+	 * waves: a layer routing > QWEN_ARENA_CAP distinct experts used to evict
+	 * during set-build and silently drop contributions (fixtures only had
+	 * 8/16 experts). qwen_arena_plan must return every distinct id exactly
+	 * once, in first-appearance order, bounded by cap. */
+	/* 256 distinct ids: C=64 tokens, K=8 picks, every pick unique */
+	int picks256[64 * 8];
+	int uniq[300], n;
+	for (int j = 0; j < 64; j++)
+		for (int k = 0; k < 8; k++) picks256[j * 8 + k] = j * 8 + k;
+	n = qwen_arena_plan(picks256, 64, 8, uniq, 256);
+	CHECK(n == 256, "256 distinct experts planned: %d", n);
+	int seen[256] = { 0 }, ok = 1;
+	for (int i = 0; i < n; i++) { if (uniq[i] < 0 || uniq[i] >= 256 || seen[uniq[i]]) ok = 0; seen[uniq[i]] = 1; }
+	CHECK(ok, "256 distinct: no dups, in range");
+	/* duplicates collapse: same 8 experts repeated across all tokens */
+	int picksdup[64 * 8];
+	for (int j = 0; j < 64; j++)
+		for (int k = 0; k < 8; k++) picksdup[j * 8 + k] = (j + k) % 8;
+	n = qwen_arena_plan(picksdup, 64, 8, uniq, 256);
+	CHECK(n == 8, "duplicates collapse to 8: %d", n);
+	/* first-appearance order preserved */
+	int picks2[4] = { 42, 7, 42, 99 };
+	n = qwen_arena_plan(picks2, 2, 2, uniq, 16);
+	CHECK(n == 3 && uniq[0] == 42 && uniq[1] == 7 && uniq[2] == 99,
+	      "first-appearance order: %d,%d,%d", n ? uniq[0] : -1, n > 1 ? uniq[1] : -1, n > 2 ? uniq[2] : -1);
+	/* cap clamps: 256 distinct but cap 64 */
+	n = qwen_arena_plan(picks256, 64, 8, uniq, 64);
+	CHECK(n == 64, "cap clamps to 64: %d", n);
+	/* 65 distinct (one wave over the cap boundary) */
+	int picks65[65];
+	for (int i = 0; i < 65; i++) picks65[i] = i;
+	n = qwen_arena_plan(picks65, 65, 1, uniq, 256);
+	CHECK(n == 65, "65 distinct planned: %d", n);
+}
+
 int main(void){
 	test_padded_vocab_selection();
 	test_lifetime_exits();
@@ -272,6 +309,7 @@ int main(void){
 	test_gated_attention();
 	test_request_reset_and_stop_feedback();
 	test_packed_expert_size_math();
+	test_arena_plan();
 	if (failures) {
 		fprintf(stderr, "qwen_moe: %d failure(s)\n", failures);
 		return 1;

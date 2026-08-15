@@ -1685,6 +1685,20 @@ static void gdn_batch(Model *m, Layer *l, int layer, const float *xs, int C, flo
 #define QWEN_ARENA_CAP 64
 typedef struct { int eid; int order; Slot s; } ArenaSlot;
 
+/* Distinct routed expert set, first-appearance order: the arena builds the
+ * FULL set before loading anything, so a layer routing more than
+ * QWEN_ARENA_CAP distinct experts is processed in waves instead of evicting
+ * (evict-during-build silently dropped routed contributions). */
+static int qwen_arena_plan(const int *picks, int C, int K, int *uniq, int cap){
+    int n = 0;
+    for (int j = 0; j < C; j++) for (int k = 0; k < K; k++) {
+        int e = picks[j * K + k], dup = 0;
+        for (int i = 0; i < n; i++) if (uniq[i] == e) { dup = 1; break; }
+        if (!dup && n < cap) uniq[n++] = e;
+    }
+    return n;
+}
+
 static void arena_free(ArenaSlot *a, int n){
     for (int i = 0; i < n; i++) {
         Slot *s = &a[i].s;
@@ -1722,7 +1736,105 @@ static void moe_batch(Model *m, Layer *l, int layer, const float *xs, int C, flo
     free(rlogits);
     if (K <= 64) { memcpy(m->last_route, picks, (size_t)K * sizeof(int)); m->last_route_k = K; }
 
-    /* shared expert, batched over the chunk */
+    /* plan: the FULL distinct routed set first — never evict during build
+     * (the old cap-64 arena silently dropped experts evicted before their
+     * routed rows ran on layers routing >64 distinct experts). */
+    int nuniq_cap = C * K < E ? C * K : E;   /* distinct <= picks <= E */
+    int *uniq = malloc(size_mul_or_die((size_t)nuniq_cap, sizeof(int), "arena distinct"));
+    int *eid_slot = malloc(size_mul_or_die((size_t)E, sizeof(int), "arena index"));
+    if (!uniq || !eid_slot) { fprintf(stderr, "OOM arena plan\n"); exit(1); }
+    for (int i = 0; i < E; i++) eid_slot[i] = -1;
+    int nuniq = qwen_arena_plan(picks, C, K, uniq, nuniq_cap);
+    for (int i = 0; i < nuniq; i++) eid_slot[uniq[i]] = i;
+
+    /* per-(token, topk-position) scratch: every routed contribution is
+     * computed exactly once, then accumulated token-major in k-order —
+     * bit-exact against moe_token's reference order. */
+    float *yrow = calloc(size_mul_or_die((size_t)C * K * D, sizeof(float), "arena y"), sizeof(float));
+    if (!yrow) { fprintf(stderr, "OOM arena y scratch\n"); exit(1); }
+    int I = c->moe_inter;
+    float *xscratch = falloc((int64_t)C * D);
+    float *yscratch = falloc((int64_t)C * D);
+    ArenaSlot *arena = calloc((size_t)QWEN_ARENA_CAP, sizeof(ArenaSlot));
+    if (!arena) { fprintf(stderr, "OOM arena\n"); exit(1); }
+
+    /* bounded waves: load up to ARENA_CAP experts at a time; every expert in
+     * a wave is applied before the wave is freed — no eviction, no drops. */
+    for (int wb = 0; wb < nuniq; wb += QWEN_ARENA_CAP) {
+        int wn = nuniq - wb < QWEN_ARENA_CAP ? nuniq - wb : QWEN_ARENA_CAP;
+        for (int a = 0; a < wn; a++) {
+            Slot *s = &arena[a].s;
+            memset(s, 0, sizeof(*s));
+            double t0 = now_s();
+            load_expert(m, layer, uniq[wb + a], s);
+            m->t_expio += now_s() - t0;
+        }
+        for (int a = 0; a < wn; a++) {
+            Slot *s = &arena[a].s;
+            int e = uniq[wb + a];
+            int st = 0;
+            for (int j = 0; j < C; j++) for (int k = 0; k < K; k++)
+                if (picks[j * K + k] == e) {
+                    memcpy(xscratch + (int64_t)st * D, xs + (int64_t)j * D, (size_t)D * sizeof(float));
+                    st++;
+                }
+            if (s->fmt == 4 || s->fmt == 5) {
+                float *gate = falloc((int64_t)st * I), *up = falloc((int64_t)st * I);
+                if (s->fmt == 4) {
+                    matmul_i4_grouped(gate, xscratch, s->g4, s->g4s, st, D, I, 64);
+                    matmul_i4_grouped(up,   xscratch, s->u4, s->u4s, st, D, I, 64);
+                } else {
+                    matmul_i3(gate, xscratch, s->g4, s->g4s, st, D, I);
+                    matmul_i3(up,   xscratch, s->u4, s->u4s, st, D, I);
+                }
+                float *h = falloc((int64_t)st * I);
+                for (int r = 0; r < st; r++)
+                    for (int i = 0; i < I; i++) h[(int64_t)r * I + i] = silu(gate[(int64_t)r * I + i]) * up[(int64_t)r * I + i];
+                if (s->fmt == 4) matmul_i4_grouped(yscratch, h, s->d4, s->d4s, st, I, D, 64);
+                else             matmul_i3(yscratch, h, s->d4, s->d4s, st, I, D);
+                free(gate); free(up); free(h);
+            } else if (s->fmt == 8) {
+                float *gate = falloc((int64_t)st * I), *up = falloc((int64_t)st * I);
+                matmul_q8(gate, xscratch, s->g, s->gs, st, I, D);
+                matmul_q8(up,   xscratch, s->u, s->us, st, I, D);
+                float *h = falloc((int64_t)st * I);
+                for (int r = 0; r < st; r++)
+                    for (int i = 0; i < I; i++) h[(int64_t)r * I + i] = silu(gate[(int64_t)r * I + i]) * up[(int64_t)r * I + i];
+                matmul_q8(yscratch, h, s->dd, s->ds, st, D, I);
+                free(gate); free(up); free(h);
+            } else {
+                float *gu = falloc((int64_t)st * 2 * I);
+                matmul(gu, xscratch, s->gu, st, 2 * I, D);
+                float *h = falloc((int64_t)st * I);
+                for (int r = 0; r < st; r++)
+                    for (int i = 0; i < I; i++) h[(int64_t)r * I + i] = silu(gu[(int64_t)r * 2 * I + i]) * gu[(int64_t)r * 2 * I + I + i];
+                matmul(yscratch, h, s->d, st, D, I);
+                free(gu); free(h);
+            }
+            /* store this expert's routed rows at their (token, topk) slots */
+            int si = 0;
+            for (int j = 0; j < C; j++) for (int k = 0; k < K; k++)
+                if (picks[j * K + k] == e) {
+                    memcpy(yrow + ((int64_t)j * K + k) * D, yscratch + (int64_t)si * D, (size_t)D * sizeof(float));
+                    si++;
+                }
+        }
+        arena_free(arena, wn);
+    }
+    free(uniq); free(eid_slot); free(arena); free(xscratch); free(yscratch);
+
+    /* routed accumulation: token-major, k = 0..K-1 — moe_token's order */
+    for (int j = 0; j < C; j++) {
+        float *accrow = out + (int64_t)j * D;
+        for (int k = 0; k < K; k++) {
+            const float *y = yrow + ((int64_t)j * K + k) * D;
+            float ww = w[j * K + k];
+            for (int d = 0; d < D; d++) accrow[d] += y[d] * ww;
+        }
+    }
+    free(yrow);
+
+    /* shared expert AFTER routed experts (moe_token reference order) */
     float *sg_all = falloc(C), *h_all = falloc((int64_t)C * c->shared_inter);
     float *gv_all = falloc((int64_t)C * c->shared_inter);
     wt_mul(sg_all, xs, &l->se_g, C, 1, D);
@@ -1741,104 +1853,12 @@ static void moe_batch(Model *m, Layer *l, int layer, const float *xs, int C, flo
     }
     free(sg_all); free(h_all); free(gv_all); free(sy_all);
 
-    /* arena: load each distinct routed expert once */
-    int arena_cap = C * K < QWEN_ARENA_CAP ? C * K : QWEN_ARENA_CAP;
-    if (arena_cap > E) arena_cap = E;
-    ArenaSlot *arena = calloc((size_t)arena_cap, sizeof(ArenaSlot));
-    int *eid_slot = malloc(size_mul_or_die((size_t)E, sizeof(int), "arena index"));
-    if (!arena || !eid_slot) { fprintf(stderr, "OOM arena\n"); exit(1); }
-    for (int i = 0; i < E; i++) eid_slot[i] = -1;
-    int arena_n = 0, arena_clock = 0;
-    for (int j = 0; j < C; j++) for (int k = 0; k < K; k++) {
-        int e = picks[j * K + k];
-        if (eid_slot[e] >= 0) continue;
-        if (arena_n == arena_cap) {         /* evict oldest arena slot */
-            int lru = 0;
-            for (int i = 1; i < arena_n; i++)
-                if (arena[i].order < arena[lru].order) lru = i;
-            eid_slot[arena[lru].eid] = -1;
-            Slot *s = &arena[lru].s;
-            free(s->gu); free(s->g); free(s->g4); free(s->g4s);
-            memset(s, 0, sizeof(*s));
-            double t0 = now_s();
-            load_expert(m, layer, e, s);
-            m->t_expio += now_s() - t0;
-            arena[lru].eid = e; arena[lru].order = arena_clock++;
-            eid_slot[e] = lru;
-            continue;
-        }
-        Slot *s = &arena[arena_n].s;
-        memset(s, 0, sizeof(*s));
-        double t0 = now_s();
-        load_expert(m, layer, e, s);
-        m->t_expio += now_s() - t0;
-        arena[arena_n].eid = e; arena[arena_n].order = arena_clock++;
-        eid_slot[e] = arena_n;
-        arena_n++;
-    }
-
-    /* batched applies: per expert, S-batch its routed rows, then accumulate
-     * back per token in k-order (bit-exact vs moe_token's row order). */
-    int I = c->moe_inter;
-    float *xscratch = falloc((int64_t)C * D);
-    float *yscratch = falloc((int64_t)C * D);
-    for (int a = 0; a < arena_n; a++) {
-        Slot *s = &arena[a].s;
-        int st = 0;
-        for (int j = 0; j < C; j++) for (int k = 0; k < K; k++)
-            if (picks[j * K + k] == arena[a].eid) {
-                memcpy(xscratch + (int64_t)st * D, xs + (int64_t)j * D, (size_t)D * sizeof(float));
-                st++;
-            }
-        if (s->fmt == 4 || s->fmt == 5) {
-            float *gate = falloc((int64_t)st * I), *up = falloc((int64_t)st * I);
-            if (s->fmt == 4) {
-                matmul_i4_grouped(gate, xscratch, s->g4, s->g4s, st, D, I, 64);
-                matmul_i4_grouped(up,   xscratch, s->u4, s->u4s, st, D, I, 64);
-            } else {
-                matmul_i3(gate, xscratch, s->g4, s->g4s, st, D, I);
-                matmul_i3(up,   xscratch, s->u4, s->u4s, st, D, I);
-            }
-            float *h = falloc((int64_t)st * I);
-            for (int r = 0; r < st; r++)
-                for (int i = 0; i < I; i++) h[(int64_t)r * I + i] = silu(gate[(int64_t)r * I + i]) * up[(int64_t)r * I + i];
-            if (s->fmt == 4) matmul_i4_grouped(yscratch, h, s->d4, s->d4s, st, I, D, 64);
-            else             matmul_i3(yscratch, h, s->d4, s->d4s, st, I, D);
-            free(gate); free(up); free(h);
-        } else if (s->fmt == 8) {
-            float *gate = falloc((int64_t)st * I), *up = falloc((int64_t)st * I);
-            matmul_q8(gate, xscratch, s->g, s->gs, st, I, D);
-            matmul_q8(up,   xscratch, s->u, s->us, st, I, D);
-            float *h = falloc((int64_t)st * I);
-            for (int r = 0; r < st; r++)
-                for (int i = 0; i < I; i++) h[(int64_t)r * I + i] = silu(gate[(int64_t)r * I + i]) * up[(int64_t)r * I + i];
-            matmul_q8(yscratch, h, s->dd, s->ds, st, D, I);
-            free(gate); free(up); free(h);
-        } else {
-            float *gu = falloc((int64_t)st * 2 * I);
-            matmul(gu, xscratch, s->gu, st, 2 * I, D);
-            float *h = falloc((int64_t)st * I);
-            for (int r = 0; r < st; r++)
-                for (int i = 0; i < I; i++) h[(int64_t)r * I + i] = silu(gu[(int64_t)r * 2 * I + i]) * gu[(int64_t)r * 2 * I + I + i];
-            matmul(yscratch, h, s->d, st, D, I);
-            free(gu); free(h);
-        }
-        int si = 0;
-        for (int j = 0; j < C; j++) for (int k = 0; k < K; k++)
-            if (picks[j * K + k] == arena[a].eid) {
-                float ww = w[j * K + k];
-                float *accrow = out + (int64_t)j * D;
-                const float *yrow = yscratch + (int64_t)si * D;
-                for (int d = 0; d < D; d++) accrow[d] += yrow[d] * ww;
-                si++;
-            }
-    }
-    /* routing telemetry, same as moe_token */
-    rt_route(layer, 0, picks, w, C * K > 0 ? C * K : 1);
+    /* routing telemetry: one row per token (route_trace expects one record
+     * per routed batch row, not the flattened C*K chunk). */
+    for (int j = 0; j < C; j++)
+        rt_route(layer, j, picks + j * K, w + j * K, K);
     m->t_moe += now_s() - t0;
-    free(picks); free(w); free(eid_slot);
-    arena_free(arena, arena_n);
-    free(arena); free(xscratch); free(yscratch);
+    free(picks); free(w);
 }
 
 /* chunked layer-major prefill: returns logits for the last token */
