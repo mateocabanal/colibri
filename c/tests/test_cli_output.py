@@ -116,13 +116,15 @@ class ChatCapForwardingTest(unittest.TestCase):
         cls.coli = importlib.util.module_from_spec(spec)
         loader.exec_module(cls.coli)
 
-    def _chat_server_cmd(self, cap):
+    def _chat_server_launch(self, cap, model_type="inkling", ram=None, ctx=None,
+                            ambient=None):
         coli = self.coli
         captured = {}
 
         class FakeProc:
-            def __init__(self, cmd, **_kw):
+            def __init__(self, cmd, **kwargs):
                 captured["cmd"] = cmd
+                captured["env"] = kwargs["env"]
             def poll(self):
                 return None
             def terminate(self):
@@ -140,21 +142,27 @@ class ChatCapForwardingTest(unittest.TestCase):
             def stop(self):
                 pass
 
-        model = tempfile.mkdtemp()
-        self.addCleanup(lambda: subprocess.run(["rm", "-rf", model], check=False))
-        (Path(model) / "config.json").write_text(json.dumps({"model_type": "inkling"}))
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        model = directory.name
+        (Path(model) / "config.json").write_text(json.dumps({"model_type": model_type}))
         args = types.SimpleNamespace(model=model, cap=cap, ngen=256, api_key=None,
-                                     no_attach=True, attach=None)
-        with mock.patch.object(coli, "need_model"), \
+                                     no_attach=True, attach=None, ram=ram, ctx=ctx,
+                                     temp=None)
+        with mock.patch.dict(os.environ, ambient or {}, clear=True), \
+             mock.patch("resource_plan.physical_cpu_count", return_value=6), \
+             mock.patch.object(coli, "need_model"), \
              mock.patch.object(coli, "banner"), \
              mock.patch.object(coli, "engine_for", return_value="/stub/inkling"), \
-             mock.patch.object(coli, "env_for_engine", return_value={}), \
              mock.patch.object(coli, "server_probe", return_value="inkling-colibri"), \
              mock.patch.object(coli, "chat_attached"), \
              mock.patch.object(coli, "Spinner", FakeSpinner), \
              mock.patch("subprocess.Popen", FakeProc):
             coli.cmd_chat(args)
-        return captured["cmd"]
+        return captured["cmd"], captured["env"]
+
+    def _chat_server_cmd(self, cap):
+        return self._chat_server_launch(cap)[0]
 
     def test_explicit_cap_rides_along(self):
         cmd = self._chat_server_cmd(cap=32)
@@ -170,6 +178,30 @@ class ChatCapForwardingTest(unittest.TestCase):
     def test_absent_cap_stays_absent(self):
         cmd = self._chat_server_cmd(cap=None)
         self.assertNotIn("--cap", cmd)
+
+    def test_qwen_chat_resource_launch_matrix(self):
+        cases = (
+            ("absent", None, None, None, {}, None, {}),
+            ("explicit cap beats CACHE and RAM", 13, 32, 8192, {"CACHE": "7"},
+             "13", {"CACHE": "7", "RAM_GB": "32", "CTX": "8192"}),
+            ("CACHE beats RAM", None, 32, None, {"CACHE": "7"},
+             None, {"CACHE": "7", "RAM_GB": "32"}),
+            ("RAM and CTX are effective", None, 32, 8192, {},
+             None, {"CACHE": "16", "RAM_GB": "32", "CTX": "8192"}),
+        )
+        for label, cap, ram, ctx, ambient, expected_cap, expected_env in cases:
+            with self.subTest(label=label):
+                cmd, env = self._chat_server_launch(
+                    cap, "qwen3_moe", ram=ram, ctx=ctx, ambient=ambient)
+                self.assertEqual(cmd[cmd.index("--arch") + 1], "qwen3_moe")
+                if expected_cap is None:
+                    self.assertNotIn("--cap", cmd)
+                else:
+                    self.assertEqual(cmd[cmd.index("--cap") + 1], expected_cap)
+                for key, value in expected_env.items():
+                    self.assertEqual(env[key], value)
+                for key in {"CACHE", "RAM_GB", "CTX"} - expected_env.keys():
+                    self.assertNotIn(key, env)
 
 
 class BannerModelLineTest(unittest.TestCase):
@@ -219,6 +251,9 @@ class BannerModelLineTest(unittest.TestCase):
             ("kimi_k3", "Kimi K3"),
             ("deepseek_v4", "DeepSeek V4 Flash"),
             ("olmoe", "OLMoE"),
+            ("qwen3_5_moe", "Qwen3.5"),
+            ("qwen3_6_moe", "Qwen3.6"),
+            ("qwen3_7_moe", "Qwen3.7"),
         ):
             with self.subTest(model_type=model_type):
                 line = self.line({"model_type": model_type, "n_routed_experts": 8})
@@ -232,9 +267,9 @@ class BannerModelLineTest(unittest.TestCase):
 
     def test_unknown_model_states_its_own_type(self):
         """No forcing into the roster: an unknown checkpoint speaks for itself."""
-        line = self.line({"model_type": "qwen3_moe", "num_hidden_layers": 48,
+        line = self.line({"model_type": "mystery_moe", "num_hidden_layers": 48,
                           "n_routed_experts": 128})
-        self.assertIn("qwen3_moe", line)
+        self.assertIn("mystery_moe", line)
         self.assertIn("48L x 128E", line)
         self.assertNotIn("GLM", line)
 
@@ -286,7 +321,7 @@ class OmpThreadsForEveryEngineTest(unittest.TestCase):
 
     def test_every_engine_gets_physical_cores(self):
         with mock.patch("resource_plan.physical_cpu_count", return_value=6):
-            for arch in ("inkling", "kimi", "olmoe", "deepseek_v4"):
+            for arch in ("inkling", "kimi", "olmoe", "deepseek_v4", "qwen3_moe"):
                 with self.subTest(arch=arch):
                     env = self.coli.env_for_engine(self.args(), arch)
                     self.assertEqual(env.get("OMP_NUM_THREADS"), "6")
@@ -311,6 +346,31 @@ class OmpThreadsForEveryEngineTest(unittest.TestCase):
             os.environ.pop("OMP_NUM_THREADS", None)
             env = self.coli.env_for_engine(self.args(), "deepseek_v4")
         self.assertNotIn("OMP_NUM_THREADS", env)
+
+    def test_qwen_resource_environment_matrix(self):
+        cases = (
+            ("absent stays auto", {}, {}, {}, ("CACHE", "RAM_GB", "CTX")),
+            ("RAM derives conservative cache", {}, {"ram": 32, "ctx": 8192},
+             {"RAM_GB": "32", "CACHE": "16", "CTX": "8192"}, ()),
+            ("explicit CACHE wins over RAM", {"CACHE": "7"}, {"ram": 32},
+             {"RAM_GB": "32", "CACHE": "7"}, ()),
+            ("ambient RAM delegates to engine", {"RAM_GB": "24"}, {},
+             {"RAM_GB": "24"}, ("CACHE",)),
+            ("CLI CTX wins over ambient", {"CTX": "4096"}, {"ctx": 12288},
+             {"CTX": "12288"}, ()),
+        )
+        for label, ambient, overrides, expected, absent in cases:
+            with self.subTest(label=label), \
+                 mock.patch.dict(os.environ, ambient, clear=True), \
+                 mock.patch("resource_plan.physical_cpu_count", return_value=6):
+                args = self.args()
+                for key, value in overrides.items():
+                    setattr(args, key, value)
+                env = self.coli.env_for_engine(args, "qwen3_moe")
+                for key, value in expected.items():
+                    self.assertEqual(env[key], value)
+                for key in absent:
+                    self.assertNotIn(key, env)
 
 
 if __name__ == "__main__":

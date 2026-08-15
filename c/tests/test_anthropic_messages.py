@@ -12,11 +12,15 @@ is the reference client from the issue — not merely that the handler returns 2
 """
 import json
 import re
+import sys
 import threading
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from openai_server import (APIServer, anthropic_to_openai, anthropic_tools, APIError,
                            render_chat, render_chat_inkling, render_chat_kimi, render_chat_v4)

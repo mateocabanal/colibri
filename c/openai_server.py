@@ -908,6 +908,44 @@ def render_chat_olmoe(messages, enable_thinking=False, reasoning_effort=None, to
     return "".join(parts)
 
 
+def render_chat_qwen(messages, enable_thinking=False, reasoning_effort=None, tools=None,
+                     tool_choice=None):
+    """Qwen3.5/3.6/3.7 ChatML template (chat_template.jinja, text-only
+    subset): <|im_start|>system|user|assistant turns closed by <|im_end|>;
+    prior-assistant <think> blocks stripped (the template's default, since
+    the splitter already surfaced them as reasoning_content); generation
+    prompt ends <|im_start|>assistant\\n<think>\\n (thinking on) or
+    <|im_start|>assistant\\n<think>\\n\\n</think>\\n\\n (off). No tool-call
+    syntax is wired up yet, so tools are rejected like OLMoE's."""
+    if not isinstance(messages, list) or not messages:
+        raise APIError(400, "`messages` must be a non-empty array.", "messages")
+    if tools or tool_choice not in (None, "none"):
+        raise APIError(400, "Tool use is not wired up for the Qwen MoE engine yet.",
+                       "tools", "unsupported_parameter")
+    parts = []
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            raise APIError(400, "Each message must be an object.", f"messages.{index}")
+        role = message.get("role")
+        if role not in ("system", "developer", "user", "assistant"):
+            raise APIError(400, f"Unsupported role {role!r}.", f"messages.{index}.role")
+        raw = message.get("content")
+        text = content_text(raw, f"messages.{index}.content") if raw is not None else ""
+        if role in ("system", "developer"):
+            if index != 0:
+                raise APIError(400, "System message must be at the beginning.", f"messages.{index}")
+            parts.append(f"<|im_start|>system\n{text}<|im_end|>\n")
+        elif role == "user":
+            parts.append(f"<|im_start|>user\n{text}<|im_end|>\n")
+        else:
+            if "</think>" in text:              # template default: drop prior reasoning
+                text = text.split("</think>")[-1].lstrip("\n")
+            parts.append(f"<|im_start|>assistant\n{text}<|im_end|>\n")
+    parts.append("<|im_start|>assistant\n")
+    parts.append("<think>\n\n</think>\n\n" if not enable_thinking else "<think>\n")
+    return "".join(parts)
+
+
 def render_chat_inkling(messages, enable_thinking=False, reasoning_effort=None, tools=None,
                         tool_choice=None, audio_out=None):
     """Text-only subset of Inkling's chat_template.jinja: role tokens with
@@ -1084,7 +1122,8 @@ def render_chat_for_arch(messages, enable_thinking=False, reasoning_effort=None,
                                     tool_choice, audio_out=audio_out)
     renderer = (render_chat_kimi if ARCH == "kimi" else
                 render_chat_v4 if ARCH == "deepseek_v4" else
-                render_chat_olmoe if ARCH == "olmoe" else render_chat)
+                render_chat_olmoe if ARCH == "olmoe" else
+                render_chat_qwen if ARCH == "qwen3_moe" else render_chat)
     return renderer(messages, enable_thinking, reasoning_effort, tools, tool_choice)
 
 
@@ -1627,22 +1666,24 @@ def model_arch(model):
         return "deepseek_v4"
     if "olmoe" in model_type:
         return "olmoe"
+    if "qwen3" in model_type:
+        return "qwen3_moe"
     return "glm"
 
 
-def cap_for_arch(arch, cap):
-    """Cap-sentinel shim (#379): CURRENT-STATE CALIBRATION, not durable core.
+def cap_for_arch(arch, cap, cache=None):
+    """Translate the public cache contract to each engine's argv convention.
 
     An absent cap (None) means different things across today's engines --
     platform-auto in colibri.c (coli_resolve_cap resolves the 0 sentinel
     Metal/darwin/SSD-aware), RAM-auto in inkling.c (cap <= 0 fits the expert
     LRU to available RAM), while the coli wrapper historically forced 8 on
-    every engine. This shim INTERNALIZES that external inconsistency at the
-    one funnel every engine launch passes through: with no explicit cap, a
-    glm-arch model's engine receives the 0 sentinel to resolve platform-aware
-    and a non-glm arch receives the legacy 8. An EXPLICIT cap passes through
-    verbatim to any engine -- including an explicit 0, which for inkling means
-    upstream's RAM-auto (people who ask for upstream semantics get them).
+    every engine. Qwen also uses 0 as its auto sentinel: the engine resolves it
+    from RAM_GB and finally its model topk. ``cache`` carries Engine's explicit
+    CACHE setting into argv because Qwen's serve protocol gives argv priority.
+    The complete Qwen precedence is explicit cap, CACHE, RAM-derived auto
+    sizing, then topk. An EXPLICIT cap passes through verbatim to every engine
+    -- including an explicit 0.
     Keyed on the MODEL's arch (config.json model_type), not the engine
     binary's file name: COLI_ENGINE users package the glm engine under
     arbitrary names (glm52, colibri-1.2, ...), and basename keying silently
@@ -1652,6 +1693,8 @@ def cap_for_arch(arch, cap):
     -> this shim must be removed and re-derived."""
     if cap is not None:
         return cap
+    if arch == "qwen3_moe":
+        return 0 if cache is None else int(cache)
     return 0 if arch == "glm" else 8
 
 
@@ -1687,17 +1730,18 @@ def tune_child_env(env, arch):
 class Engine:
     # cap=None = "not explicitly set": a glm-arch model's engine resolves the
     # 0 sentinel (8 historically, 1 on Metal+darwin+fast SSD -- colibri.c
-    # coli_resolve_cap, #379), non-glm arches get the legacy 8, via
-    # cap_for_arch above. Same convention as the --cap flags in coli and
-    # main() below, so programmatic callers that never pass cap get the same
-    # auto behavior as the CLI; an explicit int (0 included) is verbatim.
+    # coli_resolve_cap, #379), Qwen resolves CACHE -> RAM_GB -> topk, and the
+    # remaining non-glm arches get the legacy 8, via cap_for_arch above. Same
+    # convention as the --cap flags in coli and main() below; an explicit int
+    # (0 included) is verbatim.
     def __init__(self, executable, model, cap=None, max_tokens=1024, env=None, kv_slots=1):
         arch = model_arch(model)
         child_env = dict(env or os.environ, SNAP=str(model), SERVE="1", SERVE_BATCH="1",
                          NGEN=str(max_tokens), KV_SLOTS=str(kv_slots))
         tune_child_env(child_env, arch)
         self.process = subprocess.Popen(
-            [str(executable), str(cap_for_arch(arch, cap))], env=child_env,
+            [str(executable), str(cap_for_arch(arch, cap, child_env.get("CACHE")))],
+            env=child_env,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0,
         )
         self.write_lock = threading.Lock()
@@ -2476,7 +2520,7 @@ class APIHandler(BaseHTTPRequestHandler):
             sys.stderr.flush()
         maximum, temperature, top_p, grammar, _requested_stop_sequences = generation_options(
             body, self.server.max_tokens)
-        if grammar is not None and ARCH in ("inkling", "kimi", "olmoe"):
+        if grammar is not None and ARCH in ("inkling", "kimi", "olmoe", "qwen3_moe"):
             # sibling engines speak the 6-field SUBMIT header only; sending the
             # grammar payload extension would desync its stdin framing.
             raise APIError(400, f"`response_format` grammars are not supported by the {ARCH} "
@@ -3070,7 +3114,7 @@ def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_ke
         raise ValueError("queue_timeout must be positive")
     if not 1 <= kv_slots <= 16:
         raise ValueError("kv_slots must be between 1 and 16")
-    if ARCH in ("inkling", "kimi", "deepseek_v4", "olmoe") and kv_slots != 1:
+    if ARCH in ("inkling", "kimi", "deepseek_v4", "olmoe", "qwen3_moe") and kv_slots != 1:
         raise ValueError(f"{ARCH} engine currently supports exactly one KV slot")
     if host not in ("127.0.0.1", "localhost", "::1") and not api_key:
         # (#SEC-6) Fail closed: an unauthenticated engine on a non-loopback bind exposes
@@ -3110,7 +3154,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=os.environ.get("COLI_MODEL"), required=not os.environ.get("COLI_MODEL"))
     parser.add_argument("--engine", default=str(default_engine()))
-    parser.add_argument("--arch", choices=("auto", "glm", "inkling", "kimi", "deepseek_v4", "olmoe"), default="auto",
+    parser.add_argument("--arch", choices=("auto", "glm", "inkling", "kimi", "deepseek_v4", "olmoe", "qwen3_moe"), default="auto",
                         help="chat-template family; auto reads model_type from the model's config.json")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
@@ -3118,9 +3162,10 @@ def main():
     parser.add_argument("--api-key", default=os.environ.get("COLI_API_KEY"))
     parser.add_argument("--cors-origin", action="append", default=None,
                         help="allowed browser origin; repeat as needed (use '*' for any origin)")
-    # Absent = not explicitly set: mirrors coli's --cap (see cap_for_arch and issue
-    # #379 -- glm arch resolves platform-aware, non-glm gets the legacy 8). An
-    # explicit value, 0 included, reaches the engine verbatim.
+    # Absent = not explicitly set: mirrors coli's --cap (see cap_for_arch and
+    # issue #379). GLM resolves platform-aware; Qwen preserves CACHE -> RAM_GB
+    # -> topk; other non-glm engines retain legacy 8. An explicit value, 0
+    # included, reaches the engine verbatim.
     parser.add_argument("--cap", type=int, default=None, help="cache slots/layer (default: auto)")
     parser.add_argument("--max-tokens", type=int, default=1024)
     parser.add_argument("--max-queue", type=int, default=int(os.environ.get("COLI_MAX_QUEUE", "8")))
@@ -3142,6 +3187,7 @@ def main():
                          "kimi-k3-colibri" if ARCH == "kimi" else
                          "deepseek-v4-colibri" if ARCH == "deepseek_v4" else
                          "olmoe-colibri" if ARCH == "olmoe" else
+                         "qwen3-moe-colibri" if ARCH == "qwen3_moe" else
                          "glm-5.2-colibri")
     serve(args.model, args.host, args.port, args.model_id, args.api_key,
           args.cap,args.max_tokens,args.engine,cors_origins=args.cors_origin,

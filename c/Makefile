@@ -720,6 +720,12 @@ cuda-bench: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/bench_tens
 olmoe$(EXE): olmoe.c st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h
 	$(CC) $(NOCUDA_CFLAGS) olmoe.c -o olmoe$(EXE) $(NOCUDA_LDFLAGS)
 
+# Qwen3.5/3.6/3.7 MoE (hybrid Gated DeltaNet + Gated Attention + fine-grained
+# MoE with shared expert). CPU-only engine, disk-streamed int8 experts; same
+# no-CUDA build class as olmoe (#783).
+qwen_moe$(EXE): qwen_moe.c st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h
+	$(CC) $(NOCUDA_CFLAGS) qwen_moe.c -o qwen_moe$(EXE) $(NOCUDA_LDFLAGS)
+
 inkling$(EXE): inkling.c st.h json.h compat.h $(INK_CUDA_OBJ) $(METAL_OBJ)
 	$(CC) $(CFLAGS) inkling.c $(INK_CUDA_OBJ) $(METAL_OBJ) -o inkling$(EXE) $(LDFLAGS)
 
@@ -1078,13 +1084,14 @@ check:
 	$(MAKE) portable
 	$(MAKE) test
 
-install: colibri$(EXE) olmoe$(EXE) $(if $(filter 1,$(COLI_V4_SUPPORTED)),deepseek-v4,)
+install: colibri$(EXE) olmoe$(EXE) qwen_moe$(EXE) $(if $(filter 1,$(COLI_V4_SUPPORTED)),deepseek-v4,)
 	$(INSTALL) -d $(DESTDIR)$(BINDIR)
 	$(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)
 	$(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)/tools
 	$(INSTALL) -m 755 coli $(DESTDIR)$(BINDIR)/coli
 	$(INSTALL) -m 755 colibri$(EXE) $(DESTDIR)$(LIBEXECDIR)/colibri$(EXE)
 	$(INSTALL) -m 755 olmoe$(EXE) $(DESTDIR)$(LIBEXECDIR)/olmoe$(EXE)
+	$(INSTALL) -m 755 qwen_moe$(EXE) $(DESTDIR)$(LIBEXECDIR)/qwen_moe$(EXE)
 	@if [ -f deepseek_v4$(EXE) ]; then \
 	  $(INSTALL) -m 755 deepseek_v4$(EXE) $(DESTDIR)$(LIBEXECDIR)/deepseek_v4$(EXE); \
 	fi
@@ -1123,3 +1130,6 @@ tests/test_kv_prefix$(EXE): tests/test_kv_prefix.c kv_prefix.h
 
 tests/test_kimi_request_state$(EXE): tests/test_kimi_request_state.c kimi_k3.c kv_prefix.h st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h omp_tune.h route_trace.h
 	$(CC) $(NOCUDA_CFLAGS) tests/test_kimi_request_state.c $(VK_OBJ) -o tests/test_kimi_request_state$(EXE) $(NOCUDA_LDFLAGS)
+
+tests/test_qwen_moe$(EXE): tests/test_qwen_moe.c qwen_moe.c st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h sample.h omp_tune.h route_trace.h
+	$(CC) $(NOCUDA_CFLAGS) tests/test_qwen_moe.c -o tests/test_qwen_moe$(EXE) $(NOCUDA_LDFLAGS)

@@ -161,6 +161,10 @@ _BANNER_MODELS = (
     ("inkling",     "Inkling",           "975B"),
     ("kimi",        "Kimi K3",           "2.8T"),
     ("olmoe",       "OLMoE",             "7B"),
+    ("qwen3_7_moe", "Qwen3.7",           "TBD"),
+    ("qwen3_6_moe", "Qwen3.6",           "35B-A3B"),
+    ("qwen3_5_moe", "Qwen3.5",           "397B-A17B"),
+    ("qwen3_moe",   "Qwen3 MoE",         "235B-A22B"),
     ("glm",         "GLM-5.2",           "744B"),
 )
 
@@ -323,6 +327,8 @@ def model_arch(model):
         return "olmoe"
     if "deepseek_v4" in model_type or ("deepseek" in model_type and "v4" in model_type):
         return "deepseek_v4"
+    if "qwen3" in model_type:
+        return "qwen3_moe"
     return "glm"
 
 def engine_for(model):
@@ -330,7 +336,7 @@ def engine_for(model):
     if arch == "glm" or os.environ.get("COLI_ENGINE"):
         return GLM
     name = {"inkling": "inkling", "kimi": "kimi_k3", "olmoe": "olmoe",
-            "deepseek_v4": "deepseek_v4"}[arch]
+            "deepseek_v4": "deepseek_v4", "qwen3_moe": "qwen_moe"}[arch]
     local = os.path.join(HERE, name + _EXE)
     return local if os.path.exists(local) else os.path.join(_LIBEXEC, name + _EXE)
 
@@ -346,7 +352,8 @@ def need_model(model, engine=None):
         arch = model_arch(model)
         target = ("kimi_k3" if arch == "kimi" else "inkling" if arch == "inkling" else
                   "olmoe" if arch == "olmoe" else
-                  "deepseek-v4" if arch == "deepseek_v4" else "colibri")
+                  "deepseek-v4" if arch == "deepseek_v4" else
+                  "qwen_moe" if arch == "qwen3_moe" else "colibri")
         sys.exit(f"{C.yel}{target} engine is not built.{C.r} Run: make -C c {target}")
 
 # One-shot runs keep the historic 1024. Interactive sessions get 16384, because
@@ -400,10 +407,18 @@ def env_for_engine(a, arch):
     # #855; before that `grep -c RAM_GB c/kimi_k3.c` returned 0, so `coli chat
     # --ram 242` on Kimi K3 set an environment variable nobody looked at and the
     # user's session ran itself out of memory with the flag apparently set.
-    if arch in ("deepseek_v4", "kimi"):
+    if arch in ("deepseek_v4", "kimi", "qwen3_moe"):
         if a.ram: env["RAM_GB"] = str(a.ram)
-    if arch == "deepseek_v4":
+    if arch == "qwen3_moe":
+        env["CHAT"] = "1"
+        env["MAX_NEW"] = str(ngen_for(a))
+        # Intentional conservative policy: RAM_GB/2 is a count of resident
+        # experts per layer (not GB), leaving room for dense weights and KV.
+        # An explicit CACHE wins; without either, qwen_moe defaults to topk.
+        if a.ram: env.setdefault("CACHE", str(max(1, min(4096, a.ram // 2))))
+    if arch in ("deepseek_v4", "qwen3_moe"):
         if a.ctx: env["CTX"] = str(a.ctx)
+    if arch == "deepseek_v4":
         # Speculation stays opt-in. Real multi-turn chat measured only 1/15
         # accepted prompt-lookup candidates; recurrent-state replay dominated
         # the visible decode. V4_DRAFT=5 remains available for repeated code.
@@ -788,7 +803,7 @@ def cmd_build(a):
                   f"  Clone https://github.com/JustVugg/colibri and run ./setup.sh, or make -C c colibri.")
     arch=model_arch(a.model) if a.model else "glm"
     target={"glm":"colibri","inkling":"inkling","kimi":"kimi_k3","olmoe":"olmoe",
-            "deepseek_v4":"deepseek-v4"}[arch]
+            "deepseek_v4":"deepseek-v4","qwen3_moe":"qwen_moe"}[arch]
     sys.exit(subprocess.call(["make","-C",HERE,target]))
 
 def cmd_info(a):
@@ -970,6 +985,15 @@ def cmd_run(a):
             [engine, str(a.cap if a.cap is not None else 16), "8"],
             input=prompt+"\n", text=True, env=env_for_engine(a,arch), check=False)
         sys.exit(result.returncode)
+    if arch=="qwen3_moe":
+        # In direct mode qwen_moe reads SNAP from argv[1] and an optional
+        # explicit cap from argv[2]. Keep argv[2] absent when --cap is absent
+        # so its native CACHE -> RAM_GB -> topk precedence remains observable.
+        cmd=[engine,os.path.abspath(a.model)]
+        if a.cap is not None: cmd.append(str(a.cap))
+        result=subprocess.run(
+            cmd,input=prompt+"\n",text=True,env=env_for_engine(a,arch),check=False)
+        sys.exit(result.returncode)
     # template ufficiale GLM-5.2: niente \n dopo i ruoli; <think></think> = risposta diretta (nothink).
     # THINK=1 lascia <think> aperto, stessa convenzione del serve mode (glm.c). EN: THINK=1 leaves
     # <think> open so the engine emits its reasoning block; the default stays nothink.
@@ -1147,14 +1171,16 @@ def cmd_chat(a):
         need_model(a.model,engine)
         model_id=("kimi-k3-colibri" if arch=="kimi" else
                   "inkling-colibri" if arch=="inkling" else
-                  "olmoe-colibri" if arch=="olmoe" else "deepseek-v4-colibri")
+                  "olmoe-colibri" if arch=="olmoe" else
+                  "qwen3-moe-colibri" if arch=="qwen3_moe" else "deepseek-v4-colibri")
         banner(f"chat · {model_id} · local server", model=a.model)
         import openai_server
         # --cap rides along so an explicit `coli chat --cap N` reaches the
         # engine (it was silently eaten for years -- disclosed behavior
         # change); absent stays absent, and openai_server translates the
-        # missing flag per model arch (cap_for_arch, #379: non-glm gets the
-        # legacy 8, an explicit value -- 0 included -- passes verbatim).
+        # missing flag per model arch. Qwen preserves CACHE -> RAM_GB -> topk;
+        # the other non-glm engines retain legacy 8. Explicit values, including
+        # 0, pass verbatim (cap_for_arch, #379).
         cmd=[sys.executable,openai_server.__file__,"--model",a.model,
              "--engine",engine,"--arch",arch,"--model-id",model_id,
              "--host","127.0.0.1","--port","8000","--max-tokens",str(ngen_for(a,interactive=True))]
@@ -1541,9 +1567,10 @@ def main():
     common.add_argument("--repin", type=int, default=0, help="adapt RAM/VRAM experts every N tokens")
     # Absent (None) = not explicitly set: the glm engine gets the 0 sentinel and picks
     # (8 historically; 1 on Metal+darwin+fast SSD, #379 -- an honest F_NOCACHE probe
-    # measures "fast", cached in <model>/.coli_ssd), while non-glm arches get the
-    # legacy 8 (openai_server.cap_for_arch). An explicit --cap N -- 0 included --
-    # reaches the engine verbatim; see colibri.c's coli_resolve_cap().
+    # measures "fast", cached in <model>/.coli_ssd). Qwen uses CACHE, then a
+    # RAM-derived size, then topk; other non-glm arches retain legacy 8
+    # (openai_server.cap_for_arch). An explicit --cap N -- 0 included -- reaches
+    # the engine verbatim; see colibri.c's coli_resolve_cap().
     common.add_argument("--cap", type=int, default=None, help="cache slots/layer (default: auto)")
     # default None, resolved per command by ngen_for() below. 1024 is a sensible
     # safety net for a one-shot `coli run`; it is the wrong number for a session

@@ -501,9 +501,10 @@ generated tiny independent oracle, and the full knob list.
   lower cost per useful token. Everything lands the way this project works:
   measured end to end, reviewed, and developed in the open.
 - **More open models.** The tiering algorithm is model-agnostic: any MoE with
-  routed experts can be staged the same way. GLM-5.2 and OLMoE run today;
-  support for more open-weight families — **Kimi K2** (Moonshot AI),
-  **Qwen3 MoE** (Alibaba), **MiniMax** — is on the roadmap.
+  routed experts can be staged the same way. GLM-5.2, OLMoE and **Qwen3
+  MoE** (Alibaba, incl. the Qwen3.5/3.6 Gated-DeltaNet hybrid family — see
+  `docs/qwen-moe.md`) run today; support for more open-weight families —
+  **Kimi K2** (Moonshot AI), **MiniMax** — is on the roadmap.
 
 ## Supporting the project
 

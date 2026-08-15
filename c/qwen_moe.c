@@ -1,0 +1,1752 @@
+/* qwen_moe.c — Qwen3.5 / Qwen3.6 / Qwen3.7 MoE inference engine (CPU, C11).
+ *
+ * Architecture (from transformers Qwen3_5MoeForCausalLM, verified against the
+ * reference source on 2026-08-13 — see docs/qwen-moe-config-census.md):
+ *
+ *   hybrid decoder: per-layer `layer_types`:
+ *     "linear_attention" -> Gated DeltaNet block (Mamba-style: causal depthwise
+ *                           conv1d + delta-rule recurrence + gated RMSNorm)
+ *     "full_attention"   -> GQA attention (QK-norm, partial RoPE, output gate)
+ *   every layer ends with a fine-grained MoE FFN: softmax top-k router with
+ *   renormalised weights, per-expert SwiGLU, plus a sigmoid-gated shared expert.
+ *
+ * Weight layout (engine snapshot produced by tools/convert_qwen_moe.py or
+ * tools/make_qwen_moe_tiny.py):
+ *   - dense tensors resident in RAM as f32 (embed, norms, attn, router,
+ *     shared expert, lm_head)
+ *   - routed experts STREAMED FROM DISK: per-expert tensors, either
+ *       f32:   layers.N.mlp.experts.E.gate_up_proj [2*I, H] + .down_proj [H, I]
+ *     or int8 (merged, olmoe byte layout):
+ *       layers.N.mlp.experts.E.merged_weight (int8 g|u|d packed) + .qs (f32
+ *       row scales) — the low-RAM path: 1 byte/param instead of 4.
+ *   - per-layer LRU cache of resident experts, HOT pinning via route_trace.h
+ *     usage heatmaps, COLI_USAGE history. This is what lets a low-spec box
+ *     run a 397B checkpoint: only ~1.8GB dense + cache-sized experts resident.
+ *
+ * Modes:
+ *   QWENMOE_MODE=teacher  QWENMOE_TEACHER="ids"  -> prints PRED <argmax> per
+ *                          teacher-forced position (oracle logit check)
+ *   QWENMOE_MODE=greedy   QWENMOE_PROMPT_IDS="..." QWENMOE_MAX_NEW=n
+ *                          -> prints ID <token> per generated token
+ *   CHAT=1                -> interactive chat (prompt on stdin, decoded output)
+ *   (default)             -> self-test: runs every ref.json case in the model
+ *                            dir and reports PASS/FAIL per case
+ *
+ * Env: SNAP (or argv[1]) model dir; CACHE (or argv[2]) experts resident per
+ * layer; HOT, WARMUP pinning; EXPERT_DROP=1 fadvise(DONTNEED) after expert
+ * reads; CTX; MAX_NEW; COLI_TEMP/NUCLEUS; COLI_USAGE; ROUTE_TRACE.
+ */
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <time.h>
+#include <errno.h>
+#include <limits.h>
+#include <stdint.h>
+#include <pthread.h>
+#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
+#include <sys/resource.h>
+#include <unistd.h>
+#endif
+#include "st.h"
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+#include "omp_tune.h"
+#include "route_trace.h"
+
+static double now_s(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec + t.tv_nsec*1e-9; }
+#if defined(__APPLE__)
+static double rss_gb(void){ struct rusage r; getrusage(RUSAGE_SELF,&r); return r.ru_maxrss/(1024.0*1024.0*1024.0); }
+#else
+static double rss_gb(void){ struct rusage r; getrusage(RUSAGE_SELF,&r); return r.ru_maxrss/(1024.0*1024.0); }
+#endif
+static int size_mul_ok(size_t a, size_t b, size_t *out){
+    if (a && b > SIZE_MAX / a) return 0;
+    *out = a * b;
+    return 1;
+}
+static int size_add_ok(size_t a, size_t b, size_t *out){
+    if (b > SIZE_MAX - a) return 0;
+    *out = a + b;
+    return 1;
+}
+static int i64_mul_ok(int64_t a, int64_t b, int64_t *out){
+    if (a < 0 || b < 0 || (a && b > INT64_MAX / a)) return 0;
+    *out = a * b;
+    return 1;
+}
+static int i64_add_ok(int64_t a, int64_t b, int64_t *out){
+    if (a < 0 || b < 0 || b > INT64_MAX - a) return 0;
+    *out = a + b;
+    return 1;
+}
+static int tensor_numel_ok(int64_t got, int64_t want){
+    return got >= 0 && want >= 0 && got == want;
+}
+static size_t size_mul_or_die(size_t a, size_t b, const char *what){
+    size_t out;
+    if (!size_mul_ok(a, b, &out)) {
+        fprintf(stderr, "%s: size overflow (%zu * %zu)\n", what, a, b);
+        exit(1);
+    }
+    return out;
+}
+static void *calloc_checked(size_t n, size_t size, const char *what){
+    size_t bytes = size_mul_or_die(n, size, what);
+    void *p = calloc(1, bytes);
+    if (!p && bytes) { fprintf(stderr, "OOM %s (%zu bytes)\n", what, bytes); exit(1); }
+    return p;
+}
+static float *falloc(int64_t n){
+    size_t bytes;
+    if (n <= 0 || (uint64_t)n > SIZE_MAX ||
+        !size_mul_ok((size_t)n, sizeof(float), &bytes)) {
+        fprintf(stderr, "invalid float allocation count %lld\n", (long long)n);
+        exit(1);
+    }
+    float *p = malloc(bytes);
+    if (!p) { fprintf(stderr, "OOM %lld\n", (long long)n); exit(1); }
+    return p;
+}
+
+static float g_temp = 0.0f, g_nuc = 0.0f;       /* sample.h contract; 0 = greedy */
+static int g_expert_drop = 0;
+static int g_dense_drop = 0;    /* RAM-tight: DONTNEED dense file pages after the
+                                 * resident f32 copy is made (page cache would
+                                 * otherwise duplicate the whole snapshot) */
+
+/* ---------- config ---------- */
+
+typedef struct {
+    int hidden, n_layers, n_heads, n_kv_heads, head_dim, rotary_dim;
+    int n_experts, topk, moe_inter, shared_inter;
+    int lin_k_heads, lin_k_dim, lin_v_heads, lin_v_dim, conv_kernel;
+    int vocab, max_pos;
+    float theta, eps;
+    int eos;
+    int n_stop, stop_ids[8];        /* sample.h stop contract (empty = none) */
+    int8_t *layer_is_gdn;           /* 1 = linear_attention (GDN), 0 = full */
+} Cfg;
+
+#include "tok.h"
+#include "sample.h"                 /* needs Cfg (stops_arm_tok) + falloc/g_temp */
+
+static int cfg_validate(const Cfg *c, char *why, size_t why_n){
+#define CFG_BAD(...) do { snprintf(why, why_n, __VA_ARGS__); return 0; } while (0)
+    if (c->hidden < 1 || c->hidden > (1 << 20) ||
+        c->n_layers < 1 || c->n_layers > 4096 ||
+        c->n_heads < 1 || c->n_heads > (1 << 16) ||
+        c->n_kv_heads < 1 || c->n_kv_heads > c->n_heads ||
+        c->head_dim < 1 || c->head_dim > (1 << 20) ||
+        c->n_experts < 1 || c->n_experts > (1 << 20) ||
+        c->topk < 1 || c->topk > c->n_experts ||
+        c->moe_inter < 1 || c->moe_inter > (1 << 24) ||
+        c->shared_inter < 1 || c->shared_inter > (1 << 24) ||
+        c->lin_k_heads < 1 || c->lin_k_heads > (1 << 16) ||
+        c->lin_k_dim < 1 || c->lin_k_dim > (1 << 20) ||
+        c->lin_v_heads < 1 || c->lin_v_heads > (1 << 16) ||
+        c->lin_v_dim < 1 || c->lin_v_dim > (1 << 20) ||
+        c->conv_kernel < 1 || c->conv_kernel > 16 ||
+        c->vocab < 1 || c->vocab > (1 << 24) ||
+        c->max_pos < 1 || c->max_pos > (1 << 30))
+        CFG_BAD("dimension out of range");
+    if (!isfinite(c->theta) || c->theta <= 0.f ||
+        !isfinite(c->eps) || c->eps <= 0.f)
+        CFG_BAD("theta/epsilon must be finite and positive");
+    if (c->eos < 0 || c->eos >= c->vocab)
+        CFG_BAD("eos_token_id %d outside vocab_size %d", c->eos, c->vocab);
+    if (c->hidden % c->n_heads)
+        CFG_BAD("hidden_size %d is not divisible by attention heads %d",
+                c->hidden, c->n_heads);
+    if (c->n_heads % c->n_kv_heads)
+        CFG_BAD("attention heads %d are not divisible by KV heads %d",
+                c->n_heads, c->n_kv_heads);
+    if (c->rotary_dim < 2 || c->rotary_dim > c->head_dim || (c->rotary_dim & 1))
+        CFG_BAD("rotary_dim %d must be even and within [2,head_dim]", c->rotary_dim);
+    if (c->lin_v_heads < c->lin_k_heads || c->lin_v_heads % c->lin_k_heads)
+        CFG_BAD("GDN value heads %d must be a multiple of key heads %d",
+                c->lin_v_heads, c->lin_k_heads);
+
+    size_t qdim, kdim, vdim, conv, tmp, expert, bytes;
+    if (!size_mul_ok((size_t)c->n_heads, c->head_dim, &qdim) ||
+        qdim > (size_t)INT_MAX / 2)
+        CFG_BAD("attention query projection rows overflow int");
+    if (!size_mul_ok((size_t)c->n_kv_heads, c->head_dim, &tmp) || tmp > INT_MAX)
+        CFG_BAD("attention KV projection rows overflow int");
+    if (!size_mul_ok((size_t)c->lin_k_heads, c->lin_k_dim, &kdim) ||
+        !size_mul_ok((size_t)c->lin_v_heads, c->lin_v_dim, &vdim) ||
+        !size_mul_ok(kdim, 2, &tmp) || !size_add_ok(tmp, vdim, &conv) ||
+        conv > INT_MAX || vdim > INT_MAX)
+        CFG_BAD("GDN projection rows overflow int");
+    if (!size_mul_ok((size_t)c->lin_v_heads, c->lin_k_dim, &tmp) ||
+        !size_mul_ok(tmp, c->lin_v_dim, &tmp) ||
+        !size_mul_ok(tmp, sizeof(float), &bytes))
+        CFG_BAD("GDN recurrence allocation overflows size_t");
+    if (!size_mul_ok(conv, (size_t)(c->conv_kernel - 1), &tmp) ||
+        !size_mul_ok(tmp, sizeof(float), &bytes))
+        CFG_BAD("GDN convolution allocation overflows size_t");
+    if (!size_mul_ok((size_t)c->moe_inter, c->hidden, &expert) ||
+        !size_mul_ok(expert, 3, &tmp) || !size_mul_ok(tmp, sizeof(float), &bytes))
+        CFG_BAD("expert allocation overflows size_t");
+    if (!size_mul_ok((size_t)c->vocab, c->hidden, &tmp) ||
+        !size_mul_ok(tmp, sizeof(float), &bytes))
+        CFG_BAD("embedding allocation overflows size_t");
+    if (!size_mul_ok((size_t)c->n_layers, c->n_experts, &tmp))
+        CFG_BAD("route-state allocation overflows size_t");
+#undef CFG_BAD
+    if (why_n) why[0] = 0;
+    return 1;
+}
+
+/* ---------- dense per-layer weights ---------- */
+
+/* dense matmul weight: f32 resident, or row-int8 (q + per-row f32 scales)
+ * when the snapshot carries <name>_q8/<name>_qs — the low-RAM path used for
+ * the real checkpoints (4x smaller resident dense, same scheme as experts). */
+typedef struct { float *f; int8_t *q; float *s; } WT;
+
+typedef struct {
+    float *in_ln, *post_ln;
+    /* full attention */
+    WT q, k, v, o; float *qn, *kn;
+    /* gated deltanet (linear_attn.*) */
+    float *A_log, *dt_bias, *conv1d;    /* conv1d [C, 1, k] = [C, k] flat */
+    WT in_a, in_b, in_qkv, in_z, gdn_out; float *gdn_norm;
+    /* moe */
+    WT router, se_gate, se_up, se_down, se_g;  /* shared expert */
+} Layer;
+
+/* ---------- expert cache (STREAMED from disk) ---------- */
+
+typedef struct {
+    int eid;                       /* -1 = slot in flight */
+    int pinned;
+    int q8;                        /* 1 = int8 merged + scales, 0 = f32 */
+    float *gu, *d;                 /* f32: [2I,H] gate|up, [H,I] down */
+    int8_t *g, *u, *dd;            /* q8: int8 blocks */
+    float *gs, *us, *ds;           /* q8: row scales */
+    uint64_t used;
+} Slot;
+typedef struct { Slot *slots; int n, cap; } LCache;
+
+typedef struct {
+    Cfg c;
+    shards S;
+    Tok *tok;                       /* tokenizer owns the valid-vocabulary map */
+    WT embed, lm_head; float *final_norm;
+    Layer *L;
+    LCache *cache;                 /* [n_layers] */
+    uint64_t clock, hits, miss;
+    float **K, **V;                /* [n_layers][kv_heads*max_t*head_dim] */
+    int kv_len, max_t;
+    float **gdn_S;                 /* [n_layers][v_heads*k_dim*v_dim] state */
+    float **gdn_conv;              /* [n_layers][conv_dim*(k-1)] conv state */
+    uint32_t **freq;               /* route_trace heatmap alias */
+    int hot_pinned, hot_n, warmup_tokens, token_count;
+    uint8_t *is_pinned;            /* [n_layers*n_experts] */
+    double dense_load_s;
+} Model;
+
+static pthread_mutex_t g_mx = PTHREAD_MUTEX_INITIALIZER;
+
+static size_t gdn_state_count(const Cfg *c){
+    size_t n = size_mul_or_die((size_t)c->lin_v_heads, c->lin_k_dim, "GDN recurrence");
+    return size_mul_or_die(n, c->lin_v_dim, "GDN recurrence");
+}
+static size_t gdn_conv_count(const Cfg *c){
+    size_t k = size_mul_or_die((size_t)c->lin_k_heads, c->lin_k_dim, "GDN convolution");
+    size_t v = size_mul_or_die((size_t)c->lin_v_heads, c->lin_v_dim, "GDN convolution");
+    size_t twice, channels;
+    if (!size_mul_ok(k, 2, &twice) || !size_add_ok(twice, v, &channels)) {
+        fprintf(stderr, "GDN convolution channel count overflow\n"); exit(1);
+    }
+    return size_mul_or_die(channels, (size_t)(c->conv_kernel - 1), "GDN convolution");
+}
+static size_t kv_state_count(const Cfg *c, int max_t){
+    size_t n = size_mul_or_die((size_t)c->n_kv_heads, (size_t)max_t, "KV cache");
+    return size_mul_or_die(n, c->head_dim, "KV cache");
+}
+
+/* All output-token selection comes through this helper.  Checkpoints often
+ * pad lm_head/embed to an accelerator-friendly row count beyond the actual
+ * tokenizer vocabulary; those rows have no Tok.id2str entry and must never be
+ * sampled.  Added stop/control tokens do have entries and remain eligible. */
+static int qwen_pick_token(Model *m, const float *logits, int ban){
+    int V = m->c.vocab, eligible = 0;
+    float *masked = falloc(V);
+    for (int id = 0; id < V; id++) {
+        int valid = m->tok && id < m->tok->n_ids && m->tok->id2str[id];
+        if (valid && id != ban) { masked[id] = logits[id]; eligible++; }
+        else masked[id] = -INFINITY;
+    }
+    if (!eligible) {
+        fprintf(stderr, "tokenizer.json: no selectable token ids inside vocab_size=%d\n", V);
+        free(masked);
+        exit(1);
+    }
+    int token = pick_tok(masked, V, -1);
+    free(masked);
+    if (token < 0 || token >= V || token >= m->tok->n_ids || !m->tok->id2str[token]) {
+        fprintf(stderr, "token selection produced invalid id %d\n", token);
+        exit(1);
+    }
+    return token;
+}
+
+static int ids_in_vocab(const Cfg *c, const int *ids, int n, const char *source){
+    if (!ids || n < 1) {
+        fprintf(stderr, "%s: empty token sequence\n", source);
+        return 0;
+    }
+    for (int i = 0; i < n; i++) if (ids[i] < 0 || ids[i] >= c->vocab) {
+        fprintf(stderr, "%s: token id %d at position %d outside [0,%d)\n",
+                source, ids[i], i, c->vocab);
+        return 0;
+    }
+    return 1;
+}
+
+static void logits_free(float **p){
+    if (!p) return;
+    free(*p);
+    *p = NULL;
+}
+
+/* ---------- config.json ---------- */
+
+/* config.json arrives from an untrusted mirror: require each dimension to be
+ * present and numeric (same discipline as olmoe.c / SEC-9). */
+static double req_num(jval *r, const char *k){
+    jval *v = json_get(r, k);
+    if (!v || v->t != J_NUM || !isfinite(v->num)) {
+        fprintf(stderr, "config.json: missing, non-numeric, or non-finite \"%s\"\n", k);
+        exit(1);
+    }
+    return v->num;
+}
+static double opt_num(jval *r, const char *k, double dflt){
+    jval *v = json_get(r, k);
+    if (!v) return dflt;
+    if (v->t != J_NUM || !isfinite(v->num)) {
+        fprintf(stderr, "config.json: non-numeric or non-finite \"%s\"\n", k);
+        exit(1);
+    }
+    return v->num;
+}
+static int num_to_int(double v, const char *k){
+    if (!isfinite(v) || v < INT_MIN || v > INT_MAX || trunc(v) != v) {
+        fprintf(stderr, "config.json: \"%s\" must be an integer in int range\n", k);
+        exit(1);
+    }
+    return (int)v;
+}
+static int req_int(jval *r, const char *k){
+    return num_to_int(req_num(r, k), k);
+}
+static int opt_int(jval *r, const char *k, int dflt){
+    jval *v = json_get(r, k);
+    return v ? num_to_int(opt_num(r, k, dflt), k) : dflt;
+}
+
+/* Qwen3.5/3.6 checkpoints carry the text config inside "text_config"
+ * (vision-language wrapper). The tiny fixtures write it flat. Handle both. */
+static jval *cfg_root(jval *r){
+    jval *tc = json_get(r, "text_config");
+    return (tc && tc->t == J_OBJ) ? tc : r;
+}
+
+static int parse_layer_types(jval *r, int n_layers, int8_t *out){
+    jval *lt = json_get(r, "layer_types");
+    if (!lt || lt->t != J_ARR || lt->len != n_layers) {
+        fprintf(stderr, "config.json: layer_types must be an array of %d entries "
+                        "({\"linear_attention\"|\"full_attention\"})\n", n_layers);
+        return -1;
+    }
+    for (int i = 0; i < n_layers; i++) {
+        jval *e = lt->kids[i];
+        if (e->t != J_STR) return -1;
+        if (!strcmp(e->str, "linear_attention")) out[i] = 1;
+        else if (!strcmp(e->str, "full_attention")) out[i] = 0;
+        else { fprintf(stderr, "config.json: unknown layer type \"%s\"\n", e->str); return -1; }
+    }
+    return 0;
+}
+
+static void load_cfg(Cfg *c, const char *snap){
+    char path[2048]; snprintf(path, sizeof(path), "%s/config.json", snap);
+    FILE *f = fopen(path, "rb"); if (!f) { perror(path); exit(1); }
+    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+    if (n < 0 || n > (256L << 20)) { fprintf(stderr, "%s: config.json missing or larger than 256 MB\n", path); exit(1); }
+    char *buf = malloc((size_t)n + 1); if (!buf) { fprintf(stderr, "OOM reading %s\n", path); exit(1); }
+    if (fread(buf, 1, (size_t)n, f) != (size_t)n) { fprintf(stderr, "%s: short read\n", path); exit(1); }
+    buf[n] = 0; fclose(f);
+    char *arena = NULL; jval *r = json_parse(buf, &arena);
+    jval *root = cfg_root(r);
+
+    c->hidden    = req_int(root, "hidden_size");
+    c->n_layers  = req_int(root, "num_hidden_layers");
+    c->n_heads   = req_int(root, "num_attention_heads");
+    c->n_kv_heads= req_int(root, "num_key_value_heads");
+    c->head_dim  = opt_int(root, "head_dim",
+                           c->n_heads ? c->hidden / c->n_heads : 0);
+    c->n_experts = req_int(root, "num_experts");
+    c->topk      = req_int(root, "num_experts_per_tok");
+    c->moe_inter = req_int(root, "moe_intermediate_size");
+    c->shared_inter = req_int(root, "shared_expert_intermediate_size");
+    c->lin_k_heads = req_int(root, "linear_num_key_heads");
+    c->lin_k_dim   = req_int(root, "linear_key_head_dim");
+    c->lin_v_heads = req_int(root, "linear_num_value_heads");
+    c->lin_v_dim   = req_int(root, "linear_value_head_dim");
+    c->conv_kernel = req_int(root, "linear_conv_kernel_dim");
+    c->vocab     = req_int(root, "vocab_size");
+    c->max_pos   = opt_int(root, "max_position_embeddings", 262144);
+    c->eps       = (float)opt_num(root, "rms_norm_eps", 1e-6);
+    c->eos       = opt_int(root, "eos_token_id", 248044);
+
+    jval *rp = json_get(root, "rope_parameters");
+    c->theta = (rp && rp->t == J_OBJ) ? (float)opt_num(rp, "rope_theta", 10000000.0)
+                                      : (float)opt_num(root, "rope_theta", 10000000.0);
+    double prf = (rp && rp->t == J_OBJ) ? opt_num(rp, "partial_rotary_factor", 1.0)
+                                        : opt_num(root, "partial_rotary_factor", 1.0);
+    double rotary = c->head_dim * prf;
+    if (!isfinite(prf) || !isfinite(rotary) || rotary < INT_MIN || rotary > INT_MAX ||
+        trunc(rotary) != rotary) {
+        fprintf(stderr, "config.json: partial rotary dimension must be an integer\n");
+        exit(1);
+    }
+    c->rotary_dim = (int)rotary;
+
+    char why[256];
+    if (!cfg_validate(c, why, sizeof(why))) {
+        fprintf(stderr, "config.json: %s\n", why);
+        exit(1);
+    }
+    c->n_stop = 0;
+    c->layer_is_gdn = malloc((size_t)c->n_layers);
+    if (!c->layer_is_gdn) { fprintf(stderr, "OOM layer_types\n"); exit(1); }
+    if (parse_layer_types(root, c->n_layers, c->layer_is_gdn) != 0) exit(1);
+    free(buf); free(arena);
+}
+
+/* ---------- tensor loading ---------- */
+
+static char g_prefix[64] = "";      /* "model.language_model." or "" (probed) */
+
+static float *load_t(Model *m, const char *name, int64_t want){
+    char nm[512]; snprintf(nm, sizeof(nm), "%s%s", g_prefix, name);
+    int64_t n = st_numel(&m->S, nm);
+    if (n < 0) { fprintf(stderr, "missing %s\n", nm); exit(1); }
+    if (!tensor_numel_ok(n, want)) {
+        fprintf(stderr, "%s: %lld elems — expected %lld, refusing\n",
+                nm, (long long)n, (long long)want);
+        exit(1);
+    }
+    float *p = falloc(n);
+    st_read_f32(&m->S, nm, p, g_dense_drop);
+    return p;
+}
+
+/* tensor present in f32 or q8 form (q8-only snapshots have no f32 copy) */
+static int st_have(Model *m, const char *name){
+    char nm[512]; snprintf(nm, sizeof(nm), "%s_q8", name);
+    return st_has(&m->S, name) || st_has(&m->S, nm);
+}
+
+/* dense matmul weight: probes <base>_q8 + <base>_qs (row-int8, exact-size
+ * checked — hostile-container guard), falls back to f32 <base>. */
+static WT load_wt_named(Model *m, const char *base, int64_t O, int64_t I){
+    WT w = {0};
+    int64_t want;
+    if (!i64_mul_ok(O, I, &want) || (uint64_t)want > SIZE_MAX) {
+        fprintf(stderr, "%s: tensor dimensions overflow (%lld x %lld)\n",
+                base, (long long)O, (long long)I);
+        exit(1);
+    }
+    char nm[512]; snprintf(nm, sizeof(nm), "%s_q8", base);
+    st_tensor *tq = st_find(&m->S, nm);
+    if (tq) {
+        if (!tensor_numel_ok(tq->nbytes, want)) {
+            fprintf(stderr, "%s: %lld bytes — expected %lld, refusing\n",
+                    nm, (long long)tq->nbytes, (long long)want); exit(1);
+        }
+        char qsnm[512]; snprintf(qsnm, sizeof(qsnm), "%s_qs", base);
+        st_tensor *ts = st_find(&m->S, qsnm);
+        if (!ts || ts->numel != O) {
+            fprintf(stderr, "%s: scale array is %lld elems — expected %lld, refusing\n",
+                    qsnm, (long long)(ts ? ts->numel : -1), (long long)O); exit(1);
+        }
+        w.q = malloc((size_t)want); if (!w.q) { fprintf(stderr, "OOM %s\n", nm); exit(1); }
+        w.s = falloc(O);
+        st_read_raw(&m->S, nm, w.q, g_dense_drop);
+        st_read_f32(&m->S, qsnm, w.s, g_dense_drop);
+        return w;
+    }
+    int64_t n = st_numel(&m->S, base);
+    if (n < 0) { fprintf(stderr, "missing %s\n", base); exit(1); }
+    if (!tensor_numel_ok(n, want)) {
+        fprintf(stderr, "%s: %lld elems — expected %lld, refusing\n",
+                base, (long long)n, (long long)want); exit(1);
+    }
+    w.f = falloc(n);
+    st_read_f32(&m->S, base, w.f, g_dense_drop);
+    return w;
+}
+static WT load_wt(Model *m, const char *name, int64_t O, int64_t I){
+    char base[512]; snprintf(base, sizeof(base), "%s%s", g_prefix, name);
+    return load_wt_named(m, base, O, I);
+}
+
+/* ---------- kernels ---------- */
+
+static void matmul(float *y, const float *x, const float *w, int S, int O, int I){
+    #pragma omp parallel for schedule(static)
+    for (int so = 0; so < S * O; so++) {
+        int s = so / O, o = so % O;
+        const float *xs = x + (int64_t)s * I;
+        const float *wr = w + (int64_t)o * I;
+        float acc = 0.f;
+        #pragma omp simd reduction(+:acc)
+        for (int i = 0; i < I; i++) acc += xs[i] * wr[i];
+        y[(int64_t)so] = acc;
+    }
+}
+
+/* int8 weights + per-row f32 scales (dequant on use) */
+static void matmul_q8(float *y, const float *x, const int8_t *q, const float *sc,
+                      int S, int O, int I){
+    #pragma omp parallel for schedule(static)
+    for (int so = 0; so < S * O; so++) {
+        int s = so / O, o = so % O;
+        const float *xs = x + (int64_t)s * I;
+        const int8_t *wr = q + (int64_t)o * I;
+        float acc = 0;
+        #pragma omp simd reduction(+:acc)
+        for (int i = 0; i < I; i++) acc += xs[i] * (float)wr[i];
+        y[(int64_t)so] = acc * sc[o];
+    }
+}
+
+/* WT dispatch: row-int8 when the snapshot supplied it, f32 otherwise */
+static void wt_mul(float *y, const float *x, WT *w, int S, int O, int I){
+    if (w->q) matmul_q8(y, x, w->q, w->s, S, O, I);
+    else      matmul(y, x, w->f, S, O, I);
+}
+
+/* Qwen3.5 RMSNorm: weight is ZERO-initialised and applied as (1 + w). */
+static void rmsnorm_row(float *out, const float *x, const float *w, int D, float eps){
+    double ms = 0; for (int i = 0; i < D; i++) ms += (double)x[i] * x[i];
+    float r = 1.f / sqrtf((float)(ms / D) + eps);
+    for (int i = 0; i < D; i++) out[i] = x[i] * r * (1.f + w[i]);
+}
+
+static float silu(float x){ return x / (1.f + expf(-x)); }
+
+/* RMSNormGated (GDN output norm): w * rmsnorm(x) * silu(gate) */
+static void rmsnorm_gated_row(float *out, const float *x, const float *z,
+                              const float *w, int D, float eps){
+    double ms = 0; for (int i = 0; i < D; i++) ms += (double)x[i] * x[i];
+    float r = 1.f / sqrtf((float)(ms / D) + eps);
+    for (int i = 0; i < D; i++) out[i] = w[i] * (x[i] * r) * silu(z[i]);
+}
+
+static void softmax_row(float *x, int n){
+    float m = -1e30f; for (int i = 0; i < n; i++) if (x[i] > m) m = x[i];
+    float s = 0; for (int i = 0; i < n; i++) { x[i] = expf(x[i] - m); s += x[i]; }
+    for (int i = 0; i < n; i++) x[i] /= s;
+}
+
+/* ---------- expert cache (disk streaming) ---------- */
+
+/* Slot buffers are allocated per-format, ONLY what the load actually uses:
+ * the f32 path needs the gate|up|down f32 block; the int8 path needs the
+ * int8 merged block + f32 row scales. Never both (that was a 12 MB/slot
+ * waste on int8 snapshots: at 8 slots x 40 layers = ~4 GB of dead RAM). */
+static void slot_alloc_f32(Slot *s, int64_t ng, int64_t nd){
+    if (s->gu) return;
+    int64_t twice, total;
+    if (!i64_mul_ok(ng, 2, &twice) || !i64_add_ok(twice, nd, &total)) {
+        fprintf(stderr, "expert f32 allocation overflows\n"); exit(1);
+    }
+    s->gu = falloc(total);                    /* gate|up [2I,H] + down [H,I] */
+    s->d = s->gu + 2 * ng;
+}
+static void slot_alloc_q8(Model *m, Slot *s){
+    if (s->g) return;
+    Cfg *c = &m->c;
+    int64_t ng = (int64_t)c->moe_inter * c->hidden;
+    int64_t nd = (int64_t)c->hidden * c->moe_inter;
+    int64_t twice, total;
+    if (!i64_mul_ok(ng, 2, &twice) || !i64_add_ok(twice, nd, &total) ||
+        (uint64_t)total > SIZE_MAX) {
+        fprintf(stderr, "expert q8 allocation overflows\n"); exit(1);
+    }
+    s->g = malloc((size_t)total); if (!s->g) { fprintf(stderr, "OOM expert\n"); exit(1); }
+    s->u = s->g + ng; s->dd = s->g + ng + ng;
+    int64_t scale_n = (int64_t)c->moe_inter * 2 + c->hidden;
+    float *sb = falloc(scale_n);
+    s->gs = sb; s->us = sb + c->moe_inter; s->ds = sb + c->moe_inter + c->moe_inter;
+    s->pinned = 0;
+}
+
+static void load_expert(Model *m, int layer, int eid, Slot *s){
+    char nm[512], qsnm[512];
+    Cfg *cc = &m->c;
+    int64_t ng = (int64_t)cc->moe_inter * cc->hidden;
+    int64_t nd = (int64_t)cc->hidden * cc->moe_inter;
+
+    /* int8 merged format (converter output, olmoe byte layout)? */
+    snprintf(nm, sizeof(nm), "%slayers.%d.mlp.experts.%d.merged_weight", g_prefix, layer, eid);
+    st_tensor *tw = st_find(&m->S, nm);
+    if (tw) {
+        int64_t twice, want_w;
+        if (!i64_mul_ok(ng, 2, &twice) || !i64_add_ok(twice, nd, &want_w)) {
+            fprintf(stderr, "%s: expected size overflows\n", nm); exit(1);
+        }
+        if (!tensor_numel_ok(tw->nbytes, want_w)) {
+            fprintf(stderr, "%s: expert weight is %lld bytes — expected %lld, refusing\n",
+                    nm, (long long)tw->nbytes, (long long)want_w); exit(1);
+        }
+        snprintf(qsnm, sizeof(qsnm), "%slayers.%d.mlp.experts.%d.qs", g_prefix, layer, eid);
+        st_tensor *ts = st_find(&m->S, qsnm);
+        int64_t want_s = cc->moe_inter + cc->moe_inter + cc->hidden;
+        if (!ts || ts->numel != want_s) {
+            fprintf(stderr, "%s: scale array is %lld elems — expected %lld, refusing\n",
+                    qsnm, (long long)(ts ? ts->numel : -1), (long long)want_s); exit(1);
+        }
+        slot_alloc_q8(m, s);
+        s->q8 = 1;
+        st_read_raw(&m->S, nm, s->g, g_expert_drop);
+        st_read_f32(&m->S, qsnm, s->gs, g_expert_drop);
+        return;
+    }
+    /* f32 per-expert format (fixture / --bits 32 converter output) */
+    snprintf(nm, sizeof(nm), "%slayers.%d.mlp.experts.%d.gate_up_proj", g_prefix, layer, eid);
+    st_tensor *tgu = st_find(&m->S, nm);
+    if (!tgu) { fprintf(stderr, "missing %s\n", nm); exit(1); }
+    int64_t twice_ng, want_gu, want_d;
+    if (!i64_mul_ok(ng, 2, &twice_ng) || !i64_mul_ok(twice_ng, 4, &want_gu) ||
+        !i64_mul_ok(nd, 4, &want_d)) {
+        fprintf(stderr, "%s: expected size overflows\n", nm); exit(1);
+    }
+    if (!tensor_numel_ok(tgu->nbytes, want_gu)) {
+        fprintf(stderr, "%s: %lld bytes — expected %lld, refusing\n",
+                nm, (long long)tgu->nbytes, (long long)want_gu); exit(1);
+    }
+    snprintf(qsnm, sizeof(qsnm), "%slayers.%d.mlp.experts.%d.down_proj", g_prefix, layer, eid);
+    st_tensor *td = st_find(&m->S, qsnm);
+    if (!td || !tensor_numel_ok(td->nbytes, want_d)) {
+        fprintf(stderr, "%s: %lld bytes — expected %lld, refusing\n",
+                qsnm, (long long)(td ? td->nbytes : -1), (long long)want_d); exit(1);
+    }
+    slot_alloc_f32(s, ng, nd);
+    s->q8 = 0;
+    st_read_f32(&m->S, nm, s->gu, g_expert_drop);
+    st_read_f32(&m->S, qsnm, s->d, g_expert_drop);
+}
+
+static void expert_get(Model *m, int layer, int eid, Slot **out){
+    LCache *lc = &m->cache[layer];
+    Cfg *c = &m->c;
+    pthread_mutex_lock(&g_mx);
+    for (int i = 0; i < lc->n; i++) if (lc->slots[i].eid == eid) {
+        m->hits++; lc->slots[i].used = ++m->clock; *out = &lc->slots[i];
+        pthread_mutex_unlock(&g_mx); return;
+    }
+    m->miss++;
+    Slot *s;
+    if (lc->n < lc->cap) {
+        s = &lc->slots[lc->n++];        /* buffers allocated by load_expert */
+    } else {
+        /* LRU eviction — skip pinned and in-flight (eid==-1) slots */
+        int lru = -1;
+        for (int i = 0; i < lc->n; i++) {
+            if (lc->slots[i].pinned || lc->slots[i].eid < 0) continue;
+            if (lru < 0 || lc->slots[i].used < lc->slots[lru].used) lru = i;
+        }
+        if (lru < 0)
+            for (int i = 0; i < lc->n; i++) {
+                if (lc->slots[i].eid < 0) continue;
+                if (lru < 0 || lc->slots[i].used < lc->slots[lru].used) lru = i;
+            }
+        while (lru < 0) {   /* every slot in flight: wait for a publish */
+            pthread_mutex_unlock(&g_mx);
+            struct timespec ts = {0, 1000000L}; nanosleep(&ts, NULL);
+            pthread_mutex_lock(&g_mx);
+            for (int i = 0; i < lc->n; i++) {
+                if (lc->slots[i].eid < 0) continue;
+                if (lru < 0 || lc->slots[i].used < lc->slots[lru].used) lru = i;
+            }
+        }
+        s = &lc->slots[lru];
+        s->pinned = 0;
+    }
+    s->eid = -1;
+    pthread_mutex_unlock(&g_mx);
+
+    load_expert(m, layer, eid, s);          /* disk I/O outside the lock */
+
+    pthread_mutex_lock(&g_mx);
+    s->eid = eid;
+    s->pinned = m->is_pinned[(size_t)layer * c->n_experts + eid];
+    s->used = ++m->clock;
+    pthread_mutex_unlock(&g_mx);
+    *out = s;
+}
+
+/* ---------- HOT pinning (usage heatmap -> never-evict set) ---------- */
+
+static void pin_hot_experts(Model *m){
+    Cfg *c = &m->c;
+    if (m->hot_n <= 0 || m->hot_pinned) return;
+    m->hot_pinned = 1;
+    int pinned_total = 0;
+    for (int l = 0; l < c->n_layers; l++) {
+        uint32_t *freq_l = m->freq[l];
+        if (!freq_l) continue;
+        uint64_t layer_total = 0;
+        for (int e = 0; e < c->n_experts; e++) layer_total += freq_l[e];
+        if (layer_total == 0) continue;
+        int hn = m->hot_n < c->n_experts ? m->hot_n : c->n_experts;
+        if (hn > 256) hn = 256;
+        int hot_eids[256], actual = 0;
+        for (int k = 0; k < hn; k++) {
+            int best = -1; uint32_t bv = 0;
+            for (int e = 0; e < c->n_experts; e++) {
+                int already = 0;
+                for (int j = 0; j < k; j++) if (hot_eids[j] == e) { already = 1; break; }
+                if (!already && freq_l[e] > bv) { bv = freq_l[e]; best = e; }
+            }
+            if (best < 0 || bv == 0) break;
+            hot_eids[k] = best; actual++;
+        }
+        for (int k = 0; k < actual; k++) {
+            int eid = hot_eids[k];
+            m->is_pinned[(size_t)l * c->n_experts + eid] = 1;
+            pthread_mutex_lock(&g_mx);
+            LCache *lc = &m->cache[l];
+            for (int i = 0; i < lc->n; i++)
+                if (lc->slots[i].eid == eid) lc->slots[i].pinned = 1;
+            pthread_mutex_unlock(&g_mx);
+            pinned_total++;
+        }
+    }
+    printf("[HOT] Pinned %d experts (top-%d/layer) after %d warmup tokens\n",
+           pinned_total, m->hot_n, m->token_count);
+}
+
+/* ---------- full attention (GQA + QK-norm + partial RoPE + output gate) ---------- */
+
+static void rope_partial(float *v, int pos, const Cfg *c){
+    int rd = c->rotary_dim;
+    for (int j = 0; j < rd / 2; j++) {
+        float inv = powf(c->theta, -2.0f * j / rd);
+        float ang = pos * inv, cs = cosf(ang), sn = sinf(ang);
+        float a = v[j], b = v[j + rd / 2];
+        v[j] = a * cs - b * sn; v[j + rd / 2] = b * cs + a * sn;
+    }
+}
+
+/* one token through one full_attention layer; K/V stored at pos BEFORE scoring
+ * (causal attention includes the token's own key, matching transformers). */
+static void attention_token(Model *m, Layer *l, int layer, const float *x, int pos, float *out){
+    Cfg *c = &m->c; int H = c->n_heads, hd = c->head_dim, D = c->hidden;
+    int kv = c->n_kv_heads, groups = H / kv;
+    float *qg = falloc((int64_t)2 * H * hd);        /* per head: [q hd | gate hd] */
+    float *k = falloc((int64_t)kv * hd), *vv = falloc((int64_t)kv * hd);
+    wt_mul(qg, x, &l->q, 1, 2 * H * hd, D);
+    wt_mul(k, x, &l->k, 1, kv * hd, D);
+    wt_mul(vv, x, &l->v, 1, kv * hd, D);
+    for (int h = 0; h < H; h++) {
+        float *qh = qg + (int64_t)h * 2 * hd;       /* head h's q block */
+        rmsnorm_row(qh, qh, l->qn, hd, c->eps);     /* QK-norm per head */
+    }
+    for (int g = 0; g < kv; g++)
+        rmsnorm_row(k + (int64_t)g * hd, k + (int64_t)g * hd, l->kn, hd, c->eps);
+    /* partial RoPE: rotate each q head block and each kv head ONCE (the old
+     * per-h call rotated shared kv heads `groups` times, compounding the
+     * angle — pos*groups rad instead of pos). */
+    for (int h = 0; h < H; h++)
+        rope_partial(qg + (int64_t)h * 2 * hd, pos, c);
+    for (int g = 0; g < kv; g++)
+        rope_partial(k + (int64_t)g * hd, pos, c);
+
+    /* store K/V at pos (self-attention sees its own key) */
+    for (int g = 0; g < kv; g++) {
+        memcpy(m->K[layer] + ((int64_t)g * m->max_t + pos) * hd, k + (int64_t)g * hd, (size_t)hd * sizeof(float));
+        memcpy(m->V[layer] + ((int64_t)g * m->max_t + pos) * hd, vv + (int64_t)g * hd, (size_t)hd * sizeof(float));
+    }
+
+    float *scores = falloc((int64_t)pos + 1);
+    float *attn_out = falloc((int64_t)H * hd);
+    float scale = 1.f / sqrtf((float)hd);
+    for (int h = 0; h < H; h++) {
+        const float *qh = qg + (int64_t)h * 2 * hd;
+        /* keys/values come from the KV CACHE (past positions), not from the
+         * current token's k/vv buffers — those hold only this token's head. */
+        const float *kg = m->K[layer] + (int64_t)(h / groups) * m->max_t * hd;
+        const float *vg = m->V[layer] + (int64_t)(h / groups) * m->max_t * hd;
+        float mx = -1e30f;
+        for (int p = 0; p <= pos; p++) {
+            const float *kp = kg + (int64_t)p * hd;
+            float acc = 0;
+            for (int d = 0; d < hd; d++) acc += qh[d] * kp[d];
+            scores[p] = acc * scale;
+            if (scores[p] > mx) mx = scores[p];
+        }
+        float ssum = 0;
+        for (int p = 0; p <= pos; p++) { scores[p] = expf(scores[p] - mx); ssum += scores[p]; }
+        float *oh = attn_out + (int64_t)h * hd;
+        for (int d = 0; d < hd; d++) oh[d] = 0;
+        for (int p = 0; p <= pos; p++) {
+            const float *vp = vg + (int64_t)p * hd;
+            float w = scores[p] / ssum;
+            for (int d = 0; d < hd; d++) oh[d] += w * vp[d];
+        }
+        /* output gate: attn * sigmoid(gate) elementwise over the head dim
+         * (gate is a full head_dim vector per head, second half of the block) */
+        const float *gh = qg + (int64_t)(2 * h + 1) * hd;
+        for (int d = 0; d < hd; d++) oh[d] *= 1.f / (1.f + expf(-gh[d]));
+    }
+    wt_mul(out, attn_out, &l->o, 1, D, H * hd);
+    free(qg); free(k); free(vv); free(scores); free(attn_out);
+}
+
+/* ---------- Gated DeltaNet (linear_attention) ---------- */
+
+static void l2norm(float *x, int D){
+    double s = 0; for (int i = 0; i < D; i++) s += (double)x[i] * x[i];
+    float r = 1.f / sqrtf((float)s + 1e-6f);
+    for (int i = 0; i < D; i++) x[i] *= r;
+}
+
+/* one token through one GDN layer; updates conv + recurrence state */
+static void gdn_token(Model *m, Layer *l, int layer, const float *x, float *out){
+    Cfg *c = &m->c;
+    int kd = c->lin_k_dim, kheads = c->lin_k_heads;
+    int vd = c->lin_v_dim, vheads = c->lin_v_heads;
+    int kdim = kd * kheads, vdim = vd * vheads, C = kdim * 2 + vdim, D = c->hidden;
+    int kk = c->conv_kernel;
+
+    float *qkv = falloc(C);
+    wt_mul(qkv, x, &l->in_qkv, 1, C, D);
+    float *a = falloc((int64_t)vheads), *b = falloc((int64_t)vheads);
+    float *z = falloc(vdim);
+    wt_mul(a, x, &l->in_a, 1, vheads, D);
+    wt_mul(b, x, &l->in_b, 1, vheads, D);
+    wt_mul(z, x, &l->in_z, 1, vdim, D);
+
+    /* causal depthwise conv1d over channels with silu; state = last kk-1 */
+    float *y = falloc(C);
+    if (kk > 1) {
+        float *conv_st = m->gdn_conv[layer];
+        for (int ch = 0; ch < C; ch++) {
+            float acc = 0;
+            for (int j = 0; j < kk; j++) {
+                /* HF mamba-style causal conv (F.conv1d + left pad): the
+                 * kernel is applied REVERSED — w[kk-1] taps the current
+                 * input (lag 0), w[j] taps state[j] (lag kk-1-j).
+                 * state[idx] = x_{t-(kk-2)+idx} after each update. */
+                float vv = (j == kk - 1) ? qkv[ch]
+                                         : conv_st[ch * (kk - 1) + j];
+                acc += l->conv1d[ch * kk + j] * vv;
+            }
+            y[ch] = silu(acc);
+        }
+        /* per-channel shift: state[ch][s] = x_{t-(kk-2)+s} (oldest first);
+         * drop slot 0, append the current qkv at slot kk-2. */
+        for (int ch = 0; ch < C; ch++) {
+            for (int s = 0; s < kk - 2; s++)
+                conv_st[ch * (kk - 1) + s] = conv_st[ch * (kk - 1) + s + 1];
+            conv_st[ch * (kk - 1) + (kk - 2)] = qkv[ch];
+        }
+    } else {
+        for (int ch = 0; ch < C; ch++) y[ch] = silu(l->conv1d[ch] * qkv[ch]);
+    }
+
+    const float *q_ = y, *k_ = y + kdim, *v_ = y + kdim * 2;
+    int rep = vheads / kheads;
+    if (rep < 1 || vheads % kheads) { fprintf(stderr, "GDN head ratio invalid\n"); exit(1); }
+
+    float *S = m->gdn_S[layer];                    /* [vheads, kdim, vdim] */
+    float *qh = falloc((int64_t)vheads * kd), *kh = falloc((int64_t)vheads * kd);
+    float *vh = falloc((int64_t)vheads * vd);
+    for (int h = 0; h < vheads; h++) {
+        int khd = h / rep;
+        for (int d = 0; d < kd; d++) { qh[(int64_t)h * kd + d] = q_[khd * kd + d]; kh[(int64_t)h * kd + d] = k_[khd * kd + d]; }
+        for (int d = 0; d < vd; d++) vh[(int64_t)h * vd + d] = v_[h * vd + d];
+        l2norm(qh + (int64_t)h * kd, kd);
+        l2norm(kh + (int64_t)h * kd, kd);
+        float sc = 1.f / sqrtf((float)kd);
+        for (int d = 0; d < kd; d++) qh[(int64_t)h * kd + d] *= sc;
+    }
+
+    float *Snew = falloc((int64_t)vheads * kd * vd);
+    float *kv_mem = falloc(vd);
+    for (int h = 0; h < vheads; h++) {
+        float ga = -expf(l->A_log[h]) * logf(1.f + expf(a[h] + l->dt_bias[h]));
+        float gt = expf(ga);
+        float bt = 1.f / (1.f + expf(-b[h]));
+        const float *Sh = S + (int64_t)h * kd * vd;
+        float *Sn = Snew + (int64_t)h * kd * vd;
+        const float *qhh = qh + (int64_t)h * kd, *khh = kh + (int64_t)h * kd;
+        const float *vhh = vh + (int64_t)h * vd;
+        for (int d = 0; d < vd; d++) kv_mem[d] = 0;
+        for (int kk2 = 0; kk2 < kd; kk2++) {
+            const float *Srow = Sh + (int64_t)kk2 * vd;
+            for (int d = 0; d < vd; d++) {
+                float s = Srow[d] * gt;             /* decay */
+                Sn[kk2 * vd + d] = s;
+                kv_mem[d] += s * khh[kk2];
+            }
+        }
+        for (int d = 0; d < vd; d++) {
+            float delta = (vhh[d] - kv_mem[d]) * bt;
+            for (int kk2 = 0; kk2 < kd; kk2++)
+                Sn[kk2 * vd + d] += khh[kk2] * delta;
+        }
+        for (int d = 0; d < vd; d++) {
+            float acc = 0;
+            for (int kk2 = 0; kk2 < kd; kk2++) acc += Sn[kk2 * vd + d] * qhh[kk2];
+            kv_mem[d] = acc;                        /* reuse: out_h */
+        }
+        /* write out_h for this head */
+        for (int d = 0; d < vd; d++) vh[(int64_t)h * vd + d] = kv_mem[d];
+    }
+    memcpy(S, Snew, (size_t)vheads * kd * vd * sizeof(float));
+
+    /* RMSNormGated: per-head over head_v_dim (weight is [head_v_dim]),
+     * w * rmsnorm(o) * silu(z); then out_proj over the flattened heads. */
+    float *normed = falloc(vdim);
+    for (int h = 0; h < vheads; h++)
+        rmsnorm_gated_row(normed + (int64_t)h * vd, vh + (int64_t)h * vd,
+                          z + (int64_t)h * vd, l->gdn_norm, vd, c->eps);
+    wt_mul(out, normed, &l->gdn_out, 1, D, vdim);
+
+    free(qkv); free(a); free(b); free(z); free(y);
+    free(qh); free(kh); free(vh); free(Snew); free(kv_mem); free(normed);
+}
+
+/* ---------- MoE ---------- */
+
+/* one expert applied to one token, result written into acc (caller zeroes) */
+static void expert_apply(Model *m, Slot *s, const float *x, float *acc){
+    Cfg *c = &m->c; int I = c->moe_inter, D = c->hidden;
+    if (s->q8) {
+        float *gate = falloc(I), *up = falloc(I);
+        matmul_q8(gate, x, s->g, s->gs, 1, I, D);
+        matmul_q8(up,   x, s->u, s->us, 1, I, D);
+        float *h = falloc(I);
+        for (int i = 0; i < I; i++) h[i] = silu(gate[i]) * up[i];
+        float *y = falloc(D);
+        matmul_q8(y, h, s->dd, s->ds, 1, D, I);
+        for (int d = 0; d < D; d++) acc[d] += y[d];
+        free(gate); free(up); free(h); free(y);
+    } else {
+        float *gu = falloc(2 * I);
+        matmul(gu, x, s->gu, 1, 2 * I, D);
+        float *h = falloc(I);
+        for (int i = 0; i < I; i++) h[i] = silu(gu[i]) * gu[I + i];
+        float *y = falloc(D);
+        matmul(y, h, s->d, 1, D, I);
+        for (int d = 0; d < D; d++) acc[d] += y[d];
+        free(gu); free(h); free(y);
+    }
+}
+
+static void moe_token(Model *m, Layer *l, int layer, const float *x, float *out){
+    Cfg *c = &m->c; int E = c->n_experts, K = c->topk, D = c->hidden;
+    float *logits = falloc(E);
+    wt_mul(logits, x, &l->router, 1, E, D);
+    softmax_row(logits, E);
+
+    /* top-k by probability (torch.topk on probs), deterministic tie-break:
+     * lower index wins on exact ties. */
+    int *idx = malloc(size_mul_or_die((size_t)E, sizeof(int), "router indices"));
+    float *val = malloc(size_mul_or_die((size_t)E, sizeof(float), "router values"));
+    if (!idx || !val) { fprintf(stderr, "OOM router selection\n"); exit(1); }
+    for (int i = 0; i < E; i++) { idx[i] = i; val[i] = logits[i]; }
+    for (int i = 0; i < K; i++) {
+        int best = i;
+        for (int j = i + 1; j < E; j++)
+            if (val[j] > val[best] || (val[j] == val[best] && idx[j] < idx[best])) best = j;
+        int ti = idx[i]; idx[i] = idx[best]; idx[best] = ti;
+        float tv = val[i]; val[i] = val[best]; val[best] = tv;
+    }
+    float wsum = 0; for (int i = 0; i < K; i++) wsum += val[i];
+
+    float *acc = calloc((size_t)D, sizeof(float));
+    if (!acc) { fprintf(stderr, "OOM\n"); exit(1); }
+    float *w = malloc(size_mul_or_die((size_t)K, sizeof(float), "router top-k weights"));
+    if (!w) { fprintf(stderr, "OOM router weights\n"); exit(1); }
+    for (int i = 0; i < K; i++) w[i] = val[i] / wsum;
+    for (int i = 0; i < K; i++) {
+        Slot *s;
+        expert_get(m, layer, idx[i], &s);
+        float *y = calloc((size_t)D, sizeof(float));    /* expert_apply ACCUMULATES */
+        if (!y) { fprintf(stderr, "OOM\n"); exit(1); }
+        expert_apply(m, s, x, y);
+        for (int d = 0; d < D; d++) acc[d] += y[d] * w[i];
+        free(y);
+    }
+    /* routing telemetry: counts (HOT/COLI_USAGE) + ROUTE_TRACE stream */
+    rt_route(layer, 0, idx, w, K);
+
+    /* shared expert: silu(gate(x))*up(x) -> down; * sigmoid(se_g(x)) */
+    float *sg = falloc(1);
+    wt_mul(sg, x, &l->se_g, 1, 1, D);
+    float gs = 1.f / (1.f + expf(-sg[0]));
+    float *h = falloc(c->shared_inter);
+    float *gv = falloc(c->shared_inter);
+    wt_mul(gv, x, &l->se_gate, 1, c->shared_inter, D);
+    wt_mul(h, x, &l->se_up, 1, c->shared_inter, D);
+    for (int i = 0; i < c->shared_inter; i++) h[i] = silu(gv[i]) * h[i];
+    float *sy = falloc(D);
+    wt_mul(sy, h, &l->se_down, 1, D, c->shared_inter);
+    for (int d = 0; d < D; d++) acc[d] += sy[d] * gs;
+    memcpy(out, acc, (size_t)D * sizeof(float));
+
+    free(logits); free(idx); free(val); free(acc); free(w);
+    free(sg); free(h); free(gv); free(sy);
+}
+
+/* ---------- forward ---------- */
+
+/* process one token at position `pos`, return output hidden state in out */
+static void forward_token(Model *m, int token, int pos, float *out){
+    Cfg *c = &m->c; int D = c->hidden;
+    if (token < 0 || token >= c->vocab) {
+        fprintf(stderr, "token id %d outside [0,%d)\n", token, c->vocab);
+        exit(1);
+    }
+    if (pos < 0) { fprintf(stderr, "negative position %d\n", pos); exit(1); }
+    if (pos >= m->max_t) {          /* K/V would overflow; refuse before corrupting */
+        fprintf(stderr, "position %d >= CTX %d — raise CTX or shorten the prompt\n", pos, m->max_t);
+        exit(1);
+    }
+    if (m->embed.q) {   /* row-int8 embed: dequant one row per token */
+        const int8_t *row = m->embed.q + (int64_t)token * D;
+        float sc = m->embed.s[token];
+        for (int d = 0; d < D; d++) out[d] = (float)row[d] * sc;
+    } else {
+        memcpy(out, m->embed.f + (int64_t)token * D, (size_t)D * sizeof(float));
+    }
+    float *h = falloc(D);
+    for (int l = 0; l < c->n_layers; l++) {
+        Layer *L = &m->L[l];
+        float *normed = falloc(D);
+        float *attn = falloc(D);
+        rmsnorm_row(normed, out, L->in_ln, D, c->eps);
+        if (c->layer_is_gdn[l]) gdn_token(m, L, l, normed, attn);
+        else                    attention_token(m, L, l, normed, pos, attn);
+        for (int d = 0; d < D; d++) out[d] += attn[d];
+
+        rmsnorm_row(normed, out, L->post_ln, D, c->eps);
+        moe_token(m, L, l, normed, h);
+        for (int d = 0; d < D; d++) out[d] += h[d];
+        free(normed); free(attn);
+    }
+    free(h);
+    if (m->hot_n > 0) {
+        m->token_count++;
+        if (m->token_count == m->warmup_tokens) pin_hot_experts(m);
+    }
+}
+
+/* process n ids (prefill or decode), return logits for the next token */
+static float *step(Model *m, const int *ids, int n, int pos_base){
+    Cfg *c = &m->c; int D = c->hidden;
+    if (!ids_in_vocab(c, ids, n, "input")) exit(1);
+    if (pos_base < 0 || n > m->max_t - pos_base) {
+        fprintf(stderr, "token positions [%d,%d) outside CTX %d\n",
+                pos_base, pos_base + n, m->max_t);
+        exit(1);
+    }
+    float *h = falloc(D);
+    for (int i = 0; i < n; i++) forward_token(m, ids[i], pos_base + i, h);
+    float *normed = falloc(D);
+    rmsnorm_row(normed, h, m->final_norm, D, c->eps);
+    float *logits = falloc(c->vocab);
+    wt_mul(logits, normed, &m->lm_head, 1, c->vocab, D);
+    free(h); free(normed);
+    return logits;
+}
+
+/* ---------- model init ---------- */
+
+static void model_init(Model *m, const char *snap, int cap){
+    memset(m, 0, sizeof(*m));
+    load_cfg(&m->c, snap);
+    st_init(&m->S, snap);
+    Cfg *c = &m->c;
+    double t0 = now_s();
+
+    /* weight prefix probe: real checkpoints nest text weights under
+     * model.language_model.*; the tiny fixtures use model.*; lm_head.weight
+     * is always top-level. */
+    g_prefix[0] = 0;
+    {
+        char probe[512];
+        snprintf(probe, sizeof(probe), "model.language_model.embed_tokens.weight");
+        if (st_have(m, probe))
+            snprintf(g_prefix, sizeof(g_prefix), "model.language_model.");
+        else {
+            snprintf(probe, sizeof(probe), "model.embed_tokens.weight");
+            if (st_have(m, probe))
+                snprintf(g_prefix, sizeof(g_prefix), "model.");
+        }
+    }
+
+    m->embed      = load_wt(m, "embed_tokens.weight", c->vocab, c->hidden);
+    {   /* lm_head: top-level in the checkpoints; prefixed only in synthetic ones */
+        char nm[512]; snprintf(nm, sizeof(nm), "lm_head.weight");
+        if (!st_have(m, nm)) snprintf(nm, sizeof(nm), "%slm_head.weight", g_prefix);
+        m->lm_head = load_wt_named(m, nm, c->vocab, c->hidden);
+    }
+    m->final_norm = load_t(m, "norm.weight", c->hidden);
+    m->L = calloc(c->n_layers, sizeof(Layer));
+    if (!m->L) { fprintf(stderr, "OOM layers\n"); exit(1); }
+    for (int i = 0; i < c->n_layers; i++) {
+        Layer *l = &m->L[i];
+        char nm[512];
+        int D = c->hidden, H = c->n_heads, hd = c->head_dim, kv = c->n_kv_heads;
+        int C = c->lin_k_dim * c->lin_k_heads * 2 + c->lin_v_dim * c->lin_v_heads;
+        int vdim = c->lin_v_dim * c->lin_v_heads;
+        /* load_t prepends g_prefix and reads f32; LDW probes <name>_q8/_qs */
+        #define LD(field, suffix, N) snprintf(nm, sizeof(nm), "layers.%d." suffix, i); l->field = load_t(m, nm, N)
+        #define LDW(field, suffix, O, I) snprintf(nm, sizeof(nm), "layers.%d." suffix, i); l->field = load_wt(m, nm, O, I)
+        LD(in_ln, "input_layernorm.weight", D);
+        LD(post_ln, "post_attention_layernorm.weight", D);
+        if (c->layer_is_gdn[i]) {
+            LD(A_log, "linear_attn.A_log", c->lin_v_heads);
+            LD(dt_bias, "linear_attn.dt_bias", c->lin_v_heads);
+            LD(conv1d, "linear_attn.conv1d.weight", (int64_t)C * c->conv_kernel);
+            LDW(in_a, "linear_attn.in_proj_a.weight", c->lin_v_heads, D);
+            LDW(in_b, "linear_attn.in_proj_b.weight", c->lin_v_heads, D);
+            LDW(in_qkv, "linear_attn.in_proj_qkv.weight", C, D);
+            LDW(in_z, "linear_attn.in_proj_z.weight", vdim, D);
+            LD(gdn_norm, "linear_attn.norm.weight", c->lin_v_dim);
+            LDW(gdn_out, "linear_attn.out_proj.weight", D, vdim);
+        } else {
+            LDW(q, "self_attn.q_proj.weight", 2 * H * hd, D);
+            LDW(k, "self_attn.k_proj.weight", kv * hd, D);
+            LDW(v, "self_attn.v_proj.weight", kv * hd, D);
+            LDW(o, "self_attn.o_proj.weight", D, H * hd);
+            LD(qn, "self_attn.q_norm.weight", hd);
+            LD(kn, "self_attn.k_norm.weight", hd);
+        }
+        LDW(router, "mlp.gate.weight", c->n_experts, D);
+        LDW(se_gate, "mlp.shared_expert.gate_proj.weight", c->shared_inter, D);
+        LDW(se_up, "mlp.shared_expert.up_proj.weight", c->shared_inter, D);
+        LDW(se_down, "mlp.shared_expert.down_proj.weight", D, c->shared_inter);
+        LDW(se_g, "mlp.shared_expert_gate.weight", 1, D);
+        #undef LD
+        #undef LDW
+    }
+    m->cache = calloc_checked((size_t)c->n_layers, sizeof(LCache), "expert cache rows");
+    for (int i = 0; i < c->n_layers; i++) {
+        m->cache[i].cap = cap;
+        m->cache[i].slots = calloc_checked((size_t)cap, sizeof(Slot), "expert cache slots");
+        for (int s = 0; s < cap; s++) m->cache[i].slots[s].eid = -2;   /* empty */
+    }
+    rt_init("qwen3_moe", c->n_layers, c->n_experts);
+    rt_drop_row(c->n_layers);                    /* every layer routes; no MTP row */
+    m->freq = rt_counts_all();
+    { const char *up = getenv("COLI_USAGE");
+      if (up && *up) { int64_t h = rt_load(up);
+        if (h > 0) fprintf(stderr, "[USAGE] expert history: %lld selections (%s)\n", (long long)h, up); } }
+    m->hot_n         = getenv("HOT")    ? atoi(getenv("HOT"))    : 0;
+    m->warmup_tokens = getenv("WARMUP") ? atoi(getenv("WARMUP")) : 5;
+    size_t pin_count = size_mul_or_die((size_t)c->n_layers, c->n_experts, "expert pin map");
+    m->is_pinned = calloc_checked(pin_count, 1, "expert pin map");
+    char pinpath[512]; snprintf(pinpath, sizeof(pinpath), "%s/hot_pinned.bin", snap);
+    FILE *pinf = fopen(pinpath, "rb");
+    if (pinf) {
+        size_t want = pin_count;
+        if (fread(m->is_pinned, 1, want, pinf) == want) {
+            m->hot_pinned = 1;
+            printf("[HOT] Loaded persistent pinning from %s\n", pinpath);
+        }
+        fclose(pinf);
+    }
+    m->dense_load_s = now_s() - t0;
+}
+
+/* ---------- modes ---------- */
+
+static int *parse_ids(const char *s, int *n_out){
+    int cap = 64, n = 0;
+    int *ids = malloc(size_mul_or_die((size_t)cap, sizeof(int), "token-id input"));
+    if (!ids) { fprintf(stderr, "OOM token-id input\n"); exit(1); }
+    const char *p = s;
+    while (*p) {
+        while (*p == ' ') p++;
+        if (!*p) break;
+        char *end;
+        errno = 0;
+        long v = strtol(p, &end, 10);
+        if (end == p || errno == ERANGE || v < INT_MIN || v > INT_MAX) {
+            fprintf(stderr, "invalid token id near \"%.24s\"\n", p);
+            free(ids); *n_out = -1; return NULL;
+        }
+        if (*end && *end != ' ') {
+            fprintf(stderr, "invalid token-id separator near \"%.24s\"\n", end);
+            free(ids); *n_out = -1; return NULL;
+        }
+        if (n == cap) {
+            if (cap > INT_MAX / 2) { fprintf(stderr, "too many token ids\n"); free(ids); *n_out = -1; return NULL; }
+            cap *= 2;
+            int *grown = realloc(ids, size_mul_or_die((size_t)cap, sizeof(int), "token-id input"));
+            if (!grown) { fprintf(stderr, "OOM token-id input\n"); free(ids); exit(1); }
+            ids = grown;
+        }
+        ids[n++] = (int)v;
+        p = end;
+    }
+    *n_out = n;
+    return ids;
+}
+
+static void save_usage(Model *m, const char *snap){
+    const char *up = getenv("COLI_USAGE");
+    if (up && *up) rt_save(up, 0);
+    if (m->hot_pinned) {
+        char pinpath[512]; snprintf(pinpath, sizeof(pinpath), "%s/hot_pinned.bin", snap);
+        FILE *f = fopen(pinpath, "wb");
+        if (f) {
+            size_t n = size_mul_or_die((size_t)m->c.n_layers, m->c.n_experts, "expert pin map");
+            fwrite(m->is_pinned, 1, n, f);
+            fclose(f);
+        }
+    }
+}
+
+/* QWENMOE_MODE=teacher: teacher-forced argmax per position */
+static int mode_teacher(Model *m){
+    const char *s = getenv("QWENMOE_TEACHER");
+    if (!s || !*s) { fprintf(stderr, "QWENMOE_TEACHER required\n"); return 1; }
+    int n; int *ids = parse_ids(s, &n);
+    if (n < 1 || !ids_in_vocab(&m->c, ids, n, "QWENMOE_TEACHER")) {
+        fprintf(stderr, "invalid QWENMOE_TEACHER\n"); free(ids); return 1;
+    }
+    for (int i = 0; i < n; i++) {
+        float *logits = step(m, ids + i, 1, i);     /* prefix grows via KV */
+        int best = qwen_pick_token(m, logits, -1);
+        printf("PRED %d\n", best);
+        logits_free(&logits);
+    }
+    free(ids);
+    return 0;
+}
+
+/* QWENMOE_MODE=greedy: generate from prompt ids */
+static int mode_greedy(Model *m){
+    const char *ps = getenv("QWENMOE_PROMPT_IDS");
+    if (!ps || !*ps) { fprintf(stderr, "QWENMOE_PROMPT_IDS required\n"); return 1; }
+    int max_new = getenv("QWENMOE_MAX_NEW") ? atoi(getenv("QWENMOE_MAX_NEW")) : 8;
+    if (max_new < 1 || max_new > 4096) { fprintf(stderr, "QWENMOE_MAX_NEW out of range\n"); return 1; }
+    int np; int *ids = parse_ids(ps, &np);
+    if (np < 1 || !ids_in_vocab(&m->c, ids, np, "QWENMOE_PROMPT_IDS")) {
+        fprintf(stderr, "invalid QWENMOE_PROMPT_IDS\n"); free(ids); return 1;
+    }
+    float *logits = step(m, ids, np, 0);
+    for (int s = 0; s < max_new; s++) {
+        int best = qwen_pick_token(m, logits, -1);
+        logits_free(&logits);
+        if (best == m->c.eos) break;
+        printf("ID %d\n", best);
+        logits = step(m, &best, 1, np + s);
+    }
+    logits_free(&logits);
+    free(ids);
+    return 0;
+}
+
+/* Special-token id by content: added tokens are atomic in tok.h's encode
+ * (sp[] sorted by length desc), so <|im_start|> etc. map to their ids.
+ * Fallback to the vocab map for tokenizers that keep them there only. */
+static int tok_sp_id(Tok *T, const char *s){
+    int n = (int)strlen(s);
+    for (int i = 0; i < T->nsp; i++)
+        if (T->sp[i].len == n && !memcmp(T->sp[i].str, s, n)) return T->sp[i].id;
+    return hm_get(&T->vocab, s, n);
+}
+
+/* Independent requests always restart sequence-dependent GDN state.  KV is
+ * intentionally retained: a position-zero prefill overwrites every position
+ * that causal attention can read for the new request. */
+static void request_state_reset(Model *m){
+    for (int i = 0; i < m->c.n_layers; i++) {
+        if (m->gdn_S && m->gdn_S[i])
+            memset(m->gdn_S[i], 0, size_mul_or_die(gdn_state_count(&m->c), sizeof(float), "GDN recurrence reset"));
+        if (m->gdn_conv && m->gdn_conv[i])
+            memset(m->gdn_conv[i], 0, size_mul_or_die(gdn_conv_count(&m->c), sizeof(float), "GDN convolution reset"));
+    }
+}
+
+/* Full session/test reset also clears KV, unlike the narrow serve reset. */
+static void state_reset(Model *m){
+    request_state_reset(m);
+    for (int i = 0; i < m->c.n_layers; i++) {
+        if (m->K && m->K[i])
+            memset(m->K[i], 0, size_mul_or_die(kv_state_count(&m->c, m->max_t), sizeof(float), "K cache reset"));
+        if (m->V && m->V[i])
+            memset(m->V[i], 0, size_mul_or_die(kv_state_count(&m->c, m->max_t), sizeof(float), "V cache reset"));
+    }
+}
+
+static void chat_feed_stop(Model *m, int token, int *hist, int *hpos){
+    int pos = *hpos;
+    hist[pos] = token;
+    *hpos = pos + 1;
+    float *discard = step(m, &token, 1, pos);
+    logits_free(&discard);
+}
+
+/* CHAT=1: interactive multi-turn chat (prompt on stdin, decoded stream).
+ * Each turn is framed with the Qwen ChatML template (system turn once per
+ * session, <|im_start|>user/assistant, <think> prefix), and history stays
+ * in the KV cache so turns continue each other. Env:
+ *   QWEN_THINK=0  -> disable the <think> reasoning prefix (answer only)
+ *   QWEN_SYSTEM   -> system prompt text; empty string disables the turn
+ *   COLI_TEMP/NUCLEUS -> sampling (defaults 0.7 / 0.9; chat, not greedy) */
+static int mode_chat(Model *m, Tok *T){
+    stops_arm_tok(&m->c, m->c.eos, T);
+    int max_new = getenv("MAX_NEW") ? atoi(getenv("MAX_NEW")) : 1024;
+    const char *ct = getenv("COLI_TEMP");
+    if (ct) g_temp = (float)atof(ct);
+    const char *nc = getenv("NUCLEUS");
+    if (nc) g_nuc = (float)atof(nc);
+    if (!ct) g_temp = 0.7f;
+    if (!nc) g_nuc = 0.9f;
+    int thinking = getenv("QWEN_THINK") ? atoi(getenv("QWEN_THINK")) : 1;
+    const char *sys = getenv("QWEN_SYSTEM");
+    if (!sys) sys = "You are Qwen, a helpful AI assistant.";
+    int i_im_start = tok_sp_id(T, "<|im_start|>");
+    int i_im_end   = tok_sp_id(T, "<|im_end|>");
+    if (i_im_start < 0 || i_im_end < 0) {
+        fprintf(stderr, "tokenizer.json: missing <|im_start|>/<|im_end|> added tokens\n");
+        return 1;
+    }
+    int *hist = malloc(size_mul_or_die((size_t)m->max_t, sizeof(int), "chat history"));
+    if (!hist) { fprintf(stderr, "OOM\n"); return 1; }
+    int hpos = 0;
+    int sys_ids[4096]; int sys_n = 0;
+    if (sys && *sys) {
+        char sseg[8192];
+        int sl = snprintf(sseg, sizeof(sseg), "<|im_start|>system\n%s<|im_end|>\n", sys);
+        sys_n = tok_encode(T, sseg, sl, sys_ids, 4096);
+        if (sys_n > 0) { memcpy(hist, sys_ids, (size_t)sys_n * sizeof(int)); hpos = sys_n; }
+    }
+    printf("resident weights loaded in %.1fs | RSS after load: %.2f GB\n", m->dense_load_s, rss_gb());
+    printf("Qwen chat ready (temp %.2f nuc %.2f think %d; Ctrl-D to quit)\n", g_temp, g_nuc, thinking);
+    char line[8192];
+    while (fgets(line, sizeof(line), stdin)) {
+        int n = (int)strlen(line);
+        while (n > 0 && (line[n-1] == '\n' || line[n-1] == '\r')) line[--n] = 0;
+        if (!n) continue;
+        char seg[16384]; int sl = 0;
+        sl += snprintf(seg + sl, sizeof(seg) - sl, "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n", line);
+        sl += snprintf(seg + sl, sizeof(seg) - sl,
+                       thinking ? "<think>\n" : "<think>\n\n</think>\n\n");
+        int ids[16384];
+        int np = tok_encode(T, seg, sl, ids, 16384);
+        if (np <= 0) { printf("(empty prompt)\n"); continue; }
+        if (hpos + np > m->max_t) {
+            state_reset(m);
+            hpos = 0;
+            printf("[context full: session restarted]\n");
+            if (sys_n > 0) { step(m, sys_ids, sys_n, 0); hpos = sys_n; }
+        }
+        float *logits = step(m, ids, np, hpos);
+        memcpy(hist + hpos, ids, (size_t)np * sizeof(int));
+        hpos += np;
+        char buf[1024];
+        for (int s = 0; s < max_new; s++) {
+            if (hpos >= m->max_t) { printf("\n[context full]\n"); break; }
+            int nt = qwen_pick_token(m, logits, -1);
+            logits_free(&logits);
+            if (is_stop(nt)) {
+                /* Keep the turn boundary in context: feed the stop token
+                 * (the model chose it; for <|im_end|> it IS the template's
+                 * turn terminator). Without this the assistant turn stays
+                 * open in the KV and the next turn opens incoherently. */
+                chat_feed_stop(m, nt, hist, &hpos);
+                break;
+            }
+            int pos = hpos;
+            hist[hpos++] = nt;
+            int nb = tok_decode(T, &nt, 1, buf, sizeof(buf) - 1);
+            buf[nb] = 0;
+            fwrite(buf, 1, (size_t)nb, stdout);
+            fflush(stdout);
+            logits = step(m, &nt, 1, pos);
+        }
+        logits_free(&logits);
+        printf("\n");
+    }
+    free(hist);
+    return 0;
+}
+
+/* ---------- serve mode: openai_server.py engine protocol ----------
+ * stdin:  SUBMIT <id> <slot> <len> <max_tokens> <temp> <top_p>\n<payload>\n
+ *         CANCEL <id>\n
+ * stdout: READY sentinel once loaded, then per request a stream of
+ *         DATA <id> <size>\n<bytes>\n frames and a final
+ *         DONE <id> STAT <tok> <tps> <hit%> <rss> <prompt_tok> <len_limited>\n
+ * Byte-identical to colibri.c's serve protocol (inkling.c documents it in
+ * full above its own SUBMIT handling) so the shared openai_server.py gateway
+ * drives this engine unchanged.
+ *
+ * v1 scope, same as olmoe: one request in flight, full re-prefill every turn,
+ * no cross-request KV reuse. The payload arrives already rendered by
+ * openai_server.py's render_chat_qwen — this engine tokenizes it as-is.
+ * Expert-cache contents, route counts, and immutable weights persist.  Before
+ * each prefill we clear GDN recurrence/conv state; KV storage need not be
+ * cleared because position-zero prefill overwrites every position attention
+ * reads for the new request. */
+typedef struct { char id[64]; int max_tok; float temp, top_p; char *payload; int plen; } SReq;
+#define SRV_QMAX 16
+static SReq g_q[SRV_QMAX]; static int g_qn = 0;
+
+/* read one control line (+ payload for SUBMIT). cur_id: request in flight;
+ * returns 1 if that request was cancelled, 0 otherwise, -1 on stdin EOF. */
+static int serve_read_cmd(const char *cur_id) {
+    char ln[512];
+    if (!fgets(ln, sizeof(ln), stdin)) return -1;
+    char cmd[16], id[64];
+    if (sscanf(ln, "%15s %63s", cmd, id) < 2) return 0;
+    if (!strcmp(cmd, "CANCEL")) return cur_id && !strcmp(id, cur_id);
+    if (!strcmp(cmd, "SUBMIT")) {
+        int slot, plen, max_tok; float temp, top_p;
+        int nf = sscanf(ln, "%*s %*s %d %d %d %f %f", &slot, &plen, &max_tok, &temp, &top_p);
+        if (nf < 5 || plen < 0 || plen > (1<<22) || max_tok < 1 || max_tok > (1<<20)) {
+            printf("ERROR %s bad submit header\n", id); fflush(stdout); return 0; }
+        (void)slot;
+        char *pl = malloc((size_t)plen + 1);
+        if (fread(pl, 1, (size_t)plen, stdin) != (size_t)plen) { free(pl); return -1; }
+        pl[plen] = 0;
+        int nl = fgetc(stdin); (void)nl;
+        if (g_qn < SRV_QMAX) {
+            SReq *q = &g_q[g_qn++];
+            snprintf(q->id, sizeof(q->id), "%s", id);
+            q->max_tok = max_tok; q->temp = temp; q->top_p = top_p;
+            q->payload = pl; q->plen = plen;
+        } else { printf("ERROR %s queue full\n", id); fflush(stdout); free(pl); }
+    }
+    return 0;
+}
+
+static void serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
+    int cap = q->plen + 16;
+    int *ids = malloc(size_mul_or_die((size_t)cap, sizeof(int), "serve prompt ids"));
+    if (!ids) { fprintf(stderr, "OOM serve prompt ids\n"); exit(1); }
+    int np = tok_encode(T, q->payload, q->plen, ids, cap);
+    if (np <= 0) { printf("ERROR %s empty prompt\n", q->id); fflush(stdout); free(ids); return; }
+    if (np + q->max_tok > ctx_cap) {
+        printf("ERROR %s context exceeds CTX (%d + %d > %d)\n", q->id, np, q->max_tok, ctx_cap);
+        fflush(stdout); free(ids); return;
+    }
+    g_temp = q->temp; g_nuc = q->top_p;
+    double t0 = now_s();
+    uint64_t h0 = m->hits, m0 = m->miss;
+    /* ACCEPT before prefill: the server commits the streaming 200 here and,
+     * critically, stops polling `cancelled()` (connected flips True), so a
+     * long prefill no longer looks like a dead client and draws a spurious
+     * CANCEL that would arrive mid-turn and truncate the reply. */
+    printf("ACCEPT %s %d\n", q->id, np); fflush(stdout);
+    request_state_reset(m);
+    float *logit = step(m, ids, np, 0);
+    int hist_len = np, gen = 0, limited = 1, cancelled = 0;
+    char buf[512];
+    for (int s = 0; s < q->max_tok && !cancelled; s++) {
+        int nt = qwen_pick_token(m, logit, -1);
+        logits_free(&logit);
+        if (is_stop(nt)) { limited = 0; break; }
+        int nb = tok_decode(T, &nt, 1, buf, sizeof(buf)-1);
+        printf("DATA %s %d\n", q->id, nb);
+        fwrite(buf, 1, (size_t)nb, stdout);
+        fputc('\n', stdout); fflush(stdout);
+        gen++; hist_len++;
+        while (coli_stdin_readable()) {
+            int r = serve_read_cmd(q->id);
+            if (r < 0) { free(ids); return; }
+            if (r > 0) { cancelled = 1; limited = 0; }
+        }
+        if (cancelled || s == q->max_tok - 1 || hist_len >= ctx_cap) break;
+        logit = step(m, &nt, 1, hist_len - 1);
+    }
+    logits_free(&logit);
+    double dt = now_s() - t0;
+    double tot = (double)(m->hits - h0 + m->miss - m0);
+    printf("DONE %s STAT %d %.3f %.1f %.2f %d %d\n", q->id, gen,
+           dt > 0 ? gen/dt : 0.0, tot ? 100.0*(m->hits-h0)/tot : 0.0, rss_gb(), np, limited);
+    /* PROF: per-turn phase timings for the dashboard (total only, like
+     * olmoe — qwen_moe.c does not split wall time into phases either). */
+    printf("PROF %.3f %d %d 0.0 0.0 0.0 0.0 0.0 %d\n", dt, np, gen, gen + 1);
+    fflush(stdout);
+    free(ids);
+}
+
+/* dashboard HWINFO/TIERS/EMAP: same lines the other serve-capable engines
+ * emit for the web dashboard's hardware panel and Brain page (CPU-only, so
+ * the GPU fields are always empty). */
+static void serve_hwinfo(Model *m) {
+    (void)m;
+    char cpu[256] = ""; int cores = 0; double rt = 0, ra = 0;
+    FILE *ci = fopen("/proc/cpuinfo", "r");
+    if (ci) { char ln[256];
+        while (fgets(ln, sizeof(ln), ci)) if (!strncmp(ln, "model name", 10)) {
+            char *p = strchr(ln, ':'); if (p) { p++; while (*p == ' ') p++;
+            int n = (int)strlen(p); if (n > 0 && p[n-1] == '\n') p[--n] = 0;
+            snprintf(cpu, sizeof(cpu), "%s", p); } break; }
+        fclose(ci); }
+#ifdef _SC_NPROCESSORS_ONLN
+    cores = (int)sysconf(_SC_NPROCESSORS_ONLN);
+#endif
+    FILE *mi = fopen("/proc/meminfo", "r");
+    if (mi) { char ln[256]; double v = 0;
+        while (fgets(ln, sizeof(ln), mi)) {
+            if (sscanf(ln, "MemTotal: %lf", &v) == 1) rt = v/1e6;
+            if (sscanf(ln, "MemAvailable: %lf", &v) == 1) ra = v/1e6;
+        } fclose(mi); }
+    printf("HWINFO %d %.1f %.1f 0 0.0 %s|\n", cores, rt, ra, cpu[0] ? cpu : "unknown");
+    fflush(stdout);
+}
+
+static void serve_tiers_emap(Model *m) {
+    Cfg *c = &m->c; int E = c->n_experts;
+    int filled = 0;
+    for (int i = 0; i < c->n_layers; i++) filled += m->cache[i].n;
+    int64_t I = c->moe_inter, D = c->hidden;
+    /* per-expert resident bytes: int8 gate/up/down + one f32 scale per row */
+    int64_t slotb = 3*I*D + (2*I+D)*4;
+    int64_t total_experts = (int64_t)c->n_layers * E;
+    printf("TIERS 0 %d %lld 0.00 %.2f\n", filled,
+           (long long)(total_experts - filled), filled*(double)slotb/1e9);
+    /* EMAP: 1 byte/expert hex — tier(2b: 0=disk 1=RAM)<<6 | heat(6b: log2 usage) */
+    size_t hex_n = size_mul_or_die((size_t)c->n_layers, E, "expert map");
+    hex_n = size_mul_or_die(hex_n, 2, "expert map hex");
+    if (!size_add_ok(hex_n, 1, &hex_n)) { fprintf(stderr, "expert map size overflow\n"); exit(1); }
+    char *hex = malloc(hex_n); size_t w = 0;
+    if (!hex) { fprintf(stderr, "OOM expert map\n"); exit(1); }
+    for (int i = 0; i < c->n_layers; i++) {
+        LCache *lc = &m->cache[i];
+        for (int e = 0; e < E; e++) {
+            int tier = 0;
+            for (int z = 0; z < lc->n; z++) if (lc->slots[z].eid == e) { tier = 1; break; }
+            uint32_t u = m->freq[i] ? m->freq[i][e] : 0;
+            int heat = 0; while (u) { heat++; u >>= 1; } if (heat > 63) heat = 63;
+            int b = (tier << 6) | heat;
+            hex[w++] = "0123456789abcdef"[b >> 4];
+            hex[w++] = "0123456789abcdef"[b & 15];
+        }
+    }
+    hex[w] = 0;
+    printf("EMAP %d %d %s\n", c->n_layers, E, hex);
+    fflush(stdout); free(hex);
+}
+
+static void serve_loop(Model *m, Tok *T, int ctx_cap) {
+    coli_serve_binary_mode();
+    setvbuf(stdin, NULL, _IONBF, 0);
+    stops_arm_tok(&m->c, m->c.eos, T);
+    /* Batched-serve stop filtering keeps ONLY eos (#401 tool-call safety);
+     * Qwen turns end with <|im_end|>, so re-arm it or every response runs
+     * into the next hallucinated turn. */
+    int im_end = tok_sp_id(T, "<|im_end|>");
+    if (im_end >= 0 && !is_stop(im_end) && g_nstop < 64) g_stop[g_nstop++] = im_end;
+    fputs("\x01\x01READY\x01\x01\n", stdout);
+    printf("STAT 0 0.0 0.0 %.2f 0 0\n", rss_gb());
+    fflush(stdout);
+    serve_hwinfo(m);
+    serve_tiers_emap(m);
+    for (;;) {
+        while (!g_qn) if (serve_read_cmd(NULL) < 0) return;
+        SReq q = g_q[0];
+        memmove(g_q, g_q + 1, (size_t)(--g_qn) * sizeof(SReq));
+        serve_one(m, T, &q, ctx_cap);
+        free(q.payload);
+    }
+}
+
+static int mode_serve(Model *m, Tok *T){
+    serve_loop(m, T, m->max_t);
+    return 0;
+}
+
+static int json_token_array_ok(jval *a, int vocab, const char *name, int ci){
+    if (!a || a->t != J_ARR) {
+        fprintf(stderr, "ref.json: case %d %s must be an array\n", ci, name);
+        return 0;
+    }
+    for (int i = 0; i < a->len; i++) {
+        jval *v = a->kids[i];
+        if (!v || v->t != J_NUM || !isfinite(v->num) || trunc(v->num) != v->num ||
+            v->num < 0 || v->num >= vocab) {
+            fprintf(stderr, "ref.json: case %d %s[%d] is not an id in [0,%d)\n",
+                    ci, name, i, vocab);
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* default: self-test every ref.json case in the model dir */
+static int mode_selftest(Model *m, const char *snap){
+    char refpath[2048]; snprintf(refpath, sizeof(refpath), "%s/ref.json", snap);
+    FILE *f = fopen(refpath, "rb"); if (!f) { perror(refpath); return 1; }
+    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+    char *buf = malloc((size_t)n + 1); if (!buf) { fprintf(stderr, "OOM\n"); return 1; }
+    if (fread(buf, 1, (size_t)n, f) != (size_t)n) { fprintf(stderr, "short read\n"); return 1; }
+    buf[n] = 0; fclose(f);
+    char *arena = NULL; jval *ref = json_parse(buf, &arena);
+    jval *cases = json_get(ref, "cases");
+    if (!cases || (cases->t != J_OBJ && cases->t != J_ARR)) { fprintf(stderr, "ref.json: no cases\n"); return 1; }
+    int all_ok = 1;
+    for (int ci = 0; ci < cases->len; ci++) {
+        jval *case_ = cases->kids[ci];
+        jval *teacher = json_get(case_, "teacher_forcing_ids");
+        jval *greedy = json_get(case_, "greedy_new_ids");
+        jval *prompt = json_get(case_, "prompt_ids");
+        jval *maxnew = json_get(case_, "max_new_tokens");
+        if (!teacher || !greedy || !prompt || !maxnew) continue;
+        int ok = 1;
+        if (!json_token_array_ok(teacher, m->c.vocab, "teacher_forcing_ids", ci) ||
+            !json_token_array_ok(greedy, m->c.vocab, "greedy_new_ids", ci) ||
+            !json_token_array_ok(prompt, m->c.vocab, "prompt_ids", ci) ||
+            prompt->len < 1 || maxnew->t != J_NUM || !isfinite(maxnew->num) ||
+            trunc(maxnew->num) != maxnew->num || maxnew->num < 0 ||
+            maxnew->num > greedy->len || prompt->len > m->max_t ||
+            greedy->len > m->max_t - prompt->len ||
+            teacher->len > prompt->len + greedy->len) {
+            fprintf(stderr, "ref.json: malformed bounds/lengths in case %d\n", ci);
+            all_ok = 0;
+            continue;
+        }
+        int max_new = (int)maxnew->num;
+        /* fresh states for THIS case: the previous case's KV/GDN state must
+         * not leak into the next teacher pass */
+        state_reset(m);
+        /* teacher-forced logits: feed the ACTUAL sequence (prompt + greedy
+         * continuation = greedy_full_ids); each position's argmax must equal
+         * teacher_forcing_ids[i] (the oracle's prediction at that position). */
+        int np = prompt->len;
+        int *full = malloc(size_mul_or_die((size_t)(np + greedy->len), sizeof(int), "selftest teacher ids"));
+        if (!full) { fprintf(stderr, "OOM selftest teacher ids\n"); exit(1); }
+        for (int i = 0; i < np; i++) full[i] = (int)prompt->kids[i]->num;
+        for (int i = 0; i < greedy->len; i++) full[np + i] = (int)greedy->kids[i]->num;
+        for (int i = 0; i < teacher->len; i++) {
+            float *logits = step(m, full + i, 1, i);
+            int best = qwen_pick_token(m, logits, -1);
+            if (best != (int)teacher->kids[i]->num) {
+                printf("  FAIL case %d teacher pos %d: engine=%d oracle=%d\n",
+                       ci, i, best, (int)teacher->kids[i]->num);
+                ok = 0; logits_free(&logits); break;
+            }
+            logits_free(&logits);
+        }
+        free(full);
+        printf("  %s case %d teacher-forced (%d positions)\n", ok ? "ok  " : "FAIL", ci, teacher->len);
+        if (ok) {
+            /* greedy decode: re-prefill from prompt (fresh KV via fresh states) */
+            state_reset(m);
+            int np = prompt->len;
+            int *ids = malloc(size_mul_or_die((size_t)np, sizeof(int), "selftest prompt ids"));
+            if (!ids) { fprintf(stderr, "OOM selftest prompt ids\n"); exit(1); }
+            for (int i = 0; i < np; i++) ids[i] = (int)prompt->kids[i]->num;
+            float *logits = step(m, ids, np, 0);
+            for (int s = 0; s < max_new; s++) {
+                int best = qwen_pick_token(m, logits, -1);
+                logits_free(&logits);
+                if (best != (int)greedy->kids[s]->num) {
+                    printf("  FAIL case %d greedy token %d: engine=%d oracle=%d\n",
+                           ci, s, best, (int)greedy->kids[s]->num);
+                    ok = 0; break;
+                }
+                logits = step(m, &best, 1, np + s);
+            }
+            logits_free(&logits); free(ids);
+            printf("  %s case %d greedy (%d tokens)\n", ok ? "ok  " : "FAIL", ci, max_new);
+        }
+        all_ok &= ok;
+    }
+    free(buf); free(arena);
+    printf(all_ok ? "SELFTEST PASS\n" : "SELFTEST FAIL\n");
+    return all_ok ? 0 : 1;
+}
+
+int main(int argc, char **argv){
+    coli_omp_tune_threads("qwen3_moe");
+    rt_trace_open();
+    const char *snap;
+    int cap;
+    if (getenv("SERVE") && getenv("SERVE")[0] == '1') {
+        /* serve protocol (openai_server.py): argv[1] is the cap sentinel and
+         * SNAP env carries the model dir — same convention as olmoe.c. */
+        snap = getenv("SNAP");
+        cap = argc > 1 ? atoi(argv[1]) : (getenv("CACHE") ? atoi(getenv("CACHE")) : 0);
+    } else {
+        snap = argc > 1 ? argv[1] : getenv("SNAP");
+        cap = argc > 2 ? atoi(argv[2]) : (getenv("CACHE") ? atoi(getenv("CACHE")) : 0);
+    }
+    if (!snap || !*snap) { fprintf(stderr, "set SNAP=<snapshot directory>\n"); return 1; }
+    if (cap == 0) {
+        /* Default: ONLY the experts currently in use stay resident — one
+         * cache slot per selected expert per layer (topk). Everything else
+         * is streamed from disk on demand. Raise CACHE/RAM_GB for more. */
+        if (getenv("RAM_GB") && atoi(getenv("RAM_GB")) > 0) {
+            cap = atoi(getenv("RAM_GB")) / 2;
+        } else {
+            Cfg cfg0; load_cfg(&cfg0, snap);   /* config-only pre-pass for topk */
+            cap = cfg0.topk;
+            free(cfg0.layer_is_gdn);
+        }
+    }
+    if (cap < 1 || cap > 4096) { fprintf(stderr, "CACHE must be 1..4096 (got %d)\n", cap); return 1; }
+    /* page-cache discipline: DONTNEED after every file read (experts and
+     * dense). Default ON — a 35B+ snapshot otherwise floods the page cache
+     * (on a 16 GB box that reads as "too much RAM" in Activity Monitor).
+     * EXPERT_DROP=0 / DENSE_KEEP_PAGES=1 opt back out for repeated reads. */
+    g_expert_drop = getenv("EXPERT_DROP") ? atoi(getenv("EXPERT_DROP")) : 1;
+    g_dense_drop  = getenv("DENSE_KEEP_PAGES") ? 0 : 1;
+
+    Model m; model_init(&m, snap, cap);
+    Tok T;
+    char tokpath[2048]; snprintf(tokpath, sizeof(tokpath), "%s/tokenizer.json", snap);
+    tok_load(&T, tokpath);
+    m.tok = &T;
+    int ctx_cap = getenv("CTX") ? atoi(getenv("CTX")) : 65536;
+    if (ctx_cap < 1 || ctx_cap > (1 << 20)) { fprintf(stderr, "CTX out of range\n"); return 1; }
+    m.max_t = ctx_cap;
+    m.K = calloc_checked((size_t)m.c.n_layers, sizeof(float*), "K cache rows");
+    m.V = calloc_checked((size_t)m.c.n_layers, sizeof(float*), "V cache rows");
+    m.gdn_S = calloc_checked((size_t)m.c.n_layers, sizeof(float*), "GDN recurrence rows");
+    m.gdn_conv = calloc_checked((size_t)m.c.n_layers, sizeof(float*), "GDN convolution rows");
+    for (int i = 0; i < m.c.n_layers; i++) {
+        if (!m.c.layer_is_gdn[i]) {     /* only full_attention layers use K/V */
+            size_t n = kv_state_count(&m.c, m.max_t);
+            m.K[i] = calloc_checked(n, sizeof(float), "K cache");
+            m.V[i] = calloc_checked(n, sizeof(float), "V cache");
+        }
+        if (m.c.layer_is_gdn[i]) {
+            m.gdn_S[i] = calloc_checked(gdn_state_count(&m.c), sizeof(float), "GDN recurrence");
+            m.gdn_conv[i] = calloc_checked(gdn_conv_count(&m.c), sizeof(float), "GDN convolution");
+        }
+    }
+
+    int rc = 0;
+    const char *mode = getenv("QWENMOE_MODE");
+    if (mode && !strcmp(mode, "teacher"))      rc = mode_teacher(&m);
+    else if (mode && !strcmp(mode, "greedy"))  rc = mode_greedy(&m);
+    else if (getenv("SERVE") && getenv("SERVE")[0] == '1') rc = mode_serve(&m, &T);
+    else if (getenv("CHAT"))                   rc = mode_chat(&m, &T);
+    else                                       rc = mode_selftest(&m, snap);
+
+    save_usage(&m, snap);
+    tok_free(&T);
+    return rc;
+}

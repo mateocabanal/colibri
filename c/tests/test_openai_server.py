@@ -14,6 +14,8 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 from openai_server import (APIError, APIHandler, APIServer, ClientCancelled,
                            DEFAULT_CHAT_STOP_SEQUENCES, END, GenerationScheduler,
                            READY, Engine, InklingStreamSplit, StopFilter, ThinkingStreamSplit,
@@ -702,12 +704,15 @@ class CapSentinelShimTest(unittest.TestCase):
         (model / "config.json").write_text(json.dumps({"model_type": model_type}))
         return str(model)
 
-    def _spawn_argv(self, executable, model, **kwargs):
+    def _spawn(self, executable, model, **kwargs):
         process = FakeProcess(lambda _process, _frame: None)
         with patch("openai_server.subprocess.Popen", return_value=process) as popen:
             engine = Engine(executable, model, **kwargs)
             engine.close()
-        return popen.call_args[0][0]
+        return popen.call_args.args[0], popen.call_args.kwargs["env"]
+
+    def _spawn_argv(self, executable, model, **kwargs):
+        return self._spawn(executable, model, **kwargs)[0]
 
     def test_matrix_arch_times_engine_name_times_cap(self):
         # COLI_ENGINE axis: the executable name carries no information; only
@@ -747,10 +752,33 @@ class CapSentinelShimTest(unittest.TestCase):
         self.assertEqual(cap_for_arch("inkling", None), 8)
         self.assertEqual(cap_for_arch("kimi", None), 8)
         self.assertEqual(cap_for_arch("olmoe", None), 8)
+        self.assertEqual(cap_for_arch("qwen3_moe", None), 0)
         self.assertEqual(cap_for_arch("glm", 3), 3)
         self.assertEqual(cap_for_arch("inkling", 3), 3)
+        self.assertEqual(cap_for_arch("qwen3_moe", 3), 3)
         self.assertEqual(cap_for_arch("inkling", 0), 0)   # explicit 0 is explicit
         self.assertEqual(cap_for_arch("glm", 0), 0)
+
+    def test_qwen_engine_resource_precedence_matrix(self):
+        model = self._model("qwen3_moe")
+        cases = (
+            ("absent uses auto sentinel", {}, {}, "0"),
+            ("explicit cap wins", {"cap": 13},
+             {"CACHE": "7", "RAM_GB": "32", "CTX": "8192"}, "13"),
+            ("explicit zero wins", {"cap": 0},
+             {"CACHE": "7", "RAM_GB": "32"}, "0"),
+            ("CACHE wins over RAM", {}, {"CACHE": "7", "RAM_GB": "32"}, "7"),
+            ("RAM delegates to native auto", {}, {"RAM_GB": "32"}, "0"),
+            ("CTX does not alter cap", {}, {"CTX": "8192"}, "0"),
+        )
+        for label, kwargs, env, expected_cap in cases:
+            with self.subTest(label=label):
+                argv, child_env = self._spawn("qwen-engine", model, env=env, **kwargs)
+                self.assertEqual(argv, ["qwen-engine", expected_cap])
+                for key, value in env.items():
+                    self.assertEqual(child_env[key], value)
+                self.assertEqual(child_env["SNAP"], model)
+                self.assertEqual(child_env["SERVE"], "1")
 
     def test_model_arch_reads_model_type(self):
         self.assertEqual(model_arch(self._model("glm_moe_dsa")), "glm")
@@ -758,6 +786,7 @@ class CapSentinelShimTest(unittest.TestCase):
         self.assertEqual(model_arch(self._model("kimi_k3")), "kimi")
         self.assertEqual(model_arch(self._model("deepseek_v4")), "deepseek_v4")
         self.assertEqual(model_arch(self._model("olmoe")), "olmoe")
+        self.assertEqual(model_arch(self._model("qwen3_moe")), "qwen3_moe")
         self.assertEqual(model_arch("/nonexistent"), "glm")
 
     def test_direct_v4_server_gets_bounded_dspark_defaults(self):

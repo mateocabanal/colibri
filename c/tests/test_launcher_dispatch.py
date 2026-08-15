@@ -75,19 +75,37 @@ class LauncherDispatchTest(unittest.TestCase):
 
     def test_every_named_model_type_resolves_to_a_distinct_engine(self):
         """Two families must not resolve to the same binary. That is the shape
-        the bug took: everything unrecognised quietly became the GLM engine."""
-        seen = {}
+        the bug took: everything unrecognised quietly became the GLM engine.
+        Versioned families (qwen3_5_moe, qwen3_6_moe, ...) share ONE engine by
+        design, so the distinctness key is the family (name minus version)."""
+        def family(model_type):
+            parts = model_type.split("_")
+            if len(parts) > 2 and parts[-2].isdigit():
+                return parts[0] + "_" + parts[-1]
+            return model_type
+
+        seen = {}       # family -> (engine, label)
+        engines = {}    # engine -> family
         for model_type, label, _ in self.cli._BANNER_MODELS:
             with self.subTest(model_type=model_type):
                 engine = os.path.basename(
                     self.cli.engine_for(self._model_dir(model_type)))
                 self.assertTrue(engine, f"{label}: engine_for returned nothing")
-                previous = seen.get(engine)
+                key = family(model_type)
+                if key in seen:
+                    # versioned siblings must share their family's engine
+                    self.assertEqual(
+                        seen[key][0], engine,
+                        f"{label} ({model_type}) resolves to {engine!r} but the "
+                        f"{key} family resolves to {seen[key][0]!r}")
+                else:
+                    seen[key] = (engine, label)
+                previous = engines.get(engine)
                 self.assertIsNone(
-                    previous,
-                    f"{label} ({model_type}) and {previous} both dispatch to "
-                    f"{engine!r} -- one of them is being misrouted (#879)")
-                seen[engine] = label
+                    None if previous == key else previous,
+                    f"{label} ({model_type}) and family {previous} both dispatch "
+                    f"to {engine!r} -- one of them is being misrouted (#879)")
+                engines[engine] = key
 
     def test_engine_for_has_a_branch_for_every_arch_model_arch_can_return(self):
         """engine_for() indexes a dict with model_arch()'s return value. A value
@@ -106,6 +124,62 @@ class LauncherDispatchTest(unittest.TestCase):
         """Guards the whole file: if _BANNER_MODELS is ever renamed or emptied,
         the loops above pass vacuously and this suite proves nothing."""
         self.assertGreaterEqual(len(self.cli._BANNER_MODELS), 5)
+
+
+class QwenDirectLaunchTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.cli = load_cli()
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.model = Path(self.directory.name)
+        (self.model / "config.json").write_text(
+            json.dumps({"model_type": "qwen3_moe"}), encoding="utf-8")
+
+    def _launch(self, cap=None, ram=None, ctx=None, ambient=None):
+        args = types.SimpleNamespace(
+            model=str(self.model), prompt=["hello", "qwen"], cap=cap,
+            ram=ram, ctx=ctx, ngen=64, temp=None, policy="quality", topp=0,
+            topk=0, repin=0, auto_tier=False, gpu=None)
+        completed = types.SimpleNamespace(returncode=0)
+        with mock.patch.dict(os.environ, ambient or {}, clear=True), \
+             mock.patch("resource_plan.physical_cpu_count", return_value=6), \
+             mock.patch.object(self.cli, "need_model"), \
+             mock.patch.object(self.cli, "banner"), \
+             mock.patch.object(self.cli, "engine_for", return_value="/stub/qwen_moe"), \
+             mock.patch.object(self.cli.subprocess, "call", return_value=0), \
+             mock.patch.object(self.cli.subprocess, "run", return_value=completed) as run:
+            with self.assertRaises(SystemExit) as stopped:
+                self.cli.cmd_run(args)
+        self.assertEqual(stopped.exception.code, 0)
+        return run.call_args
+
+    def test_direct_qwen_resource_precedence_matrix(self):
+        cases = (
+            ("absent delegates to native defaults", None, None, None, {}, None, {}),
+            ("explicit cap is argv", 13, 32, 8192, {"CACHE": "7"}, "13",
+             {"CACHE": "7", "RAM_GB": "32", "CTX": "8192"}),
+            ("CACHE wins over RAM", None, 32, None, {"CACHE": "7"}, None,
+             {"CACHE": "7", "RAM_GB": "32"}),
+            ("RAM derives cache and CTX forwards", None, 32, 8192, {}, None,
+             {"CACHE": "16", "RAM_GB": "32", "CTX": "8192"}),
+        )
+        for label, cap, ram, ctx, ambient, expected_cap, expected_env in cases:
+            with self.subTest(label=label):
+                call = self._launch(cap, ram, ctx, ambient)
+                self.assertIsNotNone(call)
+                cmd = call.args[0]
+                expected = ["/stub/qwen_moe", str(self.model)]
+                if expected_cap is not None:
+                    expected.append(expected_cap)
+                self.assertEqual(cmd, expected)
+                self.assertEqual(call.kwargs["input"], "hello qwen\n")
+                for key, value in expected_env.items():
+                    self.assertEqual(call.kwargs["env"][key], value)
+                for key in {"CACHE", "RAM_GB", "CTX"} - expected_env.keys():
+                    self.assertNotIn(key, call.kwargs["env"])
 
 
 class ProjectPythonTest(unittest.TestCase):

@@ -19,6 +19,8 @@ c/inkling
 c/kimi_k3
 c/kimi_k3.exe
 c/olmoe.exe
+c/qwen_moe
+c/qwen_moe.exe
 # deepseek_v4 and the per-unit objects its amalgamated Makefile leaves behind.
 # The same omission as #858, one file over: every engine is listed here except
 # the one added last, so `make deepseek-v4` left 26 untracked .o files in
@@ -100,6 +102,9 @@ olmoe_merged/
 olmoe_i4/
 c/olmoe_merged/
 c/olmoe_i4/
+# qwen_moe fixture + converted snapshots (make_qwen_moe_tiny.py / convert_qwen_moe.py)
+c/qwen_moe_tiny/
+c/qwen_moe_merged/
 .idea
 c/tiny_inkling/
 
