@@ -241,6 +241,7 @@ typedef struct {
     int fmt;                       /* 0=f32, 8=int8 merged, 4=i4-grouped, 5=int3-g64 */
     int mio;                       /* 1 = weight bytes live in a MetalIO shared buffer */
     int mio_slot;                  /* metalio slot id, -1 = not backed yet */
+    int mio_resident;              /* 1 = current pointers point INTO the mio buffer */
     int64_t mio_event;             /* event value of the slot's latest load */
     int64_t mio_waited;            /* highest mio event already waited (pending if < mio_event) */
     float *gu, *d;                 /* f32: [2I,H] gate|up, [H,I] down */
@@ -953,6 +954,7 @@ static void load_expert(Model *m, int layer, int eid, Slot *s){
                 s->fmt = probes[pi].fmt;
             }
             s->pinned = 0;
+            s->mio_resident = 1;
             return;
         }
         /* fall through: any failure keeps the pread path */
@@ -1811,14 +1813,16 @@ static void moe_batch(Model *m, Layer *l, int layer, const float *xs, int C, flo
             double t0 = now_s();
 #ifdef COLI_METALIO
             if (pool) {
-                s->mio = 1; s->mio_slot = pool[a].mio_slot;
                 if (wb >= QWEN_ARENA_CAP) {
                     /* this expert was already pipelined into the pool slot
-                     * during the previous wave's apply loop — re-enqueueing
-                     * would double-read it; wait_ready drains it at apply. */
+                     * during the previous wave's apply loop — the data
+                     * pointers live in pool[a] (set by that pipeline);
+                     * re-enqueueing would double-read the expert. */
+                    *s = pool[a];
                     m->t_expio += now_s() - t0;
                     continue;
                 }
+                s->mio = 1; s->mio_slot = pool[a].mio_slot;
             }
 #endif
             load_expert(m, layer, uniq[wb + a], s);
@@ -1885,6 +1889,10 @@ static void moe_batch(Model *m, Layer *l, int layer, const float *xs, int C, flo
              * remaining applies of this wave. */
 #ifdef COLI_METALIO
             if (pool && wb + QWEN_ARENA_CAP < nuniq) {
+                /* pipeline the next wave's expert into the SAME buffer right
+                 * after the apply finished reading it; persist the full
+                 * descriptor so the next wave's skip path finds the
+                 * pointers + mio_resident state. */
                 int ne = uniq[wb + QWEN_ARENA_CAP + a];
                 Slot tmp; memset(&tmp, 0, sizeof(tmp));
                 tmp.mio = 1; tmp.mio_slot = s->mio_slot;
@@ -1893,15 +1901,15 @@ static void moe_batch(Model *m, Layer *l, int layer, const float *xs, int C, flo
                 load_expert(m, layer, ne, &tmp);
                 g_mio_async_issue = 0;
                 m->t_expio += now_s() - t0;
-                pool[a].mio_slot = tmp.mio_slot;
+                pool[a] = tmp;
             }
 #endif
         }
-        /* free heap buffers from any fallback (pread) wave slots; mio slots
-         * point into the persistent pool and have nothing to free */
+        /* free heap buffers from any fallback (pread) wave slots; mio-RESIDENT
+         * slots point into the persistent pool and have nothing to free */
         for (int a = 0; a < wn; a++) {
             Slot *s = &wave[a];
-            if (s->mio) continue;
+            if (s->mio_resident) continue;
             free(s->gu); free(s->g); free(s->gs); free(s->g4); free(s->g4s);
         }
     }
