@@ -253,7 +253,8 @@ typedef struct {
     Layer *L;
     LCache *cache;                 /* [n_layers] */
     uint64_t clock, hits, miss;
-    float **K, **V;                /* [n_layers][kv_heads*max_t*head_dim] */
+    float **K, **V;                /* [n_layers][kv_heads*max_t*head_dim] (f32 KV) */
+    uint16_t **K16, **V16;         /* same layout as halves (QWEN_KV_F16) */
     int kv_len, max_t;
     float **gdn_S;                 /* [n_layers][v_heads*k_dim*v_dim] state */
     float **gdn_conv;              /* [n_layers][conv_dim*(k-1)] conv state */
@@ -286,6 +287,71 @@ static size_t gdn_conv_count(const Cfg *c){
 static size_t kv_state_count(const Cfg *c, int max_t){
     size_t n = size_mul_or_die((size_t)c->n_kv_heads, (size_t)max_t, "KV cache");
     return size_mul_or_die(n, c->head_dim, "KV cache");
+}
+
+/* ---------- fp16 KV cache (QWEN_KV_F16, default on) ---------- */
+
+/* IEEE half, round-to-nearest-even (bit-exact vs the usual softfloat path;
+ * st.h already carries the f16_to_f32 decoder). */
+static uint16_t f32_to_f16(float x){
+    uint32_t u; memcpy(&u, &x, 4);
+    uint32_t sign = (u >> 16) & 0x8000u;
+    int32_t e = (int32_t)((u >> 23) & 0xFF) - 127 + 15;
+    uint32_t m = u & 0x7FFFFFu;
+    if (e >= 0x1F) return (uint16_t)(sign | 0x7C00u);          /* inf/nan */
+    if (e <= 0) {
+        if (e < -10) return (uint16_t)sign;                    /* underflow */
+        m |= 0x800000u;                                        /* subnormal */
+        int shift = 14 - e;
+        uint32_t half = m >> shift;
+        uint32_t rem = m & ((1u << shift) - 1);
+        uint32_t halfway = 1u << (shift - 1);
+        if (rem > halfway || (rem == halfway && (half & 1))) half++;
+        return (uint16_t)(sign | half);
+    }
+    uint32_t half = (m >> 13);
+    uint32_t rem = m & 0x1FFFu;
+    if (rem > 0x1000u || (rem == 0x1000u && (half & 1))) half++;   /* RNE */
+    return (uint16_t)(sign | ((uint32_t)e << 10) | half);
+}
+
+static int g_kv_f16 = 1;             /* QWEN_KV_F16=0 disables (f32 KV) */
+
+static void kv_store_row(Model *m, int layer, int g, int pos, const float *row, int hd){
+    int64_t off = ((int64_t)g * m->max_t + pos) * hd;
+    if (g_kv_f16) {
+        uint16_t *dst = m->K16[layer] + off;
+        for (int d = 0; d < hd; d++) dst[d] = f32_to_f16(row[d]);
+    } else {
+        memcpy(m->K[layer] + off, row, (size_t)hd * sizeof(float));
+    }
+}
+static void kv_store_row_v(Model *m, int layer, int g, int pos, const float *row, int hd){
+    int64_t off = ((int64_t)g * m->max_t + pos) * hd;
+    if (g_kv_f16) {
+        uint16_t *dst = m->V16[layer] + off;
+        for (int d = 0; d < hd; d++) dst[d] = f32_to_f16(row[d]);
+    } else {
+        memcpy(m->V[layer] + off, row, (size_t)hd * sizeof(float));
+    }
+}
+static void kv_load_row(Model *m, int layer, int g, int pos, float *out, int hd){
+    int64_t off = ((int64_t)g * m->max_t + pos) * hd;
+    if (g_kv_f16) {
+        const uint16_t *src = m->K16[layer] + off;
+        for (int d = 0; d < hd; d++) out[d] = f16_to_f32(src[d]);
+    } else {
+        memcpy(out, m->K[layer] + off, (size_t)hd * sizeof(float));
+    }
+}
+static void kv_load_row_v(Model *m, int layer, int g, int pos, float *out, int hd){
+    int64_t off = ((int64_t)g * m->max_t + pos) * hd;
+    if (g_kv_f16) {
+        const uint16_t *src = m->V16[layer] + off;
+        for (int d = 0; d < hd; d++) out[d] = f16_to_f32(src[d]);
+    } else {
+        memcpy(out, m->V[layer] + off, (size_t)hd * sizeof(float));
+    }
 }
 
 /* All output-token selection comes through this helper.  Checkpoints often
@@ -1020,24 +1086,25 @@ static void attention_token(Model *m, Layer *l, int layer, const float *x, int p
 
     /* store K/V at pos (self-attention sees its own key) */
     for (int g = 0; g < kv; g++) {
-        memcpy(m->K[layer] + ((int64_t)g * m->max_t + pos) * hd, k + (int64_t)g * hd, (size_t)hd * sizeof(float));
-        memcpy(m->V[layer] + ((int64_t)g * m->max_t + pos) * hd, vv + (int64_t)g * hd, (size_t)hd * sizeof(float));
+        kv_store_row(m, layer, g, pos, k + (int64_t)g * hd, hd);
+        kv_store_row_v(m, layer, g, pos, vv + (int64_t)g * hd, hd);
     }
 
     float *scores = falloc((int64_t)pos + 1);
     float *attn_out = falloc((int64_t)H * hd);
+    float krow[512], vrow[512];
+    if (hd > 512) { fprintf(stderr, "head_dim %d > 512\n", hd); exit(1); }
     float scale = 1.f / sqrtf((float)hd);
     for (int h = 0; h < H; h++) {
         const float *qh = qg + (int64_t)h * 2 * hd;
         /* keys/values come from the KV CACHE (past positions), not from the
          * current token's k/vv buffers — those hold only this token's head. */
-        const float *kg = m->K[layer] + (int64_t)(h / groups) * m->max_t * hd;
-        const float *vg = m->V[layer] + (int64_t)(h / groups) * m->max_t * hd;
+        int hg = h / groups;
         float mx = -1e30f;
         for (int p = 0; p <= pos; p++) {
-            const float *kp = kg + (int64_t)p * hd;
+            kv_load_row(m, layer, hg, p, krow, hd);
             float acc = 0;
-            for (int d = 0; d < hd; d++) acc += qh[d] * kp[d];
+            for (int d = 0; d < hd; d++) acc += qh[d] * krow[d];
             scores[p] = acc * scale;
             if (scores[p] > mx) mx = scores[p];
         }
@@ -1046,9 +1113,9 @@ static void attention_token(Model *m, Layer *l, int layer, const float *x, int p
         float *oh = attn_out + (int64_t)h * hd;
         for (int d = 0; d < hd; d++) oh[d] = 0;
         for (int p = 0; p <= pos; p++) {
-            const float *vp = vg + (int64_t)p * hd;
+            kv_load_row_v(m, layer, hg, p, vrow, hd);
             float w = scores[p] / ssum;
-            for (int d = 0; d < hd; d++) oh[d] += w * vp[d];
+            for (int d = 0; d < hd; d++) oh[d] += w * vrow[d];
         }
         /* output gate: attn * sigmoid(gate) elementwise over the head dim
          * (gate is a full head_dim vector per head, second half of the block) */
@@ -1329,21 +1396,21 @@ static void attention_batch(Model *m, Layer *l, int layer, const float *xs, int 
         for (int h = 0; h < H; h++) rope_partial(qg_row + (int64_t)h * 2 * hd, pos, c);
         for (int h = 0; h < kv; h++) rope_partial(k_row + (int64_t)h * hd, pos, c);
         for (int h = 0; h < kv; h++) {
-            memcpy(m->K[layer] + ((int64_t)h * m->max_t + pos) * hd, k_row + (int64_t)h * hd, (size_t)hd * sizeof(float));
-            memcpy(m->V[layer] + ((int64_t)h * m->max_t + pos) * hd, vv_row + (int64_t)h * hd, (size_t)hd * sizeof(float));
+            kv_store_row(m, layer, h, pos, k_row + (int64_t)h * hd, hd);
+            kv_store_row_v(m, layer, h, pos, vv_row + (int64_t)h * hd, hd);
         }
         /* scores + weighted sum + gate, exactly as attention_token's row path */
         float *scores = falloc((int64_t)pos + 1);
         float *oh = attn_all + (int64_t)g * H * hd;
+        float krow[512], vrow[512];
         for (int h = 0; h < H; h++) {
             const float *qh = qg_row + (int64_t)h * 2 * hd;
-            const float *kg = m->K[layer] + (int64_t)(h / groups) * m->max_t * hd;
-            const float *vg = m->V[layer] + (int64_t)(h / groups) * m->max_t * hd;
+            int hg = h / groups;
             float mx = -1e30f;
             for (int p = 0; p <= pos; p++) {
-                const float *kp = kg + (int64_t)p * hd;
+                kv_load_row(m, layer, hg, p, krow, hd);
                 float acc = 0;
-                for (int d = 0; d < hd; d++) acc += qh[d] * kp[d];
+                for (int d = 0; d < hd; d++) acc += qh[d] * krow[d];
                 scores[p] = acc * scale;
                 if (scores[p] > mx) mx = scores[p];
             }
@@ -1352,9 +1419,9 @@ static void attention_batch(Model *m, Layer *l, int layer, const float *xs, int 
             float *ohh = oh + (int64_t)h * hd;
             for (int d = 0; d < hd; d++) ohh[d] = 0;
             for (int p = 0; p <= pos; p++) {
-                const float *vp = vg + (int64_t)p * hd;
+                kv_load_row_v(m, layer, hg, p, vrow, hd);
                 float w = scores[p] / ssum;
-                for (int d = 0; d < hd; d++) ohh[d] += w * vp[d];
+                for (int d = 0; d < hd; d++) ohh[d] += w * vrow[d];
             }
             const float *gh = qg_row + (int64_t)(2 * h + 1) * hd;
             for (int d = 0; d < hd; d++) ohh[d] *= 1.f / (1.f + expf(-gh[d]));
@@ -1978,11 +2045,15 @@ static void request_state_reset(Model *m){
 /* Full session/test reset also clears KV, unlike the narrow serve reset. */
 static void state_reset(Model *m){
     request_state_reset(m);
+    size_t n = size_mul_or_die(kv_state_count(&m->c, m->max_t), sizeof(float), "KV cache reset");
     for (int i = 0; i < m->c.n_layers; i++) {
-        if (m->K && m->K[i])
-            memset(m->K[i], 0, size_mul_or_die(kv_state_count(&m->c, m->max_t), sizeof(float), "K cache reset"));
-        if (m->V && m->V[i])
-            memset(m->V[i], 0, size_mul_or_die(kv_state_count(&m->c, m->max_t), sizeof(float), "V cache reset"));
+        if (g_kv_f16) {
+            if (m->K16 && m->K16[i]) memset(m->K16[i], 0, n / 2);
+            if (m->V16 && m->V16[i]) memset(m->V16[i], 0, n / 2);
+        } else {
+            if (m->K && m->K[i]) memset(m->K[i], 0, n);
+            if (m->V && m->V[i]) memset(m->V[i], 0, n);
+        }
     }
 }
 
@@ -2408,6 +2479,7 @@ int main(int argc, char **argv){
     g_chunk = getenv("QWENMOE_CHUNK") ? atoi(getenv("QWENMOE_CHUNK")) : 64;
     if (g_chunk < 1) g_chunk = 1;
     if (g_chunk > QWEN_CHUNK_MAX) g_chunk = QWEN_CHUNK_MAX;
+    g_kv_f16 = getenv("QWEN_KV_F16") ? atoi(getenv("QWEN_KV_F16")) : 1;
     g_dense_drop  = getenv("DENSE_KEEP_PAGES") ? 0 : 1;
 
     Model m; model_init(&m, snap, cap);
@@ -2420,13 +2492,20 @@ int main(int argc, char **argv){
     m.max_t = ctx_cap;
     m.K = calloc_checked((size_t)m.c.n_layers, sizeof(float*), "K cache rows");
     m.V = calloc_checked((size_t)m.c.n_layers, sizeof(float*), "V cache rows");
+    m.K16 = calloc_checked((size_t)m.c.n_layers, sizeof(uint16_t*), "K16 cache rows");
+    m.V16 = calloc_checked((size_t)m.c.n_layers, sizeof(uint16_t*), "V16 cache rows");
     m.gdn_S = calloc_checked((size_t)m.c.n_layers, sizeof(float*), "GDN recurrence rows");
     m.gdn_conv = calloc_checked((size_t)m.c.n_layers, sizeof(float*), "GDN convolution rows");
     for (int i = 0; i < m.c.n_layers; i++) {
         if (!m.c.layer_is_gdn[i]) {     /* only full_attention layers use K/V */
             size_t n = kv_state_count(&m.c, m.max_t);
-            m.K[i] = calloc_checked(n, sizeof(float), "K cache");
-            m.V[i] = calloc_checked(n, sizeof(float), "V cache");
+            if (g_kv_f16) {
+                m.K16[i] = calloc_checked(n, sizeof(uint16_t), "K cache (f16)");
+                m.V16[i] = calloc_checked(n, sizeof(uint16_t), "V cache (f16)");
+            } else {
+                m.K[i] = calloc_checked(n, sizeof(float), "K cache");
+                m.V[i] = calloc_checked(n, sizeof(float), "V cache");
+            }
         }
         if (m.c.layer_is_gdn[i]) {
             m.gdn_S[i] = calloc_checked(gdn_state_count(&m.c), sizeof(float), "GDN recurrence");
