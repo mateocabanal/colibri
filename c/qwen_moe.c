@@ -263,6 +263,7 @@ typedef struct {
     int last_route[64];            /* most recent top-k (for lookahead prefetch) */
     int last_route_k;
     uint64_t prefetch_misses;      /* loads triggered by lookahead prefetch */
+    double t_attn, t_gdn, t_moe, t_expio;   /* per-request phase timings (PROF) */
     double dense_load_s;
 } Model;
 
@@ -927,7 +928,9 @@ static void expert_get(Model *m, int layer, int eid, Slot **out){
     s->loading_eid = eid;
     pthread_mutex_unlock(&g_mx);
 
+    double t0 = now_s();
     load_expert(m, layer, eid, s);          /* disk I/O outside the lock */
+    m->t_expio += now_s() - t0;
 
     pthread_mutex_lock(&g_mx);
     s->eid = eid;
@@ -1278,6 +1281,409 @@ static void moe_token(Model *m, Layer *l, int layer, const float *x, float *out)
     free(sg); free(h); free(gv); free(sy);
 }
 
+/* ---------- batched prefill (chunked layer-major) ---------- */
+
+/* The numerics contract (see the batched-prefill ADR): matmul/matmul_q8 and
+ * the packed kernels parallelize over OUTPUT ROWS with per-row accumulation
+ * order untouched, so batching S>1 rows is bit-identical per row to S=1.
+ * GDN recurrence, conv state and K/V writes stay strictly in token order.
+ * Decode (n<=1) keeps the original per-token functions verbatim. */
+
+#define QWEN_CHUNK_MAX 256
+static int g_chunk = 64;             /* QWENMOE_CHUNK, clamped 1..QWEN_CHUNK_MAX */
+
+static void embed_row(Model *m, int token, float *out){
+    Cfg *c = &m->c; int D = c->hidden;
+    if (m->embed.q) {
+        const int8_t *row = m->embed.q + (int64_t)token * D;
+        float sc = m->embed.s[token];
+        for (int d = 0; d < D; d++) out[d] = (float)row[d] * sc;
+    } else {
+        memcpy(out, m->embed.f + (int64_t)token * D, (size_t)D * sizeof(float));
+    }
+}
+
+/* batched full attention over a chunk: projections with S=C, per-token
+ * QK-norm/RoPE/KV-store/scores/gate in token order, o_proj with S=C. */
+static void attention_batch(Model *m, Layer *l, int layer, const float *xs, int C,
+                            int pos0, float *out){
+    Cfg *c = &m->c; int H = c->n_heads, hd = c->head_dim, D = c->hidden;
+    int kv = c->n_kv_heads, groups = H / kv;
+    float *qg = falloc((int64_t)C * 2 * H * hd);
+    float *k = falloc((int64_t)C * kv * hd), *vv = falloc((int64_t)C * kv * hd);
+    double t0 = now_s();
+    wt_mul(qg, xs, &l->q, C, 2 * H * hd, D);
+    wt_mul(k,  xs, &l->k, C, kv * hd, D);
+    wt_mul(vv, xs, &l->v, C, kv * hd, D);
+    float *attn_all = falloc((int64_t)C * H * hd);
+    float scale = 1.f / sqrtf((float)hd);
+    for (int g = 0; g < C; g++) {
+        int pos = pos0 + g;
+        float *qg_row = qg + (int64_t)g * 2 * H * hd;
+        float *k_row = k + (int64_t)g * kv * hd;
+        float *vv_row = vv + (int64_t)g * kv * hd;
+        for (int h = 0; h < H; h++)
+            rmsnorm_row(qg_row + (int64_t)h * 2 * hd, qg_row + (int64_t)h * 2 * hd, l->qn, hd, c->eps);
+        for (int h = 0; h < kv; h++)
+            rmsnorm_row(k_row + (int64_t)h * hd, k_row + (int64_t)h * hd, l->kn, hd, c->eps);
+        for (int h = 0; h < H; h++) rope_partial(qg_row + (int64_t)h * 2 * hd, pos, c);
+        for (int h = 0; h < kv; h++) rope_partial(k_row + (int64_t)h * hd, pos, c);
+        for (int h = 0; h < kv; h++) {
+            memcpy(m->K[layer] + ((int64_t)h * m->max_t + pos) * hd, k_row + (int64_t)h * hd, (size_t)hd * sizeof(float));
+            memcpy(m->V[layer] + ((int64_t)h * m->max_t + pos) * hd, vv_row + (int64_t)h * hd, (size_t)hd * sizeof(float));
+        }
+        /* scores + weighted sum + gate, exactly as attention_token's row path */
+        float *scores = falloc((int64_t)pos + 1);
+        float *oh = attn_all + (int64_t)g * H * hd;
+        for (int h = 0; h < H; h++) {
+            const float *qh = qg_row + (int64_t)h * 2 * hd;
+            const float *kg = m->K[layer] + (int64_t)(h / groups) * m->max_t * hd;
+            const float *vg = m->V[layer] + (int64_t)(h / groups) * m->max_t * hd;
+            float mx = -1e30f;
+            for (int p = 0; p <= pos; p++) {
+                const float *kp = kg + (int64_t)p * hd;
+                float acc = 0;
+                for (int d = 0; d < hd; d++) acc += qh[d] * kp[d];
+                scores[p] = acc * scale;
+                if (scores[p] > mx) mx = scores[p];
+            }
+            float ssum = 0;
+            for (int p = 0; p <= pos; p++) { scores[p] = expf(scores[p] - mx); ssum += scores[p]; }
+            float *ohh = oh + (int64_t)h * hd;
+            for (int d = 0; d < hd; d++) ohh[d] = 0;
+            for (int p = 0; p <= pos; p++) {
+                const float *vp = vg + (int64_t)p * hd;
+                float w = scores[p] / ssum;
+                for (int d = 0; d < hd; d++) ohh[d] += w * vp[d];
+            }
+            const float *gh = qg_row + (int64_t)(2 * h + 1) * hd;
+            for (int d = 0; d < hd; d++) ohh[d] *= 1.f / (1.f + expf(-gh[d]));
+        }
+        free(scores);
+    }
+    float *outs = falloc((int64_t)C * D);
+    wt_mul(outs, attn_all, &l->o, C, D, H * hd);
+    for (int g = 0; g < C; g++)
+        for (int d = 0; d < D; d++) out[(int64_t)g * D + d] += outs[(int64_t)g * D + d];
+    m->t_attn += now_s() - t0;
+    free(qg); free(k); free(vv); free(attn_all); free(outs);
+}
+
+/* GDN per-token core (conv + delta-rule recurrence + RMSNormGated), shared by
+ * gdn_token and gdn_batch. Reads/writes conv + recurrence state in order. */
+static void gdn_token_core(Model *m, Layer *l, int layer,
+                           const float *qkv_row, float a, float b,
+                           const float *z_row, float *y_out){
+    Cfg *c = &m->c;
+    int kd = c->lin_k_dim, kheads = c->lin_k_heads;
+    int vd = c->lin_v_dim, vheads = c->lin_v_heads;
+    int kdim = kd * kheads, vdim = vd * vheads, C = kdim * 2 + vdim;
+    int kk = c->conv_kernel;
+
+    /* causal depthwise conv1d over channels with silu; state = last kk-1 */
+    float *y = falloc(C);
+    if (kk > 1) {
+        float *conv_st = m->gdn_conv[layer];
+        for (int ch = 0; ch < C; ch++) {
+            float acc = 0;
+            for (int j = 0; j < kk; j++) {
+                float vv = (j == kk - 1) ? qkv_row[ch] : conv_st[ch * (kk - 1) + j];
+                acc += l->conv1d[ch * kk + j] * vv;
+            }
+            y[ch] = silu(acc);
+        }
+        for (int ch = 0; ch < C; ch++) {
+            for (int s = 0; s < kk - 2; s++)
+                conv_st[ch * (kk - 1) + s] = conv_st[ch * (kk - 1) + s + 1];
+            conv_st[ch * (kk - 1) + (kk - 2)] = qkv_row[ch];
+        }
+    } else {
+        for (int ch = 0; ch < C; ch++) y[ch] = silu(l->conv1d[ch] * qkv_row[ch]);
+    }
+
+    const float *q_ = y, *k_ = y + kdim, *v_ = y + kdim * 2;
+    int rep = vheads / kheads;
+    if (rep < 1 || vheads % kheads) { fprintf(stderr, "GDN head ratio invalid\n"); exit(1); }
+
+    float *S = m->gdn_S[layer];                    /* [vheads, kdim, vdim] */
+    float *qh = falloc((int64_t)vheads * kd), *kh = falloc((int64_t)vheads * kd);
+    float *vh = falloc((int64_t)vheads * vd);
+    for (int h = 0; h < vheads; h++) {
+        int khd = h / rep;
+        for (int d = 0; d < kd; d++) { qh[(int64_t)h * kd + d] = q_[khd * kd + d]; kh[(int64_t)h * kd + d] = k_[khd * kd + d]; }
+        for (int d = 0; d < vd; d++) vh[(int64_t)h * vd + d] = v_[h * vd + d];
+        l2norm(qh + (int64_t)h * kd, kd);
+        l2norm(kh + (int64_t)h * kd, kd);
+        float sc = 1.f / sqrtf((float)kd);
+        for (int d = 0; d < kd; d++) qh[(int64_t)h * kd + d] *= sc;
+    }
+
+    float *Snew = falloc((int64_t)vheads * kd * vd);
+    float *kv_mem = falloc(vd);
+    for (int h = 0; h < vheads; h++) {
+        float ga = -expf(l->A_log[h]) * logf(1.f + expf(a + l->dt_bias[h]));
+        float gt = expf(ga);
+        float bt = 1.f / (1.f + expf(-b));
+        const float *Sh = S + (int64_t)h * kd * vd;
+        float *Sn = Snew + (int64_t)h * kd * vd;
+        const float *qhh = qh + (int64_t)h * kd, *khh = kh + (int64_t)h * kd;
+        const float *vhh = vh + (int64_t)h * vd;
+        for (int d = 0; d < vd; d++) kv_mem[d] = 0;
+        for (int kk2 = 0; kk2 < kd; kk2++) {
+            const float *Srow = Sh + (int64_t)kk2 * vd;
+            for (int d = 0; d < vd; d++) {
+                float s = Srow[d] * gt;
+                Sn[kk2 * vd + d] = s;
+                kv_mem[d] += s * khh[kk2];
+            }
+        }
+        for (int d = 0; d < vd; d++) {
+            float delta = (vhh[d] - kv_mem[d]) * bt;
+            for (int kk2 = 0; kk2 < kd; kk2++)
+                Sn[kk2 * vd + d] += khh[kk2] * delta;
+        }
+        for (int d = 0; d < vd; d++) {
+            float acc = 0;
+            for (int kk2 = 0; kk2 < kd; kk2++) acc += Sn[kk2 * vd + d] * qhh[kk2];
+            kv_mem[d] = acc;
+        }
+        for (int d = 0; d < vd; d++) vh[(int64_t)h * vd + d] = kv_mem[d];
+    }
+    memcpy(S, Snew, (size_t)vheads * kd * vd * sizeof(float));
+
+    for (int h = 0; h < vheads; h++)
+        rmsnorm_gated_row(y_out + (int64_t)h * vd, vh + (int64_t)h * vd,
+                          z_row + (int64_t)h * vd, l->gdn_norm, vd, c->eps);
+    free(y); free(qh); free(kh); free(vh); free(Snew); free(kv_mem);
+}
+
+/* batched GDN layer: projections with S=C, per-token conv+recurrence in order,
+ * out_proj with S=C. */
+static void gdn_batch(Model *m, Layer *l, int layer, const float *xs, int C, float *out){
+    Cfg *c = &m->c;
+    int kd = c->lin_k_dim, kheads = c->lin_k_heads;
+    int vd = c->lin_v_dim, vheads = c->lin_v_heads;
+    int kdim = kd * kheads, vdim = vd * vheads, Cdim = kdim * 2 + vdim, D = c->hidden;
+    double t0 = now_s();
+    float *qkv = falloc((int64_t)C * Cdim);
+    float *a = falloc((int64_t)C * vheads), *b = falloc((int64_t)C * vheads);
+    float *z = falloc((int64_t)C * vdim);
+    wt_mul(qkv, xs, &l->in_qkv, C, Cdim, D);
+    wt_mul(a, xs, &l->in_a, C, vheads, D);
+    wt_mul(b, xs, &l->in_b, C, vheads, D);
+    wt_mul(z, xs, &l->in_z, C, vdim, D);
+    float *y = falloc((int64_t)C * vdim);
+    for (int g = 0; g < C; g++)
+        gdn_token_core(m, l, layer, qkv + (int64_t)g * Cdim, a[g], b[g],
+                       z + (int64_t)g * vdim, y + (int64_t)g * vdim);
+    float *outs = falloc((int64_t)C * D);
+    wt_mul(outs, y, &l->gdn_out, C, D, vdim);
+    for (int g = 0; g < C; g++)
+        for (int d = 0; d < D; d++) out[(int64_t)g * D + d] += outs[(int64_t)g * D + d];
+    m->t_gdn += now_s() - t0;
+    free(qkv); free(a); free(b); free(z); free(y); free(outs);
+}
+
+/* Prefill expert arena: per-chunk, per-layer scratch slots so a chunk's
+ * experts load ONCE regardless of how many tokens route to them (the LRU's
+ * 78% miss storm was re-reading the same experts every few tokens).
+ * ponytail: arena capped at 64 slots/layer (evicting LRU-within-arena);
+ * 64 * 3.1MB = ~200MB transient at 35B geometry — sized from RAM_GB if the
+ * cap ever needs to grow past ~128. */
+#define QWEN_ARENA_CAP 64
+typedef struct { int eid; int order; Slot s; } ArenaSlot;
+
+static void arena_free(ArenaSlot *a, int n){
+    for (int i = 0; i < n; i++) {
+        Slot *s = &a[i].s;
+        free(s->gu); free(s->g); free(s->g4); free(s->g4s);
+        s->gu = NULL; s->g = NULL; s->g4 = NULL; s->g4s = NULL;
+    }
+}
+
+static void moe_batch(Model *m, Layer *l, int layer, const float *xs, int C, float *out){
+    Cfg *c = &m->c; int E = c->n_experts, K = c->topk, D = c->hidden;
+    double t0 = now_s();
+    /* router over the whole chunk */
+    float *rlogits = falloc((int64_t)C * E);
+    wt_mul(rlogits, xs, &l->router, C, E, D);
+    int *picks = malloc(size_mul_or_die((size_t)C * K, sizeof(int), "moe picks"));
+    float *w = malloc(size_mul_or_die((size_t)C * K, sizeof(float), "moe weights"));
+    if (!picks || !w) { fprintf(stderr, "OOM moe picks\n"); exit(1); }
+    for (int j = 0; j < C; j++) {
+        float *row = rlogits + (int64_t)j * E;
+        softmax_row(row, E);
+        int *idx = malloc(size_mul_or_die((size_t)E, sizeof(int), "router indices"));
+        if (!idx) { fprintf(stderr, "OOM router indices\n"); exit(1); }
+        for (int i = 0; i < E; i++) idx[i] = i;
+        for (int i = 0; i < K; i++) {
+            int best = i;
+            for (int jj = i + 1; jj < E; jj++)
+                if (row[jj] > row[best] || (row[jj] == row[best] && idx[jj] < idx[best])) best = jj;
+            int ti = idx[i]; idx[i] = idx[best]; idx[best] = ti;
+            float tv = row[i]; row[i] = row[best]; row[best] = tv;
+        }
+        float wsum = 0; for (int i = 0; i < K; i++) wsum += row[i];
+        for (int i = 0; i < K; i++) { picks[j * K + i] = idx[i]; w[j * K + i] = row[i] / wsum; }
+        free(idx);
+    }
+    free(rlogits);
+    if (K <= 64) { memcpy(m->last_route, picks, (size_t)K * sizeof(int)); m->last_route_k = K; }
+
+    /* shared expert, batched over the chunk */
+    float *sg_all = falloc(C), *h_all = falloc((int64_t)C * c->shared_inter);
+    float *gv_all = falloc((int64_t)C * c->shared_inter);
+    wt_mul(sg_all, xs, &l->se_g, C, 1, D);
+    wt_mul(gv_all, xs, &l->se_gate, C, c->shared_inter, D);
+    wt_mul(h_all, xs, &l->se_up, C, c->shared_inter, D);
+    for (int j = 0; j < C; j++)
+        for (int i = 0; i < c->shared_inter; i++)
+            h_all[(int64_t)j * c->shared_inter + i] =
+                silu(gv_all[(int64_t)j * c->shared_inter + i]) *
+                h_all[(int64_t)j * c->shared_inter + i];
+    float *sy_all = falloc((int64_t)C * D);
+    wt_mul(sy_all, h_all, &l->se_down, C, D, c->shared_inter);
+    for (int j = 0; j < C; j++) {
+        float gs = 1.f / (1.f + expf(-sg_all[j]));
+        for (int d = 0; d < D; d++) out[(int64_t)j * D + d] += sy_all[(int64_t)j * D + d] * gs;
+    }
+    free(sg_all); free(h_all); free(gv_all); free(sy_all);
+
+    /* arena: load each distinct routed expert once */
+    int arena_cap = C * K < QWEN_ARENA_CAP ? C * K : QWEN_ARENA_CAP;
+    if (arena_cap > E) arena_cap = E;
+    ArenaSlot *arena = calloc((size_t)arena_cap, sizeof(ArenaSlot));
+    int *eid_slot = malloc(size_mul_or_die((size_t)E, sizeof(int), "arena index"));
+    if (!arena || !eid_slot) { fprintf(stderr, "OOM arena\n"); exit(1); }
+    for (int i = 0; i < E; i++) eid_slot[i] = -1;
+    int arena_n = 0, arena_clock = 0;
+    for (int j = 0; j < C; j++) for (int k = 0; k < K; k++) {
+        int e = picks[j * K + k];
+        if (eid_slot[e] >= 0) continue;
+        if (arena_n == arena_cap) {         /* evict oldest arena slot */
+            int lru = 0;
+            for (int i = 1; i < arena_n; i++)
+                if (arena[i].order < arena[lru].order) lru = i;
+            eid_slot[arena[lru].eid] = -1;
+            Slot *s = &arena[lru].s;
+            free(s->gu); free(s->g); free(s->g4); free(s->g4s);
+            memset(s, 0, sizeof(*s));
+            double t0 = now_s();
+            load_expert(m, layer, e, s);
+            m->t_expio += now_s() - t0;
+            arena[lru].eid = e; arena[lru].order = arena_clock++;
+            eid_slot[e] = lru;
+            continue;
+        }
+        Slot *s = &arena[arena_n].s;
+        memset(s, 0, sizeof(*s));
+        double t0 = now_s();
+        load_expert(m, layer, e, s);
+        m->t_expio += now_s() - t0;
+        arena[arena_n].eid = e; arena[arena_n].order = arena_clock++;
+        eid_slot[e] = arena_n;
+        arena_n++;
+    }
+
+    /* batched applies: per expert, S-batch its routed rows, then accumulate
+     * back per token in k-order (bit-exact vs moe_token's row order). */
+    int I = c->moe_inter;
+    float *xscratch = falloc((int64_t)C * D);
+    float *yscratch = falloc((int64_t)C * D);
+    for (int a = 0; a < arena_n; a++) {
+        Slot *s = &arena[a].s;
+        int st = 0;
+        for (int j = 0; j < C; j++) for (int k = 0; k < K; k++)
+            if (picks[j * K + k] == arena[a].eid) {
+                memcpy(xscratch + (int64_t)st * D, xs + (int64_t)j * D, (size_t)D * sizeof(float));
+                st++;
+            }
+        if (s->fmt == 4 || s->fmt == 5) {
+            float *gate = falloc((int64_t)st * I), *up = falloc((int64_t)st * I);
+            if (s->fmt == 4) {
+                matmul_i4_grouped(gate, xscratch, s->g4, s->g4s, st, D, I, 64);
+                matmul_i4_grouped(up,   xscratch, s->u4, s->u4s, st, D, I, 64);
+            } else {
+                matmul_i3(gate, xscratch, s->g4, s->g4s, st, D, I);
+                matmul_i3(up,   xscratch, s->u4, s->u4s, st, D, I);
+            }
+            float *h = falloc((int64_t)st * I);
+            for (int r = 0; r < st; r++)
+                for (int i = 0; i < I; i++) h[(int64_t)r * I + i] = silu(gate[(int64_t)r * I + i]) * up[(int64_t)r * I + i];
+            if (s->fmt == 4) matmul_i4_grouped(yscratch, h, s->d4, s->d4s, st, I, D, 64);
+            else             matmul_i3(yscratch, h, s->d4, s->d4s, st, I, D);
+            free(gate); free(up); free(h);
+        } else if (s->fmt == 8) {
+            float *gate = falloc((int64_t)st * I), *up = falloc((int64_t)st * I);
+            matmul_q8(gate, xscratch, s->g, s->gs, st, I, D);
+            matmul_q8(up,   xscratch, s->u, s->us, st, I, D);
+            float *h = falloc((int64_t)st * I);
+            for (int r = 0; r < st; r++)
+                for (int i = 0; i < I; i++) h[(int64_t)r * I + i] = silu(gate[(int64_t)r * I + i]) * up[(int64_t)r * I + i];
+            matmul_q8(yscratch, h, s->dd, s->ds, st, D, I);
+            free(gate); free(up); free(h);
+        } else {
+            float *gu = falloc((int64_t)st * 2 * I);
+            matmul(gu, xscratch, s->gu, st, 2 * I, D);
+            float *h = falloc((int64_t)st * I);
+            for (int r = 0; r < st; r++)
+                for (int i = 0; i < I; i++) h[(int64_t)r * I + i] = silu(gu[(int64_t)r * 2 * I + i]) * gu[(int64_t)r * 2 * I + I + i];
+            matmul(yscratch, h, s->d, st, D, I);
+            free(gu); free(h);
+        }
+        int si = 0;
+        for (int j = 0; j < C; j++) for (int k = 0; k < K; k++)
+            if (picks[j * K + k] == arena[a].eid) {
+                float ww = w[j * K + k];
+                float *accrow = out + (int64_t)j * D;
+                const float *yrow = yscratch + (int64_t)si * D;
+                for (int d = 0; d < D; d++) accrow[d] += yrow[d] * ww;
+                si++;
+            }
+    }
+    /* routing telemetry, same as moe_token */
+    rt_route(layer, 0, picks, w, C * K > 0 ? C * K : 1);
+    m->t_moe += now_s() - t0;
+    free(picks); free(w); free(eid_slot);
+    arena_free(arena, arena_n);
+    free(arena); free(xscratch); free(yscratch);
+}
+
+/* chunked layer-major prefill: returns logits for the last token */
+static float *step_batched(Model *m, const int *ids, int n, int pos_base){
+    Cfg *c = &m->c; int D = c->hidden;
+    int C = g_chunk;
+    if (C < 1) C = 1;
+    if (C > QWEN_CHUNK_MAX) C = QWEN_CHUNK_MAX;
+    float *hbuf = falloc((int64_t)C * D);
+    float *normed = falloc((int64_t)C * D);
+    int last_cj = 0;
+    for (int j0 = 0; j0 < n; j0 += C) {
+        int cj = n - j0 < C ? n - j0 : C;
+        last_cj = cj;
+        for (int j = 0; j < cj; j++) embed_row(m, ids[j0 + j], hbuf + (int64_t)j * D);
+        for (int l = 0; l < c->n_layers; l++) {
+            Layer *L = &m->L[l];
+            for (int j = 0; j < cj; j++)
+                rmsnorm_row(normed + (int64_t)j * D, hbuf + (int64_t)j * D, L->in_ln, D, c->eps);
+            if (c->layer_is_gdn[l]) gdn_batch(m, L, l, normed, cj, hbuf);
+            else                    attention_batch(m, L, l, normed, cj, j0, hbuf);
+            for (int j = 0; j < cj; j++)
+                rmsnorm_row(normed + (int64_t)j * D, hbuf + (int64_t)j * D, L->post_ln, D, c->eps);
+            moe_batch(m, L, l, normed, cj, hbuf);
+        }
+        if (m->hot_n > 0) {
+            m->token_count += cj;
+            if (m->token_count >= m->warmup_tokens) pin_hot_experts(m);
+        }
+    }
+    rmsnorm_row(normed, hbuf + (int64_t)(last_cj - 1) * D, m->final_norm, D, c->eps);
+    float *logits = falloc(c->vocab);
+    wt_mul(logits, normed, &m->lm_head, 1, c->vocab, D);
+    free(hbuf); free(normed);
+    return logits;
+}
+
 /* ---------- forward ---------- */
 
 /* process one token at position `pos`, return output hidden state in out */
@@ -1304,13 +1710,17 @@ static void forward_token(Model *m, int token, int pos, float *out){
         Layer *L = &m->L[l];
         float *normed = falloc(D);
         float *attn = falloc(D);
+        double t0 = now_s();
         rmsnorm_row(normed, out, L->in_ln, D, c->eps);
         if (c->layer_is_gdn[l]) gdn_token(m, L, l, normed, attn);
         else                    attention_token(m, L, l, normed, pos, attn);
         for (int d = 0; d < D; d++) out[d] += attn[d];
-
+        if (c->layer_is_gdn[l]) m->t_gdn += now_s() - t0;
+        else                    m->t_attn += now_s() - t0;
+        t0 = now_s();
         rmsnorm_row(normed, out, L->post_ln, D, c->eps);
         moe_token(m, L, l, normed, h);
+        m->t_moe += now_s() - t0;
         for (int d = 0; d < D; d++) out[d] += h[d];
         /* ponytail: layer-lookahead prefetch — layer l's top-k predicts layer
          * l+1's (routing is correlated); QWEN_PREFETCH=1 opt-in, measured
@@ -1342,6 +1752,7 @@ static float *step(Model *m, const int *ids, int n, int pos_base){
                 pos_base, pos_base + n, m->max_t);
         exit(1);
     }
+    if (n > 1 && g_chunk > 1) return step_batched(m, ids, n, pos_base);
     float *h = falloc(D);
     for (int i = 0; i < n; i++) forward_token(m, ids[i], pos_base + i, h);
     float *normed = falloc(D);
@@ -1729,6 +2140,7 @@ static void serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
         fflush(stdout); free(ids); return;
     }
     g_temp = q->temp; g_nuc = q->top_p;
+    m->t_attn = m->t_gdn = m->t_moe = m->t_expio = 0;
     double t0 = now_s();
     uint64_t h0 = m->hits, m0 = m->miss;
     /* ACCEPT before prefill: the server commits the streaming 200 here and,
@@ -1762,9 +2174,11 @@ static void serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
     double tot = (double)(m->hits - h0 + m->miss - m0);
     printf("DONE %s STAT %d %.3f %.1f %.2f %d %d\n", q->id, gen,
            dt > 0 ? gen/dt : 0.0, tot ? 100.0*(m->hits-h0)/tot : 0.0, rss_gb(), np, limited);
-    /* PROF: per-turn phase timings for the dashboard (total only, like
-     * olmoe — qwen_moe.c does not split wall time into phases either). */
-    printf("PROF %.3f %d %d 0.0 0.0 0.0 0.0 0.0 %d\n", dt, np, gen, gen + 1);
+    /* PROF: per-turn phase timings for the dashboard (field order matches
+     * colibri.c / openai_server.py's PROF parser: wall, prompt, completion,
+     * expert_disk, expert_wait, expert_matmul, attention, other, forwards). */
+    printf("PROF %.3f %d %d %.3f %.3f %.3f %.3f %.3f %d\n",
+           dt, np, gen, m->t_expio, 0.0, m->t_moe, m->t_attn, m->t_gdn, gen + 1);
     fflush(stdout);
     free(ids);
 }
@@ -1991,6 +2405,9 @@ int main(int argc, char **argv){
      * EXPERT_DROP=0 / DENSE_KEEP_PAGES=1 opt back out for repeated reads. */
     g_expert_drop = getenv("EXPERT_DROP") ? atoi(getenv("EXPERT_DROP")) : 1;
     g_prefetch = getenv("QWEN_PREFETCH") ? atoi(getenv("QWEN_PREFETCH")) : 0;
+    g_chunk = getenv("QWENMOE_CHUNK") ? atoi(getenv("QWENMOE_CHUNK")) : 64;
+    if (g_chunk < 1) g_chunk = 1;
+    if (g_chunk > QWEN_CHUNK_MAX) g_chunk = QWEN_CHUNK_MAX;
     g_dense_drop  = getenv("DENSE_KEEP_PAGES") ? 0 : 1;
 
     Model m; model_init(&m, snap, cap);
