@@ -660,6 +660,22 @@ static void matmul_i4_grouped(float *y, const float *x, const uint8_t *q4, const
                     acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i),   w0, acc);
                     acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i+8), w1, acc); }
                 a+=qm_hsum256(acc)*sc;
+#elif defined(__ARM_NEON)
+                /* group partial accumulates in f32 vectors, scaled once by the
+                 * group scale at the end — same structure as the AVX2 arm. */
+                const uint8x8_t m4v=vdup_n_u8(0x0F); const int8x8_t b8v=vdup_n_s8(8);
+                float32x4_t ac0=vdupq_n_f32(0), ac1=vdupq_n_f32(0);
+                for(; i+16<=base+glen; i+=16){
+                    uint8x8_t by=vld1_u8(w+(i>>1));
+                    uint8x8x2_t z=vzip_u8(vand_u8(by,m4v), vshr_n_u8(by,4));
+                    int16x8_t w0=vmovl_s8(vsub_s8(vreinterpret_s8_u8(z.val[0]),b8v));
+                    int16x8_t w1=vmovl_s8(vsub_s8(vreinterpret_s8_u8(z.val[1]),b8v));
+                    ac0=vfmaq_f32(ac0, vld1q_f32(xs+i),    vcvtq_f32_s32(vmovl_s16(vget_low_s16(w0))));
+                    ac1=vfmaq_f32(ac1, vld1q_f32(xs+i+4),  vcvtq_f32_s32(vmovl_s16(vget_high_s16(w0))));
+                    ac0=vfmaq_f32(ac0, vld1q_f32(xs+i+8),  vcvtq_f32_s32(vmovl_s16(vget_low_s16(w1))));
+                    ac1=vfmaq_f32(ac1, vld1q_f32(xs+i+12), vcvtq_f32_s32(vmovl_s16(vget_high_s16(w1))));
+                }
+                a += vaddvq_f32(vaddq_f32(ac0,ac1)) * sc;
 #endif
                 for(; i<base+glen; i+=2){
                     if(i+1<base+glen){ uint8_t byte=w[i>>1];
