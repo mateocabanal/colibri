@@ -125,6 +125,28 @@ static float *falloc(int64_t n){
     return p;
 }
 
+#ifdef COLI_METAL
+#include "backend_metal.h"
+/* QWEN_METAL_COMPUTE=1: route routed-expert gate/up/down matmuls to the
+ * Apple-GPU (Metal) backend's batched moe_block kernel. Slabs must be
+ * page-aligned so the backend can wrap them zero-copy (16K pages); any
+ * failure falls back to the CPU kernels per call (backend returns 0). */
+static int g_metal_compute = 0;
+#else
+#define g_metal_compute 0
+#endif
+/* page-aligned when Metal zero-copy is active, plain malloc otherwise */
+static void *moe_slab_alloc(size_t n){
+    void *p = malloc(n);
+    if (!p) { fprintf(stderr, "OOM expert\n"); exit(1); }
+    if (g_metal_compute) {
+        void *q = NULL;
+        if (!posix_memalign(&q, 16384, n)) p = q;
+        else free(p);   /* fall back to malloc'd; register will copy instead of wrap */
+    }
+    return p;
+}
+
 static float g_temp = 0.0f, g_nuc = 0.0f;       /* sample.h contract; 0 = greedy */
 static int g_expert_drop = 0;
 static int g_dense_drop = 0;    /* RAM-tight: DONTNEED dense file pages after the
@@ -909,13 +931,16 @@ static void slot_alloc_q8(Model *m, Slot *s){
         (uint64_t)total > SIZE_MAX) {
         fprintf(stderr, "expert q8 allocation overflows\n"); exit(1);
     }
-    s->g = malloc((size_t)total); if (!s->g) { fprintf(stderr, "OOM expert\n"); exit(1); }
+    s->g = moe_slab_alloc((size_t)total); if (!s->g) { fprintf(stderr, "OOM expert\n"); exit(1); }
     s->u = s->g + ng; s->dd = s->g + ng + ng;
     int64_t scale_n = (int64_t)c->moe_inter * 2 + c->hidden;
     float *sb = falloc(scale_n);
     s->gs = sb; s->us = sb + c->moe_inter; s->ds = sb + c->moe_inter + c->moe_inter;
     s->pinned = 0;
     s->fmt = 8;
+#ifdef COLI_METAL
+    if (g_metal_compute) { coli_metal_register(s->g, (size_t)total); coli_metal_register(sb, (size_t)scale_n * 4); }
+#endif
 }
 /* Packed experts (fmt 4 = i4-grouped, fmt 5 = int3-g64): weights packed with
  * 2 values/byte (i4) or 24B/64-input group (i3), scales one f32 per 64-input
@@ -934,13 +959,16 @@ static void slot_alloc_packed(Model *m, Slot *s, int fmt){
         (uint64_t)total > SIZE_MAX) {
         fprintf(stderr, "expert packed allocation overflows\n"); exit(1);
     }
-    s->g4 = malloc((size_t)total); if (!s->g4) { fprintf(stderr, "OOM expert\n"); exit(1); }
+    s->g4 = moe_slab_alloc((size_t)total); if (!s->g4) { fprintf(stderr, "OOM expert\n"); exit(1); }
     s->u4 = s->g4 + rbH * I; s->d4 = s->g4 + 2 * rbH * I;
     int64_t scale_n = I * ngH * 2 + H * ngI;
     float *sb = falloc(scale_n);
     s->g4s = sb; s->u4s = sb + I * ngH; s->d4s = sb + 2 * I * ngH;
     s->pinned = 0;
     s->fmt = fmt;
+#ifdef COLI_METAL
+    if (g_metal_compute && fmt == 4) { coli_metal_register(s->g4, (size_t)total); coli_metal_register(sb, (size_t)scale_n * 4); }
+#endif
 }
 
 static void load_expert(Model *m, int layer, int eid, Slot *s){
@@ -1543,7 +1571,45 @@ static void moe_token(Model *m, Layer *l, int layer, const float *x, float *out)
     g_mio_async_issue = 0;
 #endif
     if (K <= 64) { memcpy(m->last_route, idx, (size_t)K * sizeof(int)); m->last_route_k = K; }
-    for (int i = 0; i < K; i++) {
+    int gpu_ok = 0;
+#ifdef COLI_METAL
+    /* QWEN_METAL_COMPUTE=1: all K routed experts in ONE Metal block
+     * (gate/up/down per expert, then weighted scatter-add). Falls back to
+     * the per-expert CPU loop below when the backend declines (unresolved
+     * slab / unsupported fmt / GPU fault) — identical semantics either way. */
+    if (g_metal_compute) {
+        int fmt0 = slots[0]->fmt, unif = 1;
+        for (int i = 1; i < K; i++) if (slots[i]->fmt != fmt0) { unif = 0; break; }
+        if (unif && (fmt0 == 4 || fmt0 == 8)) {
+            for (int i = 0; i < K; i++) expert_wait_ready(m, slots[i]);   /* MIO async loads must land before GPU reads them */
+            const void *gp[64], *up[64], *dp[64];
+            const float *gsp[64], *usp[64], *dsp[64];
+            int xoff[64], nr[64], rows[64];
+            float rw[64];
+            if (K <= 64) {
+                float *xg = falloc((int64_t)K * D);
+                for (int i = 0; i < K; i++) {
+                    Slot *s = slots[i];
+                    if (fmt0 == 4) {
+                        gp[i] = s->g4; up[i] = s->u4; dp[i] = s->d4;
+                        gsp[i] = s->g4s; usp[i] = s->u4s; dsp[i] = s->d4s;
+                    } else {
+                        gp[i] = s->g; up[i] = s->u; dp[i] = s->dd;
+                        gsp[i] = s->gs; usp[i] = s->us; dsp[i] = s->ds;
+                    }
+                    memcpy(xg + (int64_t)i * D, x, (size_t)D * sizeof(float));
+                    xoff[i] = i; nr[i] = 1; rows[i] = 0;
+                    rw[i] = w[i];
+                }
+                gpu_ok = coli_metal_moe_block(K, D, c->moe_inter, fmt0 == 4 ? 4 : 1, 64,
+                                              gp, up, dp, gsp, usp, dsp,
+                                              xg, xoff, nr, rows, rw, acc, 1);
+                free(xg);
+            }
+        }
+    }
+#endif
+    if (!gpu_ok) for (int i = 0; i < K; i++) {
         expert_wait_ready(m, slots[i]);
         float *y = calloc((size_t)D, sizeof(float));    /* expert_apply ACCUMULATES */
         if (!y) { fprintf(stderr, "OOM\n"); exit(1); }
@@ -1804,6 +1870,9 @@ static int qwen_arena_plan(const int *picks, int C, int K, int *uniq, int cap){
 static void arena_free(ArenaSlot *a, int n){
     for (int i = 0; i < n; i++) {
         Slot *s = &a[i].s;
+#ifdef COLI_METAL
+        if (g_metal_compute) { coli_metal_unregister(s->g); coli_metal_unregister(s->g4); coli_metal_unregister(s->gs); coli_metal_unregister(s->g4s); }
+#endif
         free(s->gu); free(s->g); free(s->g4); free(s->g4s);
         s->gu = NULL; s->g = NULL; s->g4 = NULL; s->g4s = NULL;
     }
@@ -1988,6 +2057,9 @@ static void moe_batch(Model *m, Layer *l, int layer, const float *xs, int C, flo
         for (int a = 0; a < wn; a++) {
             Slot *s = &wave[a];
             if (s->mio_resident) continue;
+#ifdef COLI_METAL
+            if (g_metal_compute) { coli_metal_unregister(s->g4); coli_metal_unregister(s->g4s); }
+#endif
             free(s->gu); free(s->g); free(s->gs); free(s->g4); free(s->g4s);
         }
     }
@@ -2840,6 +2912,17 @@ int main(int argc, char **argv){
     }
 
     int rc = 0;
+#ifdef COLI_METAL
+    /* QWEN_METAL_COMPUTE=1: Apple-GPU batched MoE matmuls (opt-in; CPU
+     * kernels stay the default and the fallback). Init must happen AFTER
+     * the Qwen model is parsed (backend_metal resolves expert slabs lazily)
+     * but before any expert load allocates/registers slabs. */
+    g_metal_compute = getenv("QWEN_METAL_COMPUTE") ? atoi(getenv("QWEN_METAL_COMPUTE")) : 0;
+    if (g_metal_compute && !coli_metal_init()) {
+        fprintf(stderr, "qwen_moe: Metal unavailable — QWEN_METAL_COMPUTE=1 ignored (CPU MoE)\n");
+        g_metal_compute = 0;
+    }
+#endif
 #ifdef COLI_METALIO
     /* MetalIO init AFTER the shards are open (file handles need S.paths);
      * cache slots get a persistent shared-storage MTLBuffer each (lazily
