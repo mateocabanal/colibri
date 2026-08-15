@@ -97,6 +97,107 @@ def expert_merged(layer: int, expert: int, gate_up: torch.Tensor,
     }
 
 
+def quantize_grouped(w: np.ndarray, bits: int, group: int = 64):
+    """Per-row, per-`group`-input symmetric quantization. Layout matches the
+    engine's packed kernels: scale[o*ng + g] — one f32 per group per output
+    row, groups over the INPUT dimension. qmax = 2^(bits-1)-1, q clipped to
+    [-qmax-1, qmax] (i4: [-8,7], i3: [-4,3])."""
+    qmax = (1 << (bits - 1)) - 1
+    rows, cols = w.shape
+    ng = (cols + group - 1) // group
+    scales = np.zeros((rows, ng), dtype=np.float32)
+    for r in range(rows):
+        for g in range(ng):
+            lo = g * group
+            hi = min(lo + group, cols)
+            m = np.abs(w[r, lo:hi]).max()
+            scales[r, g] = max(m / qmax, 1e-12)
+    q = np.clip(np.round(w / _grouped_scale(w, scales, group)),
+                -qmax - 1, qmax).astype(np.int8)
+    return q, scales
+
+
+def _grouped_scale(w: np.ndarray, scales: np.ndarray, group: int) -> np.ndarray:
+    """Expand per-group scales to per-element for the division above."""
+    rows, cols = w.shape
+    out = np.empty_like(w, dtype=np.float32)
+    for g in range(scales.shape[1]):
+        lo = g * group
+        hi = min(lo + group, cols)
+        out[:, lo:hi] = scales[:, g][:, None]
+    return out
+
+
+def pack_i4(q: np.ndarray) -> np.ndarray:
+    """int8 q in [-8,7] -> uint8 nibbles (2/byte), even index in the low nibble
+    (engine kernel: (byte&0xF)-8 then (byte>>4)-8). Row-major, per-row ceil/2;
+    2D input is flattened row-major (each row = one kernel output row)."""
+    q = q.ravel().astype(np.int16) + 8
+    n = q.size
+    out = np.zeros((n + 1) // 2, dtype=np.uint8)
+    out[: n // 2] = (q[0::2] | (q[1::2] << 4)).astype(np.uint8)
+    if n % 2:
+        out[n // 2] = np.uint8(q[-1])
+    return out
+
+
+def pack_i3(q: np.ndarray) -> np.ndarray:
+    """int8 q in [-4,3] -> 24B per 64 values: 16B low plane (2 bits/val, v+4)
+    + 8B high plane (1 bit/val). Matches the engine's matmul_i3 layout, which
+    indexes per OUTPUT ROW: row o starts at o*i3_rowbytes(I) and the kernel
+    reads only I values from its (padded) groups — so each row must be packed
+    into its own ceil(I/64) groups. 2D input is processed row-by-row; values
+    past the row's input length are zero (never read)."""
+    u = q.astype(np.int16) + 4
+    if u.ndim == 1:
+        u = u.reshape(1, -1)
+    rows, cols = u.shape
+    ng_row = (cols + 63) // 64
+    out = np.zeros(rows * ng_row * 24, dtype=np.uint8)
+    for r in range(rows):
+        row = u[r]
+        for g in range(ng_row):
+            lo = g * 64
+            hi = min(lo + 64, cols)
+            blk = row[lo:hi]
+            low = np.zeros(16, dtype=np.uint8)
+            high = np.zeros(8, dtype=np.uint8)
+            for k in range(hi - lo):
+                v = int(blk[k])
+                low[k >> 2] |= np.uint8((v & 3) << ((k & 3) * 2))
+                high[k >> 3] |= np.uint8(((v >> 2) & 1) << (k & 7))
+            base = (r * ng_row + g) * 24
+            out[base : base + 16] = low
+            out[base + 16 : base + 24] = high
+    return out
+
+
+def expert_packed(layer: int, expert: int, gate_up: torch.Tensor,
+                  down: torch.Tensor, inter: int, hidden: int, bits: int) -> dict:
+    """Packed experts: merged_i4 (2 vals/byte, fmt=4) or merged_i3 (24B/64-group,
+    fmt=5) + per-64-group scales, same merged g|u|d shape as int8 — half the
+    bytes, still one tensor per expert streamed through the same LRU."""
+    gate, up = gate_up[:inter], gate_up[inter:]
+    wg = gate.detach().float().numpy()
+    wu = up.detach().float().numpy()
+    wd = down.detach().float().numpy()
+    qg, sg = quantize_grouped(wg, bits)
+    qu, su = quantize_grouped(wu, bits)
+    qd, sd = quantize_grouped(wd, bits)
+    pack = pack_i3 if bits == 3 else pack_i4
+    ng_hidden = (hidden + 63) // 64
+    ng_inter = (inter + 63) // 64
+    merged = np.concatenate([pack(qg), pack(qu), pack(qd)])
+    qs = np.concatenate([sg.ravel(), su.ravel(), sd.ravel()]).astype(np.float32)
+    assert qs.size == inter * ng_hidden * 2 + hidden * ng_inter
+    prefix = f"model.layers.{layer}.mlp.experts.{expert}"
+    tag = "merged_i3" if bits == 3 else "merged_i4"
+    return {
+        f"{prefix}.{tag}": torch.from_numpy(merged),
+        f"{prefix}.qs": torch.from_numpy(qs),
+    }
+
+
 def expert_f32(layer: int, expert: int, gate_up: torch.Tensor,
                down: torch.Tensor) -> dict:
     prefix = f"model.layers.{layer}.mlp.experts.{expert}"
@@ -120,7 +221,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("model_dir", type=Path, help="HF checkpoint directory")
     ap.add_argument("--out", type=Path, required=True)
-    ap.add_argument("--bits", type=int, default=8, choices=(8, 32))
+    ap.add_argument("--bits", type=int, default=8, choices=(3, 4, 8, 32))
     ap.add_argument("--force", action="store_true")
     args = ap.parse_args()
 
@@ -201,10 +302,13 @@ def main() -> int:
         for e in range(experts):
             if args.bits == 8:
                 dense.update(expert_merged(l, e, gate_up[e], down[e], inter, hidden))
+            elif args.bits in (3, 4):
+                dense.update(expert_packed(l, e, gate_up[e], down[e], inter, hidden, args.bits))
             else:
                 dense.update(expert_f32(l, e, gate_up[e], down[e]))
         save_file(dense, str(out / f"layers.{l}.safetensors"))
-        print(f"layer {l:3d}/{layers}: {lt:16s} experts {experts:4d} x int{args.bits} "
+        fmt = "f32" if args.bits == 32 else f"int{args.bits}"
+        print(f"layer {l:3d}/{layers}: {lt:16s} experts {experts:4d} x {fmt} "
               f"({len(dense)} tensors)")
 
     (out / "config.json").write_text(

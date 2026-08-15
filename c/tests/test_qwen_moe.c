@@ -236,6 +236,30 @@ static void test_request_reset_and_stop_feedback(void){
 	free(m.K); free(m.V); free(m.gdn_S); free(m.gdn_conv);
 }
 
+static void test_packed_expert_size_math(void){
+	/* The loader's exact-size rejection for packed experts must agree with the
+	 * packers (tools/convert_qwen_moe.py): i4 row = ceil(I/2) bytes, i3 row =
+	 * ceil(I/64)*24 bytes, per OUTPUT row; scales = one f32 per 64-input group
+	 * per row. Tiny geometry H=64/I=32 and real geometry H=2048/I=512. */
+	int64_t rbH4 = (64 + 1) / 2, rbI4 = (32 + 1) / 2;
+	CHECK(rbH4 == 32 && rbI4 == 16, "i4 rowbytes (tiny)");
+	int64_t want4 = 2 * rbH4 * 32 + rbI4 * 64;
+	CHECK(want4 == 2 * 32 * 32 + 16 * 64, "i4 merged bytes (tiny)");
+	CHECK(qm_i3_rowbytes(64) == 24 && qm_i3_rowbytes(32) == 24,
+	      "i3 rowbytes (tiny)");
+	int64_t want3 = 2 * 24 * 32 + 24 * 64;
+	CHECK(want3 == 3072, "i3 merged bytes (tiny)");
+	int64_t ngH = (64 + 63) / 64, ngI = (32 + 63) / 64;
+	CHECK(ngH == 1 && ngI == 1, "packed group counts (tiny)");
+	CHECK(32 * ngH * 2 + 64 * ngI == 128, "packed scale count (tiny)");
+	CHECK((2048 + 1) / 2 == 1024, "i4 rowbytes (real H)");
+	CHECK((512 + 1) / 2 == 256, "i4 rowbytes (real I)");
+	CHECK(qm_i3_rowbytes(2048) == 32 * 24, "i3 rowbytes (real H)");
+	CHECK(qm_i3_rowbytes(512) == 8 * 24, "i3 rowbytes (real I)");
+	CHECK(qm_i3_groups(2048) == 32 && qm_i3_groups(512) == 8,
+	      "i3 group counts (real)");
+}
+
 int main(void){
 	test_padded_vocab_selection();
 	test_lifetime_exits();
@@ -243,6 +267,7 @@ int main(void){
 	test_gdn_recurrence_conv_and_reset();
 	test_gated_attention();
 	test_request_reset_and_stop_feedback();
+	test_packed_expert_size_math();
 	if (failures) {
 		fprintf(stderr, "qwen_moe: %d failure(s)\n", failures);
 		return 1;

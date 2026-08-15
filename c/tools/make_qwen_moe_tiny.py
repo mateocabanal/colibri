@@ -251,7 +251,50 @@ def make_tokenizer() -> dict:
     }
 
 
-def emit_engine_tensors(torch, state):
+def compress_experts(torch, state, bits):
+    """Packed-expert fixture path (--bits 3/4): packs the ORIGINAL expert
+    weights with the converter's own quantize_grouped/pack_* (single source of
+    truth for the format), and returns an oracle state whose expert weights are
+    the dequantized q*scale values — so ref.json scores the QUANTIZED model,
+    not the f32 one. Dense tensors stay f32 (unchanged)."""
+    import numpy as np
+    from convert_qwen_moe import quantize_grouped, pack_i3, pack_i4, _grouped_scale
+
+    oracle = dict(state)
+    packed: dict[str, object] = {}
+    for layer_id in range(LAYERS):
+        hf = f"model.layers.{layer_id}"
+        gu = state[f"{hf}.mlp.experts.gate_up_proj"]      # [E, 2I, H]
+        dn = state[f"{hf}.mlp.experts.down_proj"]         # [E, H, I]
+        gu_dq, dn_dq = gu.clone(), dn.clone()
+        for e in range(EXPERTS):
+            gate, up = gu[e][:MOE_INTER], gu[e][MOE_INTER:]
+            wg = gate.detach().float().numpy()
+            wu = up.detach().float().numpy()
+            wd = dn[e].detach().float().numpy()
+            qg, sg = quantize_grouped(wg, bits)
+            qu, su = quantize_grouped(wu, bits)
+            qd, sd = quantize_grouped(wd, bits)
+            pack = pack_i3 if bits == 3 else pack_i4
+            merged = np.concatenate([pack(qg), pack(qu), pack(qd)])
+            qs = np.concatenate([sg.ravel(), su.ravel(), sd.ravel()]).astype(np.float32)
+            tag = "merged_i3" if bits == 3 else "merged_i4"
+            prefix = f"{hf}.mlp.experts.{e}"
+            packed[f"{prefix}.{tag}"] = torch.from_numpy(merged)
+            packed[f"{prefix}.qs"] = torch.from_numpy(qs)
+            # dequantized oracle weights: q * per-group scale, exact f32 math
+            gu_dq[e][:MOE_INTER] = torch.from_numpy(
+                (qg.astype(np.float32) * _grouped_scale(wg, sg, 64)))
+            gu_dq[e][MOE_INTER:] = torch.from_numpy(
+                (qu.astype(np.float32) * _grouped_scale(wu, su, 64)))
+            dn_dq[e] = torch.from_numpy(
+                (qd.astype(np.float32) * _grouped_scale(wd, sd, 64)))
+        oracle[f"{hf}.mlp.experts.gate_up_proj"] = gu_dq
+        oracle[f"{hf}.mlp.experts.down_proj"] = dn_dq
+    return oracle, packed
+
+
+def emit_engine_tensors(torch, state, packed=None):
     """Engine-layout snapshot: dense tensors under their engine names, and
     PER-EXPERT tensors (the streamable unit the qwen_moe LRU cache reads).
     The real-checkpoint fused `mlp.experts.gate_up_proj` / `down_proj` are split
@@ -278,11 +321,17 @@ def emit_engine_tensors(torch, state):
             out[f"{hf}.linear_attn.conv1d.weight"] = state[f"{hf}.linear_attn.conv1d.weight"]
         out[f"{hf}.post_attention_layernorm.weight"] = state[f"{hf}.post_attention_layernorm.weight"]
         out[f"{hf}.mlp.gate.weight"] = state[f"{hf}.mlp.gate.weight"]
-        gate_up = state[f"{hf}.mlp.experts.gate_up_proj"]
-        down = state[f"{hf}.mlp.experts.down_proj"]
-        for expert in range(EXPERTS):
-            out[f"{hf}.mlp.experts.{expert}.gate_up_proj"] = gate_up[expert]
-            out[f"{hf}.mlp.experts.{expert}.down_proj"] = down[expert]
+        if packed is not None:
+            # packed experts: one merged_i4/merged_i3 + qs tensor per expert
+            for key, value in packed.items():
+                if key.startswith(hf + ".mlp.experts."):
+                    out[key] = value
+        else:
+            gate_up = state[f"{hf}.mlp.experts.gate_up_proj"]
+            down = state[f"{hf}.mlp.experts.down_proj"]
+            for expert in range(EXPERTS):
+                out[f"{hf}.mlp.experts.{expert}.gate_up_proj"] = gate_up[expert]
+                out[f"{hf}.mlp.experts.{expert}.down_proj"] = down[expert]
         for key in ("gate_proj", "up_proj", "down_proj"):
             out[f"{hf}.mlp.shared_expert.{key}.weight"] = state[f"{hf}.mlp.shared_expert.{key}.weight"]
         out[f"{hf}.mlp.shared_expert_gate.weight"] = state[f"{hf}.mlp.shared_expert_gate.weight"]
@@ -302,7 +351,12 @@ def write_safetensors(torch, path: Path, state) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     default = Path(__file__).resolve().parents[1] / "qwen_moe_tiny"
-    parser.add_argument("--output", type=Path, default=default)
+    parser.add_argument("--output", type=Path, default=None,
+                        help="output dir (default: c/qwen_moe_tiny, c/qwen_moe_tiny_i4, "
+                             "or c/qwen_moe_tiny_i3 for --bits 4/3)")
+    parser.add_argument("--bits", type=int, default=32, choices=(3, 4, 32),
+                        help="expert format: 32 = f32 per-expert (default), "
+                             "4 = i4-grouped packed, 3 = int3-g64 packed")
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
 
@@ -312,9 +366,20 @@ def main() -> int:
     config = make_hf_config(Config)
     model = Model(config).eval()
     initialize_deterministic(torch, model)
-    reference = make_reference(torch, transformers, model)
 
-    output = args.output.resolve()
+    state = model.state_dict()
+    packed = None
+    if args.bits in (3, 4):
+        oracle_state, packed = compress_experts(torch, state, args.bits)
+        model.load_state_dict(oracle_state)
+    reference = make_reference(torch, transformers, model)
+    reference["expert_quant"] = "f32" if args.bits == 32 else f"int{args.bits}"
+
+    output = args.output.resolve() if args.output else default
+    if args.bits == 4 and not args.output:
+        output = default.with_name("qwen_moe_tiny_i4")
+    if args.bits == 3 and not args.output:
+        output = default.with_name("qwen_moe_tiny_i3")
     if output.exists():
         if not args.force:
             raise SystemExit(f"output exists (use --force): {output}")
@@ -328,12 +393,14 @@ def main() -> int:
         json.dumps(make_tokenizer(), separators=(",", ":")) + "\n",
         encoding="utf-8",
     )
-    write_safetensors(torch, output / "model.safetensors", emit_engine_tensors(torch, model.state_dict()))
+    write_safetensors(torch, output / "model.safetensors",
+                      emit_engine_tensors(torch, state, packed))
     (output / "ref.json").write_text(
         json.dumps(reference, indent=2) + "\n", encoding="utf-8"
     )
-    print(f"wrote {output} (transformers={transformers.__version__})")
-    print(f"  tensors: {len(emit_engine_tensors(torch, model.state_dict()))}")
+    print(f"wrote {output} (transformers={transformers.__version__}, "
+          f"experts={reference['expert_quant']})")
+    print(f"  tensors: {len(emit_engine_tensors(torch, state, packed))}")
     for name, case in reference["cases"].items():
         print(f"  case {name}: prompt={len(case['prompt_ids'])} "
               f"max_new={case['max_new_tokens']} greedy={case['greedy_new_ids']}")

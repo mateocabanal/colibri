@@ -19,6 +19,15 @@
  *     or int8 (merged, olmoe byte layout):
  *       layers.N.mlp.experts.E.merged_weight (int8 g|u|d packed) + .qs (f32
  *       row scales) — the low-RAM path: 1 byte/param instead of 4.
+ *     or packed (merged, ~half the int8 bytes; converted with
+ *     tools/convert_qwen_moe.py --bits 4|3):
+ *       layers.N.mlp.experts.E.merged_i4  — i4-grouped (fmt=4): 2 vals/byte,
+ *         one f32 scale per 64-input group per row
+ *       layers.N.mlp.experts.E.merged_i3  — int3-g64 (fmt=5): 24B per 64-input
+ *         group (16B low plane + 8B high plane), one f32 scale per group
+ *       both carry .qs per-group scales; the loader probes merged_weight,
+ *       then merged_i4, then merged_i3, then the f32 pair, with exact-size
+ *       rejection on every path.
  *   - per-layer LRU cache of resident experts, HOT pinning via route_trace.h
  *     usage heatmaps, COLI_USAGE history. This is what lets a low-spec box
  *     run a 397B checkpoint: only ~1.8GB dense + cache-sized experts resident.
@@ -34,7 +43,8 @@
  *
  * Env: SNAP (or argv[1]) model dir; CACHE (or argv[2]) experts resident per
  * layer; HOT, WARMUP pinning; EXPERT_DROP=1 fadvise(DONTNEED) after expert
- * reads; CTX; MAX_NEW; COLI_TEMP/NUCLEUS; COLI_USAGE; ROUTE_TRACE.
+ * reads; QWEN_PREFETCH=1 layer-lookahead expert prefetch (opt-in, measured);
+ * CTX; MAX_NEW; COLI_TEMP/NUCLEUS; COLI_USAGE; ROUTE_TRACE.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -223,11 +233,14 @@ typedef struct {
 
 typedef struct {
     int eid;                       /* -1 = slot in flight */
+    int loading_eid;               /* expert id being loaded into this slot (-1 when idle) */
     int pinned;
-    int q8;                        /* 1 = int8 merged + scales, 0 = f32 */
+    int fmt;                       /* 0=f32, 8=int8 merged, 4=i4-grouped, 5=int3-g64 */
     float *gu, *d;                 /* f32: [2I,H] gate|up, [H,I] down */
     int8_t *g, *u, *dd;            /* q8: int8 blocks */
     float *gs, *us, *ds;           /* q8: row scales */
+    uint8_t *g4, *u4, *d4;         /* packed (fmt 4/5): g|u|d blocks, packed layout */
+    float *g4s, *u4s, *d4s;        /* packed: per-64-input-group f32 scales */
     uint64_t used;
 } Slot;
 typedef struct { Slot *slots; int n, cap; } LCache;
@@ -247,10 +260,14 @@ typedef struct {
     uint32_t **freq;               /* route_trace heatmap alias */
     int hot_pinned, hot_n, warmup_tokens, token_count;
     uint8_t *is_pinned;            /* [n_layers*n_experts] */
+    int last_route[64];            /* most recent top-k (for lookahead prefetch) */
+    int last_route_k;
+    uint64_t prefetch_misses;      /* loads triggered by lookahead prefetch */
     double dense_load_s;
 } Model;
 
 static pthread_mutex_t g_mx = PTHREAD_MUTEX_INITIALIZER;
+static int g_prefetch = 0;         /* QWEN_PREFETCH: layer-lookahead expert prefetch */
 
 static size_t gdn_state_count(const Cfg *c){
     size_t n = size_mul_or_die((size_t)c->lin_v_heads, c->lin_k_dim, "GDN recurrence");
@@ -535,6 +552,139 @@ static void wt_mul(float *y, const float *x, WT *w, int S, int O, int I){
     else      matmul(y, x, w->f, S, O, I);
 }
 
+/* ---------- packed expert kernels (copied from quant.h per the standalone-
+ * engine convention; the layouts are part of the snapshot format) ---------- */
+
+#ifdef __AVX2__
+#include <immintrin.h>
+static inline float qm_hsum256(__m256 v){
+    __m128 lo=_mm256_castps256_ps128(v), hi=_mm256_extractf128_ps(v,1);
+    lo=_mm_add_ps(lo,hi); __m128 sh=_mm_movehl_ps(lo,lo); lo=_mm_add_ps(lo,sh);
+    sh=_mm_shuffle_ps(lo,lo,1); lo=_mm_add_ss(lo,sh); return _mm_cvtss_f32(lo);
+}
+#endif
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
+
+/* i4 grouped (fmt=4): 2 values/byte, per-64-input-group f32 scales.
+ * y[S,O] = x[S,I] @ W^T; values stored v+8 in [-8,7]. */
+static void matmul_i4_grouped(float *y, const float *x, const uint8_t *q4, const float *scale,
+                              int S, int I, int O, int gs){
+    int rb=(I+1)/2; int ng=(I+gs-1)/gs;
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<O;o++){
+        const uint8_t *w=q4+(int64_t)o*rb;
+        const float *scl=scale+(int64_t)o*ng;
+        for(int s=0;s<S;s++){
+            const float *xs=x+(int64_t)s*I; float a=0;
+            for(int g=0; g*gs<I; g++){
+                int base=g*gs; int glen=gs; if(base+glen>I) glen=I-base;
+                float sc=scl[g];
+                int i=base;
+#ifdef __AVX2__
+                const __m128i m4=_mm_set1_epi8(0x0F); const __m256i b8=_mm256_set1_epi32(8);
+                __m256 acc=_mm256_setzero_ps();
+                for(; i+16<=base+glen; i+=16){ __m128i by=_mm_loadl_epi64((const __m128i*)(w+(i>>1)));
+                    __m128i lo=_mm_and_si128(by,m4),hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
+                    __m128i nib=_mm_unpacklo_epi8(lo,hi);
+                    __m256 w0=_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(nib),b8));
+                    __m256 w1=_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(nib,8)),b8));
+                    acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i),   w0, acc);
+                    acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i+8), w1, acc); }
+                a+=qm_hsum256(acc)*sc;
+#endif
+                for(; i<base+glen; i+=2){
+                    if(i+1<base+glen){ uint8_t byte=w[i>>1];
+                        a+=(xs[i]*(float)((int)(byte&0xF)-8)+xs[i+1]*(float)((int)(byte>>4)-8))*sc; }
+                    else { uint8_t byte=w[i>>1]; a+=xs[i]*(float)((int)(byte&0xF)-8)*sc; }
+                }
+            }
+            y[(int64_t)s*O+o]=a;
+        }
+    }
+}
+
+/* int3-g64 (fmt=5): 3-bit weights, values [-4,3] stored v+4, ONE f32 scale per
+ * 64-input group. Per group: 16B low plane (2 bits/val) + 8B high plane
+ * (1 bit/val) = 24B. 3.5 bits/weight effective. */
+#define QM_I3_GROUP 64
+#define QM_I3_GBYTES 24
+static inline int64_t qm_i3_groups(int I){ return ((int64_t)I + QM_I3_GROUP - 1) / QM_I3_GROUP; }
+static inline int64_t qm_i3_rowbytes(int I){ return qm_i3_groups(I) * QM_I3_GBYTES; }
+static void matmul_i3(float *y, const float *x, const uint8_t *q3, const float *scale, int S, int I, int O){
+    int64_t ng=qm_i3_groups(I), rb=qm_i3_rowbytes(I);
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<O;o++){
+        const uint8_t *wrow=q3+(int64_t)o*rb;
+        const float *srow=scale+(int64_t)o*ng;
+        for(int s=0;s<S;s++){
+            const float *xs=x+(int64_t)s*I;
+            float acc=0;
+            for(int64_t g=0; g<ng; g++){
+                const uint8_t *lo=wrow+g*QM_I3_GBYTES, *hi=lo+16;
+                int base=(int)(g*QM_I3_GROUP), n = I-base < QM_I3_GROUP ? I-base : QM_I3_GROUP;
+                float a=0; int k=0;
+#ifdef __AVX2__
+                if(n==QM_I3_GROUP){
+                    const __m128i m2=_mm_set1_epi8(0x03);
+                    const __m128i bsel=_mm_set_epi8(1,1,1,1,1,1,1,1, 0,0,0,0,0,0,0,0);
+                    const __m128i bitm=_mm_set_epi8((char)128,64,32,16,8,4,2,1,(char)128,64,32,16,8,4,2,1);
+                    const __m128i four8=_mm_set1_epi8(4);
+                    const __m256i b4=_mm256_set1_epi32(4);
+                    __m256 ac0=_mm256_setzero_ps(), ac1=_mm256_setzero_ps();
+                    for(;k+16<=QM_I3_GROUP;k+=16){
+                        __m128i by=_mm_cvtsi32_si128(*(const int*)(lo+(k>>2)));
+                        __m128i p0=_mm_and_si128(by,m2), p1=_mm_and_si128(_mm_srli_epi16(by,2),m2);
+                        __m128i p2=_mm_and_si128(_mm_srli_epi16(by,4),m2), p3=_mm_and_si128(_mm_srli_epi16(by,6),m2);
+                        __m128i l01=_mm_unpacklo_epi8(p0,p1), h23=_mm_unpacklo_epi8(p2,p3);
+                        __m128i lov=_mm_unpacklo_epi16(l01,h23);
+                        __m128i hv=_mm_shuffle_epi8(_mm_cvtsi32_si128(hi[k>>3]|(hi[(k>>3)+1]<<8)),bsel);
+                        __m128i hb=_mm_and_si128(_mm_cmpeq_epi8(_mm_and_si128(hv,bitm),bitm),four8);
+                        __m128i u=_mm_add_epi8(lov,hb);
+                        __m256 w0=_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(u),b4));
+                        __m256 w1=_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(u,8)),b4));
+                        ac0=_mm256_fmadd_ps(_mm256_loadu_ps(xs+base+k),  w0,ac0);
+                        ac1=_mm256_fmadd_ps(_mm256_loadu_ps(xs+base+k+8),w1,ac1);
+                    }
+                    a=qm_hsum256(_mm256_add_ps(ac0,ac1));
+                }
+#elif defined(__ARM_NEON)
+                if(n==QM_I3_GROUP){
+                    const uint8x8_t m2v=vdup_n_u8(3); const int8x16_t b4q=vdupq_n_s8(4);
+                    const uint8x16_t bitm={1,2,4,8,16,32,64,128,1,2,4,8,16,32,64,128};
+                    const uint8x16_t fourq=vdupq_n_u8(4);
+                    float32x4_t ac0=vdupq_n_f32(0), ac1=vdupq_n_f32(0);
+                    for(;k+16<=QM_I3_GROUP;k+=16){
+                        uint32_t wd; memcpy(&wd, lo+(k>>2), 4);
+                        uint8x8_t by=vreinterpret_u8_u32(vdup_n_u32(wd));
+                        uint8x8x2_t z01=vzip_u8(vand_u8(by,m2v),              vand_u8(vshr_n_u8(by,2),m2v));
+                        uint8x8x2_t z23=vzip_u8(vand_u8(vshr_n_u8(by,4),m2v), vshr_n_u8(by,6));
+                        uint16x4x2_t zz=vzip_u16(vreinterpret_u16_u8(z01.val[0]), vreinterpret_u16_u8(z23.val[0]));
+                        uint8x16_t lov=vcombine_u8(vreinterpret_u8_u16(zz.val[0]), vreinterpret_u8_u16(zz.val[1]));
+                        uint8x16_t hv=vcombine_u8(vdup_n_u8(hi[k>>3]), vdup_n_u8(hi[(k>>3)+1]));
+                        uint8x16_t hb=vandq_u8(vtstq_u8(hv,bitm), fourq);
+                        int8x16_t wq=vsubq_s8(vreinterpretq_s8_u8(vaddq_u8(lov,hb)), b4q);
+                        int16x8_t w0=vmovl_s8(vget_low_s8(wq)), w1=vmovl_s8(vget_high_s8(wq));
+                        ac0=vfmaq_f32(ac0, vld1q_f32(xs+base+k),    vcvtq_f32_s32(vmovl_s16(vget_low_s16(w0))));
+                        ac1=vfmaq_f32(ac1, vld1q_f32(xs+base+k+4),  vcvtq_f32_s32(vmovl_s16(vget_high_s16(w0))));
+                        ac0=vfmaq_f32(ac0, vld1q_f32(xs+base+k+8),  vcvtq_f32_s32(vmovl_s16(vget_low_s16(w1))));
+                        ac1=vfmaq_f32(ac1, vld1q_f32(xs+base+k+12), vcvtq_f32_s32(vmovl_s16(vget_high_s16(w1))));
+                    }
+                    a=vaddvq_f32(vaddq_f32(ac0,ac1));
+                }
+#endif
+                for(;k<n;k++){
+                    unsigned u=((lo[k>>2]>>((k&3)*2))&3) | (((hi[k>>3]>>(k&7))&1)<<2);
+                    a += xs[base+k]*(float)((int)u-4);
+                }
+                acc += a*srow[g];
+            }
+            y[(int64_t)s*O+o]=acc;
+        }
+    }
+}
+
 /* Qwen3.5 RMSNorm: weight is ZERO-initialised and applied as (1 + w). */
 static void rmsnorm_row(float *out, const float *x, const float *w, int D, float eps){
     double ms = 0; for (int i = 0; i < D; i++) ms += (double)x[i] * x[i];
@@ -572,6 +722,7 @@ static void slot_alloc_f32(Slot *s, int64_t ng, int64_t nd){
     }
     s->gu = falloc(total);                    /* gate|up [2I,H] + down [H,I] */
     s->d = s->gu + 2 * ng;
+    s->fmt = 0;
 }
 static void slot_alloc_q8(Model *m, Slot *s){
     if (s->g) return;
@@ -589,6 +740,32 @@ static void slot_alloc_q8(Model *m, Slot *s){
     float *sb = falloc(scale_n);
     s->gs = sb; s->us = sb + c->moe_inter; s->ds = sb + c->moe_inter + c->moe_inter;
     s->pinned = 0;
+    s->fmt = 8;
+}
+/* Packed experts (fmt 4 = i4-grouped, fmt 5 = int3-g64): weights packed with
+ * 2 values/byte (i4) or 24B/64-input group (i3), scales one f32 per 64-input
+ * group per output row — HALF the int8 byte count, same merged g|u|d shape,
+ * so the disk-streaming LRU is unchanged. */
+static void slot_alloc_packed(Model *m, Slot *s, int fmt){
+    if (s->g4) return;
+    Cfg *c = &m->c;
+    int64_t I = c->moe_inter, H = c->hidden;
+    int64_t rbH = (fmt == 5) ? qm_i3_rowbytes((int)H) : (H + 1) / 2;
+    int64_t rbI = (fmt == 5) ? qm_i3_rowbytes((int)I) : (I + 1) / 2;
+    int64_t ngH = (H + 63) / 64, ngI = (I + 63) / 64;
+    int64_t gu_bytes, total;
+    if (!i64_mul_ok(rbH, I, &gu_bytes) || !i64_mul_ok(gu_bytes, 2, &gu_bytes) ||
+        !i64_mul_ok(rbI, H, &total) || !i64_add_ok(gu_bytes, total, &total) ||
+        (uint64_t)total > SIZE_MAX) {
+        fprintf(stderr, "expert packed allocation overflows\n"); exit(1);
+    }
+    s->g4 = malloc((size_t)total); if (!s->g4) { fprintf(stderr, "OOM expert\n"); exit(1); }
+    s->u4 = s->g4 + rbH * I; s->d4 = s->g4 + 2 * rbH * I;
+    int64_t scale_n = I * ngH * 2 + H * ngI;
+    float *sb = falloc(scale_n);
+    s->g4s = sb; s->u4s = sb + I * ngH; s->d4s = sb + 2 * I * ngH;
+    s->pinned = 0;
+    s->fmt = fmt;
 }
 
 static void load_expert(Model *m, int layer, int eid, Slot *s){
@@ -617,9 +794,58 @@ static void load_expert(Model *m, int layer, int eid, Slot *s){
                     qsnm, (long long)(ts ? ts->numel : -1), (long long)want_s); exit(1);
         }
         slot_alloc_q8(m, s);
-        s->q8 = 1;
+        s->fmt = 8;
         st_read_raw(&m->S, nm, s->g, g_expert_drop);
         st_read_f32(&m->S, qsnm, s->gs, g_expert_drop);
+        return;
+    }
+    /* i4-grouped packed (fmt=4): merged_i4 (2 values/byte) + qs (one f32 per
+     * 64-input group per row) — the same merged g|u|d shape at ~half the bytes. */
+    snprintf(nm, sizeof(nm), "%slayers.%d.mlp.experts.%d.merged_i4", g_prefix, layer, eid);
+    tw = st_find(&m->S, nm);
+    if (tw) {
+        int64_t rbH = (cc->hidden + 1) / 2, rbI = (cc->moe_inter + 1) / 2;
+        int64_t want_w = 2 * rbH * cc->moe_inter + rbI * cc->hidden;
+        if (want_w < 0) { fprintf(stderr, "%s: expected size overflows\n", nm); exit(1); }
+        if (!tensor_numel_ok(tw->nbytes, want_w)) {
+            fprintf(stderr, "%s: expert weight is %lld bytes — expected %lld, refusing\n",
+                    nm, (long long)tw->nbytes, (long long)want_w); exit(1);
+        }
+        snprintf(qsnm, sizeof(qsnm), "%slayers.%d.mlp.experts.%d.qs", g_prefix, layer, eid);
+        st_tensor *ts = st_find(&m->S, qsnm);
+        int64_t ngH = ((int64_t)cc->hidden + 63) / 64, ngI = ((int64_t)cc->moe_inter + 63) / 64;
+        int64_t want_s = cc->moe_inter * ngH * 2 + cc->hidden * ngI;
+        if (!ts || ts->numel != want_s) {
+            fprintf(stderr, "%s: scale array is %lld elems — expected %lld, refusing\n",
+                    qsnm, (long long)(ts ? ts->numel : -1), (long long)want_s); exit(1);
+        }
+        slot_alloc_packed(m, s, 4);
+        st_read_raw(&m->S, nm, s->g4, g_expert_drop);
+        st_read_f32(&m->S, qsnm, s->g4s, g_expert_drop);
+        return;
+    }
+    /* int3-g64 packed (fmt=5): merged_i3 (24B per 64-input group) + qs. */
+    snprintf(nm, sizeof(nm), "%slayers.%d.mlp.experts.%d.merged_i3", g_prefix, layer, eid);
+    tw = st_find(&m->S, nm);
+    if (tw) {
+        int64_t rbH = qm_i3_rowbytes(cc->hidden), rbI = qm_i3_rowbytes((int)cc->moe_inter);
+        int64_t want_w = 2 * rbH * cc->moe_inter + rbI * cc->hidden;
+        if (want_w < 0) { fprintf(stderr, "%s: expected size overflows\n", nm); exit(1); }
+        if (!tensor_numel_ok(tw->nbytes, want_w)) {
+            fprintf(stderr, "%s: expert weight is %lld bytes — expected %lld, refusing\n",
+                    nm, (long long)tw->nbytes, (long long)want_w); exit(1);
+        }
+        snprintf(qsnm, sizeof(qsnm), "%slayers.%d.mlp.experts.%d.qs", g_prefix, layer, eid);
+        st_tensor *ts = st_find(&m->S, qsnm);
+        int64_t ngH = ((int64_t)cc->hidden + 63) / 64, ngI = ((int64_t)cc->moe_inter + 63) / 64;
+        int64_t want_s = cc->moe_inter * ngH * 2 + cc->hidden * ngI;
+        if (!ts || ts->numel != want_s) {
+            fprintf(stderr, "%s: scale array is %lld elems — expected %lld, refusing\n",
+                    qsnm, (long long)(ts ? ts->numel : -1), (long long)want_s); exit(1);
+        }
+        slot_alloc_packed(m, s, 5);
+        st_read_raw(&m->S, nm, s->g4, g_expert_drop);
+        st_read_f32(&m->S, qsnm, s->g4s, g_expert_drop);
         return;
     }
     /* f32 per-expert format (fixture / --bits 32 converter output) */
@@ -642,7 +868,7 @@ static void load_expert(Model *m, int layer, int eid, Slot *s){
                 qsnm, (long long)(td ? td->nbytes : -1), (long long)want_d); exit(1);
     }
     slot_alloc_f32(s, ng, nd);
-    s->q8 = 0;
+    s->fmt = 0;
     st_read_f32(&m->S, nm, s->gu, g_expert_drop);
     st_read_f32(&m->S, qsnm, s->d, g_expert_drop);
 }
@@ -653,6 +879,20 @@ static void expert_get(Model *m, int layer, int eid, Slot **out){
     pthread_mutex_lock(&g_mx);
     for (int i = 0; i < lc->n; i++) if (lc->slots[i].eid == eid) {
         m->hits++; lc->slots[i].used = ++m->clock; *out = &lc->slots[i];
+        pthread_mutex_unlock(&g_mx); return;
+    }
+    /* in-flight dedup: another request is already loading this expert — wait
+     * for the publish instead of starting a second pread (the olmoe reload
+     * storm: repeated picks of the same expert double-loaded under cache
+     * pressure and small CACHE). */
+    for (int i = 0; i < lc->n; i++) if (lc->slots[i].loading_eid == eid) {
+        Slot *w = &lc->slots[i];
+        while (w->eid != eid) {
+            pthread_mutex_unlock(&g_mx);
+            struct timespec ts = {0, 1000000L}; nanosleep(&ts, NULL);
+            pthread_mutex_lock(&g_mx);
+        }
+        m->hits++; w->used = ++m->clock; *out = w;
         pthread_mutex_unlock(&g_mx); return;
     }
     m->miss++;
@@ -684,12 +924,14 @@ static void expert_get(Model *m, int layer, int eid, Slot **out){
         s->pinned = 0;
     }
     s->eid = -1;
+    s->loading_eid = eid;
     pthread_mutex_unlock(&g_mx);
 
     load_expert(m, layer, eid, s);          /* disk I/O outside the lock */
 
     pthread_mutex_lock(&g_mx);
     s->eid = eid;
+    s->loading_eid = -1;
     s->pinned = m->is_pinned[(size_t)layer * c->n_experts + eid];
     s->used = ++m->clock;
     pthread_mutex_unlock(&g_mx);
@@ -934,7 +1176,25 @@ static void gdn_token(Model *m, Layer *l, int layer, const float *x, float *out)
 /* one expert applied to one token, result written into acc (caller zeroes) */
 static void expert_apply(Model *m, Slot *s, const float *x, float *acc){
     Cfg *c = &m->c; int I = c->moe_inter, D = c->hidden;
-    if (s->q8) {
+    if (s->fmt == 4 || s->fmt == 5) {
+        /* packed experts: i4-grouped (2 vals/byte, 64-group scales) or
+         * int3-g64 (24B/64-group). Both stream from disk exactly like int8. */
+        float *gate = falloc(I), *up = falloc(I);
+        if (s->fmt == 4) {
+            matmul_i4_grouped(gate, x, s->g4,   s->g4s, 1, D, I, 64);
+            matmul_i4_grouped(up,   x, s->u4,   s->u4s, 1, D, I, 64);
+        } else {
+            matmul_i3(gate, x, s->g4, s->g4s, 1, D, I);
+            matmul_i3(up,   x, s->u4, s->u4s, 1, D, I);
+        }
+        float *h = falloc(I);
+        for (int i = 0; i < I; i++) h[i] = silu(gate[i]) * up[i];
+        float *y = falloc(D);
+        if (s->fmt == 4) matmul_i4_grouped(y, h, s->d4, s->d4s, 1, I, D, 64);
+        else             matmul_i3(y, h, s->d4, s->d4s, 1, I, D);
+        for (int d = 0; d < D; d++) acc[d] += y[d];
+        free(gate); free(up); free(h); free(y);
+    } else if (s->fmt == 8) {
         float *gate = falloc(I), *up = falloc(I);
         matmul_q8(gate, x, s->g, s->gs, 1, I, D);
         matmul_q8(up,   x, s->u, s->us, 1, I, D);
@@ -982,15 +1242,21 @@ static void moe_token(Model *m, Layer *l, int layer, const float *x, float *out)
     float *w = malloc(size_mul_or_die((size_t)K, sizeof(float), "router top-k weights"));
     if (!w) { fprintf(stderr, "OOM router weights\n"); exit(1); }
     for (int i = 0; i < K; i++) w[i] = val[i] / wsum;
+    /* Issue ALL top-k preads before applying any expert: the loads pipeline
+     * behind the first expert's compute instead of serialising read-then-math
+     * per expert (in-flight dedup in expert_get collapses repeats). */
+    Slot **slots = malloc(size_mul_or_die((size_t)K, sizeof(Slot *), "router slots"));
+    if (!slots) { fprintf(stderr, "OOM router slots\n"); exit(1); }
+    for (int i = 0; i < K; i++) expert_get(m, layer, idx[i], &slots[i]);
+    if (K <= 64) { memcpy(m->last_route, idx, (size_t)K * sizeof(int)); m->last_route_k = K; }
     for (int i = 0; i < K; i++) {
-        Slot *s;
-        expert_get(m, layer, idx[i], &s);
         float *y = calloc((size_t)D, sizeof(float));    /* expert_apply ACCUMULATES */
         if (!y) { fprintf(stderr, "OOM\n"); exit(1); }
-        expert_apply(m, s, x, y);
+        expert_apply(m, slots[i], x, y);
         for (int d = 0; d < D; d++) acc[d] += y[d] * w[i];
         free(y);
     }
+    free(slots);
     /* routing telemetry: counts (HOT/COLI_USAGE) + ROUTE_TRACE stream */
     rt_route(layer, 0, idx, w, K);
 
@@ -1046,6 +1312,18 @@ static void forward_token(Model *m, int token, int pos, float *out){
         rmsnorm_row(normed, out, L->post_ln, D, c->eps);
         moe_token(m, L, l, normed, h);
         for (int d = 0; d < D; d++) out[d] += h[d];
+        /* ponytail: layer-lookahead prefetch — layer l's top-k predicts layer
+         * l+1's (routing is correlated); QWEN_PREFETCH=1 opt-in, measured
+         * via prefetch_misses. Wrong guesses cost one pread, never residency:
+         * the LRU evicts them like any cold expert. */
+        if (g_prefetch && l + 1 < c->n_layers && m->last_route_k > 0) {
+            uint64_t before = m->miss;
+            for (int i = 0; i < m->last_route_k; i++) {
+                Slot *ps;
+                expert_get(m, l + 1, m->last_route[i], &ps);
+            }
+            m->prefetch_misses += m->miss - before;
+        }
         free(normed); free(attn);
     }
     free(h);
@@ -1712,6 +1990,7 @@ int main(int argc, char **argv){
      * (on a 16 GB box that reads as "too much RAM" in Activity Monitor).
      * EXPERT_DROP=0 / DENSE_KEEP_PAGES=1 opt back out for repeated reads. */
     g_expert_drop = getenv("EXPERT_DROP") ? atoi(getenv("EXPERT_DROP")) : 1;
+    g_prefetch = getenv("QWEN_PREFETCH") ? atoi(getenv("QWEN_PREFETCH")) : 0;
     g_dense_drop  = getenv("DENSE_KEEP_PAGES") ? 0 : 1;
 
     Model m; model_init(&m, snap, cap);
