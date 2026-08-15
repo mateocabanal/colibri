@@ -241,6 +241,8 @@ typedef struct {
     int fmt;                       /* 0=f32, 8=int8 merged, 4=i4-grouped, 5=int3-g64 */
     int mio;                       /* 1 = weight bytes live in a MetalIO shared buffer */
     int mio_slot;                  /* metalio slot id, -1 = not backed yet */
+    int64_t mio_event;             /* event value of the slot's latest load */
+    int64_t mio_waited;            /* highest mio event already waited (pending if < mio_event) */
     float *gu, *d;                 /* f32: [2I,H] gate|up, [H,I] down */
     int8_t *g, *u, *dd;            /* q8: int8 blocks */
     float *gs, *us, *ds;           /* q8: row scales */
@@ -282,6 +284,7 @@ static int g_prefetch = 0;         /* QWEN_PREFETCH: layer-lookahead expert pref
  * contents in place (no copy, byte-identical by construction). Scales stay on
  * the pread path (tiny). Any failure falls back to pread; never mandatory. */
 static int g_metal_io = 0;
+static int g_mio_prefetching = 0;   /* 1 = speculative expert_get: enqueue, no wait */
 static int g_mio_fd[64], g_mio_fid[64], g_mio_n;
 static int mio_file_for(int fd){
     for (int i = 0; i < g_mio_n; i++) if (g_mio_fd[i] == fd) return g_mio_fid[i];
@@ -901,7 +904,16 @@ static void load_expert(Model *m, int layer, int eid, Slot *s){
             if (s->mio_slot < 0) s->mio_slot = metalio_slot_alloc(tw->nbytes);
             if (s->mio_slot < 0) continue;
             int64_t ev = metalio_load(s->mio_slot, mf, (uint64_t)tw->off, (size_t)tw->nbytes);
-            if (ev <= 0 || metalio_wait(ev) != 0) continue;
+            if (ev <= 0) continue;
+            s->mio_event = ev;
+            if (!g_mio_prefetching) {
+                /* demand: block until the bytes are in the buffer */
+                if (metalio_wait(ev) != 0) continue;
+                s->mio_waited = ev;
+            }
+            /* prefetch (g_mio_prefetching): leave the load PENDING — the
+             * demand path's hit-wait in expert_get drains it later; the
+             * I/O overlaps compute meanwhile. */
             const unsigned char *base = (const unsigned char *)metalio_slot_ptr(s->mio_slot);
             if (!base) continue;
             snprintf(qsnm, sizeof(qsnm), "%slayers.%d.mlp.experts.%d.qs", g_prefix, layer, eid);
@@ -1045,7 +1057,20 @@ static void expert_get(Model *m, int layer, int eid, Slot **out){
     Cfg *c = &m->c;
     pthread_mutex_lock(&g_mx);
     for (int i = 0; i < lc->n; i++) if (lc->slots[i].eid == eid) {
-        m->hits++; lc->slots[i].used = ++m->clock; *out = &lc->slots[i];
+        Slot *w = &lc->slots[i];
+#ifdef COLI_METALIO
+        /* MetalIO async prefetch: a resident slot may still have its load in
+         * flight (mio_event > mio_waited). Wait only when genuinely needed —
+         * for a successfully prefetched expert this returns ~immediately. */
+        if (w->mio && w->mio_event > w->mio_waited) {
+            int64_t ev = w->mio_event;
+            pthread_mutex_unlock(&g_mx);
+            metalio_wait(ev);
+            pthread_mutex_lock(&g_mx);
+            if (w->mio_waited < ev) w->mio_waited = ev;
+        }
+#endif
+        m->hits++; w->used = ++m->clock; *out = w;
         pthread_mutex_unlock(&g_mx); return;
     }
     /* in-flight dedup: another request is already loading this expert — wait
@@ -1895,10 +1920,19 @@ static void forward_token(Model *m, int token, int pos, float *out){
          * the LRU evicts them like any cold expert. */
         if (g_prefetch && l + 1 < c->n_layers && m->last_route_k > 0) {
             uint64_t before = m->miss;
+#ifdef COLI_METALIO
+            /* MetalIO async prefetch: enqueue the loads WITHOUT waiting; the
+             * demand path's hit-wait drains the events (already signaled for
+             * correct guesses -> ~0 wait). I/O overlaps compute meanwhile. */
+            g_mio_prefetching = g_metal_io && metalio_active();
+#endif
             for (int i = 0; i < m->last_route_k; i++) {
                 Slot *ps;
                 expert_get(m, l + 1, m->last_route[i], &ps);
             }
+#ifdef COLI_METALIO
+            g_mio_prefetching = 0;
+#endif
             m->prefetch_misses += m->miss - before;
         }
         free(normed); free(attn);
