@@ -185,6 +185,10 @@ static void test_gated_attention(void){
 	float norm[] = { 0.f, 0.f };
 	float x[] = { 1.f, 0.f }, half[2], open[2];
 	memset(&m, 0, sizeof(m)); memset(&l, 0, sizeof(l));
+	/* This unit test hand-builds a Model with f32 KV only; the fp16 KV path
+	 * is exercised end-to-end by the oracle fixtures (QWEN_KV_F16 default
+	 * on). Pin the f32 storage so the helpers write the arrays we allocated. */
+	g_kv_f16 = 0;
 	m.c.hidden = 2; m.c.n_layers = 1; m.c.n_heads = 1; m.c.n_kv_heads = 1;
 	m.c.head_dim = 2; m.c.rotary_dim = 2; m.c.theta = 10000.f; m.c.eps = 1e-6f;
 	m.max_t = 1;
