@@ -642,6 +642,16 @@ backend_cuda.o: backend_cuda.cu backend_cuda.h backend_gpu_compat.h .build-confi
 backend_metal.o: backend_metal.mm backend_metal.h
 	$(METALXX) -c backend_metal.mm -o $@
 
+# MTLIO expert streaming (Apple Silicon, Metal 3): subsystem object + test.
+# Compiles only on darwin; metalio.h is plain C so engines include it behind
+# COLI_METAL without changing the Linux build surface.
+metalio.o: metalio.mm metalio.h
+	$(METALXX) -c metalio.mm -o $@
+
+metalio-test: tests/test_metalio.mm metalio.mm metalio.h
+	$(METALXX) tests/test_metalio.mm metalio.mm -framework Metal -framework Foundation -o metalio_test
+	./metalio_test
+
 metal-test: tests/test_backend_metal.mm backend_metal.mm backend_metal.h
 	$(METALXX) tests/test_backend_metal.mm backend_metal.mm -framework Metal -framework Foundation -o backend_metal_test
 	./backend_metal_test
