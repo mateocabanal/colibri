@@ -285,6 +285,7 @@ static int g_prefetch = 0;         /* QWEN_PREFETCH: layer-lookahead expert pref
  * the pread path (tiny). Any failure falls back to pread; never mandatory. */
 static int g_metal_io = 0;
 static int g_mio_prefetching = 0;   /* 1 = speculative expert_get: enqueue, no wait */
+static int g_mio_async_issue = 0;   /* 1 = exact-demand issue: enqueue, no wait */
 static int g_mio_fd[64], g_mio_fid[64], g_mio_n;
 static int mio_file_for(int fd){
     for (int i = 0; i < g_mio_n; i++) if (g_mio_fd[i] == fd) return g_mio_fid[i];
@@ -919,10 +920,12 @@ static void load_expert(Model *m, int layer, int eid, Slot *s){
                 { mq, (uint64_t)ts->off, (size_t)ts->nbytes, scale_off },
             };
             int64_t ev = metalio_loadv(s->mio_slot, regions, 2,
-                                       g_mio_prefetching ? MIO_LOAD_SPEC : MIO_LOAD_DEMAND);
+                                       g_mio_prefetching ? MIO_LOAD_SPEC
+                                     : g_mio_async_issue ? MIO_LOAD_ASYNC
+                                     : MIO_LOAD_DEMAND);
             if (ev <= 0) continue;
             s->mio_event = ev;
-            if (!g_mio_prefetching) {
+            if (!g_mio_prefetching && !g_mio_async_issue) {
                 /* demand: block until the bytes are in the buffer */
                 if (metalio_wait(ev) != 0) continue;
                 s->mio_waited = ev;
@@ -1371,6 +1374,19 @@ static void gdn_token(Model *m, Layer *l, int layer, const float *x, float *out)
 
 /* ---------- MoE ---------- */
 
+/* Drain a slot's pending MetalIO load at use time (exact-async issue and
+ * speculative prefetch both publish with the load in flight). No-op when
+ * the data is already waited, pread-loaded, or MetalIO is off. */
+static void expert_wait_ready(Model *m, Slot *s){
+    (void)m;
+#ifdef COLI_METALIO
+    if (s->mio && s->mio_event > s->mio_waited) {
+        metalio_wait(s->mio_event);
+        s->mio_waited = s->mio_event;
+    }
+#endif
+}
+
 /* one expert applied to one token, result written into acc (caller zeroes) */
 static void expert_apply(Model *m, Slot *s, const float *x, float *acc){
     Cfg *c = &m->c; int I = c->moe_inter, D = c->hidden;
@@ -1440,14 +1456,23 @@ static void moe_token(Model *m, Layer *l, int layer, const float *x, float *out)
     float *w = malloc(size_mul_or_die((size_t)K, sizeof(float), "router top-k weights"));
     if (!w) { fprintf(stderr, "OOM router weights\n"); exit(1); }
     for (int i = 0; i < K; i++) w[i] = val[i] / wsum;
-    /* Issue ALL top-k preads before applying any expert: the loads pipeline
-     * behind the first expert's compute instead of serialising read-then-math
-     * per expert (in-flight dedup in expert_get collapses repeats). */
+    /* Exact-demand async issue: the router has already produced the EXACT
+     * top-k for this layer — issue all K misses WITHOUT waiting (MetalIO
+     * path: loads stay pending; pread path is inherently synchronous), then
+     * drain each slot's event at apply time. Later loads overlap earlier
+     * expert compute and the earlier waits — no prediction involved. */
     Slot **slots = malloc(size_mul_or_die((size_t)K, sizeof(Slot *), "router slots"));
     if (!slots) { fprintf(stderr, "OOM router slots\n"); exit(1); }
+#ifdef COLI_METALIO
+    g_mio_async_issue = g_metal_io && metalio_active();
+#endif
     for (int i = 0; i < K; i++) expert_get(m, layer, idx[i], &slots[i]);
+#ifdef COLI_METALIO
+    g_mio_async_issue = 0;
+#endif
     if (K <= 64) { memcpy(m->last_route, idx, (size_t)K * sizeof(int)); m->last_route_k = K; }
     for (int i = 0; i < K; i++) {
+        expert_wait_ready(m, slots[i]);
         float *y = calloc((size_t)D, sizeof(float));    /* expert_apply ACCUMULATES */
         if (!y) { fprintf(stderr, "OOM\n"); exit(1); }
         expert_apply(m, slots[i], x, y);
