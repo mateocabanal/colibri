@@ -66,6 +66,9 @@
 #endif
 #include "omp_tune.h"
 #include "route_trace.h"
+#ifdef COLI_METALIO
+#include "metalio.h"
+#endif
 
 static double now_s(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec + t.tv_nsec*1e-9; }
 #if defined(__APPLE__)
@@ -236,6 +239,8 @@ typedef struct {
     int loading_eid;               /* expert id being loaded into this slot (-1 when idle) */
     int pinned;
     int fmt;                       /* 0=f32, 8=int8 merged, 4=i4-grouped, 5=int3-g64 */
+    int mio;                       /* 1 = weight bytes live in a MetalIO shared buffer */
+    int mio_slot;                  /* metalio slot id, -1 = not backed yet */
     float *gu, *d;                 /* f32: [2I,H] gate|up, [H,I] down */
     int8_t *g, *u, *dd;            /* q8: int8 blocks */
     float *gs, *us, *ds;           /* q8: row scales */
@@ -270,6 +275,19 @@ typedef struct {
 
 static pthread_mutex_t g_mx = PTHREAD_MUTEX_INITIALIZER;
 static int g_prefetch = 0;         /* QWEN_PREFETCH: layer-lookahead expert prefetch */
+
+#ifdef COLI_METALIO
+/* QWEN_METAL_IO=1: stream expert WEIGHT tensors through MTLIOCommandQueue
+ * into persistent shared-storage MTLBuffers; the CPU kernels read the buffer
+ * contents in place (no copy, byte-identical by construction). Scales stay on
+ * the pread path (tiny). Any failure falls back to pread; never mandatory. */
+static int g_metal_io = 0;
+static int g_mio_fd[64], g_mio_fid[64], g_mio_n;
+static int mio_file_for(int fd){
+    for (int i = 0; i < g_mio_n; i++) if (g_mio_fd[i] == fd) return g_mio_fid[i];
+    return -1;
+}
+#endif
 
 static size_t gdn_state_count(const Cfg *c){
     size_t n = size_mul_or_die((size_t)c->lin_v_heads, c->lin_k_dim, "GDN recurrence");
@@ -856,6 +874,72 @@ static void load_expert(Model *m, int layer, int eid, Slot *s){
     Cfg *cc = &m->c;
     int64_t ng = (int64_t)cc->moe_inter * cc->hidden;
     int64_t nd = (int64_t)cc->hidden * cc->moe_inter;
+
+#ifdef COLI_METALIO
+    /* MetalIO path (QWEN_METAL_IO=1): the merged expert WEIGHT tensor streams
+     * through MTLIOCommandQueue into a persistent shared-storage MTLBuffer;
+     * the CPU kernels read the buffer contents IN PLACE (no copy, byte-
+     * identical by construction). Scales are small — keep the pread path.
+     * Any failure falls through to the pread paths below. */
+    if (s->mio && g_metal_io && metalio_active()) {
+        static const struct { const char *tag; int fmt; } probes[] = {
+            { "merged_weight", 8 }, { "merged_i4", 4 }, { "merged_i3", 5 },
+        };
+        for (int pi = 0; pi < 3; pi++) {
+            snprintf(nm, sizeof(nm), "%slayers.%d.mlp.experts.%d.%s",
+                     g_prefix, layer, eid, probes[pi].tag);
+            st_tensor *tw = st_find(&m->S, nm);
+            if (!tw) continue;
+            int64_t want_w = (probes[pi].fmt == 8) ? (2 * ng + nd)
+                          : (probes[pi].fmt == 4) ? (2 * ((cc->hidden + 1) / 2) * cc->moe_inter
+                                                      + ((cc->moe_inter + 1) / 2) * cc->hidden)
+                          : (2 * qm_i3_rowbytes(cc->hidden) * cc->moe_inter
+                             + qm_i3_rowbytes((int)cc->moe_inter) * cc->hidden);
+            if (want_w < 0 || !tensor_numel_ok(tw->nbytes, want_w)) continue;
+            int mf = mio_file_for(tw->fd);
+            if (mf < 0) continue;
+            if (s->mio_slot < 0) s->mio_slot = metalio_slot_alloc(tw->nbytes);
+            if (s->mio_slot < 0) continue;
+            int64_t ev = metalio_load(s->mio_slot, mf, (uint64_t)tw->off, (size_t)tw->nbytes);
+            if (ev <= 0 || metalio_wait(ev) != 0) continue;
+            const unsigned char *base = (const unsigned char *)metalio_slot_ptr(s->mio_slot);
+            if (!base) continue;
+            snprintf(qsnm, sizeof(qsnm), "%slayers.%d.mlp.experts.%d.qs", g_prefix, layer, eid);
+            st_tensor *ts = st_find(&m->S, qsnm);
+            int64_t ngH = ((int64_t)cc->hidden + 63) / 64, ngI = ((int64_t)cc->moe_inter + 63) / 64;
+            int64_t want_s = (probes[pi].fmt == 8) ? (cc->moe_inter + cc->moe_inter + cc->hidden)
+                          : (cc->moe_inter * ngH * 2 + cc->hidden * ngI);
+            if (!ts || ts->numel != want_s) continue;
+            if (probes[pi].fmt == 8) {
+                free(s->gs);                        /* reload: drop the old scales */
+                s->gs = falloc((size_t)want_s);
+                st_read_f32(&m->S, qsnm, s->gs, g_expert_drop);
+                s->us = s->gs + cc->moe_inter;
+                s->ds = s->gs + cc->moe_inter + cc->moe_inter;
+                s->g = (int8_t *)base; s->u = s->g + ng; s->dd = s->g + ng + ng;
+                s->fmt = 8;
+            } else {
+                /* packed formats carry per-64-group scales (g4s/u4s/d4s) */
+                free(s->g4s);
+                s->g4s = falloc((size_t)want_s);
+                st_read_f32(&m->S, qsnm, s->g4s, g_expert_drop);
+                s->u4s = s->g4s + cc->moe_inter * ngH;
+                s->d4s = s->g4s + 2 * cc->moe_inter * ngH;
+                /* g|u|d blocks are contiguous in the merged tensor, same
+                 * offsets as slot_alloc_packed */
+                int64_t rbH = (probes[pi].fmt == 5) ? qm_i3_rowbytes(cc->hidden)
+                                                    : (cc->hidden + 1) / 2;
+                s->g4 = (uint8_t *)base;
+                s->u4 = s->g4 + rbH * cc->moe_inter;
+                s->d4 = s->g4 + 2 * rbH * cc->moe_inter;
+                s->fmt = probes[pi].fmt;
+            }
+            s->pinned = 0;
+            return;
+        }
+        /* fall through: any failure keeps the pread path */
+    }
+#endif
 
     /* int8 merged format (converter output, olmoe byte layout)? */
     snprintf(nm, sizeof(nm), "%slayers.%d.mlp.experts.%d.merged_weight", g_prefix, layer, eid);
@@ -2530,6 +2614,33 @@ int main(int argc, char **argv){
     }
 
     int rc = 0;
+#ifdef COLI_METALIO
+    /* MetalIO init AFTER the shards are open (file handles need S.paths);
+     * cache slots get a persistent shared-storage MTLBuffer each (lazily
+     * allocated on first use). Any failure disables the path — pread stays
+     * the fallback. */
+    g_metal_io = getenv("QWEN_METAL_IO") ? atoi(getenv("QWEN_METAL_IO")) : 0;
+    if (g_metal_io) {
+        if (metalio_init()) {
+            metalio_verbose(getenv("QWEN_METAL_IO_VERBOSE") ? 1 : 0);
+            for (int fi = 0; fi < m.S.nfd && g_mio_n < 64; fi++) {
+                int fid = metalio_file_add(m.S.paths[fi]);
+                if (fid >= 0) { g_mio_fd[g_mio_n] = m.S.fds[fi]; g_mio_fid[g_mio_n] = fid; g_mio_n++; }
+            }
+            if (g_mio_n == 0) { metalio_shutdown(); g_metal_io = 0; }
+        } else {
+            g_metal_io = 0;
+        }
+        if (g_metal_io) {
+            for (int li = 0; li < m.c.n_layers; li++)
+                for (int si = 0; si < m.cache[li].cap; si++) {
+                    m.cache[li].slots[si].mio = 1;
+                    m.cache[li].slots[si].mio_slot = -1;
+                }
+            fprintf(stderr, "[metalio] expert streaming via MTLIO active (%d shards)\n", g_mio_n);
+        }
+    }
+#endif
     const char *mode = getenv("QWENMOE_MODE");
     if (mode && !strcmp(mode, "teacher"))      rc = mode_teacher(&m);
     else if (mode && !strcmp(mode, "greedy"))  rc = mode_greedy(&m);
@@ -2538,6 +2649,19 @@ int main(int argc, char **argv){
     else                                       rc = mode_selftest(&m, snap);
 
     save_usage(&m, snap);
+#ifdef COLI_METALIO
+    if (g_metal_io) {
+        ColiMetalioStats st;
+        metalio_stats(&st);
+        fprintf(stderr, "[metalio] loads=%llu bytes=%llu waits=%llu fails=%llu "
+                        "outstanding=%llu peak=%llu avg_lat_ms=%.2f\n",
+                (unsigned long long)st.loads, (unsigned long long)st.bytes,
+                (unsigned long long)st.waits, (unsigned long long)st.fails,
+                (unsigned long long)st.outstanding, (unsigned long long)st.peak_outstanding,
+                st.latency_samples ? st.total_latency_s * 1000.0 / (double)st.latency_samples : 0.0);
+        metalio_shutdown();
+    }
+#endif
     tok_free(&T);
     return rc;
 }
