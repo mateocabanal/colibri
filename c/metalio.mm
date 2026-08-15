@@ -98,7 +98,10 @@ int metalio_init(void){
         /* MTLIOCommandQueueDescriptor: default priority/depth; the engine can
          * later expose queue-depth via env if H3 measurements call for it. */
         MTLIOCommandQueueDescriptor *desc = [MTLIOCommandQueueDescriptor new];
-        desc.maxCommandBufferCount = 64;
+        const char *depth_env = getenv("MTLIO_DEPTH");
+        int depth = depth_env && atoi(depth_env) > 0 ? atoi(depth_env) : 64;
+        if (depth > 1024) depth = 1024;
+        desc.maxCommandBufferCount = depth;
         desc.priority = MTLIOPriorityHigh;
         NSError *err = nil;
         g_iq = [g_dev newIOCommandQueueWithDescriptor:desc error:&err];

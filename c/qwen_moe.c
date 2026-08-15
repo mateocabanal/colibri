@@ -1782,7 +1782,9 @@ static void gdn_batch(Model *m, Layer *l, int layer, const float *xs, int C, flo
  * ponytail: arena capped at 64 slots/layer (evicting LRU-within-arena);
  * 64 * 3.1MB = ~200MB transient at 35B geometry — sized from RAM_GB if the
  * cap ever needs to grow past ~128. */
-#define QWEN_ARENA_CAP 64
+#define QWEN_ARENA_CAP 64             /* default wave/pool size */
+#define QWEN_ARENA_CAP_MAX 256
+static int g_arena_wave = QWEN_ARENA_CAP;   /* QWEN_ARENA_WAVE, clamped 8..256 */
 typedef struct { int eid; int order; Slot s; } ArenaSlot;
 
 /* Distinct routed expert set, first-appearance order: the arena builds the
@@ -1855,26 +1857,28 @@ static void moe_batch(Model *m, Layer *l, int layer, const float *xs, int C, flo
     int I = c->moe_inter;
     float *xscratch = falloc((int64_t)C * D);
     float *yscratch = falloc((int64_t)C * D);
-    #ifdef COLI_METALIO
-    /* Persistent mio-backed arena pool: the same ARENA_CAP physical buffers
-     * are reused across every wave/layer/chunk, so long prefills never churn
-     * MTLBuffers (reusable ids keep the active set bounded). */
+    int WAVE = g_arena_wave;
+    if (WAVE < 8 || WAVE > QWEN_ARENA_CAP_MAX) WAVE = QWEN_ARENA_CAP;
+#ifdef COLI_METALIO
+    /* Persistent mio-backed arena pool: the same g_arena_wave physical
+     * buffers are reused across every wave/layer/chunk, so long prefills
+     * never churn MTLBuffers (reusable ids keep the active set bounded). */
     static Slot *pool = NULL;
     if (g_metal_io && metalio_active() && !pool) {
-        pool = calloc((size_t)QWEN_ARENA_CAP, sizeof(Slot));
-        for (int i = 0; i < QWEN_ARENA_CAP; i++) { pool[i].mio = 1; pool[i].mio_slot = -1; }
+        pool = calloc((size_t)WAVE, sizeof(Slot));
+        for (int i = 0; i < WAVE; i++) { pool[i].mio = 1; pool[i].mio_slot = -1; }
     }
 #endif
-    Slot *wave = calloc((size_t)QWEN_ARENA_CAP, sizeof(Slot));
+    Slot *wave = calloc((size_t)QWEN_ARENA_CAP_MAX, sizeof(Slot));
     if (!wave) { fprintf(stderr, "OOM arena wave slots\n"); exit(1); }
 
-    /* bounded waves: load up to ARENA_CAP experts at a time; every expert in
-     * a wave is applied before its slot is reused — no eviction, no drops.
+    /* bounded waves: load up to g_arena_wave experts at a time; every expert
+     * in a wave is applied before its slot is reused — no eviction, no drops.
      * MetalIO: the whole wave is issued without waiting and the NEXT wave's
      * load is enqueued into each slot right after its apply, so expert I/O
      * overlaps the current wave's compute. */
-    for (int wb = 0; wb < nuniq; wb += QWEN_ARENA_CAP) {
-        int wn = nuniq - wb < QWEN_ARENA_CAP ? nuniq - wb : QWEN_ARENA_CAP;
+    for (int wb = 0; wb < nuniq; wb += WAVE) {
+        int wn = nuniq - wb < WAVE ? nuniq - wb : WAVE;
         /* fresh per-wave descriptors ALWAYS: the previous wave's free loop
          * released heap buffers, and a reused Slot would make load_expert
          * treat the dangling pointer as already-allocated (use-after-free). */
@@ -2800,6 +2804,8 @@ int main(int argc, char **argv){
     if (g_chunk < 1) g_chunk = 1;
     if (g_chunk > QWEN_CHUNK_MAX) g_chunk = QWEN_CHUNK_MAX;
     g_kv_f16 = getenv("QWEN_KV_F16") ? atoi(getenv("QWEN_KV_F16")) : 1;
+    g_arena_wave = getenv("QWEN_ARENA_WAVE") ? atoi(getenv("QWEN_ARENA_WAVE")) : QWEN_ARENA_CAP;
+    if (g_arena_wave < 8 || g_arena_wave > QWEN_ARENA_CAP_MAX) g_arena_wave = QWEN_ARENA_CAP;
     g_dense_drop  = getenv("DENSE_KEEP_PAGES") ? 0 : 1;
 
     Model m; model_init(&m, snap, cap);
