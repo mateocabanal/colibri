@@ -903,7 +903,9 @@ static void load_expert(Model *m, int layer, int eid, Slot *s){
             if (mf < 0) continue;
             if (s->mio_slot < 0) s->mio_slot = metalio_slot_alloc(tw->nbytes);
             if (s->mio_slot < 0) continue;
-            int64_t ev = metalio_load(s->mio_slot, mf, (uint64_t)tw->off, (size_t)tw->nbytes);
+            int64_t ev = metalio_loadv(s->mio_slot, (ColiMetalioRegion[]){
+                { mf, (uint64_t)tw->off, (size_t)tw->nbytes, 0 },
+            }, 1, g_mio_prefetching ? MIO_LOAD_SPEC : MIO_LOAD_DEMAND);
             if (ev <= 0) continue;
             s->mio_event = ev;
             if (!g_mio_prefetching) {

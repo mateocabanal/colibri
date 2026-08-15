@@ -36,15 +36,34 @@ int  metalio_file_add(const char *path);
 
 /* --- persistent slot pool ------------------------------------------------ */
 /* One shared-storage MTLBuffer, 16 KiB-aligned length, alive across many
- * expert replacements. Returns slot id or -1. */
+ * expert replacements. Slot ids are REUSABLE: freed ids come back to the
+ * pool while the active set stays bounded (hard ceiling). Returns slot id
+ * or -1. */
 int  metalio_slot_alloc(size_t max_bytes);
-void metalio_slot_free(int slot);
+void metalio_slot_free(int slot);     /* waits for in-flight, then releases */
 void *metalio_slot_ptr(int slot);             /* CPU-visible (shared storage) */
 size_t metalio_slot_bytes(int slot);
 
-/* --- async loads --------------------------------------------------------- */
-/* Enqueue a load of [offset, offset+bytes) from `file` into `slot`. Returns
- * the shared-event value to wait on, or -1 on failure (fall back to pread). */
+/* --- vectored async loads ------------------------------------------------ */
+typedef enum { MIO_LOAD_DEMAND = 0, MIO_LOAD_ASYNC = 1, MIO_LOAD_SPEC = 2 }
+    ColiMetalioKind;
+
+typedef struct {
+    int      file;       /* source file id (metalio_file_add) */
+    uint64_t src_off;    /* source offset in the file */
+    size_t   bytes;
+    uint64_t dst_off;    /* destination offset within the slot buffer */
+} ColiMetalioRegion;
+
+/* Enqueue one or more regions into the slot via ONE MTLIOCommandBuffer and a
+ * single shared-event signal; every region is validated against the file
+ * length and the slot capacity BEFORE anything is committed — a rejected
+ * region set enqueues nothing. Returns the event value to wait on, or -1 on
+ * failure (fall back to pread). `kind` feeds the metrics split. */
+int64_t metalio_loadv(int slot, const ColiMetalioRegion *regions, int count,
+                      ColiMetalioKind kind);
+
+/* One-region wrapper (weights-only loads); kind = MIO_LOAD_DEMAND. */
 int64_t metalio_load(int slot, int file, uint64_t offset, size_t bytes);
 
 /* CPU wait until the load signalling `event_value` (and everything before it

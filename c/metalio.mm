@@ -58,15 +58,18 @@ static uint64_t g_ev_val;          /* next value to signal; only touched under g
 static id<MTLIOFileHandle> g_files[METALIO_MAX_FILES];
 static int g_nfiles;
 
-/* persistent slots: [slot id] -> buffer + size + last-load event value */
+/* persistent slots: [slot id] -> buffer + size + last-load event value.
+ * Ids are REUSABLE: freed ids return to the pool, active set stays bounded. */
 #define METALIO_MAX_SLOTS 256
 static struct {
     id<MTLBuffer> buf;
     size_t bytes;
+    int in_use;
     _Atomic int64_t last_event;    /* event value of the most recent load */
     _Atomic int64_t consumed;      /* event value already consumed by compute (prefetch_used) */
 } g_slots[METALIO_MAX_SLOTS];
 static int g_nslots;
+static int64_t g_consumed_high;    /* highest event value already waited (g_lock) */
 
 static NSRecursiveLock *g_lock;
 
@@ -161,18 +164,21 @@ int metalio_slot_alloc(size_t max_bytes){
     [g_lock lock];
     int sid = -1;
     if (@available(macOS 13.0, *)) {
-        if (g_nslots < METALIO_MAX_SLOTS) {
+        /* reuse a freed id first; else grow up to the hard ceiling */
+        for (int i = 0; i < g_nslots && sid < 0; i++)
+            if (!g_slots[i].in_use) sid = i;
+        if (sid < 0 && g_nslots < METALIO_MAX_SLOTS) sid = g_nslots++;
+        if (sid >= 0) {
             id<MTLBuffer> b = [g_dev newBufferWithLength:len
                                                  options:MTLResourceStorageModeShared];
             if (b) {
-                sid = g_nslots;
                 g_slots[sid].buf = b;
                 g_slots[sid].bytes = len;
+                g_slots[sid].in_use = 1;
                 atomic_store_explicit(&g_slots[sid].last_event, 0, memory_order_relaxed);
                 atomic_store_explicit(&g_slots[sid].consumed, 0, memory_order_relaxed);
-                g_nslots++;
                 verbose("slot_alloc: id=%d bytes=%zu", sid, len);
-            }
+            } else sid = -1;
         }
     }
     [g_lock unlock];
@@ -181,13 +187,14 @@ int metalio_slot_alloc(size_t max_bytes){
 
 void metalio_slot_free(int slot){
     if (!atomic_load_explicit(&g_active, memory_order_relaxed)) return;
-    if (slot < 0 || slot >= g_nslots) return;
+    if (slot < 0 || slot >= g_nslots || !g_slots[slot].in_use) return;
     [g_lock lock];
     /* wait for any in-flight load into this slot before releasing */
     int64_t ev = atomic_load_explicit(&g_slots[slot].last_event, memory_order_relaxed);
     if (ev > 0 && g_ev) [g_ev waitUntilSignaledValue:(uint64_t)ev timeoutMS:UINT64_MAX];
     g_slots[slot].buf = nil;
     g_slots[slot].bytes = 0;
+    g_slots[slot].in_use = 0;
     [g_lock unlock];
 }
 
@@ -201,52 +208,95 @@ size_t metalio_slot_bytes(int slot){
     return g_slots[slot].bytes;
 }
 
-int64_t metalio_load(int slot, int file, uint64_t offset, size_t bytes){
+/* all regions must be valid BEFORE anything is committed: a rejected set
+ * enqueues nothing (the caller falls back to pread). */
+static int regions_ok(int slot, const ColiMetalioRegion *regions, int count){
+    if (count <= 0 || !regions) return 0;
+    size_t cap = g_slots[slot].bytes, highest = 0;
+    uint64_t total = 0;
+    for (int i = 0; i < count; i++) {
+        const ColiMetalioRegion *r = &regions[i];
+        if (r->file < 0 || r->file >= g_nfiles || !g_files[r->file]) return 0;
+        if (r->bytes == 0) return 0;
+        if (r->dst_off > cap || r->bytes > cap - r->dst_off) return 0;  /* slot bound */
+        if (r->src_off > UINT64_MAX - r->bytes) return 0;               /* src overflow */
+        if (r->bytes > SIZE_MAX - total) return 0;
+        total += r->bytes;
+        if (r->dst_off + r->bytes > highest) highest = r->dst_off + r->bytes;
+    }
+    return 1;
+}
+
+int64_t metalio_loadv(int slot, const ColiMetalioRegion *regions, int count,
+                      ColiMetalioKind kind){
     if (!atomic_load_explicit(&g_active, memory_order_relaxed)) return -1;
-    if (slot < 0 || slot >= g_nslots || file < 0 || file >= g_nfiles) return -1;
-    if (bytes == 0 || bytes > g_slots[slot].bytes) return -1;
+    if (slot < 0 || slot >= g_nslots || !g_slots[slot].in_use) return -1;
     [g_lock lock];
     int64_t ev = -1;
     if (@available(macOS 13.0, *)) {
-        id<MTLIOCommandBuffer> ioCB = [g_iq commandBuffer];
-        [ioCB loadBuffer:g_slots[slot].buf
-                  offset:0
-                    size:bytes
-            sourceHandle:g_files[file]
-       sourceHandleOffset:offset];
-        uint64_t v = g_ev_val++;
-        [ioCB signalEvent:g_ev value:v];
-        [ioCB commit];
-        atomic_store_explicit(&g_slots[slot].last_event, (int64_t)v, memory_order_relaxed);
-        ev = (int64_t)v;
-        atomic_fetch_add_explicit(&m_loads, 1, memory_order_relaxed);
-        atomic_fetch_add_explicit(&m_bytes, bytes, memory_order_relaxed);
-        uint64_t out = atomic_fetch_add_explicit(&m_outstanding, 1, memory_order_relaxed) + 1;
-        uint64_t peak = atomic_load_explicit(&m_peak_outstanding, memory_order_relaxed);
-        while (out > peak &&
-               !atomic_compare_exchange_weak_explicit(&m_peak_outstanding, &peak, out,
-                                                      memory_order_relaxed, memory_order_relaxed)) {}
-        verbose("load: slot=%d file=%d offset=%llu size=%zu event=%llu",
-                slot, file, (unsigned long long)offset, bytes, (unsigned long long)v);
+        if (regions_ok(slot, regions, count)) {
+            id<MTLIOCommandBuffer> ioCB = [g_iq commandBuffer];
+            for (int i = 0; i < count; i++) {
+                const ColiMetalioRegion *r = &regions[i];
+                [ioCB loadBuffer:g_slots[slot].buf
+                          offset:r->dst_off
+                            size:r->bytes
+                    sourceHandle:g_files[r->file]
+               sourceHandleOffset:r->src_off];
+            }
+            uint64_t v = g_ev_val++;
+            [ioCB signalEvent:g_ev value:v];
+            [ioCB commit];
+            atomic_store_explicit(&g_slots[slot].last_event, (int64_t)v, memory_order_relaxed);
+            ev = (int64_t)v;
+            atomic_fetch_add_explicit(&m_loads, 1, memory_order_relaxed);
+            if (kind == MIO_LOAD_SPEC)
+                atomic_fetch_add_explicit(&m_prefetch_loads, 1, memory_order_relaxed);
+            for (int i = 0; i < count; i++)
+                atomic_fetch_add_explicit(&m_bytes, regions[i].bytes, memory_order_relaxed);
+            uint64_t out = atomic_fetch_add_explicit(&m_outstanding, 1, memory_order_relaxed) + 1;
+            uint64_t peak = atomic_load_explicit(&m_peak_outstanding, memory_order_relaxed);
+            while (out > peak &&
+                   !atomic_compare_exchange_weak_explicit(&m_peak_outstanding, &peak, out,
+                                                          memory_order_relaxed, memory_order_relaxed)) {}
+            verbose("load: slot=%d regions=%d event=%llu", slot, count, (unsigned long long)v);
+        }
     }
     [g_lock unlock];
     return ev;
 }
 
+int64_t metalio_load(int slot, int file, uint64_t offset, size_t bytes){
+    ColiMetalioRegion r = { file, offset, bytes, 0 };
+    return metalio_loadv(slot, &r, 1, MIO_LOAD_DEMAND);
+}
+
 int metalio_wait(int64_t event_value){
     if (!atomic_load_explicit(&g_active, memory_order_relaxed)) return -1;
     if (event_value <= 0 || !g_ev) return -1;
+    [g_lock lock];
+    if (event_value <= g_consumed_high) {          /* a later wait already covered it */
+        [g_lock unlock];
+        return 0;
+    }
+    if (event_value > (int64_t)g_ev_val - 1) { [g_lock unlock]; return -1; }   /* not yet issued */
+    [g_lock unlock];
     uint64_t t0 = mach_absolute_time();
     [g_ev waitUntilSignaledValue:(uint64_t)event_value timeoutMS:UINT64_MAX];
     static mach_timebase_info_data_t tb;
     if (tb.denom == 0) mach_timebase_info(&tb);
     uint64_t us = (mach_absolute_time() - t0) * tb.numer / tb.denom / 1000;
+    [g_lock lock];
+    if (event_value > g_consumed_high) {
+        g_consumed_high = event_value;
+        atomic_store_explicit(&m_outstanding, g_ev_val - 1 - (uint64_t)g_consumed_high,
+                              memory_order_relaxed);
+    }
+    [g_lock unlock];
     atomic_fetch_add_explicit(&m_waits, 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&m_lat_samples, 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&m_lat_total_us, us, memory_order_relaxed);
     hist_add(us);
-    uint64_t out = atomic_fetch_sub_explicit(&m_outstanding, 1, memory_order_relaxed);
-    (void)out;
     verbose("wait: event=%lld latency=%lluus", (long long)event_value, (unsigned long long)us);
     return 0;
 }

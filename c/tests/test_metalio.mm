@@ -97,6 +97,56 @@ int main(void){
         CHECK(st.latency_samples >= 3, "latency samples: %llu", (unsigned long long)st.latency_samples);
         CHECK(st.peak_outstanding >= 2, "peak outstanding: %llu", (unsigned long long)st.peak_outstanding);
 
+        /* --- multi-region vectored load: weights + scales, ONE event ------ */
+        int64_t evr = metalio_loadv(slot, (ColiMetalioRegion[]){
+            { file, 256u << 10, 4096, 0 },
+            { file, 60000u, 512, 4096 },
+        }, 2, MIO_LOAD_DEMAND);
+        CHECK(evr > ev4, "loadv event");
+        CHECK(metalio_wait(evr) == 0, "loadv wait");
+        const unsigned char *q = (const unsigned char *)metalio_slot_ptr(slot);
+        int badv = 0;
+        for (int i = 0; i < 4096; i++) if (q[i] != payload_byte((size_t)(256u << 10) + i)) badv = 1;
+        for (int i = 0; i < 512; i++) if (q[4096 + i] != payload_byte(60000u + i)) badv = 1;
+        CHECK(!badv, "loadv regions byte-exact at both destinations");
+
+        /* --- invalid region set must enqueue NOTHING ---------------------- */
+        int64_t evbad = metalio_loadv(slot, (ColiMetalioRegion[]){
+            { file, 0, 1 << 20, 0 },                    /* exceeds slot capacity */
+        }, 1, MIO_LOAD_DEMAND);
+        CHECK(evbad == -1, "oversized region rejected");
+        CHECK(q[0] == payload_byte((size_t)(256u << 10)), "rejected load left slot untouched");
+
+        /* --- slot id reuse: >256 lifetime allocs, bounded active set ------ */
+        int first = metalio_slot_alloc(4096);
+        CHECK(first >= 0, "alloc for reuse test");
+        metalio_slot_free(first);
+        int again = metalio_slot_alloc(4096);
+        CHECK(again == first, "freed id reused: %d -> %d", first, again);
+        int active = 2;
+        for (int i = 0; i < 300; i++) {
+            int s2 = metalio_slot_alloc(1024);
+            CHECK(s2 >= 0, "lifetime alloc %d", i);
+            active++;
+            if (i % 3 == 0) { metalio_slot_free(s2); active--; }
+        }
+        CHECK(active <= 256, "active set stays bounded: %d", active);
+
+        /* --- counter consistency: wait on the LAST event covers all ------- */
+        int64_t eva = metalio_loadv(slot, (ColiMetalioRegion[]){ { file, 0, 1024, 0 } }, 1, MIO_LOAD_DEMAND);
+        int64_t evb2 = metalio_loadv(slot, (ColiMetalioRegion[]){ { file, 1024, 1024, 0 } }, 1, MIO_LOAD_DEMAND);
+        int64_t evc = metalio_loadv(slot, (ColiMetalioRegion[]){ { file, 2048, 1024, 0 } }, 1, MIO_LOAD_DEMAND);
+        CHECK(metalio_wait(evc) == 0, "last-event wait");
+        {
+            ColiMetalioStats st2;
+            metalio_stats(&st2);
+            CHECK(st2.outstanding == 0,
+                  "outstanding drained by high-water wait: %llu",
+                  (unsigned long long)st2.outstanding);
+        }
+        /* waiting on an ALREADY-covered event is a no-op (no double count) */
+        CHECK(metalio_wait(eva) == 0, "covered wait no-op");
+
         /* --- shutdown with outstanding IO -------------------------------- */
         int64_t ev5 = metalio_load(slot, file, 0, 1024);
         CHECK(ev5 > 0, "load before shutdown");
