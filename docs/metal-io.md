@@ -20,6 +20,17 @@ measures the carryover predictor at 31-39% useful precision — below the
 50% gate (measured on an optimistic union bound; true decode precision is
 lower). GATE FAILS: QWEN_PREFETCH stays off permanently.
 
+## i4 quant on the real model (CPU path, post-T7a fusion)
+
+| Snapshot | Size | Wall (2 runs) | Tokens | First DATA |
+|---|---:|---|---:|---|
+| q8 | 32G | 16.09s / 15.47s | 23 | DATA t 7 |
+| i4 (packed, fmt=4) | 19G | 12.00s / 11.97s | 23 | DATA t 7 |
+
+i4 beats q8 by ~23% wall (-40% bytes to read) with identical first token
+and identical generation length — T7a's fused NEON gate/up pair flipped
+the earlier pre-T7a result (i4 was +9% SLOWER than q8).
+
 Status: subsystem landed (metalio.h/.mm + unit test). Engine wiring in progress.
 
 ## Existing path (CPU-mediated)
