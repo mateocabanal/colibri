@@ -899,13 +899,27 @@ static void load_expert(Model *m, int layer, int eid, Slot *s){
                           : (2 * qm_i3_rowbytes(cc->hidden) * cc->moe_inter
                              + qm_i3_rowbytes((int)cc->moe_inter) * cc->hidden);
             if (want_w < 0 || !tensor_numel_ok(tw->nbytes, want_w)) continue;
-            int mf = mio_file_for(tw->fd);
-            if (mf < 0) continue;
-            if (s->mio_slot < 0) s->mio_slot = metalio_slot_alloc(tw->nbytes);
+            /* scales ride the SAME event: raw-F32 qs tail in the same buffer.
+             * Non-F32 scales keep the pread path (st_read_f32 converts). */
+            snprintf(qsnm, sizeof(qsnm), "%slayers.%d.mlp.experts.%d.qs", g_prefix, layer, eid);
+            st_tensor *ts = st_find(&m->S, qsnm);
+            int64_t ngH = ((int64_t)cc->hidden + 63) / 64, ngI = ((int64_t)cc->moe_inter + 63) / 64;
+            int64_t want_s = (probes[pi].fmt == 8) ? (cc->moe_inter + cc->moe_inter + cc->hidden)
+                          : (cc->moe_inter * ngH * 2 + cc->hidden * ngI);
+            if (!ts || ts->numel != want_s || ts->dtype != 2 ||           /* 2 = F32 */
+                (uint64_t)ts->nbytes != (uint64_t)want_s * 4) continue;
+            int mf = mio_file_for(tw->fd), mq = mio_file_for(ts->fd);
+            if (mf < 0 || mq < 0) continue;
+            size_t scale_off = ((size_t)tw->nbytes + 15u) & ~(size_t)15u;
+            size_t slot_bytes = scale_off + (size_t)ts->nbytes;
+            if (s->mio_slot < 0) s->mio_slot = metalio_slot_alloc(slot_bytes);
             if (s->mio_slot < 0) continue;
-            int64_t ev = metalio_loadv(s->mio_slot, (ColiMetalioRegion[]){
+            ColiMetalioRegion regions[2] = {
                 { mf, (uint64_t)tw->off, (size_t)tw->nbytes, 0 },
-            }, 1, g_mio_prefetching ? MIO_LOAD_SPEC : MIO_LOAD_DEMAND);
+                { mq, (uint64_t)ts->off, (size_t)ts->nbytes, scale_off },
+            };
+            int64_t ev = metalio_loadv(s->mio_slot, regions, 2,
+                                       g_mio_prefetching ? MIO_LOAD_SPEC : MIO_LOAD_DEMAND);
             if (ev <= 0) continue;
             s->mio_event = ev;
             if (!g_mio_prefetching) {
@@ -918,34 +932,21 @@ static void load_expert(Model *m, int layer, int eid, Slot *s){
              * I/O overlaps compute meanwhile. */
             const unsigned char *base = (const unsigned char *)metalio_slot_ptr(s->mio_slot);
             if (!base) continue;
-            snprintf(qsnm, sizeof(qsnm), "%slayers.%d.mlp.experts.%d.qs", g_prefix, layer, eid);
-            st_tensor *ts = st_find(&m->S, qsnm);
-            int64_t ngH = ((int64_t)cc->hidden + 63) / 64, ngI = ((int64_t)cc->moe_inter + 63) / 64;
-            int64_t want_s = (probes[pi].fmt == 8) ? (cc->moe_inter + cc->moe_inter + cc->hidden)
-                          : (cc->moe_inter * ngH * 2 + cc->hidden * ngI);
-            if (!ts || ts->numel != want_s) continue;
+            float *sbase = (float *)(base + scale_off);    /* F32 scale tail */
             if (probes[pi].fmt == 8) {
-                free(s->gs);                        /* reload: drop the old scales */
-                s->gs = falloc((size_t)want_s);
-                st_read_f32(&m->S, qsnm, s->gs, g_expert_drop);
-                s->us = s->gs + cc->moe_inter;
-                s->ds = s->gs + cc->moe_inter + cc->moe_inter;
                 s->g = (int8_t *)base; s->u = s->g + ng; s->dd = s->g + ng + ng;
+                s->gs = sbase; s->us = sbase + cc->moe_inter;
+                s->ds = sbase + cc->moe_inter + cc->moe_inter;
                 s->fmt = 8;
             } else {
                 /* packed formats carry per-64-group scales (g4s/u4s/d4s) */
-                free(s->g4s);
-                s->g4s = falloc((size_t)want_s);
-                st_read_f32(&m->S, qsnm, s->g4s, g_expert_drop);
-                s->u4s = s->g4s + cc->moe_inter * ngH;
-                s->d4s = s->g4s + 2 * cc->moe_inter * ngH;
-                /* g|u|d blocks are contiguous in the merged tensor, same
-                 * offsets as slot_alloc_packed */
                 int64_t rbH = (probes[pi].fmt == 5) ? qm_i3_rowbytes(cc->hidden)
                                                     : (cc->hidden + 1) / 2;
                 s->g4 = (uint8_t *)base;
                 s->u4 = s->g4 + rbH * cc->moe_inter;
                 s->d4 = s->g4 + 2 * rbH * cc->moe_inter;
+                s->g4s = sbase; s->u4s = sbase + cc->moe_inter * ngH;
+                s->d4s = sbase + 2 * cc->moe_inter * ngH;
                 s->fmt = probes[pi].fmt;
             }
             s->pinned = 0;
