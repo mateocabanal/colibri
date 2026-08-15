@@ -473,6 +473,7 @@ METAL_OBJ  =
 METALXX    = clang++ -x objective-c++ -std=gnu++17 -fobjc-arc -O3
 MIO_OBJ    =
 MIO_LDFLAGS =
+MIO_CFLAGS  =
 ifeq ($(METAL),1)
 ifeq (,$(DARWIN))
 $(error METAL=1 is supported only on macOS)
@@ -482,6 +483,7 @@ LDFLAGS  += -framework Metal -framework Foundation -lc++
 METAL_OBJ = backend_metal.o
 MIO_OBJ   = metalio.o
 MIO_LDFLAGS = -framework Metal -framework Foundation
+MIO_CFLAGS  = -DCOLI_METALIO
 endif
 
 # VK=1 adds an opt-in Vulkan compute backend (any Vulkan 1.2 driver, e.g. Mesa/RADV)
@@ -740,7 +742,7 @@ olmoe$(EXE): olmoe.c st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unico
 # (QWEN_METAL_IO=1) for async expert streaming — CPU compute reads the
 # shared-storage buffers in place; MetalIO is never mandatory.
 qwen_moe$(EXE): qwen_moe.c st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h $(MIO_OBJ)
-	$(CC) $(NOCUDA_CFLAGS) -DCOLI_METALIO qwen_moe.c $(MIO_OBJ) -o qwen_moe$(EXE) $(NOCUDA_LDFLAGS) $(MIO_LDFLAGS)
+	$(CC) $(NOCUDA_CFLAGS) $(MIO_CFLAGS) qwen_moe.c $(MIO_OBJ) -o qwen_moe$(EXE) $(NOCUDA_LDFLAGS) $(MIO_LDFLAGS)
 
 inkling$(EXE): inkling.c st.h json.h compat.h $(INK_CUDA_OBJ) $(METAL_OBJ)
 	$(CC) $(CFLAGS) inkling.c $(INK_CUDA_OBJ) $(METAL_OBJ) -o inkling$(EXE) $(LDFLAGS)

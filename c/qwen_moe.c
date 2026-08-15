@@ -1875,8 +1875,12 @@ static void moe_batch(Model *m, Layer *l, int layer, const float *xs, int C, flo
      * overlaps the current wave's compute. */
     for (int wb = 0; wb < nuniq; wb += QWEN_ARENA_CAP) {
         int wn = nuniq - wb < QWEN_ARENA_CAP ? nuniq - wb : QWEN_ARENA_CAP;
+        /* fresh per-wave descriptors ALWAYS: the previous wave's free loop
+         * released heap buffers, and a reused Slot would make load_expert
+         * treat the dangling pointer as already-allocated (use-after-free). */
+        memset(wave, 0, (size_t)wn * sizeof(Slot));
 #ifdef COLI_METALIO
-        if (pool) { memset(wave, 0, (size_t)wn * sizeof(Slot)); g_mio_async_issue = 1; }
+        if (pool) g_mio_async_issue = 1;
 #endif
         for (int a = 0; a < wn; a++) {
             Slot *s = &wave[a];
