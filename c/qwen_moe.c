@@ -1783,22 +1783,56 @@ static void moe_batch(Model *m, Layer *l, int layer, const float *xs, int C, flo
     int I = c->moe_inter;
     float *xscratch = falloc((int64_t)C * D);
     float *yscratch = falloc((int64_t)C * D);
-    ArenaSlot *arena = calloc((size_t)QWEN_ARENA_CAP, sizeof(ArenaSlot));
-    if (!arena) { fprintf(stderr, "OOM arena\n"); exit(1); }
+    #ifdef COLI_METALIO
+    /* Persistent mio-backed arena pool: the same ARENA_CAP physical buffers
+     * are reused across every wave/layer/chunk, so long prefills never churn
+     * MTLBuffers (reusable ids keep the active set bounded). */
+    static Slot *pool = NULL;
+    if (g_metal_io && metalio_active() && !pool) {
+        pool = calloc((size_t)QWEN_ARENA_CAP, sizeof(Slot));
+        for (int i = 0; i < QWEN_ARENA_CAP; i++) { pool[i].mio = 1; pool[i].mio_slot = -1; }
+    }
+#endif
+    Slot *wave = calloc((size_t)QWEN_ARENA_CAP, sizeof(Slot));
+    if (!wave) { fprintf(stderr, "OOM arena wave slots\n"); exit(1); }
 
     /* bounded waves: load up to ARENA_CAP experts at a time; every expert in
-     * a wave is applied before the wave is freed — no eviction, no drops. */
+     * a wave is applied before its slot is reused — no eviction, no drops.
+     * MetalIO: the whole wave is issued without waiting and the NEXT wave's
+     * load is enqueued into each slot right after its apply, so expert I/O
+     * overlaps the current wave's compute. */
     for (int wb = 0; wb < nuniq; wb += QWEN_ARENA_CAP) {
         int wn = nuniq - wb < QWEN_ARENA_CAP ? nuniq - wb : QWEN_ARENA_CAP;
+#ifdef COLI_METALIO
+        if (pool) { memset(wave, 0, (size_t)wn * sizeof(Slot)); g_mio_async_issue = 1; }
+#endif
         for (int a = 0; a < wn; a++) {
-            Slot *s = &arena[a].s;
-            memset(s, 0, sizeof(*s));
+            Slot *s = &wave[a];
             double t0 = now_s();
+#ifdef COLI_METALIO
+            if (pool) {
+                s->mio = 1; s->mio_slot = pool[a].mio_slot;
+                if (wb >= QWEN_ARENA_CAP) {
+                    /* this expert was already pipelined into the pool slot
+                     * during the previous wave's apply loop — re-enqueueing
+                     * would double-read it; wait_ready drains it at apply. */
+                    m->t_expio += now_s() - t0;
+                    continue;
+                }
+            }
+#endif
             load_expert(m, layer, uniq[wb + a], s);
             m->t_expio += now_s() - t0;
+#ifdef COLI_METALIO
+            if (pool) pool[a].mio_slot = s->mio_slot;      /* persist for reuse */
+#endif
         }
+#ifdef COLI_METALIO
+        if (pool) g_mio_async_issue = 0;
+#endif
         for (int a = 0; a < wn; a++) {
-            Slot *s = &arena[a].s;
+            Slot *s = &wave[a];
+            expert_wait_ready(m, s);
             int e = uniq[wb + a];
             int st = 0;
             for (int j = 0; j < C; j++) for (int k = 0; k < K; k++)
@@ -1846,10 +1880,32 @@ static void moe_batch(Model *m, Layer *l, int layer, const float *xs, int C, flo
                     memcpy(yrow + ((int64_t)j * K + k) * D, yscratch + (int64_t)si * D, (size_t)D * sizeof(float));
                     si++;
                 }
+            /* pipeline: the apply finished reading this slot — enqueue the
+             * next wave's expert into it NOW, so its I/O overlaps the
+             * remaining applies of this wave. */
+#ifdef COLI_METALIO
+            if (pool && wb + QWEN_ARENA_CAP < nuniq) {
+                int ne = uniq[wb + QWEN_ARENA_CAP + a];
+                Slot tmp; memset(&tmp, 0, sizeof(tmp));
+                tmp.mio = 1; tmp.mio_slot = s->mio_slot;
+                double t0 = now_s();
+                g_mio_async_issue = 1;
+                load_expert(m, layer, ne, &tmp);
+                g_mio_async_issue = 0;
+                m->t_expio += now_s() - t0;
+                pool[a].mio_slot = tmp.mio_slot;
+            }
+#endif
         }
-        arena_free(arena, wn);
+        /* free heap buffers from any fallback (pread) wave slots; mio slots
+         * point into the persistent pool and have nothing to free */
+        for (int a = 0; a < wn; a++) {
+            Slot *s = &wave[a];
+            if (s->mio) continue;
+            free(s->gu); free(s->g); free(s->gs); free(s->g4); free(s->g4s);
+        }
     }
-    free(uniq); free(eid_slot); free(arena); free(xscratch); free(yscratch);
+    free(uniq); free(eid_slot); free(wave); free(xscratch); free(yscratch);
 
     /* routed accumulation: token-major, k = 0..K-1 — moe_token's order */
     for (int j = 0; j < C; j++) {
