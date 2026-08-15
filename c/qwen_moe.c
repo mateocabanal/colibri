@@ -711,6 +711,75 @@ static void matmul_i4_grouped(float *y, const float *x, const uint8_t *q4, const
     }
 }
 
+/* Fused gate+up i4-grouped pair (S==1): one activation load serves BOTH
+ * matrices — the decode path computes gate(x) and up(x) on the same x, so
+ * this halves the x memory traffic and the loop overhead. Accumulation
+ * order per group is identical to two separate matmul_i4_grouped calls
+ * (unpack -> fma per 16, group partial scaled once), so results are
+ * bit-exact against the reference. Only the NEON arm is needed here; the
+ * scalar tail handles the remainder exactly like the single kernel. */
+static void matmul_i4_grouped_pair(float *yg, float *yu,
+                                   const float *x,
+                                   const uint8_t *qg, const float *sg,
+                                   const uint8_t *qu, const float *su,
+                                   int I, int O, int gs){
+    int rb = (I + 1) / 2, ng = (I + gs - 1) / gs;
+    #pragma omp parallel for schedule(static)
+    for (int o = 0; o < O; o++) {
+        const uint8_t *wg = qg + (int64_t)o * rb;
+        const uint8_t *wu = qu + (int64_t)o * rb;
+        const float *scg = sg + (int64_t)o * ng;
+        const float *scu = su + (int64_t)o * ng;
+        const float *xs = x;
+        float ag = 0, au = 0;
+        for (int g = 0; g * gs < I; g++) {
+            int base = g * gs, glen = gs; if (base + glen > I) glen = I - base;
+            float scgv = scg[g], scuv = scu[g];
+            int i = base;
+#ifdef __ARM_NEON
+            const uint8x8_t m4v = vdup_n_u8(0x0F); const int8x8_t b8v = vdup_n_s8(8);
+            float32x4_t acg0 = vdupq_n_f32(0), acg1 = vdupq_n_f32(0);
+            float32x4_t acu0 = vdupq_n_f32(0), acu1 = vdupq_n_f32(0);
+            for (; i + 16 <= base + glen; i += 16) {
+                uint8x8_t byg = vld1_u8(wg + (i >> 1));
+                uint8x8_t byu = vld1_u8(wu + (i >> 1));
+                uint8x8x2_t zg = vzip_u8(vand_u8(byg, m4v), vshr_n_u8(byg, 4));
+                uint8x8x2_t zu = vzip_u8(vand_u8(byu, m4v), vshr_n_u8(byu, 4));
+                int16x8_t wg0 = vmovl_s8(vsub_s8(vreinterpret_s8_u8(zg.val[0]), b8v));
+                int16x8_t wg1 = vmovl_s8(vsub_s8(vreinterpret_s8_u8(zg.val[1]), b8v));
+                int16x8_t wu0 = vmovl_s8(vsub_s8(vreinterpret_s8_u8(zu.val[0]), b8v));
+                int16x8_t wu1 = vmovl_s8(vsub_s8(vreinterpret_s8_u8(zu.val[1]), b8v));
+                float32x4_t x0 = vld1q_f32(xs + i), x1 = vld1q_f32(xs + i + 4);
+                float32x4_t x2 = vld1q_f32(xs + i + 8), x3 = vld1q_f32(xs + i + 12);
+                acg0 = vfmaq_f32(acg0, x0, vcvtq_f32_s32(vmovl_s16(vget_low_s16(wg0))));
+                acg1 = vfmaq_f32(acg1, x1, vcvtq_f32_s32(vmovl_s16(vget_high_s16(wg0))));
+                acg0 = vfmaq_f32(acg0, x2, vcvtq_f32_s32(vmovl_s16(vget_low_s16(wg1))));
+                acg1 = vfmaq_f32(acg1, x3, vcvtq_f32_s32(vmovl_s16(vget_high_s16(wg1))));
+                acu0 = vfmaq_f32(acu0, x0, vcvtq_f32_s32(vmovl_s16(vget_low_s16(wu0))));
+                acu1 = vfmaq_f32(acu1, x1, vcvtq_f32_s32(vmovl_s16(vget_high_s16(wu0))));
+                acu0 = vfmaq_f32(acu0, x2, vcvtq_f32_s32(vmovl_s16(vget_low_s16(wu1))));
+                acu1 = vfmaq_f32(acu1, x3, vcvtq_f32_s32(vmovl_s16(vget_high_s16(wu1))));
+            }
+            ag += vaddvq_f32(vaddq_f32(acg0, acg1)) * scgv;
+            au += vaddvq_f32(vaddq_f32(acu0, acu1)) * scuv;
+#endif
+            for (; i < base + glen; i += 2) {
+                if (i + 1 < base + glen) {
+                    uint8_t bg = wg[i >> 1], bu = wu[i >> 1];
+                    ag += (xs[i] * (float)((int)(bg & 0xF) - 8) + xs[i + 1] * (float)((int)(bg >> 4) - 8)) * scgv;
+                    au += (xs[i] * (float)((int)(bu & 0xF) - 8) + xs[i + 1] * (float)((int)(bu >> 4) - 8)) * scuv;
+                } else {
+                    uint8_t bg = wg[i >> 1], bu = wu[i >> 1];
+                    ag += xs[i] * (float)((int)(bg & 0xF) - 8) * scgv;
+                    au += xs[i] * (float)((int)(bu & 0xF) - 8) * scuv;
+                }
+            }
+        }
+        yg[o] = ag;
+        yu[o] = au;
+    }
+}
+
 /* int3-g64 (fmt=5): 3-bit weights, values [-4,3] stored v+4, ONE f32 scale per
  * 64-input group. Per group: 16B low plane (2 bits/val) + 8B high plane
  * (1 bit/val) = 24B. 3.5 bits/weight effective. */
@@ -1397,8 +1466,9 @@ static void expert_apply(Model *m, Slot *s, const float *x, float *acc){
          * int3-g64 (24B/64-group). Both stream from disk exactly like int8. */
         float *gate = falloc(I), *up = falloc(I);
         if (s->fmt == 4) {
-            matmul_i4_grouped(gate, x, s->g4,   s->g4s, 1, D, I, 64);
-            matmul_i4_grouped(up,   x, s->u4,   s->u4s, 1, D, I, 64);
+            /* fused pair: one activation pass feeds both matrices (decode) */
+            matmul_i4_grouped_pair(gate, up, x, s->g4, s->g4s, s->u4, s->u4s,
+                                   D, I, 64);
         } else {
             matmul_i3(gate, x, s->g4, s->g4s, 1, D, I);
             matmul_i3(up,   x, s->u4, s->u4s, 1, D, I);
