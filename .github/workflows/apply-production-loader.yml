@@ -20,7 +20,7 @@ jobs:
         with:
           ref: codex/compiler-contracts-p0
           fetch-depth: 0
-      - name: Normalize executor option block for scripted patch
+      - name: Normalize current source shapes for scripted patch
         shell: bash
         run: |
           python3 - <<'PY'
@@ -44,6 +44,14 @@ jobs:
           if old not in text:
               raise SystemExit('executor option block changed unexpectedly')
           p.write_text(text.replace(old, new, 1))
+
+          patch = Path('tools/apply_production_loader.py')
+          source = patch.read_text()
+          source = source.replace(
+              'extern \\\"C\\\" int coli_metal_register(void *base, size_t len) {',
+              'extern \\\"C\\\" void coli_metal_register(void *base, size_t len) {'
+          )
+          patch.write_text(source)
           PY
       - name: Apply production loader patch
         run: |
