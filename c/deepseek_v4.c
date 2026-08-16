@@ -9085,13 +9085,17 @@ static int v4_omp_reserve_loader_cpus(void) {
     if (getenv("COLI_NO_OMP_TUNE")) return 0; /* family-wide kill-switch */
     if (getenv("OMP_NUM_THREADS")) return 0;  /* the user already chose */
     int logical = omp_get_max_threads();
-    int team = logical - COLI_V4_EXPERT_LOADER_COUNT;
+    /* Use ALL logical CPUs for compute. Loader lanes are separate threads that
+     * block in pread, so reserving CPUs for them starves the compute team:
+     * measured on M2 (64-token decode, 12 GiB) 8 threads = 7.21 s/tok vs the
+     * old reservation's 5 threads = 7.78 s/tok. OMP_NUM_THREADS still wins if
+     * the user sets it; COLI_NO_OMP_TUNE still disables. */
+    int team = logical;
     if (team < 2) return 0; /* tiny machine: leave the OpenMP default alone */
     omp_set_num_threads(team);
-    fprintf(stderr, "[OMP] deepseek-v4: %d compute threads (%d logical CPUs "
-                    "minus %d expert-loader workers); OMP_NUM_THREADS=<n> "
-                    "overrides, COLI_NO_OMP_TUNE=1 disables\n",
-            team, logical, COLI_V4_EXPERT_LOADER_COUNT);
+    fprintf(stderr, "[OMP] deepseek-v4: %d compute threads (%d logical CPUs); "
+                    "OMP_NUM_THREADS=<n> overrides, COLI_NO_OMP_TUNE=1 disables\n",
+            team, logical);
     return 1;
 }
 #endif

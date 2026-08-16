@@ -1369,10 +1369,12 @@ static RopeCache g_rope_cache = { NULL, 0, -1, 0.0f, 0, 0 };
 #endif
 
 static int rope_cache_enabled(void){
-    static int initialized = 0, enabled = 0;
+    static int initialized = 0, enabled = 1;
     if (!initialized) {
+        /* Default ON: token-exact (oracle selftests pass both ways) and
+         * measured -3.8% decode on M2. QWEN_ROPE_CACHE=0 opts out. */
         const char *s = getenv("QWEN_ROPE_CACHE");
-        enabled = s && s[0] && strcmp(s, "0") != 0;
+        if (s && s[0] && strcmp(s, "0") == 0) enabled = 0;
         initialized = 1;
     }
     return enabled;
