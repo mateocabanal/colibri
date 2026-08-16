@@ -1,5 +1,6 @@
 #include "coli_v4_expert_store.h"
 #include "coli_executor.h"
+#include "compat.h"
 #ifdef COLI_METAL
 #include "backend_metal.h"
 #endif
@@ -51,7 +52,8 @@ static int lookup(ColiExpertStore *store, ColiExpertKey key, ColiExpertView *vie
     for(int i=0;i<s->slots_per_layer;i++) if(!slots[i].loading&&slots[i].data&&slots[i].expert==key.expert){slot=&slots[i];s->stats.hits++;break;}
     if(!slot) { for(int i=0;i<s->slots_per_layer;i++) if(!slots[i].refs&&!slots[i].loading&&(!slot||!slots[i].data)) slot=&slots[i];
         if(!slot) { pthread_mutex_unlock(&s->mutex); memset(view,0,sizeof(*view)); return -1; }
-        if(!slot->data) { if(posix_memalign((void**)&slot->data,4096,(size_t)s->record_bytes)){pthread_mutex_unlock(&s->mutex);memset(view,0,sizeof(*view));return -1;}
+        if(!slot->data) { /* Apple shared-memory buffers are safest at the VM page size (16 KiB). */
+            if(posix_memalign((void**)&slot->data,16384,(size_t)s->record_bytes)){pthread_mutex_unlock(&s->mutex);memset(view,0,sizeof(*view));return -1;}
 #ifdef COLI_METAL
             if(coli_metal_init())coli_metal_register(slot->data,(size_t)s->record_bytes);
 #endif
@@ -69,7 +71,7 @@ static void destroy(ColiExpertStore *store){State*s=store?store->state:NULL;if(s
 #ifdef COLI_METAL
     if(s->slots[i].data)coli_metal_unregister(s->slots[i].data);
 #endif
-    free(s->slots[i].data);
+    compat_aligned_free(s->slots[i].data);
 }pthread_mutex_destroy(&s->mutex);coli_executor_close(s->executor);free(s->slots);free(s->records);free(s);}free(store);}
 int coli_v4_coli_expert_store_open(const ColiV4ColiExpertStoreOptions*o,ColiExpertStore**out,char*e,size_t n) {
     static const ColiExpertStoreOps ops={lookup,release,prefetch,stats,destroy}; ColiExpertStore*store=NULL;State*s=NULL;ColiExecutorOpenOptions xo={0};
