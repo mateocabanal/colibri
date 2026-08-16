@@ -1,6 +1,9 @@
 //! Versioned target compatibility profiles and lowering boundary.
 
-use std::io::Write;
+use std::{
+    fs::File,
+    io::{Read, Seek, SeekFrom, Write},
+};
 
 use crate::{
     error::{ColicError, Result},
@@ -212,6 +215,125 @@ pub fn exact_expert_decoded_bytes(expert: &RoutedExpert) -> Result<u64> {
         })
 }
 
+/// Emits an expert envelope from bounded transfer buffers. The v1 envelope is
+/// intentionally still source-order preserving, but no longer requires a
+/// compound gate/up/down record-sized allocation just to populate checksums.
+pub fn stream_exact_expert<W: Write + Seek>(expert: &RoutedExpert, output: &mut W) -> Result<u32> {
+    const HEADER_BYTES: u64 = 64;
+    const DESC_BYTES: u64 = 128;
+    const DATA_OFFSET: u64 = HEADER_BYTES + DESC_BYTES * 3;
+    let record_start = output.stream_position().map_err(|source| ColicError::Io {
+        path: expert.gate.source.source.clone(),
+        source,
+    })?;
+    let stored_bytes = exact_expert_stored_bytes(expert)?;
+    let record_end = record_start
+        .checked_add(stored_bytes)
+        .ok_or_else(|| ColicError::Usage("expert output offset overflows u64".into()))?;
+    let mut header = [0_u8; DATA_OFFSET as usize];
+    header[..8].copy_from_slice(b"COLIEXPT");
+    put_u16(&mut header, 8, 1);
+    put_u32(&mut header, 12, HEADER_BYTES as u32);
+    put_i32(&mut header, 16, expert.layer as i32);
+    put_i32(&mut header, 20, expert.expert as i32);
+    put_u16(&mut header, 24, 3);
+    put_u32(&mut header, 28, DESC_BYTES as u32);
+    put_u64(&mut header, 32, HEADER_BYTES);
+    put_u64(&mut header, 40, DATA_OFFSET);
+    put_u64(&mut header, 48, exact_expert_decoded_bytes(expert)?);
+
+    output.write_all(&header).map_err(|source| ColicError::Io {
+        path: expert.gate.source.source.clone(),
+        source,
+    })?;
+    let matrices = [
+        (&expert.gate, 1_u16),
+        (&expert.up, 2_u16),
+        (&expert.down, 3_u16),
+    ];
+    let mut cursor = DATA_OFFSET;
+    let mut data_state = !0_u32;
+    for (index, (matrix, role)) in matrices.into_iter().enumerate() {
+        let desc = HEADER_BYTES as usize + index * DESC_BYTES as usize;
+        let weight_offset = align_up(cursor, 16)?;
+        write_padding(
+            output,
+            weight_offset - cursor,
+            &mut data_state,
+            &matrix.source.source,
+        )?;
+        cursor = weight_offset;
+        let mut logical_state = !0_u32;
+        copy_tensor_stream(
+            &matrix.source,
+            output,
+            &mut data_state,
+            Some(&mut logical_state),
+        )?;
+        cursor = cursor
+            .checked_add(matrix.source.len)
+            .ok_or_else(|| ColicError::Usage("expert source size overflows u64".into()))?;
+        let (scale_offset, scale_len, scale_id) = if let Some(scale) = &matrix.scale {
+            let offset = align_up(cursor, 16)?;
+            write_padding(output, offset - cursor, &mut data_state, &scale.source)?;
+            cursor = offset;
+            copy_tensor_stream(scale, output, &mut data_state, Some(&mut logical_state))?;
+            cursor = cursor
+                .checked_add(scale.len)
+                .ok_or_else(|| ColicError::Usage("expert scale size overflows u64".into()))?;
+            (offset, scale.len, scale_format(&scale.dtype)?)
+        } else {
+            (0, 0, 0)
+        };
+        put_u16(&mut header, desc, role);
+        put_u16(
+            &mut header,
+            desc + 4,
+            expert_math_format(&matrix.source.dtype)?,
+        );
+        put_u16(&mut header, desc + 6, scale_id);
+        put_u64(&mut header, desc + 16, matrix.rows as u64);
+        put_u64(&mut header, desc + 24, matrix.columns as u64);
+        if matrix.source.dtype == "I8" {
+            put_u32(&mut header, desc + 32, 1);
+            put_u32(&mut header, desc + 36, 32);
+        }
+        put_u64(&mut header, desc + 48, weight_offset);
+        put_u64(&mut header, desc + 56, matrix.source.len);
+        put_u64(&mut header, desc + 64, matrix.source.len);
+        put_u64(&mut header, desc + 72, scale_offset);
+        put_u64(&mut header, desc + 80, scale_len);
+        put_u64(&mut header, desc + 88, scale_len);
+        put_u32(&mut header, desc + 96, !logical_state);
+    }
+    if cursor != stored_bytes {
+        return Err(ColicError::Usage(
+            "expert stream does not match its planned stored size".into(),
+        ));
+    }
+    output
+        .seek(SeekFrom::Start(record_start))
+        .map_err(|source| ColicError::Io {
+            path: expert.gate.source.source.clone(),
+            source,
+        })?;
+    output.write_all(&header).map_err(|source| ColicError::Io {
+        path: expert.gate.source.source.clone(),
+        source,
+    })?;
+    output
+        .seek(SeekFrom::Start(record_end))
+        .map_err(|source| ColicError::Io {
+            path: expert.gate.source.source.clone(),
+            source,
+        })?;
+    Ok(crc32c_combine(
+        crc32c(&header),
+        !data_state,
+        stored_bytes - DATA_OFFSET,
+    ))
+}
+
 /// Losslessly wraps one source tensor in the frozen COLITENS envelope.
 /// Static model roles stay independently addressable and retain canonical bytes.
 pub fn lower_exact_tensor(tensor: &source::TensorRef) -> Result<Vec<u8>> {
@@ -257,12 +379,15 @@ pub fn exact_tensor_stored_bytes(tensor: &source::TensorRef) -> Result<u64> {
 /// Writes an exact tensor envelope without materialising its payload. The
 /// source is read once for its CRC and once for emission; memory stays bounded
 /// by the 8 MiB transfer buffer.
-pub fn stream_exact_tensor(
+pub fn stream_exact_tensor<W: Write + Seek>(
     tensor: &source::TensorRef,
-    output: &mut dyn Write,
+    output: &mut W,
 ) -> Result<(u32, u32)> {
     exact_tensor_stored_bytes(tensor)?;
-    let logical_crc32c = tensor_crc32c(tensor)?;
+    let record_start = output.stream_position().map_err(|source| ColicError::Io {
+        path: tensor.source.clone(),
+        source,
+    })?;
     let mut header = [0_u8; TENSOR_HEADER_BYTES];
     header[0..8].copy_from_slice(b"COLITENS");
     put_u16(&mut header, 8, 1);
@@ -274,40 +399,42 @@ pub fn stream_exact_tensor(
     put_u64(&mut header, 96, TENSOR_HEADER_BYTES as u64);
     put_u64(&mut header, 104, tensor.len);
     put_u64(&mut header, 112, tensor.len);
-    put_u32(&mut header, 120, logical_crc32c);
+    // Source bytes have not flowed through the compiler yet. Reserve the
+    // checksum field and patch it after the one-pass copy.
     output.write_all(&header).map_err(|source| ColicError::Io {
         path: tensor.source.clone(),
         source,
     })?;
-    let mut stored_crc = crc32c_state(!0_u32, &header);
-    let mut offset = 0_u64;
-    let mut buffer = vec![0_u8; 8 * 1024 * 1024];
-    while offset < tensor.len {
-        let count = (tensor.len - offset).min(buffer.len() as u64) as usize;
-        source::read_range(tensor, offset..offset + count as u64, &mut buffer[..count])?;
-        output
-            .write_all(&buffer[..count])
-            .map_err(|source| ColicError::Io {
-                path: tensor.source.clone(),
-                source,
-            })?;
-        stored_crc = crc32c_state(stored_crc, &buffer[..count]);
-        offset += count as u64;
-    }
-    Ok((logical_crc32c, !stored_crc))
-}
-
-fn tensor_crc32c(tensor: &source::TensorRef) -> Result<u32> {
-    let mut crc = !0_u32;
-    let mut offset = 0_u64;
-    let mut buffer = vec![0_u8; 8 * 1024 * 1024];
-    while offset < tensor.len {
-        let count = (tensor.len - offset).min(buffer.len() as u64) as usize;
-        source::read_range(tensor, offset..offset + count as u64, &mut buffer[..count])?;
-        crc = crc32c_state(crc, &buffer[..count]);
-        offset += count as u64;
-    }
-    Ok(!crc)
+    let mut logical_state = !0_u32;
+    let mut payload_state = !0_u32;
+    copy_tensor_stream(tensor, output, &mut payload_state, Some(&mut logical_state))?;
+    let logical_crc32c = !logical_state;
+    put_u32(&mut header, 120, logical_crc32c);
+    output
+        .seek(SeekFrom::Start(record_start))
+        .map_err(|source| ColicError::Io {
+            path: tensor.source.clone(),
+            source,
+        })?;
+    output.write_all(&header).map_err(|source| ColicError::Io {
+        path: tensor.source.clone(),
+        source,
+    })?;
+    output
+        .seek(SeekFrom::Start(
+            record_start
+                .checked_add(TENSOR_HEADER_BYTES as u64)
+                .and_then(|offset| offset.checked_add(tensor.len))
+                .ok_or_else(|| ColicError::Usage("tensor output offset overflows u64".into()))?,
+        ))
+        .map_err(|source| ColicError::Io {
+            path: tensor.source.clone(),
+            source,
+        })?;
+    Ok((
+        logical_crc32c,
+        crc32c_combine(crc32c(&header), !payload_state, tensor.len),
+    ))
 }
 
 fn crc32c_state(mut crc: u32, bytes: &[u8]) -> u32 {
@@ -318,6 +445,123 @@ fn crc32c_state(mut crc: u32, bytes: &[u8]) -> u32 {
         }
     }
     crc
+}
+
+fn write_padding<W: Write>(
+    output: &mut W,
+    mut bytes: u64,
+    state: &mut u32,
+    path: &std::path::Path,
+) -> Result<()> {
+    const ZEROES: [u8; 16] = [0; 16];
+    while bytes != 0 {
+        let count = bytes.min(ZEROES.len() as u64) as usize;
+        output
+            .write_all(&ZEROES[..count])
+            .map_err(|source| ColicError::Io {
+                path: path.to_owned(),
+                source,
+            })?;
+        *state = crc32c_state(*state, &ZEROES[..count]);
+        bytes -= count as u64;
+    }
+    Ok(())
+}
+
+fn copy_tensor_stream<W: Write>(
+    tensor: &source::TensorRef,
+    output: &mut W,
+    output_state: &mut u32,
+    logical_state: Option<&mut u32>,
+) -> Result<()> {
+    let mut input = File::open(&tensor.source).map_err(|source| ColicError::Io {
+        path: tensor.source.clone(),
+        source,
+    })?;
+    input
+        .seek(SeekFrom::Start(tensor.offset))
+        .map_err(|source| ColicError::Io {
+            path: tensor.source.clone(),
+            source,
+        })?;
+    let mut remaining = tensor.len;
+    let mut buffer = vec![0_u8; 8 * 1024 * 1024];
+    let mut logical_state = logical_state;
+    while remaining != 0 {
+        let count = remaining.min(buffer.len() as u64) as usize;
+        input
+            .read_exact(&mut buffer[..count])
+            .map_err(|source| ColicError::Io {
+                path: tensor.source.clone(),
+                source,
+            })?;
+        output
+            .write_all(&buffer[..count])
+            .map_err(|source| ColicError::Io {
+                path: tensor.source.clone(),
+                source,
+            })?;
+        *output_state = crc32c_state(*output_state, &buffer[..count]);
+        if let Some(state) = logical_state.as_deref_mut() {
+            *state = crc32c_state(*state, &buffer[..count]);
+        }
+        remaining -= count as u64;
+    }
+    Ok(())
+}
+
+/// Combines finalized CRC32C values for `left || right` without rereading
+/// either byte stream. `right_len` is the exact length of the right stream.
+pub fn crc32c_combine(mut left: u32, right: u32, mut right_len: u64) -> u32 {
+    if right_len == 0 {
+        return left;
+    }
+    const POLY: u32 = 0x82f6_3b78;
+    let mut odd = [0_u32; 32];
+    odd[0] = POLY;
+    let mut row = 1_u32;
+    for item in odd.iter_mut().skip(1) {
+        *item = row;
+        row <<= 1;
+    }
+    let mut even = gf2_matrix_square(&odd);
+    odd = gf2_matrix_square(&even);
+    loop {
+        even = gf2_matrix_square(&odd);
+        if right_len & 1 != 0 {
+            left = gf2_matrix_times(&even, left);
+        }
+        right_len >>= 1;
+        if right_len == 0 {
+            break;
+        }
+        odd = gf2_matrix_square(&even);
+        if right_len & 1 != 0 {
+            left = gf2_matrix_times(&odd, left);
+        }
+        right_len >>= 1;
+        if right_len == 0 {
+            break;
+        }
+    }
+    left ^ right
+}
+
+fn gf2_matrix_times(matrix: &[u32; 32], mut vector: u32) -> u32 {
+    let mut sum = 0_u32;
+    let mut index = 0;
+    while vector != 0 {
+        if vector & 1 != 0 {
+            sum ^= matrix[index];
+        }
+        vector >>= 1;
+        index += 1;
+    }
+    sum
+}
+
+fn gf2_matrix_square(matrix: &[u32; 32]) -> [u32; 32] {
+    std::array::from_fn(|index| gf2_matrix_times(matrix, matrix[index]))
 }
 
 fn append_aligned(output: &mut Vec<u8>, bytes: &[u8]) -> Result<u64> {
@@ -390,6 +634,18 @@ fn put_i32(buffer: &mut [u8], offset: usize, value: i32) {
 mod tests {
     use super::*;
     use crate::{ir::Matrix, source::TensorRef};
+
+    #[test]
+    fn crc32c_combine_matches_a_contiguous_stream() {
+        let left = b"a record header";
+        let right = b" and its payload";
+        let mut joined = left.to_vec();
+        joined.extend_from_slice(right);
+        assert_eq!(
+            crc32c_combine(crc32c(left), crc32c(right), right.len() as u64),
+            crc32c(&joined)
+        );
+    }
 
     #[test]
     fn native_apple_is_versioned_metal_profile() {
@@ -484,6 +740,10 @@ mod tests {
             down: matrix(8, "F8_E4M3FN"),
         };
         let bytes = lower_exact_expert(&expert).unwrap();
+        let mut streamed = std::io::Cursor::new(Vec::new());
+        let streamed_crc = stream_exact_expert(&expert, &mut streamed).unwrap();
+        assert_eq!(streamed.into_inner(), bytes);
+        assert_eq!(streamed_crc, crc32c(&bytes));
         assert_eq!(
             exact_expert_stored_bytes(&expert).unwrap() as usize,
             bytes.len()
@@ -551,6 +811,11 @@ mod tests {
             shape: vec![1, 2],
         };
         let bytes = lower_exact_tensor(&tensor).unwrap();
+        let mut streamed = std::io::Cursor::new(Vec::new());
+        let (logical_crc, stored_crc) = stream_exact_tensor(&tensor, &mut streamed).unwrap();
+        assert_eq!(streamed.into_inner(), bytes);
+        assert_eq!(logical_crc, crc32c(&bytes[128..]));
+        assert_eq!(stored_crc, crc32c(&bytes));
         assert_eq!(
             exact_tensor_stored_bytes(&tensor).unwrap() as usize,
             bytes.len()

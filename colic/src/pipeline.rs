@@ -450,9 +450,11 @@ fn stream_payload(
             })
         }
         ExactSource::Expert(expert) => {
-            let bytes = target::lower_exact_expert(expert)?;
-            let crc = storage::crc32c(&bytes);
-            writer.write_record(planned, &bytes)?;
+            let mut crc = 0;
+            writer.write_record_stream(planned, |file| {
+                crc = target::stream_exact_expert(expert, file)?;
+                Ok(planned.record.stored_bytes)
+            })?;
             Ok(ManifestRecord {
                 id: planned.record.id,
                 name: Some(format!(
