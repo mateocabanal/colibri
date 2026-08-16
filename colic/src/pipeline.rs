@@ -421,6 +421,7 @@ fn stream_payload(
     writer: &mut storage::DataShardWriter,
     planned: &storage::PlannedRecord,
     source: &ExactSource,
+    profile: target::TargetProfile,
 ) -> Result<ManifestRecord> {
     match source {
         ExactSource::Tensor {
@@ -430,7 +431,7 @@ fn stream_payload(
         } => {
             let mut checksums = (0, 0);
             writer.write_record_stream(planned, |file| {
-                checksums = target::stream_exact_tensor(tensor, file)?;
+                checksums = target::stream_target_tensor(tensor, file)?;
                 Ok(planned.record.stored_bytes)
             })?;
             Ok(ManifestRecord {
@@ -442,7 +443,7 @@ fn stream_payload(
                 codec: 0,
                 math_format: target::math_format_for_dtype(&tensor.dtype)?,
                 scale_format: 0,
-                layout: 0,
+                layout: target::identity::for_profile(profile)?.linear_layout,
                 flags: 0b10,
                 stored_crc32c: checksums.1,
                 logical_crc32c: checksums.0,
@@ -452,7 +453,7 @@ fn stream_payload(
         ExactSource::Expert(expert) => {
             let mut crc = 0;
             writer.write_record_stream(planned, |file| {
-                crc = target::stream_exact_expert(expert, file)?;
+                crc = target::stream_target_expert(profile, expert, file)?;
                 Ok(planned.record.stored_bytes)
             })?;
             Ok(ManifestRecord {
@@ -513,7 +514,7 @@ pub fn compile(request: &CompileRequest, progress: &mut dyn ProgressSink) -> Res
         let mut completed_bytes = 0_u64;
         for shard_id in 0..plan.shards {
             let path = temporary.join(format!("data-{shard_id:05}.coli"));
-            let mut writer = storage::DataShardWriter::create(
+            let mut writer = storage::DataShardWriter::create_v11(
                 &path,
                 shard_id,
                 plan.record_alignment,
@@ -526,7 +527,7 @@ pub fn compile(request: &CompileRequest, progress: &mut dyn ProgressSink) -> Res
                 .filter(|(_, record)| record.shard_id == shard_id)
             {
                 let source = &sources[index];
-                let manifest = stream_payload(&mut writer, planned, source)?;
+                let manifest = stream_payload(&mut writer, planned, source, target)?;
                 completed_bytes += planned.record.stored_bytes;
                 metadata.push(manifest);
                 progress.emission(
@@ -550,12 +551,13 @@ pub fn compile(request: &CompileRequest, progress: &mut dyn ProgressSink) -> Res
                 })?;
             header_crcs.push(u32::from_le_bytes(header[72..76].try_into().unwrap()));
         }
-        let manifest = storage::encode_manifest_with_records(
+        let manifest = storage::v11::encode_manifest(
             &plan,
-            target.name,
+            target,
             fingerprint,
             &metadata,
             &header_crcs,
+            storage::v11::ArtifactOptions::default(),
         )?;
         let manifest_path = temporary.join("manifest.coli");
         fs::write(&manifest_path, manifest).map_err(|source| ColicError::Io {
@@ -644,16 +646,16 @@ mod tests {
             specs.insert(name, (dtype, shape));
         };
         for expert in 0..2 {
-            for (role, shape) in [("w1", vec![3, 2]), ("w2", vec![2, 3]), ("w3", vec![3, 2])] {
+            for (role, rows, columns) in [("w1", 3_u64, 2_u64), ("w2", 2, 3), ("w3", 3, 2)] {
                 add(
                     format!("layers.0.ffn.experts.{expert}.{role}.weight"),
-                    "F8_E4M3FN",
-                    shape,
+                    "I8",
+                    vec![rows, columns.div_ceil(2)],
                 );
                 add(
                     format!("layers.0.ffn.experts.{expert}.{role}.scale"),
                     "F8_E8M0",
-                    vec![1, 1],
+                    vec![rows, columns.div_ceil(32)],
                 );
             }
         }
@@ -725,7 +727,7 @@ mod tests {
         let mut payload = Vec::new();
         for (name, (dtype, shape)) in specs {
             let size = match dtype {
-                "U8" | "F8_E4M3FN" | "F8_E8M0" => 1,
+                "U8" | "I8" | "F8_E4M3FN" | "F8_E8M0" => 1,
                 "BF16" => 2,
                 "F32" => 4,
                 "I64" => 8,

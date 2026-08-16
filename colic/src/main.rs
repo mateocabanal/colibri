@@ -132,6 +132,14 @@ fn run() -> colic::Result<()> {
                     model.layer_static_tensors.len()
                 );
                 println!("semantic_resident_tensors={}", model.resident_tensors.len());
+                println!(
+                    "semantic_unclassified_tensors={}",
+                    model.resident_tensors.len()
+                );
+                println!(
+                    "semantic_assets={}",
+                    model.assets.tokenizer.len() + model.assets.config.is_some() as usize
+                );
             }
             Ok(())
         }

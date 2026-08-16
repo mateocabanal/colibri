@@ -1,5 +1,7 @@
 //! Versioned target compatibility profiles and lowering boundary.
 
+pub mod identity;
+
 use std::{
     fs::File,
     io::{Read, Seek, SeekFrom, Write},
@@ -7,7 +9,7 @@ use std::{
 
 use crate::{
     error::{ColicError, Result},
-    ir::RoutedExpert,
+    ir::{MathFormat, RoutedExpert, ScaleFormat},
     pipeline::TargetRequest,
     source,
     storage::{align_up, crc32c},
@@ -48,7 +50,7 @@ pub const MACOS_ARM64_METAL_APPLE8_V1: TargetProfile = TargetProfile {
 
 pub const LINUX_X86_64_AVX2_V1: TargetProfile = TargetProfile {
     id: 2,
-    name: "linux-x86_64-avx2-v1",
+    name: "linux-x86_64-cpu-avx2-v1",
     operating_system: "linux",
     architecture: "x86_64",
     backend: Backend::Cpu,
@@ -148,7 +150,10 @@ pub fn lower_exact_expert(expert: &RoutedExpert) -> Result<Vec<u8>> {
     for (index, (matrix, role)) in matrices.into_iter().enumerate() {
         let weight = read_tensor(&matrix.source)?;
         let (scale, scale_format) = match &matrix.scale {
-            Some(scale) => (read_tensor(scale)?, scale_format(&scale.dtype)?),
+            Some(scale) => (
+                read_tensor(scale)?,
+                scale_format_for_semantics(matrix.quantization.scale_format),
+            ),
             None => (Vec::new(), 0),
         };
         let weight_offset = append_aligned(&mut payload, &weight)?;
@@ -162,15 +167,21 @@ pub fn lower_exact_expert(expert: &RoutedExpert) -> Result<Vec<u8>> {
         put_u16(
             &mut payload,
             desc + 4,
-            expert_math_format(&matrix.source.dtype)?,
+            math_format_for_semantics(matrix.quantization.math_format),
         );
         put_u16(&mut payload, desc + 6, scale_format);
         put_u64(&mut payload, desc + 16, matrix.rows as u64);
         put_u64(&mut payload, desc + 24, matrix.columns as u64);
-        if matrix.source.dtype == "I8" {
-            put_u32(&mut payload, desc + 32, 1);
-            put_u32(&mut payload, desc + 36, 32);
-        }
+        put_u32(
+            &mut payload,
+            desc + 32,
+            matrix.quantization.scale_block_rows,
+        );
+        put_u32(
+            &mut payload,
+            desc + 36,
+            matrix.quantization.scale_block_columns,
+        );
         put_u64(&mut payload, desc + 48, weight_offset);
         put_u64(&mut payload, desc + 56, weight.len() as u64);
         put_u64(&mut payload, desc + 64, weight.len() as u64);
@@ -219,6 +230,23 @@ pub fn exact_expert_decoded_bytes(expert: &RoutedExpert) -> Result<u64> {
 /// intentionally still source-order preserving, but no longer requires a
 /// compound gate/up/down record-sized allocation just to populate checksums.
 pub fn stream_exact_expert<W: Write + Seek>(expert: &RoutedExpert, output: &mut W) -> Result<u32> {
+    stream_expert_with_layout(expert, None, output)
+}
+
+pub fn stream_target_expert<W: Write + Seek>(
+    profile: TargetProfile,
+    expert: &RoutedExpert,
+    output: &mut W,
+) -> Result<u32> {
+    let layout = identity::expert_layout(profile, expert)?;
+    stream_expert_with_layout(expert, Some(layout), output)
+}
+
+fn stream_expert_with_layout<W: Write + Seek>(
+    expert: &RoutedExpert,
+    layout: Option<u16>,
+    output: &mut W,
+) -> Result<u32> {
     const HEADER_BYTES: u64 = 64;
     const DESC_BYTES: u64 = 128;
     const DATA_OFFSET: u64 = HEADER_BYTES + DESC_BYTES * 3;
@@ -233,6 +261,7 @@ pub fn stream_exact_expert<W: Write + Seek>(expert: &RoutedExpert, output: &mut 
     let mut header = [0_u8; DATA_OFFSET as usize];
     header[..8].copy_from_slice(b"COLIEXPT");
     put_u16(&mut header, 8, 1);
+    put_u16(&mut header, 10, u16::from(layout.is_some()));
     put_u32(&mut header, 12, HEADER_BYTES as u32);
     put_i32(&mut header, 16, expert.layer as i32);
     put_i32(&mut header, 20, expert.expert as i32);
@@ -281,7 +310,11 @@ pub fn stream_exact_expert<W: Write + Seek>(expert: &RoutedExpert, output: &mut 
             cursor = cursor
                 .checked_add(scale.len)
                 .ok_or_else(|| ColicError::Usage("expert scale size overflows u64".into()))?;
-            (offset, scale.len, scale_format(&scale.dtype)?)
+            (
+                offset,
+                scale.len,
+                scale_format_for_semantics(matrix.quantization.scale_format),
+            )
         } else {
             (0, 0, 0)
         };
@@ -289,15 +322,18 @@ pub fn stream_exact_expert<W: Write + Seek>(expert: &RoutedExpert, output: &mut 
         put_u16(
             &mut header,
             desc + 4,
-            expert_math_format(&matrix.source.dtype)?,
+            math_format_for_semantics(matrix.quantization.math_format),
         );
         put_u16(&mut header, desc + 6, scale_id);
+        put_u16(&mut header, desc + 12, layout.unwrap_or(0));
         put_u64(&mut header, desc + 16, matrix.rows as u64);
         put_u64(&mut header, desc + 24, matrix.columns as u64);
-        if matrix.source.dtype == "I8" {
-            put_u32(&mut header, desc + 32, 1);
-            put_u32(&mut header, desc + 36, 32);
-        }
+        put_u32(&mut header, desc + 32, matrix.quantization.scale_block_rows);
+        put_u32(
+            &mut header,
+            desc + 36,
+            matrix.quantization.scale_block_columns,
+        );
         put_u64(&mut header, desc + 48, weight_offset);
         put_u64(&mut header, desc + 56, matrix.source.len);
         put_u64(&mut header, desc + 64, matrix.source.len);
@@ -383,6 +419,21 @@ pub fn stream_exact_tensor<W: Write + Seek>(
     tensor: &source::TensorRef,
     output: &mut W,
 ) -> Result<(u32, u32)> {
+    stream_tensor_version(tensor, 0, output)
+}
+
+pub fn stream_target_tensor<W: Write + Seek>(
+    tensor: &source::TensorRef,
+    output: &mut W,
+) -> Result<(u32, u32)> {
+    stream_tensor_version(tensor, 1, output)
+}
+
+fn stream_tensor_version<W: Write + Seek>(
+    tensor: &source::TensorRef,
+    minor: u16,
+    output: &mut W,
+) -> Result<(u32, u32)> {
     exact_tensor_stored_bytes(tensor)?;
     let record_start = output.stream_position().map_err(|source| ColicError::Io {
         path: tensor.source.clone(),
@@ -391,6 +442,7 @@ pub fn stream_exact_tensor<W: Write + Seek>(
     let mut header = [0_u8; TENSOR_HEADER_BYTES];
     header[0..8].copy_from_slice(b"COLITENS");
     put_u16(&mut header, 8, 1);
+    put_u16(&mut header, 10, minor);
     put_u32(&mut header, 12, TENSOR_HEADER_BYTES as u32);
     put_u16(&mut header, 16, tensor.shape.len() as u16);
     for (index, dimension) in tensor.shape.iter().enumerate() {
@@ -599,22 +651,15 @@ pub fn math_format_for_dtype(dtype: &str) -> Result<u16> {
         )),
     }
 }
-fn expert_math_format(dtype: &str) -> Result<u16> {
-    match dtype {
-        "I8" => Ok(0x20),
-        other => math_format_for_dtype(other),
+fn math_format_for_semantics(format: MathFormat) -> u16 {
+    match format {
+        MathFormat::Fp8E4M3 => 0x10,
+        MathFormat::MxFp4E2M1 => 0x20,
     }
 }
-fn scale_format(dtype: &str) -> Result<u16> {
-    match dtype {
-        "F32" => Ok(1),
-        "F16" => Ok(2),
-        "BF16" => Ok(3),
-        "U8" | "F8_E8M0" | "F8_E8M0FNU" => Ok(4),
-        _ => Err(ColicError::unsupported(
-            "exact expert lowering",
-            format!("unsupported scale dtype `{dtype}`"),
-        )),
+fn scale_format_for_semantics(format: ScaleFormat) -> u16 {
+    match format {
+        ScaleFormat::Ue8m0 => 4,
     }
 }
 fn put_u16(buffer: &mut [u8], offset: usize, value: u16) {

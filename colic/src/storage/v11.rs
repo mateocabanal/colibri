@@ -4,7 +4,9 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     error::{ColicError, Result},
-    storage::{align_up, crc32c, ManifestRecord, StoragePlan, MANIFEST_HEADER_BYTES, MANIFEST_MAGIC},
+    storage::{
+        MANIFEST_HEADER_BYTES, MANIFEST_MAGIC, ManifestRecord, StoragePlan, align_up, crc32c,
+    },
     target::{self, TargetProfile},
 };
 
@@ -102,7 +104,9 @@ pub fn encode_manifest(
     let mut ids = BTreeMap::<String, u32>::new();
     let mut intern = |value: &str| -> Result<u32> {
         if value.as_bytes().contains(&0) {
-            return Err(ColicError::Usage("manifest strings cannot contain NUL".into()));
+            return Err(ColicError::Usage(
+                "manifest strings cannot contain NUL".into(),
+            ));
         }
         if let Some(id) = ids.get(value) {
             return Ok(*id);
@@ -147,13 +151,19 @@ pub fn encode_manifest(
             .checked_add(value.len() as u64)
             .ok_or_else(|| ColicError::Usage("manifest string bytes overflow u64".into()))
     })?;
-    let string_table_bytes = align_up(strings.len() as u64 * STRING_DESC_BYTES + string_raw_bytes, 16)?;
+    let string_table_bytes = align_up(
+        strings.len() as u64 * STRING_DESC_BYTES + string_raw_bytes,
+        16,
+    )?;
     let manifest_bytes = string_table_offset
         .checked_add(string_table_bytes)
         .ok_or_else(|| ColicError::Usage("manifest size overflows u64".into()))?;
-    let mut manifest = vec![0_u8; manifest_bytes.try_into().map_err(|_| {
-        ColicError::Usage("manifest exceeds current address space".into())
-    })?];
+    let mut manifest = vec![
+        0_u8;
+        manifest_bytes.try_into().map_err(|_| {
+            ColicError::Usage("manifest exceeds current address space".into())
+        })?
+    ];
 
     manifest[..8].copy_from_slice(MANIFEST_MAGIC);
     put_u16(&mut manifest, 8, 1);
@@ -225,9 +235,16 @@ pub fn encode_manifest(
             .filter(|record| record.shard_id == shard_id)
             .map(|record| record.payload_offset + record.record.stored_bytes)
             .max()
-            .unwrap_or(align_up(crate::storage::DATA_SHARD_HEADER_BYTES, plan.record_alignment)?);
+            .unwrap_or(align_up(
+                crate::storage::DATA_SHARD_HEADER_BYTES,
+                plan.record_alignment,
+            )?);
         put_u64(&mut manifest, offset + 16, file_bytes);
-        put_u32(&mut manifest, offset + 24, shard_header_crcs[shard_id as usize]);
+        put_u32(
+            &mut manifest,
+            offset + 24,
+            shard_header_crcs[shard_id as usize],
+        );
     }
 
     for (index, (planned, record)) in plan.records.iter().zip(records).enumerate() {
@@ -245,7 +262,11 @@ pub fn encode_manifest(
         put_u16(&mut manifest, offset + 16, record.layout);
         put_u16(&mut manifest, offset + 18, record.flags);
         put_u32(&mut manifest, offset + 20, planned.shard_id);
-        put_u32(&mut manifest, offset + 24, record_name_ids[index].unwrap_or(u32::MAX));
+        put_u32(
+            &mut manifest,
+            offset + 24,
+            record_name_ids[index].unwrap_or(u32::MAX),
+        );
         put_i32(&mut manifest, offset + 28, record.layer);
         put_i32(&mut manifest, offset + 32, record.expert);
         put_u64(&mut manifest, offset + 40, planned.payload_offset);

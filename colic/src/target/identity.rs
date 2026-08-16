@@ -1,4 +1,8 @@
-use crate::{error::{ColicError, Result}, ir::{MathFormat, RoutedExpert}, target::TargetProfile};
+use crate::{
+    error::{ColicError, Result},
+    ir::{MathFormat, RoutedExpert},
+    target::TargetProfile,
+};
 
 pub const SEMANTIC_ABI: &str = "deepseek-v4-exec-v1";
 pub const TARGET_PROFILE_ABI: u32 = 1;

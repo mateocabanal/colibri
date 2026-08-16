@@ -47,15 +47,32 @@ pub fn verify_package_with_progress(
     if manifest.len() < MANIFEST_HEADER_BYTES || &manifest[..8] != MANIFEST_MAGIC {
         return invalid("manifest magic/header is invalid");
     }
+    let minor = u16_at(&manifest, 10)?;
     if u16_at(&manifest, 8)? != 1
-        || u16_at(&manifest, 10)? != 0
+        || !matches!(minor, 0 | 1)
         || u32_at(&manifest, 12)? != MANIFEST_HEADER_BYTES as u32
     {
-        return invalid("manifest header size is invalid");
+        return invalid("manifest header version/size is invalid");
     }
     let manifest_flags = u32_at(&manifest, 16)?;
-    if manifest_flags & 0xffff_0000 != 0 {
+    if minor == 0 && manifest_flags & 0xffff_0000 != 0 {
         return invalid("manifest contains unknown required feature flags");
+    }
+    if minor == 1 {
+        let required = (1 << 0) | (1 << 1) | (1 << 16);
+        if manifest_flags & required != required || manifest_flags & !required != 0 {
+            return invalid("v1.1 manifest target/fingerprint flags are invalid");
+        }
+        let target = variable_region(&manifest, 184, 192, "target descriptor")?;
+        if target.len() != 256 || &manifest[target.start..target.start + 8] != b"COLITGT\0" {
+            return invalid("v1.1 target descriptor is invalid");
+        }
+        if storage::crc32c(&manifest[target.clone()]) != u32_at(&manifest, 232)? {
+            return invalid("v1.1 target descriptor CRC32C does not match");
+        }
+        if !manifest[200..232].iter().any(|byte| *byte != 0) {
+            return invalid("v1.1 artifact fingerprint is zero");
+        }
     }
     let expected_crc = u32_at(&manifest, 144)?;
     let mut crc_bytes = manifest.clone();
@@ -126,7 +143,7 @@ pub fn verify_package_with_progress(
             .map_err(|source| ColicError::Io { path, source })?;
         if &header[..8] != DATA_MAGIC
             || u16_at(&header, 8)? != 1
-            || u16_at(&header, 10)? != 0
+            || u16_at(&header, 10)? != minor
             || u32_at(&header, 12)? != DATA_SHARD_HEADER_BYTES as u32
             || u32_at(&header, 20)? != shard_id
             || u32_at(&header, 24)? as u64 != alignment
@@ -157,7 +174,7 @@ pub fn verify_package_with_progress(
         let expert = i32_at(&manifest, desc + 32)?;
         let offset = u64_at(&manifest, desc + 40)?;
         let stored = u64_at(&manifest, desc + 48)?;
-        let decoded = u64_at(&manifest, desc + 56)?;
+        let resident = u64_at(&manifest, desc + 56)?;
         let stored_crc = u32_at(&manifest, desc + 64)?;
         let logical_crc = u32_at(&manifest, desc + 68)?;
         let name_string_id = u32_at(&manifest, desc + 24)?;
@@ -182,7 +199,7 @@ pub fn verify_package_with_progress(
                 &shard_paths[shard_id],
                 offset,
                 stored,
-                decoded,
+                resident,
                 codec,
                 flags,
                 logical_crc,
@@ -191,7 +208,7 @@ pub fn verify_package_with_progress(
                 &shard_paths[shard_id],
                 offset,
                 stored,
-                decoded,
+                resident,
                 layer,
                 expert,
                 codec,
