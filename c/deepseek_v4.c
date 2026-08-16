@@ -9761,15 +9761,11 @@ static void profile_emit_scope(FILE *out, const char *scope,
         COLI_V4_PROF_EXPERT_COMPUTE, COLI_V4_PROF_SHARED_EXPERT,
         COLI_V4_PROF_HC_POST_FFN, COLI_V4_PROF_HEAD_READ,
         COLI_V4_PROF_HEAD_COMPUTE,
-        /* metal wait is host-blocked; encode/submit are host-side too */
-        COLI_V4_PROF_METAL_ENCODE, COLI_V4_PROF_METAL_SUBMIT,
-        COLI_V4_PROF_METAL_WAIT,
+        /* Metal encode/submit/wait already happens INSIDE the
+         * expert_compute / attn_proj spans (synchronous per-GEMV), so adding
+         * them again would double-count; they stay reported as diagnostics. */
     };
     uint64_t accounted = 0;
-    uint64_t subnet_buckets[] = {COLI_V4_PROF_ATTN_PROJ,
-                                 COLI_V4_PROF_COMPRESSOR,
-                                 COLI_V4_PROF_INDEXER,
-                                 COLI_V4_PROF_SPARSE_ATTN};
     size_t owner_count = sizeof(owner_buckets) / sizeof(owner_buckets[0]);
     char detail[4096], field[128];
     detail[0] = 0;
@@ -9814,16 +9810,11 @@ static void profile_emit_scope(FILE *out, const char *scope,
         uint64_t ns = end->ns[kind] - start->ns[kind];
         accounted += ns;
     }
-    /* The four attn sub-buckets are part of the owner timeline chosen above,
-     * and attn_proj was measured as the whole attention span minus the
-     * sub-buckets, so no double counting here. */
-    (void)subnet_buckets;
     uint64_t io_wait =
         (end->ns[COLI_V4_PROF_EXPERT_LOADER_WAIT] -
          start->ns[COLI_V4_PROF_EXPERT_LOADER_WAIT]) +
         (end->ns[COLI_V4_PROF_HEAD_READ] - start->ns[COLI_V4_PROF_HEAD_READ]) +
-        (end->ns[COLI_V4_PROF_DENSE_READ] - start->ns[COLI_V4_PROF_DENSE_READ]) +
-        (end->ns[COLI_V4_PROF_METAL_WAIT] - start->ns[COLI_V4_PROF_METAL_WAIT]);
+        (end->ns[COLI_V4_PROF_DENSE_READ] - start->ns[COLI_V4_PROF_DENSE_READ]);
     uint64_t unaccounted = wall > accounted ? wall - accounted : 0;
     uint64_t cpu_compute = accounted > io_wait ? accounted - io_wait : 0;
     fprintf(out,
