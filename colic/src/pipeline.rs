@@ -570,6 +570,10 @@ pub fn compile(request: &CompileRequest, progress: &mut dyn ProgressSink) -> Res
         let _ = fs::remove_dir_all(&temporary);
         return Err(error);
     }
+    if let Err(error) = verify::verify_package_structure(&temporary) {
+        let _ = fs::remove_dir_all(&temporary);
+        return Err(error);
+    }
     if request.verify {
         progress.stage(Stage::Verification);
         if let Err(error) = verify::verify_package(&temporary) {
