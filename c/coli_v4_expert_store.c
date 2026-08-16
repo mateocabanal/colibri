@@ -1,5 +1,8 @@
 #include "coli_v4_expert_store.h"
 #include "coli_executor.h"
+#ifdef COLI_METAL
+#include "backend_metal.h"
+#endif
 
 #include <pthread.h>
 #include <stdarg.h>
@@ -48,7 +51,11 @@ static int lookup(ColiExpertStore *store, ColiExpertKey key, ColiExpertView *vie
     for(int i=0;i<s->slots_per_layer;i++) if(!slots[i].loading&&slots[i].data&&slots[i].expert==key.expert){slot=&slots[i];s->stats.hits++;break;}
     if(!slot) { for(int i=0;i<s->slots_per_layer;i++) if(!slots[i].refs&&!slots[i].loading&&(!slot||!slots[i].data)) slot=&slots[i];
         if(!slot) { pthread_mutex_unlock(&s->mutex); memset(view,0,sizeof(*view)); return -1; }
-        if(!slot->data) { if(posix_memalign((void**)&slot->data,4096,(size_t)s->record_bytes)){pthread_mutex_unlock(&s->mutex);memset(view,0,sizeof(*view));return -1;} s->stats.resident_bytes+=s->record_bytes; }
+        if(!slot->data) { if(posix_memalign((void**)&slot->data,4096,(size_t)s->record_bytes)){pthread_mutex_unlock(&s->mutex);memset(view,0,sizeof(*view));return -1;}
+#ifdef COLI_METAL
+            if(coli_metal_init())coli_metal_register(slot->data,(size_t)s->record_bytes);
+#endif
+            s->stats.resident_bytes+=s->record_bytes; }
         slot->expert=-1; slot->loading=1; pthread_mutex_unlock(&s->mutex);
         char error[256]; int bad=coli_executor_load_expert(s->executor,key.layer,key.expert,slot->data,(size_t)s->record_bytes,error,sizeof(error));
         pthread_mutex_lock(&s->mutex); slot->loading=0; if(bad){fprintf(stderr,"v4_coli expert-load failed layer=%d expert=%d: %s\n",key.layer,key.expert,error);pthread_mutex_unlock(&s->mutex);memset(view,0,sizeof(*view));return -1;} slot->expert=key.expert;s->stats.misses++;s->stats.bytes_read+=s->record_bytes;
@@ -58,7 +65,12 @@ static int lookup(ColiExpertStore *store, ColiExpertKey key, ColiExpertView *vie
 static void release(ColiExpertStore *store, ColiExpertView *v) { State*s=store?store->state:NULL; Slot*slot=v?v->lease:NULL;if(!s||!slot)return;pthread_mutex_lock(&s->mutex);if(slot->refs)slot->refs--;if(s->active_leases)s->active_leases--;pthread_mutex_unlock(&s->mutex); }
 static int prefetch(ColiExpertStore *store,const ColiExpertKey*k,size_t n){(void)store;(void)k;(void)n;return 0;}
 static void stats(const ColiExpertStore *store,ColiExpertStoreStats*out){State*s=store?store->state:NULL;if(!s||!out)return;pthread_mutex_lock(&s->mutex);*out=s->stats;pthread_mutex_unlock(&s->mutex);}
-static void destroy(ColiExpertStore *store){State*s=store?store->state:NULL;if(s){for(int i=0;i<s->layers*s->slots_per_layer;i++)free(s->slots[i].data);pthread_mutex_destroy(&s->mutex);coli_executor_close(s->executor);free(s->slots);free(s->records);free(s);}free(store);}
+static void destroy(ColiExpertStore *store){State*s=store?store->state:NULL;if(s){for(int i=0;i<s->layers*s->slots_per_layer;i++){
+#ifdef COLI_METAL
+    if(s->slots[i].data)coli_metal_unregister(s->slots[i].data);
+#endif
+    free(s->slots[i].data);
+}pthread_mutex_destroy(&s->mutex);coli_executor_close(s->executor);free(s->slots);free(s->records);free(s);}free(store);}
 int coli_v4_coli_expert_store_open(const ColiV4ColiExpertStoreOptions*o,ColiExpertStore**out,char*e,size_t n) {
     static const ColiExpertStoreOps ops={lookup,release,prefetch,stats,destroy}; ColiExpertStore*store=NULL;State*s=NULL;ColiExecutorOpenOptions xo={0};
     if(out)*out=NULL; if(!o||!out||!o->package_dir||!o->required_profile||o->layers<1||o->experts_per_layer<1||!o->cache_bytes)return fail(e,n,"invalid COLI V4 expert-store options");
