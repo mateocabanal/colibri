@@ -1,0 +1,26 @@
+name: CSF reader
+
+on:
+  pull_request:
+    paths:
+      - 'c/coli_format.c'
+      - 'c/coli_format.h'
+      - 'c/Makefile.csf'
+      - 'c/tests/test_coli_format.c'
+      - 'c/tests/fixtures/csf-v1-tiny/**'
+      - '.github/workflows/csf-reader.yml'
+  workflow_dispatch:
+
+jobs:
+  csf-reader:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and test
+        run: make -C c -f Makefile.csf test
+      - name: ASan + UBSan
+        run: make -C c -f Makefile.csf test-asan
