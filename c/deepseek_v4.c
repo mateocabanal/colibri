@@ -7265,6 +7265,8 @@ int coli_v4_engine_open(ColiV4Engine **output,
     }
     engine->runtime.target_model_dir = engine->owned_target_model_dir;
     engine->runtime.coli_model_dir = options->coli_model_dir;
+    if (options->coli_model_dir) fprintf(stderr, "v4_coli mode=hybrid static=COLI experts=COLI source_fallback=safetensors-dense-ancillary path=%s\n", options->coli_model_dir);
+    else fprintf(stderr, "v4_coli mode=legacy source=safetensors reason=COLI_MODEL-unset\n");
     engine->runtime.memory_limit_bytes = options->memory_limit_bytes;
     engine->runtime.context_tokens =
         options->context_tokens > 0 ? options->context_tokens : 4096;
@@ -9307,6 +9309,7 @@ static int v4_serve_main(void) {
     ColiV4Session *session = NULL;
     ColiV4EngineOpenOptions open_options = {
         .target_model_dir = model_dir,
+        .coli_model_dir = getenv("COLI_MODEL"),
         .context_tokens = context,
         .pin_slots_per_layer = -1,
         .no_dspark = 0,
@@ -9428,6 +9431,7 @@ int main(int argc, char **argv) {
     {
         ColiV4EngineOpenOptions open_opts = {
             .target_model_dir = cli.model_dir,
+            .coli_model_dir = getenv("COLI_MODEL"),
             .no_dspark = cli.no_dspark,
             .pin_slots_per_layer = -1,
             /* Same contract as v4_serve_main: CTX sets the session plan;
