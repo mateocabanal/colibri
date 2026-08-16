@@ -2,9 +2,12 @@ name: colic end-to-end
 
 on:
   push:
-    branches: [codex/compiler-contracts-p0]
+    branches:
+      - codex/compiler-contracts-p0
   pull_request:
-    branches: [main, dev]
+    branches:
+      - main
+      - dev
   workflow_dispatch:
 
 permissions:
@@ -16,45 +19,6 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.13'
-      - name: Generate deterministic DeepSeek V4 MXFP4 source fixture
-        run: python colic/tests/fixtures/make_v4_tiny.py --output "$RUNNER_TEMP/v4-source"
-      - name: Compile the fixture twice through real colic
+      - name: Run source-to-kernel compiled-path gate
         shell: bash
-        run: |
-          cargo run --locked --manifest-path colic/Cargo.toml -- compile \
-            "$RUNNER_TEMP/v4-source" \
-            --target macos-arm64-metal-apple8-v1 \
-            --quant exact --codec none --verify \
-            -o "$RUNNER_TEMP/model-a.coli"
-          cargo run --locked --manifest-path colic/Cargo.toml -- compile \
-            "$RUNNER_TEMP/v4-source" \
-            --target macos-arm64-metal-apple8-v1 \
-            --quant exact --codec none --verify \
-            -o "$RUNNER_TEMP/model-b.coli"
-      - name: Prove deterministic target bytes
-        shell: bash
-        run: |
-          cmp "$RUNNER_TEMP/model-a.coli/manifest.coli" "$RUNNER_TEMP/model-b.coli/manifest.coli"
-          cmp "$RUNNER_TEMP/model-a.coli/data-00000.coli" "$RUNNER_TEMP/model-b.coli/data-00000.coli"
-      - name: Build independent strict C reader + real MXFP4 kernel checker
-        shell: bash
-        run: >-
-          cc -O2 -Wall -Wextra -I c
-          c/tests/test_colic_e2e.c
-          c/tests/mxfp4_ref.c
-          c/coli_exec_format.c
-          c/coli_target.c
-          c/coli_target_profiles.c
-          -lm -pthread
-          -o "$RUNNER_TEMP/test_colic_e2e"
-      - name: Remove source and execute compiler-emitted expert
-        shell: bash
-        run: |
-          rm -rf "$RUNNER_TEMP/v4-source"
-          test ! -e "$RUNNER_TEMP/v4-source"
-          "$RUNNER_TEMP/test_colic_e2e" "$RUNNER_TEMP/model-a.coli"
-      - name: Corrupt one compiled expert and prove fail-closed verification
-        run: "$RUNNER_TEMP/test_colic_e2e" --corrupt-and-expect-fail "$RUNNER_TEMP/model-b.coli"
+        run: bash tools/colic_e2e.sh
