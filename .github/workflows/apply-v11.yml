@@ -1,0 +1,50 @@
+name: apply Rust CSF v1.1 integration
+
+on:
+  push:
+    branches: [codex/compiler-contracts-p0]
+    paths:
+      - '.github/workflows/apply-v11.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/compiler-contracts-p0
+          fetch-depth: 0
+      - name: Apply v1.1 compiler patch
+        run: python3 tools/apply_v11_patch2.py
+      - name: Format and test Rust compiler
+        shell: bash
+        run: |
+          cargo fmt --manifest-path colic/Cargo.toml
+          cargo test --locked --manifest-path colic/Cargo.toml --all-targets
+          cargo fmt --manifest-path colic/Cargo.toml -- --check
+      - name: Test strict C target contracts
+        shell: bash
+        run: |
+          make -C c -f Makefile.csf test
+          python c/tests/fixtures/csf-v1-targets/make_fixtures.py --output "$RUNNER_TEMP/csf-v1-targets"
+          make -C c -f Makefile.csf test-target \
+            APPLE_FIXTURE="$RUNNER_TEMP/csf-v1-targets/apple" \
+            CUDA_FIXTURE="$RUNNER_TEMP/csf-v1-targets/linux-cuda-sm89"
+          cc -O2 -Wall -Wextra -c c/coli_exec_format.c -o "$RUNNER_TEMP/coli_exec_format.o"
+      - name: Commit tested compiler integration
+        shell: bash
+        run: |
+          git config user.name 'colibri-codex'
+          git config user.email 'colibri-codex@users.noreply.github.com'
+          git add colic/src
+          if git diff --cached --quiet; then
+            echo 'No compiler changes to commit'
+          else
+            git commit -m 'feat(colic): emit target-native CSF v1.1 artifacts (#49 #52 #26)'
+            git pull --rebase origin codex/compiler-contracts-p0
+            git push origin HEAD:codex/compiler-contracts-p0
+          fi
