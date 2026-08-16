@@ -29,6 +29,14 @@ void coli_executor_close(ColiExecutor *executor);
 
 const ColiRecordInfo *coli_executor_expert(const ColiExecutor *executor,
                                            int32_t layer, int32_t expert);
+/* Cold/static lookup remains name-addressable; routed execution should use
+ * coli_executor_expert() instead. */
+const ColiRecordInfo *coli_executor_record_by_name(const ColiExecutor *executor,
+                                                   const char *name);
+int coli_executor_load_record(const ColiExecutor *executor,
+                              const ColiRecordInfo *record,
+                              void *resident_slot, size_t resident_bytes,
+                              char *error, size_t error_size);
 int coli_executor_expert_info(const ColiExecutor *executor,
                               int32_t layer, int32_t expert,
                               ColiExpertInfo *out,

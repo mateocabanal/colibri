@@ -68,6 +68,24 @@ const ColiRecordInfo *coli_executor_expert(const ColiExecutor *executor,
     return executor ? coli_package_expert(executor->package, layer, expert) : NULL;
 }
 
+const ColiRecordInfo *coli_executor_record_by_name(const ColiExecutor *executor,
+                                                   const char *name) {
+    return executor ? coli_package_record_by_name(executor->package, name) : NULL;
+}
+
+int coli_executor_load_record(const ColiExecutor *executor,
+                              const ColiRecordInfo *record,
+                              void *resident_slot, size_t resident_bytes,
+                              char *error, size_t error_size) {
+    if (!executor || !record || !resident_slot || record->stored_bytes > SIZE_MAX ||
+        resident_bytes < (size_t)record->stored_bytes) {
+        executor_error(error, error_size, "invalid COLI record resident-slot load");
+        return -1;
+    }
+    return coli_package_read_record(executor->package, record, resident_slot,
+                                    resident_bytes, error, error_size);
+}
+
 int coli_executor_expert_info(const ColiExecutor *executor,
                               int32_t layer, int32_t expert,
                               ColiExpertInfo *out,
