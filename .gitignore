@@ -110,3 +110,13 @@ c/tiny_inkling/
 
 # Claude Code working directory (agent worktrees, session scratch) — never a repo artifact
 .claude/
+
+# fork-local scratch: agents, fixtures, binaries, arch docs
+.archcore/
+.hermes/
+c/*.o
+c/metalio_test
+c/qwen_moe_medium/
+c/qwen_moe_tiny_i3/
+c/qwen_moe_tiny_i4/
+c/qwen_moe_tiny_q8/

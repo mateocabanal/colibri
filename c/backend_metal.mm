@@ -123,23 +123,45 @@ kernel void mm_gemv(device const uchar* w      [[buffer(0)]],   // raw weight by
       }
     }
   } else if (fmt == 8) {                            // fp8 e4m3 passthrough: one raw byte per
-                                                     // element (like fmt=1), scale per 128x128
-                                                     // block folded into acc (like a grouped fmt).
-    int nblkI = (I + 127) / 128;
-    device const uchar* wr = w + (long)o * I;
-    device const float* scl = scale + (long)(o/128) * nblkI;
-    for (int i = slane; i < I; i += 32) {
-      uchar b = wr[i];
-      uint sign = b >> 7, exp = (b >> 3) & 0xF, mant = b & 0x7;
-      float wv;
-      if (exp == 0xF && mant == 0x7) {
-        wv = as_type<float>(0x7fc00000u);           // qNaN -- matches quant.h's e4m3_decode
-      } else {
-        float mag = (exp == 0) ? (float(mant) * 0.001953125f)                 // subnormal: mant*2^-9
-                                : (1.0f + float(mant)*0.125f) * exp2(float(int(exp) - 7));
-        wv = sign ? -mag : mag;
+                                                       // element (like fmt=1), scale per 128x128
+                                                       // block folded into acc (like a grouped fmt).
+      int nblkI = (I + 127) / 128;
+      device const uchar* wr = w + (long)o * I;
+      device const float* scl = scale + (long)(o/128) * nblkI;
+      for (int i = slane; i < I; i += 32) {
+        uchar b = wr[i];
+        uint sign = b >> 7, exp = (b >> 3) & 0xF, mant = b & 0x7;
+        float wv;
+        if (exp == 0xF && mant == 0x7) {
+          wv = as_type<float>(0x7fc00000u);           // qNaN -- matches quant.h's e4m3_decode
+        } else {
+          float mag = (exp == 0) ? (float(mant) * 0.001953125f)                 // subnormal: mant*2^-9
+                                  : (1.0f + float(mant)*0.125f) * exp2(float(int(exp) - 7));
+          wv = sign ? -mag : mag;
+        }
+        acc += wv * xr[i] * scl[i/128];
       }
-      acc += wv * xr[i] * scl[i/128];
+    } else if (fmt == 7) {                            // MXFP4 (OCP microscaling FP4, fmt7): nibble
+                                                    // e2m1 values via mx4_lut, one UE8M0 scale
+                                                    // BYTE per 32-element group along I.
+                                                    // Layout: rb=(I+1)/2, ng=(I+31)/32; scale
+                                                    // buffer is [O, ng] raw bytes (s<<23 decodes
+                                                    // the e8m0 exponent), as in quant.h's
+                                                    // matmul_mxfp4. Scale folded into acc like
+                                                    // fmt=4/8, so the final row scale is skipped.
+    int rb = (I+1)/2, ng = (I+31)/32;
+    const float mx4_lut[16] = {0.f,.5f,1.f,1.5f,2.f,3.f,4.f,6.f,
+                               -0.f,-.5f,-1.f,-1.5f,-2.f,-3.f,-4.f,-6.f};
+    device const uchar* wr = w + (long)o * rb;
+    device const uchar* scl = (device const uchar*)scale + (long)o * ng;
+    for (int i = slane*2; i < I; i += 64) {
+      uchar b = wr[i>>1];
+      int g0 = i/32; float sc0 = as_type<float>((uint)scl[g0] << 23);
+      acc += mx4_lut[b & 0xF] * xr[i] * sc0;
+      if (i+1 < I) {
+        int g1 = (i+1)/32; float sc1 = (g1==g0) ? sc0 : as_type<float>((uint)scl[g1] << 23);
+        acc += mx4_lut[b >> 4] * xr[i+1] * sc1;
+      }
     }
   } else {                                          // f32
     device const float* wr = (device const float*)(w) + (long)o * I;
@@ -148,9 +170,9 @@ kernel void mm_gemv(device const uchar* w      [[buffer(0)]],   // raw weight by
     for (int i = I8*8 + slane; i < I; i += 32) acc += wr[i] * xr[i];
   }
   acc = simd_sum(acc);
-  // fmt==4 (per-group) and fmt==8 (per-block) already folded their scale into acc
+  // fmt==4/7/8 (per-group MXFP4, per-block) already folded their scale into acc
   // above -- do not scale again.
-  if (slane == 0) y[row] = (fmt == 4 || fmt == 8) ? acc : acc * scale[o];
+  if (slane == 0) y[row] = (fmt == 4 || fmt == 7 || fmt == 8) ? acc : acc * scale[o];
 }
 
 // Batched bindless expert GEMV: each row gr belongs to expert erow[gr], whose weight and
@@ -616,10 +638,12 @@ static size_t fmt_bytes(int fmt, int I, int O) {
   if (fmt == 2) return (size_t)O * ((I+1)/2);
   if (fmt == 3) return (size_t)O * ((I+3)/4);
   if (fmt == 4) return (size_t)O * ((I+1)/2);   // grouped int4: identical packed-nibble layout to fmt=2
+  if (fmt == 7) return (size_t)O * ((I+1)/2);   // MXFP4: same packed-nibble layout, e2m1 values + e8m0 byte scales
   if (fmt == 8) return (size_t)O * I;           // fp8 e4m3: one raw byte/element, same as fmt=1
   return (size_t)O * I * sizeof(float);
 }
 // Grouped-int4 (fmt=4) scale-array size: one f32 per gsz-element group, per row -> O*ceil(I/gsz).
+// MXFP4 (fmt=7) scale: one RAW UE8M0 BYTE per 32-element group, per row -> O*ceil(I/32) bytes.
 // fp8 (fmt=8) scale-array size: one f32 per 128x128 BLOCK -> ceil(O/128)*ceil(I/128) (2D,
 // not per-row -- quant.h isn't included here, so the ceil-div is inlined rather than sharing
 // colibri.c's qt_scale_bytes/quant.h's fp8_nblk). The block is a fixed 128x128, so gs is
@@ -629,6 +653,7 @@ static size_t fmt_bytes(int fmt, int I, int O) {
 // tensor in that encoding could ever reach this Metal-side sizing helper.
 static size_t fmt_scale_bytes(int fmt, int I, int O, int gs) {
   if (fmt == 4) return (size_t)O * ((I + gs - 1) / gs) * sizeof(float);
+  if (fmt == 7) return (size_t)O * ((I + 31) / 32);      // raw e8m0 bytes, one per 32-group
   if (fmt == 8) return (size_t)((O + 127) / 128) * (size_t)((I + 127) / 128) * sizeof(float);
   return (size_t)O * sizeof(float);
 }
@@ -798,9 +823,9 @@ extern "C" int  coli_metal_mem_info(size_t *used, size_t *total) {
 extern "C" int coli_metal_matmul(ColiMetalTensor **tp, float *y, const float *x,
                                  const void *weights, const float *scales,
                                  int fmt, int S, int I, int O, int gs) {
-  /* fmt==8 (fp8 passthrough) is an explicit allow-list entry, not folded into the 0..4
-   * contiguous range check below: it is not adjacent to it. */
-  if (!g_dev || fmt < 0 || (fmt > 4 && fmt != 8)) return 0;
+  /* fmt==8 (fp8 passthrough) and fmt==7 (MXFP4) are explicit allow-list entries,
+   * not folded into the 0..4 contiguous range check below: they are not adjacent. */
+  if (!g_dev || fmt < 0 || (fmt > 4 && fmt != 7 && fmt != 8)) return 0;
   @autoreleasepool {
     ColiMetalTensor *t = *tp;
     if (!t) {

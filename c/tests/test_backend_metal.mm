@@ -10,7 +10,7 @@
 #include <cmath>
 #include <vector>
 
-enum { F32=0, I8=1, I4=2, I2=3, I4G=4, FP8=8 };
+enum { F32=0, I8=1, I4=2, I2=3, I4G=4, MXFP4=7, FP8=8 };
 
 static void cpu_ref(int fmt, const void *W, const float *s, const float *x,
                     float *y, int S, int I, int O) {
@@ -51,6 +51,66 @@ static int run(int fmt, int O, int I, int S, const char *name) {
   double nerr=maxabs/(ymax+1e-9);
   int ok = nerr < 1e-4;
   printf("  %-22s nerr=%.2e  %s\n", name, nerr, ok?"ok":"*** MISMATCH");
+  coli_metal_tensor_free(t);
+  return ok?0:1;
+}
+
+// ---- fmt=7 (MXFP4: e2m1 nibbles + UE8M0 32-group byte scales): own CPU reference +
+// harness --------------------------------------------------------------------------
+// Mirrors quant.h matmul_mxfp4's scalar path exactly: nibble -> mx4_lut[16], scale
+// byte s decodes as (s<<23) float (E8M0 exponent). Accumulate in DOUBLE like the
+// fmt=4 oracle above; the GPU kernel must agree within the same magnitude-relative
+// tolerance. Layout: rb=(I+1)/2, ng=(I+31)/32, scale = raw bytes [O, ng].
+static void cpu_ref_mxfp4(const uint8_t *q4, const uint8_t *scale, const float *x,
+                          double *y, double *mag, int S, int I, int O) {
+  static const float lut[16] = {0.f,.5f,1.f,1.5f,2.f,3.f,4.f,6.f,
+                                -0.f,-.5f,-1.f,-1.5f,-2.f,-3.f,-4.f,-6.f};
+  int rb=(I+1)/2, ng=(I+31)/32;
+  for (int o=0;o<O;o++){
+    const uint8_t *w = q4 + (size_t)o*rb;
+    const uint8_t *scl = scale + (size_t)o*ng;
+    for (int s=0;s<S;s++){
+      const float *xs = x + (size_t)s*I; double a=0, m=0;
+      for (int i=0;i<I;i++){
+        uint8_t b = w[i>>1]; int nib = (i&1) ? (int)(b>>4) : (int)(b&0xF);
+        unsigned sbits = (unsigned)scl[i/32] << 23;
+        float sc; memcpy(&sc, &sbits, 4);
+        double term = (double)xs[i] * (double)lut[nib] * (double)sc;
+        a += term; m += fabs(term);
+      }
+      y[(size_t)s*O+o] = a; mag[(size_t)s*O+o] = m;
+    }
+  }
+}
+
+static int run_mxfp4(int O, int I, int S, int outlier, const char *name) {
+  int rb=(I+1)/2, ng=(I+31)/32;
+  std::vector<uint8_t> W((size_t)O*rb), scale((size_t)O*ng);
+  std::vector<float> x((size_t)S*I), yg((size_t)S*O);
+  std::vector<double> yr((size_t)S*O), mag((size_t)S*O);
+  srand(9100 + I*7 + O*3 + S*13 + outlier*97);
+  for (auto &b : W) b = (uint8_t)(rand()&0xFF);
+  // e8m0 exponents: real experts sit near a modest band (s<<23 in float). Use
+  // s in [110,169] -> 2^-17..2^42; products stay far from float overflow over
+  // the full row, while still spanning the magnitude range a wrong group index
+  // would expose, and the double reference never overflows.
+  for (auto &v : scale) v = (uint8_t)(110 + (rand()%60));
+  for (auto &v : x) v = ((rand()%2000)-1000)/1000.0f;
+  if (outlier) for (int s=0; s<S; s++) x[(size_t)s*I+0] = 50.0f;
+  cpu_ref_mxfp4(W.data(), scale.data(), x.data(), yr.data(), mag.data(), S, I, O);
+  ColiMetalTensor *t=nullptr;
+  if (!coli_metal_matmul(&t, yg.data(), x.data(), W.data(),
+                         reinterpret_cast<const float*>(scale.data()), MXFP4, S, I, O, 0)) {
+    printf("  %-34s FAIL (matmul returned 0)\n", name); return 1; }
+  double worst=0; int bad=0;
+  for (size_t i=0; i<(size_t)S*O; i++) {
+    double d = fabs((double)yg[i] - yr[i]);
+    double rel = mag[i] > 1e-30 ? d/mag[i] : d;
+    if (rel > worst) worst = rel;
+    if (rel > 1e-4) bad++;
+  }
+  int ok = (bad == 0);
+  printf("  %-34s worst_rel=%.2e (I=%d ng=%d S=%d)  %s\n", name, worst, I, ng, S, ok?"ok":"*** MISMATCH");
   coli_metal_tensor_free(t);
   return ok?0:1;
 }
@@ -675,6 +735,16 @@ int main(void) {
   // tail-clipping regime grouped scales exist for), verified end-to-end through the GPU.
   fail |= run_grouped(5,   512, 64,3,1, "grouped I=512(mult64) outlier-heavy S=3");
   fail |= run_grouped(5,   201, 64,2,1, "grouped I=201(non-mult-64) outlier-heavy S=2");
+  printf("Metal fmt=7 MXFP4 (V4 experts) tests:\n");
+  // V4 routed-expert shapes: gate/up I=hidden(4096) x O=moe_inter; down transposed.
+  // S=1 decode; S=4 exercises the batched row path.
+  fail |= run_mxfp4(2048,4096,1,0, "mxfp4 gate/up-shaped O=2048 I=4096 S=1");
+  fail |= run_mxfp4(4096,2048,1,0, "mxfp4 down-shaped O=4096 I=2048 S=1");
+  fail |= run_mxfp4(2048,4096,4,0, "mxfp4 gate/up-shaped S=4");
+  // I not multiple of 32 -> partial last group (glen clamp); small degenerate.
+  fail |= run_mxfp4(6,   200, 2,0, "mxfp4 I=200 (non-mult-32) S=2");
+  fail |= run_mxfp4(3,   32,  1,0, "mxfp4 I=32 (single group) S=1");
+  fail |= run_mxfp4(5,   512, 3,1, "mxfp4 I=512 outlier-heavy S=3");
   printf("Metal fmt=8 native FP8-e4m3 passthrough tests:\n");
   fail |= run_fp8_lut("fp8 LUT exactness (256/256 codes via GPU kernel)");
   fail |= run_fp8(2048,6144,1, "fp8 gate/up-shaped O=2048 I=6144 (spec example) S=1");
