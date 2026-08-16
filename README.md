@@ -18,6 +18,25 @@ parameters** — on consumer and heterogeneous hardware, in pure C with zero
 engine dependencies, by treating storage, RAM, and VRAM as a single inference
 hierarchy (AI memory multitiering).
 
+**Tiny engine, immense model.**
+
+## Fork delta (mateocabanal/colibri)
+
+Experimental fork of JustVugg/colibri. Changes on top of upstream `main`:
+
+- **Apple Metal MXFP4 (fmt7) backend** — new `backend_metal.mm` kernel for V4
+  experts (e2m1 LUT + e8m0 byte scales), sizing/allow-list, 6 parity tests.
+- **DeepSeek V4 Metal expert dispatch** — `V4_METAL_EXPERTS=1` routes fp4
+  matvecs (single/dual/batch) to the GPU with CPU fallback; `METAL=1` build
+  flag; clean DSpark `target_only` diagnostic.
+- **Qwen MoE opt-in CPU perf** — RoPE cache, expert I/O pipelining, i4
+  row-reduction (`QWEN_ROPE_CACHE=1`, `QWEN_PREFETCH_PIPE=1`,
+  `QWEN_I4_ROWREDUCE=1`); default path unchanged.
+- **More tests** — fmt7 parity + SIMD route self-check.
+
+These changes are fork-local and not yet upstream.
+
+
 Five families run today: **GLM-5.2** (744B), **Inkling** (975B), **Kimi K3**
 (2.8T), **DeepSeek V4 Flash** (284B) and **OLMoE** (7B) — one C file each, the
 same `coli chat` / `coli serve` / `coli web` front end.
