@@ -1,6 +1,6 @@
-# Standalone CSF reader gate for issue #23.
-# Kept separate from the large shared Makefile so the container parser can be
-# built/tested on all supported C hosts without pulling model-engine objects.
+# Standalone CSF reader/profile gate.
+# Kept separate from the large shared Makefile so CSF ABI helpers can be built
+# on all supported C hosts without pulling model-engine objects.
 
 CC ?= cc
 CFLAGS ?= -O2 -Wall -Wextra
@@ -13,17 +13,27 @@ CFLAGS += -D_FILE_OFFSET_BITS=64
 EXE := .exe
 endif
 
-.PHONY: test test-asan clean
+.PHONY: test test-profiles test-asan test-profiles-asan clean
 
 tests/test_coli_format$(EXE): tests/test_coli_format.c coli_format.c coli_format.h compat.h
 	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) tests/test_coli_format.c coli_format.c -o $@ -pthread $(EXTRA_LDFLAGS)
 
+tests/test_coli_target_profiles$(EXE): tests/test_coli_target_profiles.c coli_target_profiles.c coli_target_profiles.h coli_format.h
+	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) tests/test_coli_target_profiles.c coli_target_profiles.c -o $@ $(EXTRA_LDFLAGS)
+
 test: tests/test_coli_format$(EXE)
 	./tests/test_coli_format$(EXE)
+
+test-profiles: tests/test_coli_target_profiles$(EXE)
+	./tests/test_coli_target_profiles$(EXE)
 
 test-asan:
 	$(MAKE) -f Makefile.csf clean
 	$(MAKE) -f Makefile.csf test EXTRA_CFLAGS="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer" EXTRA_LDFLAGS="-fsanitize=address,undefined"
 
+test-profiles-asan:
+	$(MAKE) -f Makefile.csf clean
+	$(MAKE) -f Makefile.csf test-profiles EXTRA_CFLAGS="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer" EXTRA_LDFLAGS="-fsanitize=address,undefined"
+
 clean:
-	rm -f tests/test_coli_format tests/test_coli_format.exe
+	rm -f tests/test_coli_format tests/test_coli_format.exe tests/test_coli_target_profiles tests/test_coli_target_profiles.exe
