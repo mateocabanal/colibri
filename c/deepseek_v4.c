@@ -1088,10 +1088,10 @@ static int build_runtime_plan(ColiV4Engine *engine,
     ColiDeepSeekV4ResourceInputs inputs = {
         available, runtime->memory_limit_bytes, maximum_layer,
         runtime_other, record, config.num_hidden_layers,
-        /* COLI's bounded streaming store holds only asynchronous
-         * loader lanes. Each routed view is released after its matvec; unlike
-         * the old batch store it never needs all top-k experts resident. */
-        engine->coli_static ? coli_v4_loader_lane_budget() : config.num_experts_per_tok,
+        /* The pipeline queues replacement N+lanes before releasing current
+         * N, so its bounded resident floor is loader lanes plus one. It still
+         * never needs every top-k expert resident. */
+        engine->coli_static ? coli_v4_loader_lane_budget() + 1 : config.num_experts_per_tok,
         config.n_routed_experts,
     };
     return coli_v4_resource_plan_compute(plan, &inputs, error, error_size);
@@ -1168,13 +1168,13 @@ int coli_v4_expert_store_open_planned(
     }
     int slots = (int)(cache_limit / per_slot);
     if (slots > plan.slots_per_layer) slots = plan.slots_per_layer;
-    int minimum_slots = engine->coli_static ? coli_v4_loader_lane_budget() : 6;
+    int minimum_slots = engine->coli_static ? coli_v4_loader_lane_budget() + 1 : 6;
     int requested_cap = engine->coli_static ? coli_v4_cache_slot_cap() : 0;
     if (requested_cap && slots > requested_cap) slots = requested_cap;
     if (slots < options->experts_per_layer && slots < minimum_slots) slots = minimum_slots;
     if (requested_cap && requested_cap < minimum_slots) {
         snprintf(error, error_size,
-                 "V4_COLI_CACHE_SLOTS=%d is below %d loader lanes",
+                 "V4_COLI_CACHE_SLOTS=%d is below the %d-slot loader pipeline floor",
                  requested_cap, minimum_slots);
         return -1;
     }
