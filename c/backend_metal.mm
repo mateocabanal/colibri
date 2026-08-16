@@ -472,6 +472,7 @@ kernel void r_top8_par(device const float* sig [[buffer(0)]], device const float
 struct ColiMetalTensor {
   id<MTLBuffer> w;      // weights (wrapped, zero-copy when page-aligned)
   id<MTLBuffer> s;      // scales
+  size_t woff, soff;    // byte offsets into w/s (registered-slab resolve path)
   int fmt, I, O; size_t wbytes;
 };
 
@@ -774,6 +775,17 @@ static id<MTLBuffer> resolve(const void *p, uint64_t *addr) {
   return nil;
 }
 
+// True if p lies inside a currently-registered slab. The shim uses this to
+// self-heal its handle cache after engine teardown unregisters + frees slabs:
+// a key whose slab vanished must not serve a stale MTLBuffer wrapper.
+extern "C" int coli_metal_ptr_registered(const void *p) {
+  std::lock_guard<std::mutex> lk(g_slab_mtx);
+  uintptr_t u=(uintptr_t)p;
+  for (auto &s : g_slabs)
+    if (u>=(uintptr_t)s.base && u<(uintptr_t)s.base+s.len) return 1;
+  return 0;
+}
+
 // Keep-alive spinner (COLI_METAL_SPIN=1): keeps trivial GPU work in flight so the GPU
 // doesn't ramp its clock down between the engine's short per-layer bursts. Experiment to
 // quantify how much of the observed submit latency is clock ramp-down.
@@ -827,22 +839,43 @@ extern "C" int coli_metal_matmul(ColiMetalTensor **tp, float *y, const float *x,
    * not folded into the 0..4 contiguous range check below: they are not adjacent. */
   if (!g_dev || fmt < 0 || (fmt > 4 && fmt != 7 && fmt != 8)) return 0;
   @autoreleasepool {
-    ColiMetalTensor *t = *tp;
-    if (!t) {
-      t = new ColiMetalTensor();
-      t->fmt = fmt; t->I = I; t->O = O; t->wbytes = fmt_bytes(fmt, I, O);
-      t->w = wrap(weights, t->wbytes);
-      t->s = wrap(scales, fmt_scale_bytes(fmt, I, O, gs));
-      *tp = t;
-      g_tensor_count++; g_tensor_bytes += t->wbytes;
-    }
-    id<MTLBuffer> bx = [g_dev newBufferWithBytes:x length:(size_t)S*I*sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> by = [g_dev newBufferWithLength:(size_t)S*O*sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLCommandBuffer> cb = [g_queue commandBuffer];
-    id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
-    [e setComputePipelineState:g_gemv];
-    [e setBuffer:t->w offset:0 atIndex:0]; [e setBuffer:t->s offset:0 atIndex:1];
-    [e setBuffer:bx offset:0 atIndex:2];   [e setBuffer:by offset:0 atIndex:3];
+      ColiMetalTensor *t = *tp;
+      if (!t) {
+        /* Registered (16K-aligned) host slabs resolve zero-copy to (buffer,
+         * offset) — LIVE memory, so a pointer-keyed handle stays correct even
+         * when the caller reuses the slab for different weights (V4 expert LRU
+         * slots recycle their slab). Unregistered pointers take the existing
+         * wrap() path (zero-copy when page-aligned, otherwise a snapshot copy;
+         * callers must keep those stable at the same address — the shim frees an
+         * evicted handle precisely to avoid serving an old snapshot). */
+        uint64_t wa=0, sa=0;
+        id<MTLBuffer> wr=resolve(weights,&wa), sr=resolve(scales,&sa);
+        if (wr && sr) {
+          t = new ColiMetalTensor();
+          t->fmt = fmt; t->I = I; t->O = O; t->wbytes = fmt_bytes(fmt, I, O);
+          t->w = wr; t->s = sr;
+          t->woff = (size_t)(wa - (uint64_t)[wr gpuAddress]);
+          t->soff = (size_t)(sa - (uint64_t)[sr gpuAddress]);
+          *tp = t;
+          g_tensor_count++; g_tensor_bytes += t->wbytes;
+        }
+      }
+      if (!t) {
+        t = new ColiMetalTensor();
+        t->fmt = fmt; t->I = I; t->O = O; t->wbytes = fmt_bytes(fmt, I, O);
+        t->w = wrap(weights, t->wbytes);
+        t->s = wrap(scales, fmt_scale_bytes(fmt, I, O, gs));
+        t->woff = 0; t->soff = 0;
+        *tp = t;
+        g_tensor_count++; g_tensor_bytes += t->wbytes;
+      }
+      id<MTLBuffer> bx = [g_dev newBufferWithBytes:x length:(size_t)S*I*sizeof(float) options:MTLResourceStorageModeShared];
+      id<MTLBuffer> by = [g_dev newBufferWithLength:(size_t)S*O*sizeof(float) options:MTLResourceStorageModeShared];
+      id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+      id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+      [e setComputePipelineState:g_gemv];
+      [e setBuffer:t->w offset:t->woff atIndex:0]; [e setBuffer:t->s offset:t->soff atIndex:1];
+      [e setBuffer:bx offset:0 atIndex:2];   [e setBuffer:by offset:0 atIndex:3];
     int NT=S*O;
     [e setBytes:&S length:4 atIndex:4]; [e setBytes:&I length:4 atIndex:5];
     [e setBytes:&O length:4 atIndex:6]; [e setBytes:&fmt length:4 atIndex:7];

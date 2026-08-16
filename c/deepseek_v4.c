@@ -5625,12 +5625,21 @@ static int lookup(ColiExpertStore *store, ColiExpertKey key,
             return -1;
         }
         if (!slot->slab) {
-            slot->slab = malloc((size_t)state->record_bytes);
-            if (!slot->slab) {
+            /* 16K-aligned + registered: Metal single-GEMV resolves registered
+             * slabs zero-copy, so pointer-keyed handles read LIVE bytes even
+             * when the LRU recycles this slot to another expert. Registration
+             * is idempotent; skipped when Metal is off. */
+            size_t cap = ((size_t)state->record_bytes + 16383u) & ~(size_t)16383u;
+            if (posix_memalign((void **)&slot->slab, 16384, cap)) {
+                slot->slab = NULL;
                 pthread_mutex_unlock(&state->mutex);
                 memset(view, 0, sizeof(*view));
                 return -1;
             }
+#ifdef COLI_METAL
+            coli_metal_register(slot->slab, cap);
+#endif
+            slot->aligned_slab = 1;
             state->stats.resident_bytes += state->record_bytes;
         }
         /* A short read must never expose a partially overwritten slot: claim it
@@ -5757,13 +5766,18 @@ static void destroy(ColiExpertStore *store) {
     V4ExpertStoreState *state = store->state;
     if (state) {
         assert(state->active_leases == 0 && "destroy with active expert leases");
-        for (int i = 0; i < state->layers * state->slots_per_layer; i++)
+        for (int i = 0; i < state->layers * state->slots_per_layer; i++) {
+#ifdef COLI_METAL
+            if (state->slots[i].slab)
+                coli_metal_unregister(state->slots[i].slab);
+#endif
             /* aligned_slab means posix_memalign, which on Windows is
              * _aligned_malloc and must not reach free(). */
             if (state->slots[i].aligned_slab)
                 compat_aligned_free(state->slots[i].slab);
             else
                 free(state->slots[i].slab);
+        }
         pthread_mutex_destroy(&state->mutex);
         coli_st_index_close(state->index);
         free(state->records);
@@ -6277,13 +6291,16 @@ static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
         return -1;
     }
     if (!slot->slab) {
-        size_t capacity = (size_t)state->record_bytes + 8192u;
-        if (posix_memalign((void **)&slot->slab, 4096, capacity)) {
+        size_t capacity = ((size_t)state->record_bytes + 8192u + 16383u) & ~(size_t)16383u;
+        if (posix_memalign((void **)&slot->slab, 16384, capacity)) {
             slot->slab = NULL;
             pthread_mutex_unlock(&state->mutex);
             memset(view, 0, sizeof(*view));
             return -1;
         }
+#ifdef COLI_METAL
+        coli_metal_register(slot->slab, capacity);
+#endif
         slot->aligned_slab = 1;
         state->stats.resident_bytes += state->record_bytes;
     }
@@ -7071,6 +7088,20 @@ int coli_v4_engine_open(ColiV4Engine **output,
             engine->runtime.target_expert_cache_bytes;
         *output = engine;
         return 0;
+    }
+#endif
+#ifdef COLI_METAL
+    /* Init Metal BEFORE the expert store opens: slot slabs are registered at
+     * allocation, and registration is a no-op while g_dev is null. The lazy
+     * init in the matvec shim is then a no-op (already initialized). */
+    if (!getenv("V4_METAL_EXPERTS") || atoi(getenv("V4_METAL_EXPERTS")) != 0) {
+        if (coli_metal_init()) {
+#ifdef COLI_METAL_VERBOSE
+            fprintf(stderr, "[metal] v4 expert path enabled (V4_METAL_EXPERTS=0 disables)\n");
+#endif
+        } else {
+            fprintf(stderr, "[metal] unavailable — V4 experts stay on CPU\n");
+        }
     }
 #endif
     if (coli_v4_expert_store_open_planned(
@@ -9903,12 +9934,21 @@ static int lookup(ColiExpertStore *store, ColiExpertKey key,
             return -1;
         }
         if (!slot->slab) {
-            slot->slab = malloc((size_t)state->record_bytes);
-            if (!slot->slab) {
+            /* 16K-aligned + registered: Metal single-GEMV resolves registered
+             * slabs zero-copy, so pointer-keyed handles read LIVE bytes even
+             * when the LRU recycles this slot to another expert. Registration
+             * is idempotent; skipped when Metal is off. */
+            size_t cap = ((size_t)state->record_bytes + 16383u) & ~(size_t)16383u;
+            if (posix_memalign((void **)&slot->slab, 16384, cap)) {
+                slot->slab = NULL;
                 pthread_mutex_unlock(&state->mutex);
                 memset(view, 0, sizeof(*view));
                 return -1;
             }
+#ifdef COLI_METAL
+            coli_metal_register(slot->slab, cap);
+#endif
+            slot->aligned_slab = 1;
             state->stats.resident_bytes += state->record_bytes;
         }
         /* A short read must never expose a partially overwritten slot: claim it
@@ -10035,11 +10075,16 @@ static void destroy(ColiExpertStore *store) {
     V4ExpertStoreState *state = store->state;
     if (state) {
         assert(state->active_leases == 0 && "destroy with active expert leases");
-        for (int i = 0; i < state->layers * state->slots_per_layer; i++)
-            free(state->slots[i].slab);   /* this store allocates slabs with
-                                           * malloc only; the aligned path and
-                                           * its compat_aligned_free live in the
-                                           * hot rows16 store above. */
+        for (int i = 0; i < state->layers * state->slots_per_layer; i++) {
+#ifdef COLI_METAL
+            if (state->slots[i].slab)
+                coli_metal_unregister(state->slots[i].slab);
+#endif
+            if (state->slots[i].aligned_slab)  /* posix_memalign; see above */
+                compat_aligned_free(state->slots[i].slab);
+            else
+                free(state->slots[i].slab);
+        }
         pthread_mutex_destroy(&state->mutex);
         coli_st_index_close(state->index);
         free(state->records);

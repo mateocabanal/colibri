@@ -49,6 +49,7 @@ int coli_metal_matmul(ColiMetalTensor **tensor,
 
 void   coli_metal_tensor_free(ColiMetalTensor *tensor);
 size_t coli_metal_tensor_bytes(const ColiMetalTensor *tensor);
+int    coli_metal_ptr_registered(const void *p);
 
 /*
  * Register a page-aligned host allocation (expert slab / scale slab) so the batched
