@@ -1,6 +1,7 @@
 #include "../coli_exec_format.h"
 #include "../coli_target_profiles.h"
 
+#include <limits.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -64,7 +65,6 @@ static int execute_expert(const char *package_path) {
     static const unsigned char down_expected[4] = {0x02, 0x00, 0x20, 0x00};
     size_t i;
 
-    /* Compatibility has to fail before runtime publication for a weaker GPU. */
     incompatible.gpu_family = 7;
     if (coli_exec_package_open(&package, package_path, &incompatible, error, sizeof(error)) == 0) {
         coli_exec_package_close(package);
@@ -139,8 +139,6 @@ static int execute_expert(const char *package_path) {
         return fail("expert read failed", error);
     }
 
-    /* Exact/source comparison: the target v1 layout intentionally preserves the
-     * already-native MXFP4 row bytes. These are the fixture's source bytes. */
     if (info.matrices[0].weight_stored_bytes != sizeof(gate_expected) ||
         memcmp(bytes + info.matrices[0].weight_offset, gate_expected, sizeof(gate_expected)) ||
         info.matrices[2].weight_stored_bytes != sizeof(down_expected) ||
