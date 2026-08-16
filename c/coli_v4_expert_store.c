@@ -8,7 +8,10 @@
 #include <string.h>
 
 typedef struct { const ColiRecordInfo *record; ColiExpertInfo info; } Record;
-typedef struct { int expert; unsigned refs; unsigned char *data; } Slot;
+/* A slot remains unavailable from selection until its positioned read and CRC
+ * have completed. refs alone is insufficient: loader lanes acquire before a
+ * view exists, so two lanes could otherwise write the same resident buffer. */
+typedef struct { int expert; unsigned refs, loading; unsigned char *data; } Slot;
 typedef struct {
     ColiExecutor *executor; int layers, experts, slots_per_layer;
     uint64_t record_bytes, clock; Record *records; Slot *slots;
@@ -42,13 +45,13 @@ static int lookup(ColiExpertStore *store, ColiExpertKey key, ColiExpertView *vie
     State*s=store?store->state:NULL; Record*r=s?record_for(s,key):NULL; Slot*slot=NULL;
     if(!s||!r||!view){if(view)memset(view,0,sizeof(*view));return -1;}
     pthread_mutex_lock(&s->mutex); s->stats.requests++; Slot *slots=slots_for(s,key.layer);
-    for(int i=0;i<s->slots_per_layer;i++) if(slots[i].data&&slots[i].expert==key.expert){slot=&slots[i];s->stats.hits++;break;}
-    if(!slot) { for(int i=0;i<s->slots_per_layer;i++) if(!slots[i].refs&&(!slot||!slots[i].data)) slot=&slots[i];
+    for(int i=0;i<s->slots_per_layer;i++) if(!slots[i].loading&&slots[i].data&&slots[i].expert==key.expert){slot=&slots[i];s->stats.hits++;break;}
+    if(!slot) { for(int i=0;i<s->slots_per_layer;i++) if(!slots[i].refs&&!slots[i].loading&&(!slot||!slots[i].data)) slot=&slots[i];
         if(!slot) { pthread_mutex_unlock(&s->mutex); memset(view,0,sizeof(*view)); return -1; }
         if(!slot->data) { if(posix_memalign((void**)&slot->data,4096,(size_t)s->record_bytes)){pthread_mutex_unlock(&s->mutex);memset(view,0,sizeof(*view));return -1;} s->stats.resident_bytes+=s->record_bytes; }
-        slot->expert=-1; pthread_mutex_unlock(&s->mutex);
+        slot->expert=-1; slot->loading=1; pthread_mutex_unlock(&s->mutex);
         char error[256]; int bad=coli_executor_load_expert(s->executor,key.layer,key.expert,slot->data,(size_t)s->record_bytes,error,sizeof(error));
-        pthread_mutex_lock(&s->mutex); if(bad){fprintf(stderr,"v4_coli expert-load failed layer=%d expert=%d: %s\n",key.layer,key.expert,error);pthread_mutex_unlock(&s->mutex);memset(view,0,sizeof(*view));return -1;} slot->expert=key.expert;s->stats.misses++;s->stats.bytes_read+=s->record_bytes;
+        pthread_mutex_lock(&s->mutex); slot->loading=0; if(bad){fprintf(stderr,"v4_coli expert-load failed layer=%d expert=%d: %s\n",key.layer,key.expert,error);pthread_mutex_unlock(&s->mutex);memset(view,0,sizeof(*view));return -1;} slot->expert=key.expert;s->stats.misses++;s->stats.bytes_read+=s->record_bytes;
     }
     slot->refs++; s->active_leases++; int bad=fill(view,key,r,slot); if(bad){fprintf(stderr,"v4_coli expert-view invalid layer=%d expert=%d\n",key.layer,key.expert);slot->refs--;s->active_leases--;} pthread_mutex_unlock(&s->mutex); return bad?-1:0;
 }

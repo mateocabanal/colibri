@@ -1023,6 +1023,13 @@ static int coli_v4_loader_lane_budget(void) {
     return lanes;
 }
 
+static int coli_v4_cache_slot_cap(void) {
+    const char *value = getenv("V4_COLI_CACHE_SLOTS");
+    if (!value || !*value) return 0;
+    int cap = atoi(value);
+    return cap > 0 ? cap : 0;
+}
+
 static int build_runtime_plan(ColiV4Engine *engine,
                               const ColiDeepSeekV4ExpertStoreOptions *options,
                               ColiDeepSeekV4ResourcePlan *plan,
@@ -1162,7 +1169,15 @@ int coli_v4_expert_store_open_planned(
     int slots = (int)(cache_limit / per_slot);
     if (slots > plan.slots_per_layer) slots = plan.slots_per_layer;
     int minimum_slots = engine->coli_static ? coli_v4_loader_lane_budget() : 6;
+    int requested_cap = engine->coli_static ? coli_v4_cache_slot_cap() : 0;
+    if (requested_cap && slots > requested_cap) slots = requested_cap;
     if (slots < options->experts_per_layer && slots < minimum_slots) slots = minimum_slots;
+    if (requested_cap && requested_cap < minimum_slots) {
+        snprintf(error, error_size,
+                 "V4_COLI_CACHE_SLOTS=%d is below %d loader lanes",
+                 requested_cap, minimum_slots);
+        return -1;
+    }
     plan.expert_cache_bytes = (uint64_t)slots * per_slot;
     runtime->target_expert_cache_bytes = plan.expert_cache_bytes;
     plan.projected_bytes = fixed + dense_bytes +
