@@ -84,7 +84,10 @@ typedef struct {
     int context_tokens;             /* 0 => 4096 */
     int pin_slots_per_layer;        /* -1 => auto */
     uint64_t repin_interval;        /* 0 => auto */
-    int no_dspark;                  /* disable speculative draft/verification */
+    int no_dspark;           /* disable speculative draft/verification */
+    /* Optional target-compiled routed-expert package. Dense/static tensors
+     * remain sourced from target_model_dir during the hybrid transition. */
+    const char *coli_model_dir;
 } ColiV4EngineOpenOptions;
 
 typedef struct {

@@ -1113,6 +1113,15 @@ int coli_v4_expert_store_open_planned(
     automatic.cache_bytes = plan.expert_cache_bytes;
     automatic.pin_slots_per_layer = runtime->pin_slots_per_layer;
     automatic.repin_interval = runtime->repin_interval;
+    if (runtime->coli_model_dir) {
+        return coli_v4_coli_expert_store_open(
+            &(ColiV4ColiExpertStoreOptions){
+                runtime->coli_model_dir,
+                "macos-arm64-metal-apple8-v1",
+                automatic.layers, automatic.experts_per_layer,
+                automatic.cache_bytes
+            }, output, error, error_size);
+    }
     return coli_deepseek_v4_expert_store_open(
         &automatic, output, error, error_size);
 }
@@ -7250,6 +7259,7 @@ int coli_v4_engine_open(ColiV4Engine **output,
         goto fail;
     }
     engine->runtime.target_model_dir = engine->owned_target_model_dir;
+    engine->runtime.coli_model_dir = options->coli_model_dir;
     engine->runtime.memory_limit_bytes = options->memory_limit_bytes;
     engine->runtime.context_tokens =
         options->context_tokens > 0 ? options->context_tokens : 4096;

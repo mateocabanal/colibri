@@ -9,6 +9,7 @@
 
 #include "tensor.h"
 #include "expert_store.h"
+#include "coli_v4_expert_store.h"
 #include "native_quant.h"
 #include "native_quant_batch.h"
 #include "native_quant_dual.h"
@@ -730,6 +731,7 @@ const void *coli_v4_head_cache_data(const ColiV4Engine *engine,
 /* Runtime options live on ColiV4Engine. */
 typedef struct {
     const char *target_model_dir;
+    const char *coli_model_dir; /* optional target-compiled routed experts */
     uint64_t memory_limit_bytes;
     int context_tokens;
     int dense_resident;
