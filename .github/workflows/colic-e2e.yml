@@ -1,9 +1,6 @@
 name: colic end-to-end
 
 on:
-  push:
-    branches:
-      - codex/compiler-contracts-p0
   pull_request:
     branches:
       - main
@@ -12,6 +9,10 @@ on:
 
 permissions:
   contents: read
+
+concurrency:
+  group: colic-e2e-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   compiled-fixture:
