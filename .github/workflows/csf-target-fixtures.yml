@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - 'docs/coli-serving-format-v1.md'
+      - 'docs/coli-serving-format-v1.1-target-identity.md'
       - 'c/tests/fixtures/csf-v1-targets/**'
       - '.github/workflows/csf-target-fixtures.yml'
   workflow_dispatch:
