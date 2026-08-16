@@ -4,7 +4,6 @@ on:
   push:
     branches: [codex/compiler-contracts-p0]
     paths:
-      - 'tools/codex_patch.py'
       - '.github/workflows/codex-patch.yml'
 
 permissions:
@@ -30,8 +29,67 @@ jobs:
             c/coli_target_profiles.c c/coli_target_profiles.h \
             c/tests/test_coli_target_profiles.c \
             docs/coli-target-profiles-v1.md
-      - name: Reconcile compiler and current main
-        run: python3 tools/codex_patch.py
+      - name: Merge CSF test surfaces
+        shell: bash
+        run: |
+          cat > c/Makefile.csf <<'EOF'
+          # Standalone CSF reader / target ABI gate.
+          # Kept separate from the engine build so persisted-format compatibility remains
+          # cheap to test across Linux, macOS, and Windows.
+
+          CC ?= cc
+          CFLAGS ?= -O2 -Wall -Wextra
+          EXTRA_CFLAGS ?=
+          EXTRA_LDFLAGS ?=
+          EXE ?=
+
+          ifeq ($(OS),Windows_NT)
+          CFLAGS += -D_FILE_OFFSET_BITS=64
+          EXE := .exe
+          endif
+
+          .PHONY: test test-profiles test-target test-asan test-profiles-asan test-target-asan clean
+
+          tests/test_coli_format$(EXE): tests/test_coli_format.c coli_format.c coli_executor.c coli_format.h coli_executor.h compat.h
+          	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) tests/test_coli_format.c coli_format.c coli_executor.c -o $@ -pthread $(EXTRA_LDFLAGS)
+
+          tests/test_coli_target_profiles$(EXE): tests/test_coli_target_profiles.c coli_target_profiles.c coli_target_profiles.h coli_target.h coli_format.h
+          	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) tests/test_coli_target_profiles.c coli_target_profiles.c -o $@ $(EXTRA_LDFLAGS)
+
+          tests/test_coli_target$(EXE): tests/test_coli_target.c coli_target.c coli_target.h coli_format.c coli_format.h compat.h
+          	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) tests/test_coli_target.c coli_target.c coli_format.c -o $@ -pthread $(EXTRA_LDFLAGS)
+
+          test: tests/test_coli_format$(EXE) tests/test_coli_target_profiles$(EXE)
+          	./tests/test_coli_format$(EXE)
+          	./tests/test_coli_target_profiles$(EXE)
+
+          test-profiles: tests/test_coli_target_profiles$(EXE)
+          	./tests/test_coli_target_profiles$(EXE)
+
+          test-target: tests/test_coli_target$(EXE)
+          	@test -n "$(APPLE_FIXTURE)" || (echo "APPLE_FIXTURE is required" >&2; exit 2)
+          	@test -n "$(CUDA_FIXTURE)" || (echo "CUDA_FIXTURE is required" >&2; exit 2)
+          	./tests/test_coli_target$(EXE) "$(APPLE_FIXTURE)" "$(CUDA_FIXTURE)"
+
+          test-asan:
+          	$(MAKE) -f Makefile.csf clean
+          	$(MAKE) -f Makefile.csf test EXTRA_CFLAGS="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer" EXTRA_LDFLAGS="-fsanitize=address,undefined"
+
+          test-profiles-asan:
+          	$(MAKE) -f Makefile.csf clean
+          	$(MAKE) -f Makefile.csf test-profiles EXTRA_CFLAGS="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer" EXTRA_LDFLAGS="-fsanitize=address,undefined"
+
+          test-target-asan:
+          	$(MAKE) -f Makefile.csf clean
+          	$(MAKE) -f Makefile.csf tests/test_coli_target$(EXE) EXTRA_CFLAGS="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer" EXTRA_LDFLAGS="-fsanitize=address,undefined"
+          	$(MAKE) -f Makefile.csf test-target APPLE_FIXTURE="$(APPLE_FIXTURE)" CUDA_FIXTURE="$(CUDA_FIXTURE)" EXTRA_CFLAGS="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer" EXTRA_LDFLAGS="-fsanitize=address,undefined"
+
+          clean:
+          	rm -f tests/test_coli_format tests/test_coli_format.exe \
+          	      tests/test_coli_target tests/test_coli_target.exe \
+          	      tests/test_coli_target_profiles tests/test_coli_target_profiles.exe
+          EOF
+          sed -i 's/^          //' c/Makefile.csf
       - name: Drop superseded scratch registry and format Rust
         shell: bash
         run: |
@@ -46,6 +104,7 @@ jobs:
           if git diff --cached --quiet; then
             echo 'No changes to commit'
           else
-            git commit -m 'feat(csf): integrate target ABI and compiler contract fixes (#23 #26 #49 #52)'
+            git commit -m 'feat(csf): integrate target ABI modules and tests (#23 #26)'
+            git pull --rebase origin codex/compiler-contracts-p0
             git push origin HEAD:codex/compiler-contracts-p0
           fi
