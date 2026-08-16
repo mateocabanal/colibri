@@ -27,6 +27,15 @@ pub enum ScaleFormat {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Quantization {
+    pub math_format: MathFormat,
+    pub source_representation: SourceRepresentation,
+    pub scale_format: ScaleFormat,
+    pub scale_block_rows: u32,
+    pub scale_block_columns: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Activation {
     /// DeepSeek routed experts compute SiLU(gate) * up before the down projection.
     SwiGlu,
@@ -53,21 +62,14 @@ pub struct ModelGeometry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MatrixScale {
-    pub source: TensorRef,
-    pub format: ScaleFormat,
-    pub block_rows: u32,
-    pub block_columns: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Matrix {
     pub source: TensorRef,
     pub rows: u32,
     pub columns: u32,
-    pub math_format: MathFormat,
-    pub source_representation: SourceRepresentation,
-    pub scale: Option<MatrixScale>,
+    pub scale: Option<TensorRef>,
+    /// Semantic quantization contract. Target lowering must use this rather
+    /// than rediscovering the relationship from Hugging Face tensor names.
+    pub quantization: Quantization,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,9 +84,6 @@ pub struct RoutedExpert {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ModelAssets {
-    /// Source assets are compiler inputs, not runtime tensor records. Keeping the
-    /// classified paths here makes the semantic inventory explicit without
-    /// introducing payload ownership or physical target layout.
     pub config: Option<PathBuf>,
     pub tokenizer: Vec<PathBuf>,
 }
@@ -99,5 +98,8 @@ pub struct SemanticModel {
     /// Per-layer static execution roles, keyed by layer then canonical role name.
     /// Routed experts are stored separately because they are independently pageable.
     pub layer_static_tensors: BTreeMap<u32, BTreeMap<String, TensorRef>>,
+    /// Must be empty for a fully classified supported architecture. Kept as a
+    /// diagnostic channel so inspect-source can report the classification invariant.
+    pub resident_tensors: BTreeMap<String, TensorRef>,
     pub assets: ModelAssets,
 }
