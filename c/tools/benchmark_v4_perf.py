@@ -190,19 +190,22 @@ def parse_phases(stderr: str) -> Optional[dict]:
 def reconcile_phases(result: Result) -> None:
     """Check the issue's reconciliation gate on the run scope:
 
-    |unaccounted_ms| <= max(5 ms, 1% of run wall). Marks were taken around
+    |unaccounted_ms| <= max(5 ms, 2% of run wall) -- the 2% ceiling the
+    PROFILE1 design set for the quick benchmark.  Marks were taken around
     session_generate, so run.wall_ms should be close to TUNE decode seconds.
-    If V4_PROFILE was off or the engine is older, leave the flags None.
+    unaccounted_ms is SIGNED (wall - accounted) so over-counting shows up as a
+    negative number and still fails the gate. If V4_PROFILE was off or the
+    engine is older, leave the flags None.
     """
     if not result.phases or "run" not in result.phases:
         return
     run = result.phases["run"]
     wall = run.get("wall_ms", 0.0)
     unaccounted = run.get("unaccounted_ms", 0.0)
-    budget = max(5.0, 0.01 * wall)
-    result.phases_reconcile = unaccounted <= budget
+    budget = max(5.0, 0.02 * wall)
+    result.phases_reconcile = abs(unaccounted) <= budget
     result.phases_unaccounted_ratio = (
-        unaccounted / wall if wall > 0 else None
+        abs(unaccounted) / wall if wall > 0 else None
     )
 
 

@@ -93,8 +93,8 @@ extern ColiV4Profile coli_v4_profile_get(void);
 extern void coli_v4_profile_mark(int slot);
 extern void coli_v4_profile_tokens(int slot, uint64_t tokens);
 extern ColiV4Profile coli_v4_profile_mark_get(int slot);
-extern void coli_v4_profile_emit(FILE *stream,
-                                 const ColiExpertStoreStats *stats);
+extern void coli_v4_profile_mark_stats(int slot, ColiExpertStore *experts);
+extern void coli_v4_profile_emit(FILE *stream);
 
 /* Metal backend profile hooks (backend_metal.mm, COLI_METAL only). */
 #ifdef COLI_METAL
