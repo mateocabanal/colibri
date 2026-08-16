@@ -42,21 +42,26 @@ int coli_fp8_matvec_ref(float *output, const ColiTensorView *weight,
 #ifdef COLI_METAL
 #include <stdlib.h>
 #include "backend_metal.h"
-/* V4 routed-expert matvec on the Apple GPU (fmt=7 MXFP4), env opt-in
- * (V4_METAL_EXPERTS=1). The Metal kernel is numerically equivalent to
+/* V4 routed-expert matvec on the Apple GPU (fmt=7 MXFP4). DEFAULT ON when
+ * built with COLI_METAL: the Metal kernel is numerically equivalent to
  * matmul_mxfp4's scalar path (same e2m1 LUT + e8m0 byte scales, same lane
- * accumulation order per group); the test suite proves parity. Returns 1 on
- * success, 0 to fall back to the CPU kernel. Handles are cached keyed by
- * weight pointer (experts are few and reused); a hit skips re-wrapping. */
+ * accumulation order per group); the test suite proves parity. V4_METAL_EXPERTS
+ * still controls it: unset = ON, 0 = off, nonzero = ON. Returns 1 on success,
+ * 0 to fall back to the CPU kernel. Handles are cached keyed by weight
+ * pointer (experts are few and reused); a hit skips re-wrapping.
+ * Initialization is lazy on first use: the V4 engine never calls
+ * coli_metal_init() itself (colibri.c/inkling/qwen do), so without this the
+ * GPU path is dead even when enabled. coli_metal_init is idempotent. */
 static inline int coli_v4_metal_mxfp4_matvec(
     float *output, const float *input, const void *weights, const void *scales,
     int rows, int columns) {
     static int enabled = -1;
     if (enabled < 0) {
         const char *s = getenv("V4_METAL_EXPERTS");
-        enabled = s && *s && atoi(s) != 0;
+        enabled = (!s || !*s) ? 1 : (atoi(s) != 0);   /* default ON */
     }
     if (!enabled) return 0;
+    if (!coli_metal_init()) return 0;                /* lazy, idempotent */
     static ColiMetalTensor *handles[16];
     static const void *keys[16];
     static int n = 0;

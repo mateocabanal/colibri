@@ -65,10 +65,10 @@ CFLAGS = -D_GNU_SOURCE -O3 $(OMPC) -pthread -include pthread.h \
 	-DCOLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
 LDFLAGS = -lm $(OMPL) -pthread
 V4_BINARY := deepseek_v4
-# METAL=1 adds the opt-in Apple-GPU MXFP4 expert path (V4_METAL_EXPERTS=1 at
-# runtime; CPU is always the fallback). Shader compiles at runtime, so no
-# Xcode/offline metal compiler is needed. Default build unchanged.
-METAL ?= 0
+# METAL=1 enables the Apple-GPU MXFP4 expert path on Darwin (default ON —
+# shader compiles at runtime, no Xcode/offline metal compiler needed; CPU is
+# always the fallback). V4_METAL_EXPERTS=0 opts out at runtime.
+METAL ?= 1
 V4_METAL_OBJS =
 ifeq ($(METAL),1)
 METALXX = clang++ -x objective-c++ -std=gnu++17 -fobjc-arc -O3
