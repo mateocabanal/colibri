@@ -48,7 +48,17 @@ python3 tools/benchmark_v4_perf.py --model /path/to/v4 \
 ```
 
 The V4 runner forces `--no-dspark` so results measure the exact target path.
-It does **not** claim to flush the OS page cache; repeated trials are therefore
-reported as trials rather than synthetic "cold"/"warm" labels. A later
-engine-instrumentation slice will add phase-local CPU/I/O/Metal buckets and a
-controlled same-process warm-cache mode.
+It does **not** claim to flush the OS page cache; use `--warm-cache` for an
+explicit cold/warm pair (trial 2 = page-cache warm).
+
+Phase telemetry: by default the runner sets `V4_PROFILE=1`, and the engine
+emits one `v4_phases scope=startup|run|prompt|decode` line per scope with
+per-phase ms and byte buckets (dense/expert/head read, expert lookup/read
+work/wait/compute, shared expert, router, HC pre/post, attention projection,
+compressor, indexer, sparse attention, head, and Metal encode/submit/wait).
+The runner parses these into `result.phases` and checks the reconciliation
+gate: run-scope `unaccounted_ms <= max(5 ms, 1% of wall)` →
+`phases_reconcile`. Expert read work and Metal kernel time are reported as
+overlapping diagnostics and are deliberately excluded from the accounted sum
+(lanes/GPU run concurrently). `--no-profile` disables telemetry for a pure
+wall-clock comparison.

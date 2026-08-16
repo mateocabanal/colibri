@@ -15,6 +15,102 @@
 #include "native_quant_fp4_rows16.h"
 #include "st.h"
 
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <time.h>
+
+/* ---- end-to-end phase profile (issue #1) ----------------------------------
+ *
+ * V4_PROFILE=1 turns on per-phase wall-time and byte buckets so the benchmark
+ * runner (c/tools/benchmark_v4_perf.py) can attribute decode time per phase
+ * instead of comparing whole-wall numbers. Design rules (agreed with ChatGPT
+ * review, PROFILE1):
+ *
+ * - One owner-thread wall timeline for reconciliation: bucket sums must
+ *   reconcile with the scope wall. Worker/GPU durations (READ_WORK,
+ *   PACK_WORK, METAL_KERNEL) are labeled *diagnostics* and are NOT part of
+ *   the accounted sum — lanes/GPU run concurrently and their durations can
+ *   legitimately exceed wall time.
+ * - Gate is a runtime env var read once at engine_open (not a -D), so the
+ *   comparison never requires a special binary.
+ * - When disabled there are zero clock calls and no atomics — sites test a
+ *   single cached int.
+ * - The accumulator struct + inline helpers live in this header so every
+ *   amalgamated unit sees them; the singleton object and the extern
+ *   functions are defined exactly once under COLI_V4_UNIT_PROFILE.
+ *
+ * Scopes: startup (engine open), run/prompt/decode (session_generate).
+ * The harness asks for four v4_phases scope=... lines.
+ * ---------------------------------------------------------------------- */
+typedef enum {
+    COLI_V4_PROF_DENSE_READ = 0,
+    COLI_V4_PROF_HC_PRE_ATTN,
+    COLI_V4_PROF_ATTN_PROJ,
+    COLI_V4_PROF_COMPRESSOR,
+    COLI_V4_PROF_INDEXER,
+    COLI_V4_PROF_SPARSE_ATTN,
+    COLI_V4_PROF_HC_POST_ATTN,
+    COLI_V4_PROF_HC_PRE_FFN,
+    COLI_V4_PROF_ROUTER,
+    COLI_V4_PROF_EXPERT_LOOKUP,
+    COLI_V4_PROF_EXPERT_READ_WORK,
+    COLI_V4_PROF_EXPERT_PACK_WORK,
+    COLI_V4_PROF_EXPERT_LOADER_WAIT,
+    COLI_V4_PROF_EXPERT_COMPUTE,
+    COLI_V4_PROF_SHARED_EXPERT,
+    COLI_V4_PROF_HC_POST_FFN,
+    COLI_V4_PROF_HEAD_READ,
+    COLI_V4_PROF_HEAD_COMPUTE,
+    COLI_V4_PROF_METAL_ENCODE,
+    COLI_V4_PROF_METAL_SUBMIT,
+    COLI_V4_PROF_METAL_WAIT,
+    COLI_V4_PROF_METAL_KERNEL,
+    COLI_V4_PROF_COUNT
+} ColiV4ProfileKind;
+
+/* nsec-only accumulator; doubles only at emission. */
+typedef struct {
+    uint64_t ns[COLI_V4_PROF_COUNT];
+    uint64_t dense_read_bytes;
+    uint64_t expert_read_bytes;
+    uint64_t head_read_bytes;
+    uint64_t wall_ns;
+    uint64_t tokens;
+} ColiV4Profile;
+
+/* Exactly-once definitions live in the COLI_V4_UNIT_PROFILE amalgamated
+ * object; every other unit calls these externs. */
+extern int g_coli_v4_profile_on;
+extern void coli_v4_profile_reset(void);
+extern void coli_v4_profile_add(int kind, uint64_t ns);
+extern void coli_v4_profile_add_bytes(ColiV4ProfileKind kind, uint64_t bytes);
+extern ColiV4Profile coli_v4_profile_get(void);
+
+/* Scope marks: snapshot the running accumulator into one of 5 fixed slots
+ * (0 startup, 1 run-start, 2 prompt-start, 3 decode-start, 4 run-end).
+ * The CLI diffs adjacent pairs to emit scope=deltas. */
+extern void coli_v4_profile_mark(int slot);
+extern void coli_v4_profile_tokens(int slot, uint64_t tokens);
+extern ColiV4Profile coli_v4_profile_mark_get(int slot);
+extern void coli_v4_profile_emit(FILE *stream,
+                                 const ColiExpertStoreStats *stats);
+
+/* Metal backend profile hooks (backend_metal.mm, COLI_METAL only). */
+#ifdef COLI_METAL
+extern void coli_metal_profile_set_on(int on);
+extern void coli_metal_profile_reset(void);
+extern void coli_metal_profile_get(uint64_t *encode, uint64_t *submit,
+                                   uint64_t *wait, uint64_t *kernel);
+#endif
+
+static inline uint64_t coli_v4_profile_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * UINT64_C(1000000000) +
+           (uint64_t)ts.tv_nsec;
+}
+
 /* Worker count for the persistent expert-loader pool in the block pipeline
  * (deepseek_v4_block_pipeline.c). Shared here so the CLI can size the OpenMP
  * team around the loaders instead of scheduling compute onto their CPUs. */

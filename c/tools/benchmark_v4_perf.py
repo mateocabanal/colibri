@@ -40,6 +40,14 @@ TOKENS_RE = re.compile(
     r"expert_requests=(\d+) hits=(\d+) misses=(\d+) "
     r"hit_rate=([0-9.]+) bytes=(\d+) target_only=(\d+)"
 )
+# v4_phases scope=startup tokens=0 wall_ms=.. accounted_ms=.. unaccounted_ms=..
+# cpu_compute_ms=.. io_wait_ms=.. dense_read_ms=.. ... emitted by the engine
+# when V4_PROFILE=1.
+PHASES_RE = re.compile(r"v4_phases scope=(\w+) tokens=(\d+) wall_ms=([0-9.eE+-]+) "
+                       r"accounted_ms=([0-9.eE+-]+) unaccounted_ms=([0-9.eE+-]+) "
+                       r"cpu_compute_ms=([0-9.eE+-]+) io_wait_ms=([0-9.eE+-]+) "
+                       r"(.*)")
+PHASE_FIELD_RE = re.compile(r"(\w+)_ms=([0-9.eE+-]+)|(\w+)=(\d+)")
 
 BENCH_TEXT = (
     "Colibri streams mixture-of-experts weights from storage while the active "
@@ -99,6 +107,7 @@ class Result:
     profile: str
     case: str
     trial: int
+    warm: bool
     memory_gb: Optional[float]
     target_prompt_tokens: int
     prompt_bytes: int
@@ -122,6 +131,11 @@ class Result:
     expert_bytes: Optional[int] = None
     expert_bytes_per_total_token: Optional[float] = None
     target_only: Optional[int] = None
+    # v4_phases rows (V4_PROFILE=1): scope name -> dict of phase ms/bytes.
+    phases: Optional[dict] = None
+    # Reconciliation flags computed after parsing.
+    phases_reconcile: Optional[bool] = None
+    phases_unaccounted_ratio: Optional[float] = None
     git_sha: Optional[str] = None
     engine: Optional[str] = None
     model: Optional[str] = None
@@ -144,7 +158,55 @@ def make_prompt(target_tokens: int, chars_per_token: float) -> str:
     return text
 
 
-def parse_output(stderr: str, stdout: str, result: Result) -> None:
+def parse_phases(stderr: str) -> Optional[dict]:
+    """Parse engine v4_phases lines (V4_PROFILE=1) into {scope: {field: val}}.
+
+    Float fields keep ms units; integer fields (bytes, tokens) parsed as ints.
+    The runner additionally derives the issue's per-token bytes later.
+    """
+    scopes = {}
+    for line in stderr.splitlines():
+        match = PHASES_RE.search(line)
+        if not match:
+            continue
+        scope = match.group(1)
+        row = {
+            "tokens": int(match.group(2)),
+            "wall_ms": float(match.group(3)),
+            "accounted_ms": float(match.group(4)),
+            "unaccounted_ms": float(match.group(5)),
+            "cpu_compute_ms": float(match.group(6)),
+            "io_wait_ms": float(match.group(7)),
+        }
+        for field_match in PHASE_FIELD_RE.finditer(match.group(8)):
+            if field_match.group(1):  # *_ms=
+                row[field_match.group(1) + "_ms"] = float(field_match.group(2))
+            else:  # bytes/counters
+                row[field_match.group(3)] = int(field_match.group(4))
+        scopes[scope] = row
+    return scopes or None
+
+
+def reconcile_phases(result: Result) -> None:
+    """Check the issue's reconciliation gate on the run scope:
+
+    |unaccounted_ms| <= max(5 ms, 1% of run wall). Marks were taken around
+    session_generate, so run.wall_ms should be close to TUNE decode seconds.
+    If V4_PROFILE was off or the engine is older, leave the flags None.
+    """
+    if not result.phases or "run" not in result.phases:
+        return
+    run = result.phases["run"]
+    wall = run.get("wall_ms", 0.0)
+    unaccounted = run.get("unaccounted_ms", 0.0)
+    budget = max(5.0, 0.01 * wall)
+    result.phases_reconcile = unaccounted <= budget
+    result.phases_unaccounted_ratio = (
+        unaccounted / wall if wall > 0 else None
+    )
+
+
+def parse_output(stderr: str, stdout: str, result: Result) -> None:    # noqa: C901 (branchy by design; fields mirror the engine's lines)
     match = PROMPT_RE.search(stderr)
     if match:
         result.prompt_tokens = int(match.group(1))
@@ -172,6 +234,8 @@ def parse_output(stderr: str, stdout: str, result: Result) -> None:
         result.expert_hit_rate_pct = float(match.group(7))
         result.expert_bytes = int(match.group(8))
         result.target_only = int(match.group(9))
+
+    result.phases = parse_phases(stderr)
 
     if result.generated_tokens is None and result.tune_generated_tokens is not None:
         result.generated_tokens = result.tune_generated_tokens
@@ -244,6 +308,7 @@ def run_case(
     profile: str,
     case: Case,
     trial: int,
+    warm: bool,
     memory_gb: Optional[float],
     raw_prompt: bool,
     chars_per_token: float,
@@ -277,6 +342,7 @@ def run_case(
         profile=profile,
         case=case.name,
         trial=trial,
+        warm=warm,
         memory_gb=memory_gb,
         target_prompt_tokens=case.target_prompt_tokens,
         prompt_bytes=len(prompt.encode("utf-8")),
@@ -311,6 +377,7 @@ def run_case(
         stdout = proc.stdout
         stderr = proc.stderr
         parse_output(stderr, stdout, result)
+        reconcile_phases(result)
         if proc.returncode != 0:
             tail = stderr.strip().splitlines()[-6:]
             result.error = "\n".join(tail) or f"engine exited {proc.returncode}"
@@ -364,12 +431,25 @@ def selftest() -> None:
         "v4_tokens prompt=512 generated=8 total=520 expert_requests=99 "
         "hits=80 misses=19 hit_rate=80.808 bytes=123456 target_only=1\n"
         "timing time_to_first_token=2.500s after_first=1.400s\n"
+        "v4_phases scope=startup tokens=0 wall_ms=123.000 accounted_ms=100.000 "
+        "unaccounted_ms=23.000 cpu_compute_ms=90.000 io_wait_ms=10.000 "
+        "dense_read_ms=20.000 dense_read_bytes=6710886400 "
+        "head_read_bytes=1073741824\n"
+        "v4_phases scope=prompt tokens=512 wall_ms=500.000 accounted_ms=490.000 "
+        "unaccounted_ms=10.000 cpu_compute_ms=400.000 io_wait_ms=90.000 "
+        "dense_read_ms=0.000 attn_proj_ms=60.000\n"
+        "v4_phases scope=run tokens=8 wall_ms=1000.000 accounted_ms=990.000 "
+        "unaccounted_ms=10.000 cpu_compute_ms=800.000 io_wait_ms=190.000 "
+        "dense_read_ms=0.000 expert_wait_ms=150.000 expert_compute_ms=400.000 "
+        "hc_pre_ms=50.000 hc_post_ms=40.000 attn_proj_ms=120.000 "
+        "expert_read_work_ms=300.000 expert_read_bytes=7340032000\n"
     )
     stdout = "hello\nTUNE decode: 8 tokens in 3.900s\n"
     result = Result(
         profile="quick",
         case="selftest",
         trial=0,
+        warm=False,
         memory_gb=10.0,
         target_prompt_tokens=512,
         prompt_bytes=2048,
@@ -379,6 +459,7 @@ def selftest() -> None:
         wall_sec=4.0,
     )
     parse_output(stderr, stdout, result)
+    reconcile_phases(result)
     assert result.prompt_tokens == 512
     assert result.generated_tokens == 8
     assert result.expert_hits == 80
@@ -391,6 +472,15 @@ def selftest() -> None:
     assert PROFILES["quick"] == ("decode8",)
     assert PROFILE_TIMEOUT_SEC["quick"] == 120.0
     assert text_from_timeout(b"partial") == "partial"
+    assert result.phases is not None
+    assert "run" in result.phases
+    run = result.phases["run"]
+    assert run["tokens"] == 8
+    assert abs(run["wall_ms"] - 1000.0) < 1e-9
+    assert abs(run["attn_proj_ms"] - 120.0) < 1e-9
+    assert run["expert_read_bytes"] == 7340032000
+    assert result.phases_reconcile is True  # 10ms unaccounted on 1000ms wall
+    assert result.phases_unaccounted_ratio == 0.01
     print("benchmark_v4_perf selftest: ok")
 
 
@@ -441,6 +531,17 @@ def main() -> int:
     parser.add_argument("--keep-logs", type=Path)
     parser.add_argument("--format", choices=("jsonl", "csv"), default="jsonl")
     parser.add_argument("--output", default="-")
+    parser.add_argument(
+        "--no-profile",
+        action="store_true",
+        help="do not set V4_PROFILE=1; disables engine phase telemetry",
+    )
+    parser.add_argument(
+        "--warm-cache",
+        action="store_true",
+        help="run each case twice and label the second trial warm (page-cache "
+        "warm); requires --trials 2 for a full cold/warm pair, else adds one",
+    )
     parser.add_argument("--selftest", action="store_true")
     args = parser.parse_args()
 
@@ -466,16 +567,30 @@ def main() -> int:
     )
     budgets: list[Optional[float]] = args.memory_gb or [None]
     env = os.environ.copy()
+    if not args.no_profile:
+        env["V4_PROFILE"] = "1"
     sha = git_sha(args.repo)
 
+    cases_or_warm: list[tuple[int, bool]] = []
+    if args.warm_cache:
+        # Warm-cache pair: trial 1 cold (fresh page cache), trial 2 warm.
+        if args.trials == 1:
+            args.trials = 2
+        for trial in range(1, args.trials + 1):
+            cases_or_warm.append((trial, trial > 1))
     results: list[Result] = []
     for memory_gb in budgets:
         for case_name in case_names:
             case = CASES[case_name]
-            for trial in range(1, args.trials + 1):
+            if cases_or_warm:
+                trials: Iterable[tuple[int, bool]] = cases_or_warm
+            else:
+                trials = ((trial, False)
+                          for trial in range(1, args.trials + 1))
+            for trial, is_warm in trials:
                 print(
                     f"[v4-bench] profile={args.profile} case={case.name} "
-                    f"trial={trial} memory_gb="
+                    f"trial={trial}{' warm' if is_warm else ''} memory_gb="
                     f"{memory_gb if memory_gb is not None else 'auto'} "
                     f"timeout_sec={timeout_sec:g}",
                     file=sys.stderr,
@@ -487,6 +602,7 @@ def main() -> int:
                     profile=args.profile,
                     case=case,
                     trial=trial,
+                    warm=is_warm,
                     memory_gb=memory_gb,
                     raw_prompt=args.raw_prompt,
                     chars_per_token=args.chars_per_token,

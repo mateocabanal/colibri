@@ -520,6 +520,24 @@ static MTLResourceOptions g_res_opts = MTLResourceStorageModeShared;   // COLI_M
 #include <mach/mach_time.h>
 static double mnow(){ static mach_timebase_info_data_t tb; if(tb.denom==0) mach_timebase_info(&tb);
   return (double)mach_absolute_time()*tb.numer/tb.denom/1e9; }
+static inline uint64_t mnow_ns(){ static mach_timebase_info_data_t tb; if(tb.denom==0) mach_timebase_info(&tb);
+  return (uint64_t)((double)mach_absolute_time()*tb.numer/tb.denom); }
+
+/* Issue-#1 phase profile: Metal encode/submit/wait buckets, aggregated in
+ * nsec, enabled only while the V4 harness sets V4_PROFILE=1. The V4 unit
+ * pulls these at scope marks (backend is process-singleton, calls are serial
+ * on the queue, so no locking needed). */
+static int g_coli_metal_profile_on = 0;
+static struct { uint64_t encode_ns, submit_ns, wait_ns, kernel_ns; } g_metal_prof;
+extern "C" void coli_metal_profile_set_on(int on) { g_coli_metal_profile_on = on; }
+extern "C" void coli_metal_profile_reset() { memset(&g_metal_prof, 0, sizeof(g_metal_prof)); }
+extern "C" void coli_metal_profile_get(uint64_t *encode, uint64_t *submit,
+                                       uint64_t *wait, uint64_t *kernel) {
+  if (encode) *encode = g_metal_prof.encode_ns;
+  if (submit) *submit = g_metal_prof.submit_ns;
+  if (wait) *wait = g_metal_prof.wait_ns;
+  if (kernel) *kernel = g_metal_prof.kernel_ns;
+}
 
 extern "C" void coli_metal_moe_counts(uint64_t *ok, uint64_t *fb, uint64_t *ex) {
   if(ok)*ok=g_moe_ok; if(fb)*fb=g_moe_fb; if(ex)*ex=g_moe_experts;
@@ -838,6 +856,7 @@ extern "C" int coli_metal_matmul(ColiMetalTensor **tp, float *y, const float *x,
   /* fmt==8 (fp8 passthrough) and fmt==7 (MXFP4) are explicit allow-list entries,
    * not folded into the 0..4 contiguous range check below: they are not adjacent. */
   if (!g_dev || fmt < 0 || (fmt > 4 && fmt != 7 && fmt != 8)) return 0;
+  uint64_t t0 = g_coli_metal_profile_on ? mnow_ns() : 0;
   @autoreleasepool {
       ColiMetalTensor *t = *tp;
       if (!t) {
@@ -881,7 +900,12 @@ extern "C" int coli_metal_matmul(ColiMetalTensor **tp, float *y, const float *x,
     [e setBytes:&O length:4 atIndex:6]; [e setBytes:&fmt length:4 atIndex:7];
     [e setBytes:&NT length:4 atIndex:8]; [e setBytes:&gs length:4 atIndex:9];
     [e dispatchThreadgroups:MTLSizeMake(((size_t)NT+3)/4,1,1) threadsPerThreadgroup:MTLSizeMake(128,1,1)];
-    [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
+    [e endEncoding];
+    if (t0) { uint64_t t1 = mnow_ns(); g_metal_prof.encode_ns += t1 - t0; t0 = t1; }
+    [cb commit];
+    if (t0) { uint64_t t1 = mnow_ns(); g_metal_prof.submit_ns += t1 - t0; t0 = t1; }
+    [cb waitUntilCompleted];
+    if (t0) g_metal_prof.wait_ns += mnow_ns() - t0;
     memcpy(y, [by contents], (size_t)S*O*sizeof(float));
   }
   return 1;
