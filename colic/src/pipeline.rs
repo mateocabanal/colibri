@@ -568,15 +568,18 @@ pub fn compile(request: &CompileRequest, progress: &mut dyn ProgressSink) -> Res
         let _ = fs::remove_dir_all(&temporary);
         return Err(error);
     }
+    if request.verify {
+        progress.stage(Stage::Verification);
+        if let Err(error) = verify::verify_package(&temporary) {
+            let _ = fs::remove_dir_all(&temporary);
+            return Err(error);
+        }
+    }
     if request.force {
         storage::replace_package(&temporary, output)
     } else {
         storage::publish_package(&temporary, output)
     }?;
-    if request.verify {
-        progress.stage(Stage::Verification);
-        let _summary = verify::verify_package(output)?;
-    }
     Ok(())
 }
 
@@ -612,7 +615,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        ir::{Architecture, Matrix, ModelGeometry, RoutedExpert},
+        ir::{
+            Activation, Architecture, MathFormat, Matrix, ModelAssets, ModelGeometry,
+            Quantization, RoutedExpert, ScaleFormat, SourceRepresentation,
+        },
         source::TensorRef,
     };
 
@@ -744,6 +750,13 @@ mod tests {
             rows: 1,
             columns: 1,
             scale: None,
+            quantization: Quantization {
+                math_format: MathFormat::MxFp4E2M1,
+                source_representation: SourceRepresentation::PackedMxFp4Nibbles,
+                scale_format: ScaleFormat::Ue8m0,
+                scale_block_rows: 1,
+                scale_block_columns: 32,
+            },
         };
         let mut globals = BTreeMap::new();
         globals.insert("embed.weight".into(), tensor(2));
@@ -761,6 +774,7 @@ mod tests {
                 gate: matrix.clone(),
                 up: matrix.clone(),
                 down: matrix,
+                activation: Activation::SwiGlu,
             },
         );
         let model = SemanticModel {
@@ -787,6 +801,7 @@ mod tests {
             global_tensors: globals,
             layer_static_tensors: layers,
             resident_tensors: BTreeMap::new(),
+            assets: ModelAssets::default(),
         };
         let records = exact_record_inventory(&model).unwrap();
         assert_eq!(

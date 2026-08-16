@@ -633,7 +633,10 @@ fn put_i32(buffer: &mut [u8], offset: usize, value: i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ir::Matrix, source::TensorRef};
+    use crate::{
+        ir::{Activation, MathFormat, Matrix, Quantization, ScaleFormat, SourceRepresentation},
+        source::TensorRef,
+    };
 
     #[test]
     fn crc32c_combine_matches_a_contiguous_stream() {
@@ -731,6 +734,13 @@ mod tests {
                 dtype: "F8_E8M0".into(),
                 shape: vec![1, 1],
             }),
+            quantization: Quantization {
+                math_format: MathFormat::Fp8E4M3,
+                source_representation: SourceRepresentation::NativeFp8,
+                scale_format: ScaleFormat::Ue8m0,
+                scale_block_rows: 128,
+                scale_block_columns: 128,
+            },
         };
         let expert = RoutedExpert {
             layer: 4,
@@ -738,6 +748,7 @@ mod tests {
             gate: matrix(0, "F8_E4M3FN"),
             up: matrix(4, "F8_E4M3FN"),
             down: matrix(8, "F8_E4M3FN"),
+            activation: Activation::SwiGlu,
         };
         let bytes = lower_exact_expert(&expert).unwrap();
         let mut streamed = std::io::Cursor::new(Vec::new());
@@ -783,6 +794,13 @@ mod tests {
                 dtype: "F8_E8M0".into(),
                 shape: vec![1, 1],
             }),
+            quantization: Quantization {
+                math_format: MathFormat::MxFp4E2M1,
+                source_representation: SourceRepresentation::PackedMxFp4Nibbles,
+                scale_format: ScaleFormat::Ue8m0,
+                scale_block_rows: 1,
+                scale_block_columns: 32,
+            },
         };
         let expert = RoutedExpert {
             layer: 0,
@@ -790,6 +808,7 @@ mod tests {
             gate: matrix(0),
             up: matrix(2),
             down: matrix(4),
+            activation: Activation::SwiGlu,
         };
         let bytes = lower_exact_expert(&expert).unwrap();
         assert_eq!(u16::from_le_bytes(bytes[68..70].try_into().unwrap()), 0x20);
