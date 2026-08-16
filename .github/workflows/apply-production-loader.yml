@@ -46,7 +46,9 @@ jobs:
           p.write_text(text.replace(old, new, 1))
           PY
       - name: Apply production loader patch
-        run: python3 tools/apply_production_loader.py
+        run: |
+          python3 tools/apply_production_loader.py
+          python3 tools/production_loader_fixups.py
       - name: Rust compiler regression
         shell: bash
         run: |
