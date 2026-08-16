@@ -65,6 +65,19 @@ CFLAGS = -D_GNU_SOURCE -O3 $(OMPC) -pthread -include pthread.h \
 	-DCOLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
 LDFLAGS = -lm $(OMPL) -pthread
 V4_BINARY := deepseek_v4
+# METAL=1 adds the opt-in Apple-GPU MXFP4 expert path (V4_METAL_EXPERTS=1 at
+# runtime; CPU is always the fallback). Shader compiles at runtime, so no
+# Xcode/offline metal compiler is needed. Default build unchanged.
+METAL ?= 0
+V4_METAL_OBJS =
+ifeq ($(METAL),1)
+METALXX = clang++ -x objective-c++ -std=gnu++17 -fobjc-arc -O3
+V4_METAL_OBJS = backend_metal.o
+CFLAGS += -DCOLI_METAL
+LDFLAGS += -framework Metal -framework Foundation -lc++
+$(V4_METAL_OBJS): backend_metal.mm backend_metal.h
+	$(METALXX) -c backend_metal.mm -o $@
+endif
 else
 CC = gcc
 ARCH ?= native
@@ -88,7 +101,7 @@ include Makefile.deepseek-v4.units
 
 TARGET_OBJS = $(addsuffix .o,$(V4_TARGET_UNITS))
 TEST_UNIT_OBJS = $(addsuffix .o,$(V4_TEST_UNITS))
-V4_OBJS = $(TARGET_OBJS)
+V4_OBJS = $(TARGET_OBJS) $(V4_METAL_OBJS)
 
 .PHONY: deepseek-v4 deepseek-v4-clean deepseek-v4-test-objs
 deepseek-v4: $(V4_BINARY)

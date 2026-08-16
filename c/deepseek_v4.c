@@ -1098,6 +1098,11 @@ int coli_v4_expert_store_open_planned(
 #include <limits.h>
 #include <math.h>
 #include <stdlib.h>
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#elif defined(__AVX2__)
+#include <immintrin.h>
+#endif
 
 static float sigmoidf_stable(float value) {
     if (value >= 0.0f) {
@@ -1175,6 +1180,45 @@ int coli_v4_hc_split_sinkhorn(float *pre, float *post, float *comb,
     return 0;
 }
 
+/* V4_SIMD_HC=1: SIMD for the HC mixing/reduction loops (ChatGPT perf pass).
+ * Reduction order differs from the scalar reference; opt-in for oracle A/B. */
+static int v4_simd_hc_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *g = getenv("V4_SIMD_HC");
+        cached = g && atoi(g) != 0;
+    }
+    return cached;
+}
+
+static float v4_hc_dot(const float *a, const float *b, int n) {
+    int i = 0;
+    float sum = 0.0f;
+#if defined(__ARM_NEON)
+    if (v4_simd_hc_enabled()) {
+        float32x4_t acc = vdupq_n_f32(0.0f);
+        for (; i + 4 <= n; i += 4)
+            acc = vfmaq_f32(acc, vld1q_f32(a + i), vld1q_f32(b + i));
+        sum = vaddvq_f32(acc);
+    }
+#elif defined(__AVX2__)
+    if (v4_simd_hc_enabled()) {
+        __m256 acc = _mm256_setzero_ps();
+        for (; i + 8 <= n; i += 8)
+            acc = _mm256_fmadd_ps(_mm256_loadu_ps(a + i),
+                                  _mm256_loadu_ps(b + i), acc);
+        __m128 lo = _mm256_castps256_ps128(acc);
+        __m128 hi = _mm256_extractf128_ps(acc, 1);
+        lo = _mm_add_ps(lo, hi);
+        lo = _mm_add_ps(lo, _mm_movehl_ps(lo, lo));
+        lo = _mm_add_ss(lo, _mm_shuffle_ps(lo, lo, 1));
+        sum = _mm_cvtss_f32(lo);
+    }
+#endif
+    for (; i < n; i++) sum += a[i] * b[i];
+    return sum;
+}
+
 int coli_v4_hc_pre(float *output, float *post, float *comb,
                    const float *input, const float *hc_fn,
                    const float scale[3], const float *base,
@@ -1196,12 +1240,9 @@ int coli_v4_hc_pre(float *output, float *post, float *comb,
         free(pre);
         return -1;
     }
-    for (int row = 0; row < mix_count; row++) {
-        float sum = 0.0f;
-        for (int column = 0; column < flattened; column++)
-            sum += hc_fn[(size_t)row * flattened + column] * input[column];
-        mixes[row] = sum * inverse_rms;
-    }
+    for (int row = 0; row < mix_count; row++)
+        mixes[row] = v4_hc_dot(hc_fn + (size_t)row * flattened,
+                               input, flattened) * inverse_rms;
     if (coli_v4_hc_split_sinkhorn(pre, post, comb, mixes, scale, base,
                                   hc, iterations, hc_eps) != 0) {
         free(pre);
@@ -2976,8 +3017,77 @@ int coli_v4_indexer_compressed_count(const ColiDeepSeekV4Indexer *state) {
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#elif defined(__AVX2__)
+#include <immintrin.h>
+#endif
 
 #include "native_quant.h"
+
+/* V4_SIMD_ATTN=1: SIMD sparse attention dots (ChatGPT perf pass). */
+static int v4_simd_attn_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *g = getenv("V4_SIMD_ATTN");
+        cached = g && atoi(g) != 0;
+    }
+    return cached;
+}
+
+static float v4_attn_dot(const float *a, const float *b, int n) {
+    int i = 0;
+    float sum = 0.0f;
+#if defined(__ARM_NEON)
+    if (v4_simd_attn_enabled()) {
+        float32x4_t acc = vdupq_n_f32(0.0f);
+        for (; i + 4 <= n; i += 4)
+            acc = vfmaq_f32(acc, vld1q_f32(a + i), vld1q_f32(b + i));
+        sum = vaddvq_f32(acc);
+    }
+#elif defined(__AVX2__)
+    if (v4_simd_attn_enabled()) {
+        __m256 acc = _mm256_setzero_ps();
+        for (; i + 8 <= n; i += 8)
+            acc = _mm256_fmadd_ps(_mm256_loadu_ps(a + i),
+                                  _mm256_loadu_ps(b + i), acc);
+        __m128 lo = _mm256_castps256_ps128(acc);
+        __m128 hi = _mm256_extractf128_ps(acc, 1);
+        lo = _mm_add_ps(lo, hi);
+        lo = _mm_add_ps(lo, _mm_movehl_ps(lo, lo));
+        lo = _mm_add_ss(lo, _mm_shuffle_ps(lo, lo, 1));
+        sum = _mm_cvtss_f32(lo);
+    }
+#endif
+    for (; i < n; i++) sum += a[i] * b[i];
+    return sum;
+}
+
+/* head_output[0..n) += p * value[0..n) — contiguous, keep per-rank order. */
+static void v4_attn_accumulate(float *output, const float *value,
+                               float probability, int n) {
+    int i = 0;
+#if defined(__ARM_NEON)
+    if (v4_simd_attn_enabled()) {
+        float32x4_t p = vdupq_n_f32(probability);
+        for (; i + 4 <= n; i += 4) {
+            float32x4_t o = vld1q_f32(output + i);
+            o = vfmaq_f32(o, p, vld1q_f32(value + i));
+            vst1q_f32(output + i, o);
+        }
+    }
+#elif defined(__AVX2__)
+    if (v4_simd_attn_enabled()) {
+        __m256 p = _mm256_set1_ps(probability);
+        for (; i + 8 <= n; i += 8) {
+            __m256 o = _mm256_loadu_ps(output + i);
+            o = _mm256_fmadd_ps(p, _mm256_loadu_ps(value + i), o);
+            _mm256_storeu_ps(output + i, o);
+        }
+    }
+#endif
+    for (; i < n; i++) output[i] += probability * value[i];
+}
 
 int coli_v4_sparse_attention_ref(float *output, const float *queries,
                                  const float *kv, const float *sinks,
@@ -3003,9 +3113,7 @@ int coli_v4_sparse_attention_ref(float *output, const float *queries,
                 return -1;
             }
             const float *key = kv + (size_t)index * head_dimension;
-            float score = 0.0f;
-            for (int column = 0; column < head_dimension; column++)
-                score += query[column] * key[column];
+            float score = v4_attn_dot(query, key, head_dimension);
             score *= softmax_scale;
             scores[rank] = score;
             if (score > maximum) maximum = score;
@@ -3024,8 +3132,8 @@ int coli_v4_sparse_attention_ref(float *output, const float *queries,
             /* TileLang casts the exp fragment to BF16 before value GEMM. */
             probability = coli_bf16_round(probability);
             const float *value = kv + (size_t)indices[rank] * head_dimension;
-            for (int column = 0; column < head_dimension; column++)
-                head_output[column] += probability * value[column];
+            v4_attn_accumulate(head_output, value, probability,
+                               head_dimension);
         }
         for (int column = 0; column < head_dimension; column++)
             head_output[column] = coli_bf16_round(head_output[column] / denominator);
@@ -6672,12 +6780,68 @@ int coli_v4_expert_forward_ref(float *output, const ColiExpertView *expert,
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#elif defined(__AVX2__)
+#include <immintrin.h>
+#endif
 
 static float route_bf16_decode(uint16_t value) {
     uint32_t bits = (uint32_t)value << 16;
     float output;
     memcpy(&output, &bits, sizeof(output));
     return output;
+}
+
+/* V4_SIMD_ROUTE=1: BF16 gate x F32 hidden dot (ChatGPT perf pass).
+ * BF16 lives in the high half of an F32, so widening u16<<16 is an exact
+ * decode. SIMD reduction order differs from the scalar reference; opt-in
+ * so the oracle can A/B token identity. Scalar tail keeps exact decode. */
+static int v4_simd_route_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *g = getenv("V4_SIMD_ROUTE");
+        cached = g && atoi(g) != 0;
+    }
+    return cached;
+}
+
+static float v4_route_dot(const uint16_t *w, const float *x, int n) {
+    int i = 0;
+    float sum = 0.0f;
+#if defined(__ARM_NEON)
+    if (v4_simd_route_enabled()) {
+        float32x4_t a0 = vdupq_n_f32(0.0f), a1 = vdupq_n_f32(0.0f);
+        for (; i + 8 <= n; i += 8) {
+            uint16x8_t h = vld1q_u16(w + i);
+            uint32x4_t b0 = vshlq_n_u32(vmovl_u16(vget_low_u16(h)), 16);
+            uint32x4_t b1 = vshlq_n_u32(vmovl_u16(vget_high_u16(h)), 16);
+            float32x4_t f0 = vreinterpretq_f32_u32(b0);
+            float32x4_t f1 = vreinterpretq_f32_u32(b1);
+            a0 = vfmaq_f32(a0, vld1q_f32(x + i), f0);
+            a1 = vfmaq_f32(a1, vld1q_f32(x + i + 4), f1);
+        }
+        sum = vaddvq_f32(vaddq_f32(a0, a1));
+    }
+#elif defined(__AVX2__)
+    if (v4_simd_route_enabled()) {
+        __m256 acc = _mm256_setzero_ps();
+        for (; i + 8 <= n; i += 8) {
+            __m128i packed = _mm_loadu_si128((const __m128i *)(w + i));
+            __m256i bits = _mm256_slli_epi32(_mm256_cvtepu16_epi32(packed), 16);
+            __m256 f = _mm256_castsi256_ps(bits);
+            acc = _mm256_fmadd_ps(_mm256_loadu_ps(x + i), f, acc);
+        }
+        __m128 lo = _mm256_castps256_ps128(acc);
+        __m128 hi = _mm256_extractf128_ps(acc, 1);
+        lo = _mm_add_ps(lo, hi);
+        lo = _mm_add_ps(lo, _mm_movehl_ps(lo, lo));
+        lo = _mm_add_ss(lo, _mm_shuffle_ps(lo, lo, 1));
+        sum = _mm_cvtss_f32(lo);
+    }
+#endif
+    for (; i < n; i++) sum += route_bf16_decode(w[i]) * x[i];
+    return sum;
 }
 
 static float route_softplus(float value) {
@@ -6697,10 +6861,8 @@ int coli_v4_route_bf16(float *weights, int *indices, const float *hidden,
         free(selected); free(selection); free(scores); return -1;
     }
     for (int expert = 0; expert < experts; expert++) {
-        float sum = 0.0f;
-        const uint16_t *row = gate + (size_t)expert * dimension;
-        for (int column = 0; column < dimension; column++)
-            sum += route_bf16_decode(row[column]) * hidden[column];
+        float sum = v4_route_dot(gate + (size_t)expert * dimension,
+                                 hidden, dimension);
         scores[expert] = sqrtf(route_softplus(sum));
         selection[expert] = scores[expert] + (bias ? bias[expert] : 0.0f);
     }
@@ -9369,7 +9531,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "cannot build DeepSeek V4 prompt\n");
         goto cleanup;
     }
-    int target_only = !engine->dspark.enabled || cli.no_dspark;
+    int target_only = (!engine->dspark.enabled && !coli_v4_full_dspark_wanted) ||
+                       cli.no_dspark;
     if (cli.no_dspark && engine->dspark.enabled)
         fprintf(stderr, "note: speculative drafting disabled by CLI\n");
     fprintf(stderr, "v4_cli mode=%s memory=%s target_only=%d\n",
@@ -10948,6 +11111,12 @@ int coli_fp4_matvec_ref(float *output, const ColiTensorView *weight,
         free(activation_scales);
         return -1;
     }
+    #ifdef COLI_METAL
+    if (coli_v4_metal_mxfp4_matvec(output, activation, weight->data,
+                                   weight->scales, (int)rows, (int)columns)) {
+        free(activation_scales); free(activation); return 0;
+    }
+#endif
     matmul_mxfp4(output, activation, weight->data, weight->scales,
                  1, (int)columns, (int)rows);
     free(activation_scales);
@@ -11079,10 +11248,24 @@ int coli_fp4_dual_matvec_ref(float *output_a, float *output_b,
                                     input, columns, 128) != 0) {
         free(activation_scales); free(activation); return -1;
     }
+    #ifdef COLI_METAL
+    if (!coli_v4_metal_mxfp4_matvec(output_a, activation, a->data,
+                                    a->scales, (int)rows, (int)columns))
+        matmul_mxfp4(output_a, activation, a->data, a->scales,
+                     1, (int)columns, (int)rows);
+#else
     matmul_mxfp4(output_a, activation, a->data, a->scales,
                  1, (int)columns, (int)rows);
+#endif
+    #ifdef COLI_METAL
+    if (!coli_v4_metal_mxfp4_matvec(output_b, activation, b->data,
+                                    b->scales, (int)rows, (int)columns))
+        matmul_mxfp4(output_b, activation, b->data, b->scales,
+                     1, (int)columns, (int)rows);
+#else
     matmul_mxfp4(output_b, activation, b->data, b->scales,
                  1, (int)columns, (int)rows);
+#endif
     free(activation_scales); free(activation); return 0;
 }
 
@@ -11278,6 +11461,22 @@ int coli_fp4_matmul_batch_ref(float *outputs, const ColiTensorView *weight,
                 inputs + (size_t)item * columns, columns, 128) != 0) {
             free(activation_scales); free(activations); return -1;
         }
+    #ifdef COLI_METAL
+    /* Batched variant shares the rows16 layout: same weight/scales as S=1 but
+     * multiple activation rows. Use the GPU only for small batches (S=1 serial
+     * dispatches lose to CPU above ~4) — prefill falls back to CPU matmul. */
+    if (batch <= 4) {
+        int all_ok = 1;
+        for (int item = 0; item < batch && all_ok; item++)
+            if (!coli_v4_metal_mxfp4_matvec(
+                    outputs + (size_t)item * rows,
+                    activations + (size_t)item * columns,
+                    weight->data, weight->scales,
+                    (int)rows, (int)columns))
+                all_ok = 0;
+        if (all_ok) { free(activation_scales); free(activations); return 0; }
+    }
+#endif
     matmul_mxfp4(outputs, activations, weight->data, weight->scales,
                  batch, (int)columns, (int)rows);
     free(activation_scales); free(activations); return 0;
