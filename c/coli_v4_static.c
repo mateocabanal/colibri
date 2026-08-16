@@ -15,3 +15,23 @@ int coli_v4_coli_layer_load(ColiExecutor*x,ColiDeepSeekV4LayerWeights*w,const Co
   if(s->dtype==COLI_ST_F8_E8M0){size_t k=(size_t)t.data_stored_bytes;float*out=malloc(k*sizeof(*out));if(!out){free(b);goto fail;}for(size_t q=0;q<k;q++)out[q]=b[t.data_offset+q]==255?NAN:ldexpf(1.f,(int)b[t.data_offset+q]-127);free(b);w->data[i]=out;w->stats.fp8_scale_bytes+=k*sizeof(*out);w->stats.total_bytes+=k*sizeof(*out);}else{memmove(b,b+t.data_offset,(size_t)t.data_stored_bytes);w->data[i]=b;w->stats.total_bytes+=t.data_stored_bytes;}
   w->stats.tensor_count++;
  }return 0;fail:coli_v4_layer_free(NULL,w);return -1;}
+
+int coli_v4_coli_layer_bytes(ColiExecutor *x, const ColiDeepSeekV4Config *c,
+                             int layer, uint64_t *bytes, char *e, size_t n) {
+    ColiDeepSeekV4LayerPlan p; uint64_t total = 0;
+    if (!x || !bytes || coli_v4_layer_plan(&p, c, layer, e, n)) return -1;
+    for (size_t i = 0; i < p.tensor_count; i++) {
+        const ColiRecordInfo *r = coli_executor_record_by_name(x, p.tensors[i].name);
+        ColiTensorInfo t; uint64_t resident;
+        if (!r || coli_package_tensor_info(coli_executor_package(x), r, &t, e, n))
+            return bad(e, n, "COLI planner missing tensor: %s", p.tensors[i].name);
+        resident = t.data_stored_bytes;
+        if (p.tensors[i].dtype == COLI_ST_F8_E8M0) {
+            if (resident > UINT64_MAX / sizeof(float)) return bad(e,n,"COLI planner scale overflow: %s",p.tensors[i].name);
+            resident *= sizeof(float);
+        }
+        if (UINT64_MAX - total < resident) return bad(e,n,"COLI planner byte overflow: %s",p.tensors[i].name);
+        total += resident;
+    }
+    *bytes = total; return 0;
+}

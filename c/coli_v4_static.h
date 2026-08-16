@@ -5,4 +5,6 @@
 int coli_v4_coli_layer_load(ColiExecutor *executor, ColiDeepSeekV4LayerWeights *weights,
                             const ColiDeepSeekV4Config *config, int layer,
                             char *error, size_t error_size);
+int coli_v4_coli_layer_bytes(ColiExecutor *executor, const ColiDeepSeekV4Config *config,
+                             int layer, uint64_t *bytes, char *error, size_t error_size);
 #endif
