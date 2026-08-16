@@ -616,8 +616,8 @@ mod tests {
     use super::*;
     use crate::{
         ir::{
-            Activation, Architecture, MathFormat, Matrix, ModelAssets, ModelGeometry,
-            Quantization, RoutedExpert, ScaleFormat, SourceRepresentation,
+            Activation, Architecture, MathFormat, Matrix, ModelAssets, ModelGeometry, Quantization,
+            RoutedExpert, ScaleFormat, SourceRepresentation,
         },
         source::TensorRef,
     };
