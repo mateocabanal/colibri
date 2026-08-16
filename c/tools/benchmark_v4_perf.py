@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """DeepSeek-V4 end-to-end benchmark harness.
 
-The default `quick` profile is intentionally suitable for development loops:
-each subprocess is capped at 120 seconds and the cases avoid long generations.
+The default `quick` profile is intentionally suitable for development loops: it
+runs one representative 8-token decode and caps that subprocess at 120 seconds.
 Long-context and sustained-decode measurements remain available explicitly via
 `--profile standard` / `--profile full`.
 
@@ -57,7 +57,7 @@ class Case:
 
 
 # Split prefill from sustained decode instead of always doing +32 generation
-# after long prompts. That makes the short loop far cheaper and gives cleaner
+# after long prompts. That makes targeted runs far cheaper and gives cleaner
 # attribution: prefill cases primarily measure TTFT, decode cases measure token
 # latency after a short prompt.
 CASES = {
@@ -71,11 +71,10 @@ CASES = {
 }
 
 PROFILES = {
-    # Intended for edit -> build -> benchmark loops on the M2 target. At the
-    # measured ~7 s/token, decode8 is roughly a one-minute decode rather than
-    # several minutes. prefill512 asks for only the first output token.
-    "quick": ("decode1", "decode8", "prefill512"),
-    # Adds a representative longer prefill without a long generation tail.
+    # Normal edit -> build -> benchmark loop. One subprocess only. At the
+    # measured ~7 s/token, decode8 is roughly a one-minute decode.
+    "quick": ("decode8",),
+    # Adds representative prefill cases without long generation tails.
     "standard": ("decode8", "prefill512", "prefill2k"),
     # Explicit regression/sustained suite. This is allowed to take a long time.
     "full": (
@@ -389,7 +388,7 @@ def selftest() -> None:
     assert abs(result.after_first_tok_s - 5.0) < 1e-9
     assert abs(result.tune_tok_s - (8 / 3.9)) < 1e-9
     assert make_prompt(512, 4.0) == make_prompt(512, 4.0)
-    assert PROFILES["quick"] == ("decode1", "decode8", "prefill512")
+    assert PROFILES["quick"] == ("decode8",)
     assert PROFILE_TIMEOUT_SEC["quick"] == 120.0
     assert text_from_timeout(b"partial") == "partial"
     print("benchmark_v4_perf selftest: ok")
@@ -397,7 +396,7 @@ def selftest() -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Run DeepSeek-V4 performance benchmarks. Default: quick <=120s/case."
+        description="Run DeepSeek-V4 performance benchmarks. Default: one <=120s quick run."
     )
     parser.add_argument("--engine", default="./deepseek_v4")
     parser.add_argument("--model", required=False)
