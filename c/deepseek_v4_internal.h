@@ -719,7 +719,7 @@ int coli_v4_resident_tier_plan(
 #include <stddef.h>
 #include <stdint.h>
 
-int coli_v4_head_cache_probe(const char *model_dir, uint64_t *bytes,
+int coli_v4_head_cache_probe(ColiV4Engine *engine, const char *model_dir, uint64_t *bytes,
                              char *error, size_t error_size);
 int coli_v4_head_cache_load(ColiV4Engine *engine, const char *model_dir,
                             char *error, size_t error_size);
@@ -781,6 +781,11 @@ struct ColiV4Engine {
 /* Session ownership helpers shared by production session code and tests. */
 void coli_v4_engine_attach_session(ColiV4Engine *engine);
 void coli_v4_engine_detach_session(ColiV4Engine *engine);
+
+int coli_v4_coli_layer_bytes(ColiExecutor *, const ColiDeepSeekV4Config *, int,
+                             uint64_t *, char *, size_t);
+int coli_v4_coli_tensor_load_f32(ColiExecutor *, ColiFloatTensor *, const char *,
+                                 char *, size_t);
 
 #include "tok.h"
 #include "kv_prefix.h"

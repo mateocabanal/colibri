@@ -8,6 +8,7 @@
 /* Shared st.h adapter and V4 tensor materialization helpers. */
 #include "deepseek_v4_internal.h"
 
+#include <sys/stat.h>
 #include <dirent.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -849,8 +850,20 @@ static int find_head(const char *model_dir, ColiSafetensorsIndex **index,
     return 0;
 }
 
-int coli_v4_head_cache_probe(const char *model_dir, uint64_t *bytes,
+int coli_v4_head_cache_probe(ColiV4Engine *engine, const char *model_dir, uint64_t *bytes,
                              char *error, size_t error_size) {
+    if (engine && engine->coli_static) {
+        const ColiRecordInfo *record = coli_executor_record_by_name(engine->coli_static, "head.weight");
+        ColiTensorInfo info;
+        if (!bytes || !record || record->math_format != COLI_CSF_MATH_BF16 ||
+            coli_package_tensor_info(coli_executor_package(engine->coli_static), record,
+                                     &info, error, error_size) || info.rank != 2) {
+            snprintf(error, error_size, "missing or invalid COLI BF16 head.weight");
+            return -1;
+        }
+        *bytes = info.data_stored_bytes;
+        return 0;
+    }
     ColiSafetensorsIndex *index;
     const ColiSafetensorsTensor *head;
     if (!bytes || find_head(model_dir, &index, &head, error, error_size)) return -1;
@@ -863,6 +876,33 @@ int coli_v4_head_cache_load(ColiV4Engine *engine, const char *model_dir,
     if (!engine) {
         snprintf(error, error_size, "head cache requires a V4 engine");
         return -1;
+    }
+    if (engine->coli_static) {
+        const ColiRecordInfo *record = coli_executor_record_by_name(engine->coli_static, "head.weight");
+        ColiTensorInfo info;
+        if (!record || record->math_format != COLI_CSF_MATH_BF16 ||
+            coli_package_tensor_info(coli_executor_package(engine->coli_static), record,
+                                     &info, error, error_size) || info.rank != 2 ||
+            info.data_stored_bytes > SIZE_MAX) {
+            snprintf(error, error_size, "missing or invalid COLI BF16 head.weight");
+            return -1;
+        }
+        uint64_t read_began = g_coli_v4_profile_on ? coli_v4_profile_now() : 0;
+        unsigned char *data = malloc((size_t)info.data_stored_bytes);
+        if (!data || coli_package_read_range(coli_executor_package(engine->coli_static), record,
+                                             info.data_offset, data,
+                                             (size_t)info.data_stored_bytes,
+                                             error, error_size)) {
+            free(data); return -1;
+        }
+        if (read_began) coli_v4_profile_add(COLI_V4_PROF_HEAD_READ,
+                                             coli_v4_profile_now() - read_began);
+        if (g_coli_v4_profile_on) coli_v4_profile_add_bytes(COLI_V4_PROF_HEAD_READ,
+                                                            info.data_stored_bytes);
+        free(engine->head_cache.data); engine->head_cache.data = data;
+        engine->head_cache.bytes = info.data_stored_bytes;
+        engine->head_cache.offset = 0; engine->head_cache.shard = -2;
+        return 0;
     }
     ColiSafetensorsIndex *index;
     const ColiSafetensorsTensor *head;
@@ -971,6 +1011,18 @@ static uint64_t context_bytes(const ColiDeepSeekV4Config *config, int context) {
     return total;
 }
 
+/* Keep the planner's cache floor synchronized with the bounded asynchronous
+ * loader pool. The same V4_LOADER_LANES contract is consumed later by
+ * dual_loader_lanes(); exposing it here prevents a low-memory plan from
+ * opening fewer resident slots than outstanding reads. */
+static int coli_v4_loader_lane_budget(void) {
+    const char *value = getenv("V4_LOADER_LANES");
+    int lanes = value ? atoi(value) : COLI_V4_EXPERT_LOADER_COUNT;
+    if (lanes < 1) lanes = COLI_V4_EXPERT_LOADER_COUNT;
+    if (lanes > 16) lanes = 16;
+    return lanes;
+}
+
 static int build_runtime_plan(ColiV4Engine *engine,
                               const ColiDeepSeekV4ExpertStoreOptions *options,
                               ColiDeepSeekV4ResourcePlan *plan,
@@ -981,23 +1033,29 @@ static int build_runtime_plan(ColiV4Engine *engine,
         snprintf(error, error_size, "V4 runtime requires an engine");
         return -1;
     }
-    if (coli_v4_config_load(&config, options->model_dir, error, error_size) ||
-        coli_st_index_open(&index, options->model_dir, error, error_size))
+    if (coli_v4_config_load(&config, options->model_dir, error, error_size))
+        return -1;
+    if (!engine->coli_static && coli_st_index_open(&index, options->model_dir, error, error_size))
         return -1;
     uint64_t maximum_layer = 0;
     for (int layer = 0; layer < config.num_hidden_layers; layer++) {
-        ColiDeepSeekV4LayerPlan layer_plan;
-        ColiDeepSeekV4LayerStats stats;
-        if (coli_v4_layer_plan(&layer_plan, &config, layer,
-                               error, error_size) ||
-            coli_v4_layer_validate(&layer_plan, index, &stats,
-                                   error, error_size)) {
-            coli_st_index_close(index); return -1;
+        uint64_t layer_bytes = 0;
+        if (engine->coli_static
+            ? coli_v4_coli_layer_bytes(engine->coli_static, &config, layer,
+                                       &layer_bytes, error, error_size)
+            : ({ ColiDeepSeekV4LayerPlan p; ColiDeepSeekV4LayerStats s;
+                 int rc = coli_v4_layer_plan(&p, &config, layer, error, error_size) ||
+                          coli_v4_layer_validate(&p, index, &s, error, error_size);
+                 if (!rc) layer_bytes = s.total_bytes; rc; })) {
+            if (index) coli_st_index_close(index); return -1;
         }
-        if (stats.total_bytes > maximum_layer) maximum_layer = stats.total_bytes;
+        if (layer_bytes > maximum_layer) maximum_layer = layer_bytes;
     }
-    uint64_t record = expert_record_bytes(index);
-    coli_st_index_close(index);
+    uint64_t record = engine->coli_static
+        ? (coli_executor_expert(engine->coli_static, 0, 0)
+           ? coli_executor_expert(engine->coli_static, 0, 0)->stored_bytes : 0)
+        : expert_record_bytes(index);
+    if (index) coli_st_index_close(index);
     if (!record) {
         snprintf(error, error_size, "cannot determine V4 expert record size");
         return -1;
@@ -1023,29 +1081,36 @@ static int build_runtime_plan(ColiV4Engine *engine,
     ColiDeepSeekV4ResourceInputs inputs = {
         available, runtime->memory_limit_bytes, maximum_layer,
         runtime_other, record, config.num_hidden_layers,
-        config.num_experts_per_tok, config.n_routed_experts,
+        /* COLI's bounded streaming store holds only asynchronous
+         * loader lanes. Each routed view is released after its matvec; unlike
+         * the old batch store it never needs all top-k experts resident. */
+        engine->coli_static ? coli_v4_loader_lane_budget() : config.num_experts_per_tok,
+        config.n_routed_experts,
     };
     return coli_v4_resource_plan_compute(plan, &inputs, error, error_size);
 }
 
-static int v5_dense_inventory(const char *model_dir,
+static int v5_dense_inventory(ColiV4Engine *engine, const char *model_dir,
                               uint64_t *bytes,
                               char *error, size_t error_size) {
     ColiDeepSeekV4Config config; ColiSafetensorsIndex *index = NULL;
     if (coli_v4_config_load(&config, model_dir, error, error_size) ||
-        coli_st_index_open(&index, model_dir, error, error_size)) return -1;
+        (!engine->coli_static && coli_st_index_open(&index, model_dir, error, error_size))) return -1;
     uint64_t total = 0;
     for (int layer = 0; layer < config.num_hidden_layers; layer++) {
-        ColiDeepSeekV4LayerPlan layer_plan; ColiDeepSeekV4LayerStats stats;
-        if (coli_v4_layer_plan(&layer_plan, &config, layer,
-                               error, error_size) ||
-            coli_v4_layer_validate(&layer_plan, index, &stats,
-                                   error, error_size)) {
-            coli_st_index_close(index); return -1;
+        uint64_t layer_bytes = 0;
+        if (engine->coli_static
+            ? coli_v4_coli_layer_bytes(engine->coli_static, &config, layer,
+                                       &layer_bytes, error, error_size)
+            : ({ ColiDeepSeekV4LayerPlan p; ColiDeepSeekV4LayerStats s;
+                 int rc = coli_v4_layer_plan(&p, &config, layer, error, error_size) ||
+                          coli_v4_layer_validate(&p, index, &s, error, error_size);
+                 if (!rc) layer_bytes = s.total_bytes; rc; })) {
+            if (index) coli_st_index_close(index); return -1;
         }
-        total += stats.total_bytes;
+        total += layer_bytes;
     }
-    coli_st_index_close(index); *bytes = total; return 0;
+    if (index) coli_st_index_close(index); *bytes = total; return 0;
 }
 
 int coli_v4_expert_store_open_planned(
@@ -1059,9 +1124,9 @@ int coli_v4_expert_store_open_planned(
     uint64_t per_slot = plan.expert_cache_bytes /
                         (uint64_t)plan.slots_per_layer;
     uint64_t head_bytes = 0, dense_bytes = 0;
-    if (coli_v4_head_cache_probe(options->model_dir, &head_bytes,
+    if (coli_v4_head_cache_probe(engine, options->model_dir, &head_bytes,
                                  error, error_size) ||
-        v5_dense_inventory(options->model_dir, &dense_bytes,
+        v5_dense_inventory(engine, options->model_dir, &dense_bytes,
                            error, error_size)) return -1;
 
     uint64_t fixed = plan.system_reserve_bytes + plan.runtime_reserve_bytes;
@@ -1096,7 +1161,8 @@ int coli_v4_expert_store_open_planned(
     }
     int slots = (int)(cache_limit / per_slot);
     if (slots > plan.slots_per_layer) slots = plan.slots_per_layer;
-    if (slots < options->experts_per_layer && slots < 6) slots = 6;
+    int minimum_slots = engine->coli_static ? coli_v4_loader_lane_budget() : 6;
+    if (slots < options->experts_per_layer && slots < minimum_slots) slots = minimum_slots;
     plan.expert_cache_bytes = (uint64_t)slots * per_slot;
     runtime->target_expert_cache_bytes = plan.expert_cache_bytes;
     plan.projected_bytes = fixed + dense_bytes +
@@ -7264,8 +7330,19 @@ int coli_v4_engine_open(ColiV4Engine **output,
         goto fail;
     }
     engine->runtime.target_model_dir = engine->owned_target_model_dir;
-    engine->runtime.coli_model_dir = options->coli_model_dir;
-    if (options->coli_model_dir) fprintf(stderr, "v4_coli mode=hybrid static=COLI experts=COLI source_fallback=safetensors-dense-ancillary path=%s\n", options->coli_model_dir);
+    char manifest_path[4096]; struct stat manifest_stat;
+    int manifest_length = snprintf(manifest_path, sizeof(manifest_path), "%s/manifest.coli",
+                                   engine->runtime.target_model_dir);
+    int target_is_coli = manifest_length > 0 &&
+        (size_t)manifest_length < sizeof(manifest_path) &&
+        stat(manifest_path, &manifest_stat) == 0 && S_ISREG(manifest_stat.st_mode);
+    const char *coli_dir = options->coli_model_dir ? options->coli_model_dir :
+        (target_is_coli ? engine->runtime.target_model_dir : NULL);
+    engine->runtime.coli_model_dir = coli_dir;
+    if (coli_dir && target_is_coli && !options->coli_model_dir)
+        fprintf(stderr, "v4_coli mode=package-only source_fallback=none path=%s\n", coli_dir);
+    else if (coli_dir)
+        fprintf(stderr, "v4_coli mode=hybrid static=COLI experts=COLI source_fallback=safetensors-dense-ancillary path=%s\n", coli_dir);
     else fprintf(stderr, "v4_coli mode=legacy source=safetensors reason=COLI_MODEL-unset\n");
     engine->runtime.memory_limit_bytes = options->memory_limit_bytes;
     engine->runtime.context_tokens =
@@ -7277,15 +7354,24 @@ int coli_v4_engine_open(ColiV4Engine **output,
     if (coli_v4_config_load(&engine->config, engine->runtime.target_model_dir,
                             error, error_size))
         goto fail;
-    if (coli_st_index_open(&engine->target_index,
-                           engine->runtime.target_model_dir, error,
-                           error_size))
+    if (!coli_dir && coli_st_index_open(&engine->target_index,
+                                        engine->runtime.target_model_dir, error,
+                                        error_size))
         goto fail;
-    engine->owns_index = 1;
-    if (options->coli_model_dir && coli_executor_open(&engine->coli_static, options->coli_model_dir,
-            &(ColiExecutorOpenOptions){"macos-arm64-metal-apple8-v1", COLI_CSF_CHECKSUM_RECORD_ON_READ, 0}, error, error_size)) goto fail;
+    engine->owns_index = engine->target_index != NULL;
+    ColiCsfChecksumPolicy coli_checksum_policy =
+        getenv("COLI_VERIFY_RECORDS") && atoi(getenv("COLI_VERIFY_RECORDS"))
+            ? COLI_CSF_CHECKSUM_RECORD_ON_READ : COLI_CSF_CHECKSUM_MANIFEST_ONLY;
+    if (coli_dir && coli_checksum_policy == COLI_CSF_CHECKSUM_MANIFEST_ONLY)
+        fprintf(stderr, "v4_coli integrity=manifest-and-shard record_crc=skipped reason=COLI_VERIFY_RECORDS-unset\n");
+    if (coli_dir && coli_executor_open(&engine->coli_static, coli_dir,
+            &(ColiExecutorOpenOptions){"macos-arm64-metal-apple8-v1", coli_checksum_policy, 0}, error, error_size)) goto fail;
     const ColiSafetensorsTensor *dspark_w1 = NULL, *dspark_w2 = NULL;
     int requested_full_dspark = v4_dspark_full_wanted(options);
+    if (!engine->target_index && requested_full_dspark) {
+        fprintf(stderr, "v4_coli unsupported=dspark source_fallback=none reason=COLI-package-has-no-dspark-loader; continuing-target-only\n");
+        requested_full_dspark = 0;
+    }
     int want_full_dspark = requested_full_dspark &&
                            v4_dspark_full_profile_present(
                                engine->target_index, &engine->config);
@@ -7295,7 +7381,7 @@ int coli_v4_engine_open(ColiV4Engine **output,
                 "expected_full_profile=3stage actual_mtp_layers=%d; "
                 "continuing-target-only\n",
                 engine->config.num_nextn_predict_layers);
-    int want_dspark = !want_full_dspark && v4_dspark_markov_wanted(options);
+    int want_dspark = engine->target_index && !want_full_dspark && v4_dspark_markov_wanted(options);
     if (want_dspark && v4_dspark_markov_probe(engine, &dspark_w1,
                                                &dspark_w2)) {
         fprintf(stderr,
@@ -7479,6 +7565,29 @@ static int load_embedding(float *state, const ColiSafetensorsIndex *index,
     return 0;
 }
 
+static int load_embedding_engine(ColiV4Engine *engine, float *state,
+                                 const ColiSafetensorsIndex *index,
+                                 const ColiDeepSeekV4Config *config, int token) {
+    if (!engine || !engine->coli_static)
+        return load_embedding(state, index, config, token);
+    const ColiRecordInfo *record = coli_executor_record_by_name(engine->coli_static, "embed.weight");
+    ColiTensorInfo info; int d = config->hidden_size, hc = config->hc_mult;
+    uint16_t *row = malloc((size_t)d * sizeof(*row));
+    if (!record || record->math_format != COLI_CSF_MATH_BF16 || !row || token < 0 ||
+        token >= config->vocab_size ||
+        coli_package_tensor_info(coli_executor_package(engine->coli_static), record,
+                                 &info, NULL, 0) || info.rank != 2 ||
+        info.dims[0] != (uint64_t)config->vocab_size || info.dims[1] != (uint64_t)d ||
+        coli_package_read_range(coli_executor_package(engine->coli_static), record,
+                                info.data_offset + (uint64_t)token * d * sizeof(*row),
+                                row, (size_t)d * sizeof(*row), NULL, 0)) {
+        free(row); return -1;
+    }
+    for (int copy = 0; copy < hc; copy++)
+        for (int i = 0; i < d; i++) state[(size_t)copy * d + i] = coli_bf16_decode(row[i]);
+    free(row); return 0;
+}
+
 static int final_hidden(float *output, const float *state,
                         const ColiSafetensorsIndex *index,
                         const ColiDeepSeekV4Config *config,
@@ -7522,6 +7631,40 @@ static int final_hidden(float *output, const float *state,
     return 0;
 }
 
+static int final_hidden_engine(ColiV4Engine *engine, float *output, const float *state,
+                               const ColiSafetensorsIndex *index,
+                               const ColiDeepSeekV4Config *config,
+                               char *error, size_t error_size) {
+    if (!engine || !engine->coli_static)
+        return final_hidden(output, state, index, config, error, error_size);
+    ColiFloatTensor function = {0}, base = {0}, scale = {0}, norm = {0};
+    if (coli_v4_coli_tensor_load_f32(engine->coli_static, &function, "hc_head_fn", error, error_size) ||
+        coli_v4_coli_tensor_load_f32(engine->coli_static, &base, "hc_head_base", error, error_size) ||
+        coli_v4_coli_tensor_load_f32(engine->coli_static, &scale, "hc_head_scale", error, error_size) ||
+        coli_v4_coli_tensor_load_f32(engine->coli_static, &norm, "norm.weight", error, error_size)) {
+        coli_float_tensor_free(&norm); coli_float_tensor_free(&scale);
+        coli_float_tensor_free(&base); coli_float_tensor_free(&function); return -1;
+    }
+    int d = config->hidden_size, hc = config->hc_mult, flattened = hc * d;
+    float square = 0.0f, pre[16];
+    if (hc > 16 || function.count != (uint64_t)hc * flattened || base.count != (uint64_t)hc ||
+        scale.count != 1 || norm.count != (uint64_t)d) goto fail;
+    for (int i = 0; i < flattened; i++) square += state[i] * state[i];
+    float inverse_rms = 1.0f / sqrtf(square / flattened + config->rms_norm_eps);
+    for (int copy = 0; copy < hc; copy++) {
+        float mix = 0.0f; for (int i = 0; i < flattened; i++) mix += function.data[(size_t)copy * flattened + i] * state[i];
+        mix *= inverse_rms;
+        float z = mix * scale.data[0] + base.data[copy];
+        pre[copy] = (z >= 0.0f ? 1.0f / (1.0f + expf(-z)) : expf(z) / (1.0f + expf(z))) + config->hc_eps;
+    }
+    for (int i = 0; i < d; i++) { float value = 0.0f; for (int copy = 0; copy < hc; copy++) value += pre[copy] * state[(size_t)copy * d + i]; output[i] = coli_bf16_round(value); }
+    coli_v4_rmsnorm(output, output, norm.data, d, config->rms_norm_eps); coli_bf16_round_array(output, (size_t)d);
+    coli_float_tensor_free(&norm); coli_float_tensor_free(&scale); coli_float_tensor_free(&base); coli_float_tensor_free(&function); return 0;
+fail:
+    snprintf(error, error_size, "invalid COLI final-head tensor shapes");
+    coli_float_tensor_free(&norm); coli_float_tensor_free(&scale); coli_float_tensor_free(&base); coli_float_tensor_free(&function); return -1;
+}
+
 static float head_bf16_dot(const uint16_t *weight, const float *hidden,
                            int dimension) {
     float sum = 0.0f;
@@ -7555,8 +7698,33 @@ static int head_argmax(ColiV4Engine *engine, const float *hidden,
                        const ColiSafetensorsIndex *index,
                        const ColiDeepSeekV4Config *config,
                        int *best_token, float *best_logit) {
-    const ColiSafetensorsTensor *head = coli_st_find(index, "head.weight");
     int d = config->hidden_size, vocab = config->vocab_size;
+    if (engine && engine->coli_static) {
+        const ColiRecordInfo *record = coli_executor_record_by_name(engine->coli_static, "head.weight");
+        ColiTensorInfo info;
+        if (!record || record->math_format != COLI_CSF_MATH_BF16 ||
+            coli_package_tensor_info(coli_executor_package(engine->coli_static), record, &info, NULL, 0) ||
+            info.rank != 2 || info.dims[0] != (uint64_t)vocab || info.dims[1] != (uint64_t)d)
+            return -1;
+        const uint16_t *resident = engine->head_cache.shard == -2
+            ? (const uint16_t *)engine->head_cache.data : NULL;
+        enum { ROWS = 64 }; uint16_t *raw = resident ? NULL : malloc((size_t)ROWS * d * sizeof(*raw));
+        float *scores = malloc((size_t)(resident ? vocab : ROWS) * sizeof(*scores));
+        if ((!resident && !raw) || !scores) { free(scores); free(raw); return -1; }
+        int winner = -1; float maximum = -FLT_MAX;
+        for (int start = 0; start < vocab; start += resident ? vocab : ROWS) {
+            int rows = resident ? vocab : (vocab - start < ROWS ? vocab - start : ROWS);
+            const uint16_t *weights = resident ? resident : raw;
+            if (!resident && coli_package_read_range(coli_executor_package(engine->coli_static), record,
+                                                     info.data_offset + (uint64_t)start * d * sizeof(*raw), raw,
+                                                     (size_t)rows * d * sizeof(*raw), NULL, 0)) { free(scores); free(raw); return -1; }
+            #pragma omp parallel for
+            for (int row = 0; row < rows; row++) scores[row] = head_bf16_dot(weights + (size_t)row * d, hidden, d);
+            for (int row = 0; row < rows; row++) if (scores[row] > maximum) { maximum = scores[row]; winner = start + row; }
+        }
+        free(scores); free(raw); *best_token = winner; *best_logit = maximum; return winner < 0 ? -1 : 0;
+    }
+    const ColiSafetensorsTensor *head = coli_st_find(index, "head.weight");
     if (!head || head->dtype != COLI_ST_BF16 || d < 1 || vocab < 1)
         return -1;
     int shard = coli_st_tensor_shard(index, head);
@@ -7631,7 +7799,7 @@ static int head_argmax_batch(ColiV4Engine *engine, const float *hidden,
                              const ColiSafetensorsIndex *index,
                              const ColiDeepSeekV4Config *config, int batch,
                              int *best_tokens, float *best_logits) {
-    if (!engine || !hidden || !index || !config || batch < 1 ||
+    if (!engine || !hidden || (!index && !engine->coli_static) || !config || batch < 1 ||
         !best_tokens || !best_logits) return -1;
     if (batch == 1)
         return head_argmax(engine, hidden, index, config, best_tokens,
@@ -7943,7 +8111,7 @@ static int target_batch(ColiV4Engine *engine, float **state_ptr, float **next_pt
                         ColiExpertStore *experts, const int *tokens,
                         int start, int batch, char *error, size_t error_size) {
     if (!state_ptr || !next_ptr || !*state_ptr || !*next_ptr || !attention ||
-        !index || !config || !experts || !tokens || start < 0 || batch < 1) {
+        (!index && !(engine && engine->coli_static)) || !config || !experts || !tokens || start < 0 || batch < 1) {
         if (error && error_size)
             snprintf(error, error_size, "invalid target batch arguments");
         return -1;
@@ -7953,7 +8121,11 @@ static int target_batch(ColiV4Engine *engine, float **state_ptr, float **next_pt
     for (int layer_id = 0; layer_id < config->num_hidden_layers; layer_id++) {
         ColiDeepSeekV4LayerWeights layer;
         if (coli_v4_layer_load(engine, &layer, config, index, layer_id,
-                               error, error_size)) return -1;
+                               error, error_size)) {
+            if (error && error_size && !error[0])
+                snprintf(error, error_size, "cannot load target layer %d", layer_id);
+            return -1;
+        }
         int result = 0;
         /* Chunk width caps every batch-scaled buffer in the block AND bounds
          * the expert union: each chunk boundary re-reads the experts it
@@ -7999,7 +8171,7 @@ static int target_token(ColiV4Engine *engine, float **state_ptr, float **next_pt
                         ColiExpertStore *experts, int token, int position,
                         char *error, size_t error_size) {
     float *state = *state_ptr, *next = *next_ptr;
-    if (load_embedding(state, index, config, token)) return -1;
+    if (load_embedding_engine(engine, state, index, config, token)) return -1;
     for (int layer_id = 0; layer_id < config->num_hidden_layers; layer_id++) {
         ColiDeepSeekV4LayerWeights layer;
         if (coli_v4_layer_load(engine, &layer, config, index, layer_id,
@@ -8577,7 +8749,7 @@ int coli_v4_session_generate(ColiV4Session *session,
 
     int fresh = prompt_count - reuse;
     for (int item = 0; item < fresh; item++)
-        if (load_embedding(state + (size_t)item * hd, index, config,
+        if (load_embedding_engine(engine, state + (size_t)item * hd, index, config,
                            session->prompt_ids[reuse + item])) {
             /* The state now matches neither the old ids nor the new ones. */
             kv_prefix_taint(&session->fed);
@@ -8604,7 +8776,7 @@ int coli_v4_session_generate(ColiV4Session *session,
     const float *last = state + (size_t)(fresh - 1) * hd;
     int current = 0;
     float current_logit = 0.0f;
-    if (final_hidden(hidden, last, index, config, error, error_size) ||
+    if (final_hidden_engine(engine, hidden, last, index, config, error, error_size) ||
         head_argmax(engine, hidden, index, config, &current, &current_logit)) {
         kv_prefix_taint(&session->fed);
         return -1;
@@ -8703,7 +8875,7 @@ int coli_v4_session_generate(ColiV4Session *session,
                 } else {
                     int old_last = last_processed;
                     for (int item = 0; item < batch; item++)
-                        if (load_embedding(state + (size_t)item * hd, index,
+                        if (load_embedding_engine(engine, state + (size_t)item * hd, index,
                                            config, inputs[item])) {
                             spec_attention_free(snapshots,
                                                 config->num_hidden_layers);
@@ -8727,7 +8899,7 @@ int coli_v4_session_generate(ColiV4Session *session,
                         (size_t)batch * config->hidden_size * sizeof(float));
                     int heads_ok = batch_hidden != NULL;
                     for (int item = 0; heads_ok && item < batch; item++)
-                        if (final_hidden(
+                        if (final_hidden_engine(engine,
                                 batch_hidden +
                                     (size_t)item * config->hidden_size,
                                 state + (size_t)item * hd, index, config,
@@ -8806,7 +8978,7 @@ int coli_v4_session_generate(ColiV4Session *session,
                         if (coli_v4_full_dspark_wanted)
                             v4_ds_invalidate_from(old_last + 1);
                         for (int item = 0; item < retained; item++)
-                            if (load_embedding(state + (size_t)item * hd,
+                            if (load_embedding_engine(engine, state + (size_t)item * hd,
                                                index, config, inputs[item])) {
                                 spec_attention_free(
                                     snapshots, config->num_hidden_layers);
@@ -8858,7 +9030,7 @@ int coli_v4_session_generate(ColiV4Session *session,
         {
             uint64_t head_began = g_coli_v4_profile_on
                 ? coli_v4_profile_now() : 0;
-            if (final_hidden(hidden, state, index, config, error, error_size) ||
+            if (final_hidden_engine(engine, hidden, state, index, config, error, error_size) ||
                 head_argmax(engine, hidden, index, config, &current,
                             &current_logit)) {
                 kv_prefix_taint(&session->fed);

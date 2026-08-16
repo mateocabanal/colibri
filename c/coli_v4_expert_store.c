@@ -48,9 +48,9 @@ static int lookup(ColiExpertStore *store, ColiExpertKey key, ColiExpertView *vie
         if(!slot->data) { if(posix_memalign((void**)&slot->data,4096,(size_t)s->record_bytes)){pthread_mutex_unlock(&s->mutex);memset(view,0,sizeof(*view));return -1;} s->stats.resident_bytes+=s->record_bytes; }
         slot->expert=-1; pthread_mutex_unlock(&s->mutex);
         char error[256]; int bad=coli_executor_load_expert(s->executor,key.layer,key.expert,slot->data,(size_t)s->record_bytes,error,sizeof(error));
-        pthread_mutex_lock(&s->mutex); if(bad){pthread_mutex_unlock(&s->mutex);memset(view,0,sizeof(*view));return -1;} slot->expert=key.expert;s->stats.misses++;s->stats.bytes_read+=s->record_bytes;
+        pthread_mutex_lock(&s->mutex); if(bad){fprintf(stderr,"v4_coli expert-load failed layer=%d expert=%d: %s\n",key.layer,key.expert,error);pthread_mutex_unlock(&s->mutex);memset(view,0,sizeof(*view));return -1;} slot->expert=key.expert;s->stats.misses++;s->stats.bytes_read+=s->record_bytes;
     }
-    slot->refs++; s->active_leases++; int bad=fill(view,key,r,slot); if(bad){slot->refs--;s->active_leases--;} pthread_mutex_unlock(&s->mutex); return bad?-1:0;
+    slot->refs++; s->active_leases++; int bad=fill(view,key,r,slot); if(bad){fprintf(stderr,"v4_coli expert-view invalid layer=%d expert=%d\n",key.layer,key.expert);slot->refs--;s->active_leases--;} pthread_mutex_unlock(&s->mutex); return bad?-1:0;
 }
 static void release(ColiExpertStore *store, ColiExpertView *v) { State*s=store?store->state:NULL; Slot*slot=v?v->lease:NULL;if(!s||!slot)return;pthread_mutex_lock(&s->mutex);if(slot->refs)slot->refs--;if(s->active_leases)s->active_leases--;pthread_mutex_unlock(&s->mutex); }
 static int prefetch(ColiExpertStore *store,const ColiExpertKey*k,size_t n){(void)store;(void)k;(void)n;return 0;}
@@ -60,7 +60,9 @@ int coli_v4_coli_expert_store_open(const ColiV4ColiExpertStoreOptions*o,ColiExpe
     static const ColiExpertStoreOps ops={lookup,release,prefetch,stats,destroy}; ColiExpertStore*store=NULL;State*s=NULL;ColiExecutorOpenOptions xo={0};
     if(out)*out=NULL; if(!o||!out||!o->package_dir||!o->required_profile||o->layers<1||o->experts_per_layer<1||!o->cache_bytes)return fail(e,n,"invalid COLI V4 expert-store options");
     store=calloc(1,sizeof(*store));s=calloc(1,sizeof(*s));if(!store||!s){free(store);free(s);return fail(e,n,"out of memory creating COLI expert store");}pthread_mutex_init(&s->mutex,NULL);
-    xo.required_profile=o->required_profile;xo.checksum_policy=COLI_CSF_CHECKSUM_RECORD_ON_READ;
+    xo.required_profile=o->required_profile;
+    xo.checksum_policy=getenv("COLI_VERIFY_RECORDS")&&atoi(getenv("COLI_VERIFY_RECORDS"))
+        ?COLI_CSF_CHECKSUM_RECORD_ON_READ:COLI_CSF_CHECKSUM_MANIFEST_ONLY;
     if(coli_executor_open(&s->executor,o->package_dir,&xo,e,n))goto bad;s->layers=o->layers;s->experts=o->experts_per_layer;
     s->records=calloc((size_t)s->layers*s->experts,sizeof(*s->records));if(!s->records){fail(e,n,"out of memory indexing COLI experts");goto bad;}
     for(int l=0;l<s->layers;l++)for(int x=0;x<s->experts;x++){Record*r=&s->records[(size_t)l*s->experts+x];r->record=coli_executor_expert(s->executor,l,x);if(!r->record||coli_executor_expert_info(s->executor,l,x,&r->info,e,n)){fail(e,n,"COLI package is missing/invalid expert (%d,%d)",l,x);goto bad;}if(!s->record_bytes)s->record_bytes=r->record->stored_bytes;if(r->record->stored_bytes!=s->record_bytes){fail(e,n,"COLI experts have non-uniform stored sizes");goto bad;}}
