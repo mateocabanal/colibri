@@ -20,6 +20,7 @@ pub struct CompileRequest {
     pub dry_run: bool,
     pub verify: bool,
     pub force: bool,
+    pub shard_size_bytes: u64,
 }
 
 impl CompileRequest {
@@ -34,6 +35,7 @@ impl CompileRequest {
             dry_run: false,
             verify: false,
             force: false,
+            shard_size_bytes: 4 * 1024 * 1024 * 1024,
         }
     }
 }
@@ -180,7 +182,7 @@ pub fn dry_run(request: &CompileRequest) -> Result<DryRunSummary> {
     })?;
     let target = target::resolve(&request.target, target::HostCapabilities::current())?;
     let records = exact_record_inventory(&model)?;
-    let plan = storage::plan_records(&records, target, 4 * 1024 * 1024 * 1024)?;
+    let plan = storage::plan_records(&records, target, request.shard_size_bytes)?;
     Ok(DryRunSummary {
         target_name: target.name,
         source_tensors: inventory.tensors.len(),
@@ -504,7 +506,7 @@ pub fn compile(request: &CompileRequest, progress: &mut dyn ProgressSink) -> Res
     progress.stage(Stage::StoragePlanning);
     let sources = exact_sources(&model);
     let records = exact_record_inventory(&model)?;
-    let plan = storage::plan_records(&records, target, 4 * 1024 * 1024 * 1024)?;
+    let plan = storage::plan_records(&records, target, request.shard_size_bytes)?;
     let fingerprint = source::fingerprint_bytes(&inventory.source_fingerprint)?;
     let temporary = storage::temporary_package_path(output)?;
     progress.stage(Stage::Emission);
@@ -551,13 +553,17 @@ pub fn compile(request: &CompileRequest, progress: &mut dyn ProgressSink) -> Res
                 })?;
             header_crcs.push(u32::from_le_bytes(header[72..76].try_into().unwrap()));
         }
+        let profile_data = storage::v11::storage_profile_data(request.shard_size_bytes);
         let manifest = storage::v11::encode_manifest(
             &plan,
             target,
             fingerprint,
             &metadata,
             &header_crcs,
-            storage::v11::ArtifactOptions::default(),
+            storage::v11::ArtifactOptions {
+                profile_data: &profile_data,
+                ..storage::v11::ArtifactOptions::default()
+            },
         )?;
         let manifest_path = temporary.join("manifest.coli");
         fs::write(&manifest_path, manifest).map_err(|source| ColicError::Io {
@@ -590,6 +596,11 @@ pub fn compile(request: &CompileRequest, progress: &mut dyn ProgressSink) -> Res
 }
 
 fn validate_supported_options(request: &CompileRequest) -> Result<()> {
+    if request.shard_size_bytes == 0 {
+        return Err(ColicError::Usage(
+            "shard size must be greater than zero".into(),
+        ));
+    }
     if !matches!(request.quant, QuantRequest::Exact) {
         return Err(ColicError::unsupported(
             Stage::TargetPlanning.as_str(),

@@ -13,7 +13,7 @@ pub enum Command {
     Help,
 }
 
-pub const USAGE: &str = "Usage:\n  colic inspect-source MODEL_DIR\n  colic verify PACKAGE_DIR\n  colic compile MODEL_DIR --target native|PROFILE --quant exact|PROFILE --codec none|auto|PROFILE --opt default|size|latency -o OUTPUT [--dry-run] [--verify] [--force]";
+pub const USAGE: &str = "Usage:\n  colic inspect-source MODEL_DIR\n  colic verify PACKAGE_DIR\n  colic compile MODEL_DIR --target native|PROFILE --quant exact|PROFILE --codec none|auto|PROFILE --opt default|size|latency -o OUTPUT [--shard-size-gb N|--shard-size-mib N] [--dry-run] [--verify] [--force]";
 
 pub fn parse<I>(args: I) -> Result<Command>
 where
@@ -81,6 +81,14 @@ where
             "-o" | "--output" => {
                 request.output = Some(PathBuf::from(value(&mut args, "--output")?))
             }
+            "--shard-size-gb" => {
+                request.shard_size_bytes =
+                    parse_shard_size(&value(&mut args, "--shard-size-gb")?, 1024 * 1024 * 1024)?
+            }
+            "--shard-size-mib" => {
+                request.shard_size_bytes =
+                    parse_shard_size(&value(&mut args, "--shard-size-mib")?, 1024 * 1024)?
+            }
             "--dry-run" => request.dry_run = true,
             "--verify" => request.verify = true,
             "--force" => request.force = true,
@@ -97,6 +105,20 @@ where
         ));
     }
     Ok(Command::Compile(request))
+}
+
+fn parse_shard_size(value: &str, unit_bytes: u64) -> Result<u64> {
+    let units: u64 = value
+        .parse()
+        .map_err(|_| ColicError::Usage(format!("invalid shard size `{value}`")))?;
+    if units == 0 {
+        return Err(ColicError::Usage(
+            "shard size must be greater than zero".into(),
+        ));
+    }
+    units
+        .checked_mul(unit_bytes)
+        .ok_or_else(|| ColicError::Usage("shard size overflows u64".into()))
 }
 
 #[cfg(test)]
@@ -121,6 +143,21 @@ mod tests {
         assert_eq!(request.codec, CodecRequest::None);
         assert_eq!(request.optimization, OptimizationProfile::Latency);
         assert!(request.verify);
+    }
+
+    #[test]
+    fn parses_explicit_shard_size() {
+        let Command::Compile(request) =
+            parse(["compile", "fixture", "--shard-size-mib", "2", "--dry-run"].map(str::to_owned))
+                .unwrap()
+        else {
+            panic!("expected compile")
+        };
+        assert_eq!(request.shard_size_bytes, 2 * 1024 * 1024);
+        assert!(
+            parse(["compile", "fixture", "--shard-size-gb", "0", "--dry-run"].map(str::to_owned))
+                .is_err()
+        );
     }
 
     #[test]

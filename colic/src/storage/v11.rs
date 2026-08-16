@@ -22,6 +22,7 @@ pub struct ArtifactOptions<'a> {
     pub quant_profile: &'a str,
     pub storage_profile: &'a str,
     pub optimization_profile: &'a str,
+    pub profile_data: &'a [u8],
 }
 
 impl Default for ArtifactOptions<'static> {
@@ -31,6 +32,7 @@ impl Default for ArtifactOptions<'static> {
             quant_profile: "exact",
             storage_profile: "none",
             optimization_profile: "default",
+            profile_data: &[],
         }
     }
 }
@@ -76,8 +78,13 @@ pub fn artifact_fingerprint(
     hasher.update(identity.required_runtime_features.to_le_bytes());
     hasher.update([0]);
     hasher.update([0_u8; 32]);
-    hasher.update(0_u64.to_le_bytes());
-    hasher.update(Sha256::digest([]));
+    let profile_data_bytes: u64 = options
+        .profile_data
+        .len()
+        .try_into()
+        .map_err(|_| ColicError::Usage("profile data exceeds u64".into()))?;
+    hasher.update(profile_data_bytes.to_le_bytes());
+    hasher.update(Sha256::digest(options.profile_data));
     Ok(hasher.finalize().into())
 }
 
@@ -155,9 +162,26 @@ pub fn encode_manifest(
         strings.len() as u64 * STRING_DESC_BYTES + string_raw_bytes,
         16,
     )?;
-    let manifest_bytes = string_table_offset
+    let string_table_end = string_table_offset
         .checked_add(string_table_bytes)
         .ok_or_else(|| ColicError::Usage("manifest size overflows u64".into()))?;
+    let profile_data_bytes: u64 = options
+        .profile_data
+        .len()
+        .try_into()
+        .map_err(|_| ColicError::Usage("profile data exceeds u64".into()))?;
+    let profile_data_offset = if profile_data_bytes == 0 {
+        0
+    } else {
+        align_up(string_table_end, 16)?
+    };
+    let manifest_bytes = if profile_data_bytes == 0 {
+        string_table_end
+    } else {
+        profile_data_offset
+            .checked_add(profile_data_bytes)
+            .ok_or_else(|| ColicError::Usage("profile data span overflows u64".into()))?
+    };
     let mut manifest = vec![
         0_u8;
         manifest_bytes.try_into().map_err(|_| {
@@ -218,9 +242,21 @@ pub fn encode_manifest(
     put_u32(target_desc, 100, optimization_id);
     put_u32(target_desc, 104, kernel_id);
     put_u32(target_desc, 108, triple_id);
+    put_u64(target_desc, 144, profile_data_offset);
+    put_u64(target_desc, 152, profile_data_bytes);
+    if profile_data_bytes != 0 {
+        put_u32(target_desc, 160, crc32c(options.profile_data));
+    }
     put_u32(target_desc, 164, semantic_id);
     let target_crc = crc32c(target_desc);
     put_u32(&mut manifest, 232, target_crc);
+
+    if profile_data_bytes != 0 {
+        let start: usize = profile_data_offset
+            .try_into()
+            .map_err(|_| ColicError::Usage("profile data offset exceeds usize".into()))?;
+        manifest[start..start + options.profile_data.len()].copy_from_slice(options.profile_data);
+    }
 
     let artifact = artifact_fingerprint(source_fingerprint, profile, options)?;
     manifest[200..232].copy_from_slice(&artifact);
@@ -294,6 +330,13 @@ pub fn encode_manifest(
     Ok(manifest)
 }
 
+pub fn storage_profile_data(shard_size_bytes: u64) -> [u8; 24] {
+    let mut data = [0_u8; 24];
+    data[..16].copy_from_slice(b"COLI-STORAGE-V1\0");
+    data[16..24].copy_from_slice(&shard_size_bytes.to_le_bytes());
+    data
+}
+
 fn hash_string(hasher: &mut Sha256, value: &str) -> Result<()> {
     let bytes = value.as_bytes();
     let len: u32 = bytes
@@ -334,5 +377,16 @@ mod tests {
         let b = artifact_fingerprint([7; 32], profile, ArtifactOptions::default()).unwrap();
         assert_eq!(a, b);
         assert_ne!(a, [0; 32]);
+        let profile_data = storage_profile_data(1024 * 1024);
+        let changed = artifact_fingerprint(
+            [7; 32],
+            profile,
+            ArtifactOptions {
+                profile_data: &profile_data,
+                ..ArtifactOptions::default()
+            },
+        )
+        .unwrap();
+        assert_ne!(a, changed);
     }
 }
