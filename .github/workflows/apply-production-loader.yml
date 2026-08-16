@@ -46,8 +46,7 @@ jobs:
           p.write_text(text.replace(old, new, 1))
 
           patch = Path('tools/apply_production_loader.py')
-          source = patch.read_text()
-          source = source.replace(
+          source = patch.read_text().replace(
               'extern \\\"C\\\" int coli_metal_register(void *base, size_t len) {',
               'extern \\\"C\\\" void coli_metal_register(void *base, size_t len) {'
           )
@@ -57,15 +56,30 @@ jobs:
         run: |
           python3 tools/apply_production_loader.py
           python3 tools/production_loader_fixups.py
+      - name: CSF reader and target ABI regression
+        shell: bash
+        run: |
+          set +e
+          make -C c -f Makefile.csf test > "$RUNNER_TEMP/csf.log" 2>&1
+          status=$?
+          if [ "$status" -ne 0 ]; then
+            tail -n 25 "$RUNNER_TEMP/csf.log" | while IFS= read -r line; do
+              safe=${line//'%'/'%25'}
+              safe=${safe//$'\r'/'%0D'}
+              safe=${safe//$'\n'/'%0A'}
+              echo "::error::$safe"
+            done
+            cat "$RUNNER_TEMP/csf.log"
+            exit "$status"
+          fi
+          cat "$RUNNER_TEMP/csf.log"
+      - name: Build V4 production loader path
+        run: make -C c -f Makefile.deepseek-v4 deepseek-v4 METAL=0 LTO=0
       - name: Rust compiler regression
         shell: bash
         run: |
           cargo fmt --manifest-path colic/Cargo.toml -- --check
           cargo test --locked --manifest-path colic/Cargo.toml --all-targets
-      - name: CSF reader and target ABI regression
-        run: make -C c -f Makefile.csf test
-      - name: Build V4 production loader path
-        run: make -C c -f Makefile.deepseek-v4 deepseek-v4 METAL=0 LTO=0
       - name: Source -> compiler -> production executor -> strict reader -> kernel
         run: bash tools/colic_e2e.sh "$RUNNER_TEMP/colic-production-e2e"
       - name: Commit tested convergence
