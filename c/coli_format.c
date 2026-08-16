@@ -738,7 +738,8 @@ static int record_generic_valid(ColiPackage *p, ColiRecordInfo *r,
             r->stored_bytes < CSF_TENSOR_HEADER_BYTES) {
             csf_error(error, error_size, "record %llu violates TENSOR invariants", (unsigned long long)r->record_id); return -1;
         }
-        if (r->layer < -1) { csf_error(error, error_size, "tensor has invalid layer"); return -1; }
+        /* -1 is global and -2 is compiler-resident static state. */
+        if (r->layer < -2) { csf_error(error, error_size, "tensor has invalid layer"); return -1; }
         break;
     case COLI_CSF_REC_EXPERT:
         if (r->codec != COLI_CSF_CODEC_NONE || r->codec_table_id ||
@@ -1076,7 +1077,10 @@ static int parse_manifest(ColiPackage *p, char *error, size_t error_size) {
     profile_id = rd32(h + 148); compiler_id = rd32(h + 152);
     if (profile_id >= p->string_count || compiler_id >= p->string_count) { csf_error(error, error_size, "profile/compiler string id out of range"); return -1; }
     p->profile = p->strings[profile_id]; p->compiler = p->strings[compiler_id];
-    if (strcmp(p->profile, "portable-v1")) { csf_error(error, error_size, "unsupported CSF profile %s", p->profile); return -1; }
+    if (strcmp(p->profile, COLI_CSF_PROFILE_PORTABLE_V1) &&
+        strcmp(p->profile, COLI_CSF_PROFILE_MACOS_ARM64_METAL_APPLE8_V1)) {
+        csf_error(error, error_size, "unsupported CSF profile %s", p->profile); return -1;
+    }
     if (open_shards(p, h + (size_t)regions[0].offset, shard_count, error, error_size)) return -1;
     if (parse_codec_tables(p, regions[4].bytes ? h + (size_t)regions[4].offset : NULL, regions[4].bytes, codec_count, error, error_size)) return -1;
     if (parse_records(p, h + (size_t)regions[1].offset, record_count, error, error_size)) return -1;

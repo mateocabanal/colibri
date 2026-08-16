@@ -15,8 +15,8 @@ endif
 
 .PHONY: test test-asan clean
 
-tests/test_coli_format$(EXE): tests/test_coli_format.c coli_format.c coli_format.h compat.h
-	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) tests/test_coli_format.c coli_format.c -o $@ -pthread $(EXTRA_LDFLAGS)
+tests/test_coli_format$(EXE): tests/test_coli_format.c coli_format.c coli_executor.c coli_format.h coli_executor.h compat.h
+	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) tests/test_coli_format.c coli_format.c coli_executor.c -o $@ -pthread $(EXTRA_LDFLAGS)
 
 test: tests/test_coli_format$(EXE)
 	./tests/test_coli_format$(EXE)

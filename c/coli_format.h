@@ -16,6 +16,12 @@ extern "C" {
 #define COLI_CSF_VERSION_MINOR 0u
 #define COLI_CSF_MAX_RANK 8u
 
+/* Known v1.0 physical-layout profiles. A package reader accepts only these
+ * profiles; a target executor must still select one explicitly at open. */
+#define COLI_CSF_PROFILE_PORTABLE_V1 "portable-v1"
+#define COLI_CSF_PROFILE_MACOS_ARM64_METAL_APPLE8_V1 \
+    "macos-arm64-metal-apple8-v1"
+
 /* Container record kinds. These are CSF IDs, not QT.fmt ordinals. */
 enum {
     COLI_CSF_REC_INVALID = 0x0000,

@@ -3,6 +3,7 @@
 #endif
 
 #include "../coli_format.h"
+#include "../coli_executor.h"
 #include "../compat.h"
 
 #include <errno.h>
@@ -207,6 +208,25 @@ static int test_expert_and_duplicate(void) {
     CHECK(make_temp(dir)==0);CHECK(build_expert_package(dir,2)==0);CHECK(coli_package_open(&p,dir,err,sizeof(err))!=0);CHECK(p==NULL);cleanup_dir(dir,1);return 0;
 }
 
+static int test_executor(void) {
+    char dir[128],err[256]; ColiExecutor *executor=NULL; ColiExecutorOpenOptions opt;
+    const ColiRecordInfo *record; unsigned char *resident;
+    CHECK(make_temp(dir)==0); CHECK(build_expert_package(dir,1)==0);
+    memset(&opt,0,sizeof(opt)); opt.required_profile=COLI_CSF_PROFILE_PORTABLE_V1;
+    opt.checksum_policy=COLI_CSF_CHECKSUM_RECORD_ON_READ;
+    CHECK(coli_executor_open(&executor,dir,&opt,err,sizeof(err))==0);
+    record=coli_executor_expert(executor,2,7); CHECK(record&&record->stored_bytes==529);
+    CHECK(coli_executor_expert(executor,2,8)==NULL);
+    resident=(unsigned char*)malloc((size_t)record->stored_bytes); CHECK(resident);
+    CHECK(coli_executor_load_expert(executor,2,7,resident,(size_t)record->stored_bytes-1,err,sizeof(err))!=0);
+    CHECK(coli_executor_load_expert(executor,2,7,resident,(size_t)record->stored_bytes,err,sizeof(err))==0);
+    CHECK(!memcmp(resident,"COLIEXPT",8)); CHECK(resident[448]==1 && resident[464]==0x7f);
+    free(resident); coli_executor_close(executor); executor=NULL;
+    opt.required_profile=COLI_CSF_PROFILE_MACOS_ARM64_METAL_APPLE8_V1;
+    CHECK(coli_executor_open(&executor,dir,&opt,err,sizeof(err))!=0); CHECK(executor==NULL);
+    cleanup_dir(dir,1); return 0;
+}
+
 static int test_multishard(void) {
     char dir[128],err[256];ColiPackage*p=NULL;unsigned char b;const ColiRecordInfo*r;
     CHECK(make_temp(dir)==0);CHECK(build_two_shard_package(dir)==0);CHECK(coli_package_open(&p,dir,err,sizeof(err))==0);CHECK(coli_package_record_count(p)==2);r=coli_package_record_by_name(p,"b");CHECK(r&&r->shard_id==1);CHECK(coli_package_read_range(p,r,128,&b,1,err,sizeof(err))==0&&b==0x2b);CHECK(coli_package_verify_all(p,err,sizeof(err))==0);coli_package_close(p);cleanup_dir(dir,2);return 0;
@@ -237,6 +257,7 @@ int main(void) {
     CHECK(coli_crc32c("123456789",9)==0xe3069283u);
     CHECK(test_hand_fixture()==0);
     CHECK(test_expert_and_duplicate()==0);
+    CHECK(test_executor()==0);
     CHECK(test_multishard()==0);
     CHECK(expect_mutation_rejected(mut_major,0,0)==0);
     CHECK(expect_mutation_rejected(mut_bad_manifest_crc,0,0)==0);
