@@ -1,84 +1,80 @@
-use std::time::Instant;
+mod cli;
 
-use colic::{
-    cli::{self, Command, USAGE},
-    pipeline::{self, ProgressSink, Stage},
-    source::DiscoveryProgress,
-    verify::VerificationProgress,
-};
+use std::time::{Duration, Instant};
+
+use cli::{Command, USAGE};
+use colic::{pipeline, source::DiscoveryProgress, verify::VerificationProgress};
 
 struct ConsoleProgress {
-    emission_started: Option<Instant>,
-    verification_started: Option<Instant>,
+    last: Option<Instant>,
 }
 
 impl ConsoleProgress {
     fn new() -> Self {
-        Self {
-            emission_started: None,
-            verification_started: None,
-        }
+        Self { last: None }
     }
-}
 
-impl ConsoleProgress {
-    fn verification(&mut self, update: VerificationProgress) {
-        let started = self.verification_started.get_or_insert_with(Instant::now);
-        let elapsed = started.elapsed().as_secs_f64();
-        let throughput = if elapsed == 0.0 {
-            0.0
+    fn ready(&mut self) -> bool {
+        let now = Instant::now();
+        if self
+            .last
+            .is_none_or(|last| now.duration_since(last) >= Duration::from_millis(100))
+        {
+            self.last = Some(now);
+            true
         } else {
-            update.verified_bytes as f64 / elapsed / (1024.0 * 1024.0)
-        };
-        eprintln!(
-            "colic: verify {}/{} records, {} checked, shard {}/{} ({throughput:.1} MiB/s)",
-            update.completed_records,
-            update.total_records,
-            human_bytes(update.verified_bytes),
-            update.current_shard + 1,
-            update.total_shards,
-        );
-    }
-}
-
-impl ProgressSink for ConsoleProgress {
-    fn stage(&mut self, stage: Stage) {
-        if stage == Stage::Emission {
-            self.emission_started = Some(Instant::now());
+            false
         }
-        eprintln!("colic: {}...", stage.as_str());
-    }
-
-    fn emission(&mut self, completed: u64, total: u64, bytes: u64, total_bytes: u64) {
-        let elapsed = self
-            .emission_started
-            .map(|start| start.elapsed().as_secs_f64())
-            .unwrap_or(0.0);
-        let eta = if bytes > 0 && elapsed > 0.0 {
-            ((total_bytes - bytes) as f64 / (bytes as f64 / elapsed)).ceil() as u64
-        } else {
-            0
-        };
-        eprintln!(
-            "colic: emission {completed}/{total} records, {}/{}; ETA {}s",
-            human_bytes(bytes),
-            human_bytes(total_bytes),
-            eta
-        );
     }
 
     fn source_file(&mut self, update: &DiscoveryProgress) {
-        eprintln!(
-            "colic: source fingerprint {}/{}: {} ({})",
-            update.completed_files,
-            update.total_files,
-            update
-                .path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy(),
-            human_bytes(update.bytes_hashed),
-        );
+        if self.ready() || update.completed_files == update.total_files {
+            eprintln!(
+                "colic: source [{}/{}] {} ({})",
+                update.completed_files,
+                update.total_files,
+                update.path.display(),
+                human_bytes(update.bytes_hashed),
+            );
+        }
+    }
+
+    fn verification(&mut self, update: VerificationProgress) {
+        if self.ready() || update.completed_records == update.total_records {
+            eprintln!(
+                "colic: verify [{}/{} records] shard {}/{} ({})",
+                update.completed_records,
+                update.total_records,
+                update.current_shard + 1,
+                update.total_shards,
+                human_bytes(update.verified_bytes),
+            );
+        }
+    }
+}
+
+impl pipeline::ProgressSink for ConsoleProgress {
+    fn event(&mut self, event: &pipeline::ProgressEvent) {
+        match event {
+            pipeline::ProgressEvent::Stage(stage) => eprintln!("colic: stage={stage:?}"),
+            pipeline::ProgressEvent::Target(name) => eprintln!("colic: target={name}"),
+            pipeline::ProgressEvent::Source(update) => self.source_file(update),
+            pipeline::ProgressEvent::Record {
+                completed,
+                total,
+                shard,
+                bytes_written,
+            } => {
+                if self.ready() || completed == total {
+                    eprintln!(
+                        "colic: records [{completed}/{total}] shard={} ({})",
+                        shard + 1,
+                        human_bytes(*bytes_written),
+                    );
+                }
+            }
+            pipeline::ProgressEvent::Verify(update) => self.verification(*update),
+        }
     }
 }
 
@@ -140,6 +136,24 @@ fn run() -> colic::Result<()> {
                     "semantic_assets={}",
                     model.assets.tokenizer.len() + model.assets.config.is_some() as usize
                 );
+                let mut has_fp8 = false;
+                let mut has_mxfp4 = false;
+                for expert in model.routed_experts.values() {
+                    for matrix in [&expert.gate, &expert.up, &expert.down] {
+                        match matrix.quantization.math_format {
+                            colic::ir::MathFormat::Fp8E4M3 => has_fp8 = true,
+                            colic::ir::MathFormat::MxFp4E2M1 => has_mxfp4 = true,
+                        }
+                    }
+                }
+                let mut formats = Vec::new();
+                if has_fp8 {
+                    formats.push("fp8-e4m3");
+                }
+                if has_mxfp4 {
+                    formats.push("mxfp4-e2m1");
+                }
+                println!("semantic_expert_quant_formats={}", formats.join(","));
             }
             Ok(())
         }
