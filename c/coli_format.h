@@ -3,6 +3,10 @@
 
 #include <stddef.h>
 #include <stdint.h>
+/* compat.h's Windows branch exposes stdio-based helpers. Keeping stdio visible
+ * before any CSF implementation includes compat.h makes this public header's
+ * normal include order portable under MinGW/UCRT64 too. */
+#include <stdio.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -76,8 +80,9 @@ typedef enum ColiCsfChecksumPolicy {
     /* Always checks manifest and data-shard headers. Record payload CRCs are
      * deferred unless explicitly requested with coli_package_validate_record(). */
     COLI_CSF_CHECKSUM_MANIFEST_ONLY = 0,
-    /* Additionally verifies stored record CRCs in read_record() and
-     * validate_record(). It still does not scan every payload at open. */
+    /* Additionally verifies stored record CRCs in read_record(). It still does
+     * not scan every payload at open; validate_record() follows its explicit
+     * verify_stored_crc argument. */
     COLI_CSF_CHECKSUM_RECORD_ON_READ = 1
 } ColiCsfChecksumPolicy;
 
