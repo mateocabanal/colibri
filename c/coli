@@ -804,7 +804,13 @@ def cmd_build(a):
     arch=model_arch(a.model) if a.model else "glm"
     target={"glm":"colibri","inkling":"inkling","kimi":"kimi_k3","olmoe":"olmoe",
             "deepseek_v4":"deepseek-v4","qwen3_moe":"qwen_moe"}[arch]
-    sys.exit(subprocess.call(["make","-C",HERE,target]))
+    # The V4 runtime has an Apple Metal backend and the package executor registers
+    # its streamed slots with it. Keep that path on by default for the public
+    # launcher too; an explicit METAL=0 remains a useful CPU-only diagnostic.
+    env=os.environ.copy()
+    if arch=="deepseek_v4" and sys.platform=="darwin":
+        env.setdefault("METAL","1")
+    sys.exit(subprocess.call(["make","-C",HERE,target],env=env))
 
 def cmd_info(a):
     banner("info", model=a.model)
@@ -1553,6 +1559,20 @@ def cmd_mirror(a):
 
 
 def main():
+    # argparse applies a subparser's inherited defaults after options parsed by
+    # the root parser.  Because every command accepts --model, that formerly
+    # made the documented `coli --model MODEL run ...` silently lose MODEL.
+    # Preserve a model supplied before the command while retaining the usual
+    # `coli run --model MODEL ...` form (whose later value correctly wins).
+    commands={"build","info","plan","mirror","doctor","tune","run","chat","serve","stop","web","bench","convert"}
+    leading_model=None
+    argv=sys.argv[1:]
+    for index,arg in enumerate(argv):
+        if arg in commands: break
+        if arg=="--model" and index+1<len(argv):
+            leading_model=argv[index+1]
+        elif arg.startswith("--model="):
+            leading_model=arg.split("=",1)[1]
     common=argparse.ArgumentParser(add_help=False)
     common.add_argument("--model", default=DEF_MODEL); common.add_argument("--ram", type=int, default=0)  # 0 = auto (il motore usa l'88% della RAM disponibile)
     common.add_argument("--auto-tier",action="store_true",help="automatically apply the RAM/VRAM plan")
@@ -1656,6 +1676,8 @@ def main():
         help="int4 scale group size: 64 (default, group-scaled quality) or 0 (legacy per-row)")
     pc.add_argument("--no-mtp",action="store_true",help="skip the MTP head (no speculative drafts)")
     a=ap.parse_args()
+    if leading_model is not None:
+        a.model=leading_model
     handler={"build":cmd_build,"info":cmd_info,"plan":cmd_plan,"mirror":cmd_mirror,
              "doctor":cmd_doctor,"tune":cmd_tune,
              "run":cmd_run,"chat":cmd_chat,"serve":cmd_serve,"stop":cmd_stop,"bench":cmd_bench,

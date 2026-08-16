@@ -103,8 +103,21 @@ TARGET_OBJS = $(addsuffix .o,$(V4_TARGET_UNITS))
 TEST_UNIT_OBJS = $(addsuffix .o,$(V4_TEST_UNITS))
 V4_COLI_OBJS = coli_v4_expert_store.o coli_v4_static.o coli_executor.o coli_format.o
 V4_OBJS = $(TARGET_OBJS) $(V4_COLI_OBJS) $(V4_METAL_OBJS)
+V4_BUILD_CONFIG = .deepseek-v4-build-config
 
-.PHONY: deepseek-v4 deepseek-v4-clean deepseek-v4-test-objs
+.PHONY: deepseek-v4 deepseek-v4-clean deepseek-v4-test-objs FORCE
+FORCE:
+
+# C/Objective-C++ objects share names across METAL=0 and METAL=1 builds.  Make
+# does not otherwise see a changed command line, so a CPU-only build could be
+# accidentally reused by a later default Metal build.  Track the effective
+# configuration and make every V4 object depend on it.
+$(V4_BUILD_CONFIG): FORCE
+	@printf '%s\n' 'CC=$(CC)' 'CFLAGS=$(CFLAGS)' 'LDFLAGS=$(LDFLAGS)' 'METAL=$(METAL)' 'LTO=$(LTO)' > $@.tmp
+	@if test -f $@ && cmp -s $@.tmp $@; then rm -f $@.tmp; else mv -f $@.tmp $@; fi
+
+$(V4_OBJS) $(TEST_UNIT_OBJS): $(V4_BUILD_CONFIG)
+
 deepseek-v4: $(V4_BINARY)
 
 coli_v4_expert_store.o: coli_v4_expert_store.c coli_v4_expert_store.h coli_executor.h coli_format.h expert_store.h tensor.h
@@ -128,4 +141,4 @@ $(TARGET_OBJS) $(TEST_UNIT_OBJS): %.o: deepseek_v4.c deepseek_v4.h \
 deepseek-v4-test-objs: $(TEST_UNIT_OBJS)
 
 deepseek-v4-clean:
-	rm -f $(V4_BINARY) $(V4_OBJS) $(TEST_UNIT_OBJS)
+	rm -f $(V4_BINARY) $(V4_OBJS) $(TEST_UNIT_OBJS) $(V4_BUILD_CONFIG)

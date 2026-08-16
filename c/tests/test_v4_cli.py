@@ -116,6 +116,25 @@ class V4CliTest(unittest.TestCase):
         self.assertEqual(env["RAM_GB"], "64")
         self.assertEqual(env["CTX"], "4096")
 
+    def test_v4_build_defaults_to_metal_on_macos(self):
+        args = argparse.Namespace(model="/models/v4")
+        captured = {}
+
+        def fake_call(command, **kwargs):
+            captured["command"] = command
+            captured.update(kwargs)
+            return 0
+
+        with mock.patch.object(self.cli, "model_arch", return_value="deepseek_v4"), \
+             mock.patch.object(self.cli, "banner"), \
+             mock.patch.object(self.cli.sys, "platform", "darwin"), \
+             mock.patch.object(self.cli.subprocess, "call", side_effect=fake_call):
+            with self.assertRaises(SystemExit) as stopped:
+                self.cli.cmd_build(args)
+        self.assertEqual(stopped.exception.code, 0)
+        self.assertEqual(captured["command"][-1], "deepseek-v4")
+        self.assertEqual(captured["env"]["METAL"], "1")
+
     def test_kimi_engine_environment_forwards_ram(self):
         """#855: `--ram` reached the environment for deepseek_v4 only, so on Kimi
         K3 it was set and never read -- the flag a user reaches for to bound

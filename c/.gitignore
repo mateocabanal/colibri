@@ -3,6 +3,7 @@ glm_tiny/
 olmoe_hf/
 olmoe_i4/
 .build-config
+.deepseek-v4-build-config
 build/
 COLI_V4_UNIT_*.o
 tests/test_st_mirror
