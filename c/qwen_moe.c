@@ -300,6 +300,7 @@ typedef struct {
 
 static pthread_mutex_t g_mx = PTHREAD_MUTEX_INITIALIZER;
 static int g_prefetch = 0;         /* QWEN_PREFETCH: layer-lookahead expert prefetch */
+static int g_prefetch_pipe = 0;    /* QWEN_PREFETCH_PIPE: early l+1 issue from moe_token */
 
 #ifdef COLI_METALIO
 /* QWEN_METAL_IO=1: stream expert WEIGHT tensors through MTLIOCommandQueue
@@ -733,6 +734,20 @@ static void matmul_i4_grouped(float *y, const float *x, const uint8_t *q4, const
     }
 }
 
+/* QWEN_I4_ROWREDUCE=1 (ChatGPT perf pass): fold each 64-group's f32 scale
+ * into the SIMD lanes and horizontally reduce once per output row instead
+ * of per group. FP order changes (scale now multiplies lanes BEFORE the
+ * final horizontal add) — hence opt-in; the default path is untouched. */
+static int qwen_i4_rowreduce_enabled(void){
+    static int initialized = 0, enabled = 0;
+    if (!initialized) {
+        const char *s = getenv("QWEN_I4_ROWREDUCE");
+        enabled = s && s[0] && strcmp(s, "0") != 0;
+        initialized = 1;
+    }
+    return enabled;
+}
+
 /* Fused gate+up i4-grouped pair (S==1): one activation load serves BOTH
  * matrices — the decode path computes gate(x) and up(x) on the same x, so
  * this halves the x memory traffic and the loop overhead. Accumulation
@@ -746,6 +761,48 @@ static void matmul_i4_grouped_pair(float *yg, float *yu,
                                    const uint8_t *qu, const float *su,
                                    int I, int O, int gs){
     int rb = (I + 1) / 2, ng = (I + gs - 1) / gs;
+#ifdef __ARM_NEON
+    /* QWEN_I4_ROWREDUCE=1: one horizontal reduce per output row. Only
+     * legal when every group is a whole number of 16-value SIMD chunks
+     * (no scalar tail inside any group). S==1 decode caller. */
+    if (qwen_i4_rowreduce_enabled() && (I % 16) == 0 && (gs % 16) == 0) {
+        #pragma omp parallel for schedule(static)
+        for (int o = 0; o < O; o++) {
+            const float *scg = sg + (int64_t)o * ng;
+            const float *scu = su + (int64_t)o * ng;
+            const uint8x8_t m4v = vdup_n_u8(0x0F), b8v = vdup_n_s8(8);
+            float32x4_t acg0 = vdupq_n_f32(0), acg1 = vdupq_n_f32(0);
+            float32x4_t acu0 = vdupq_n_f32(0), acu1 = vdupq_n_f32(0);
+            for (int g = 0; g * gs < I; g++) {
+                int base = g * gs, end = base + gs;
+                float32x4_t sg4 = vdupq_n_f32(scg[g]), su4 = vdupq_n_f32(scu[g]);
+                for (int i = base; i + 16 <= end; i += 16) {
+                    uint8x8_t byg = vld1_u8(qg + (int64_t)o * rb + (i >> 1));
+                    uint8x8_t byu = vld1_u8(qu + (int64_t)o * rb + (i >> 1));
+                    uint8x8x2_t zg = vzip_u8(vand_u8(byg, m4v), vshr_n_u8(byg, 4));
+                    uint8x8x2_t zu = vzip_u8(vand_u8(byu, m4v), vshr_n_u8(byu, 4));
+                    int16x8_t wg0 = vmovl_s8(vsub_s8(vreinterpret_s8_u8(zg.val[0]), b8v));
+                    int16x8_t wg1 = vmovl_s8(vsub_s8(vreinterpret_s8_u8(zg.val[1]), b8v));
+                    int16x8_t wu0 = vmovl_s8(vsub_s8(vreinterpret_s8_u8(zu.val[0]), b8v));
+                    int16x8_t wu1 = vmovl_s8(vsub_s8(vreinterpret_s8_u8(zu.val[1]), b8v));
+                    float32x4_t x0 = vld1q_f32(x + i), x1 = vld1q_f32(x + i + 4);
+                    float32x4_t x2 = vld1q_f32(x + i + 8), x3 = vld1q_f32(x + i + 12);
+                    acg0 = vmlaq_f32(acg0, sg4, vmulq_f32(x0, vcvtq_f32_s32(vmovl_s16(vget_low_s16(wg0)))));
+                    acg1 = vmlaq_f32(acg1, sg4, vmulq_f32(x1, vcvtq_f32_s32(vmovl_s16(vget_high_s16(wg0)))));
+                    acg0 = vmlaq_f32(acg0, sg4, vmulq_f32(x2, vcvtq_f32_s32(vmovl_s16(vget_low_s16(wg1)))));
+                    acg1 = vmlaq_f32(acg1, sg4, vmulq_f32(x3, vcvtq_f32_s32(vmovl_s16(vget_high_s16(wg1)))));
+                    acu0 = vmlaq_f32(acu0, su4, vmulq_f32(x0, vcvtq_f32_s32(vmovl_s16(vget_low_s16(wu0)))));
+                    acu1 = vmlaq_f32(acu1, su4, vmulq_f32(x1, vcvtq_f32_s32(vmovl_s16(vget_high_s16(wu0)))));
+                    acu0 = vmlaq_f32(acu0, su4, vmulq_f32(x2, vcvtq_f32_s32(vmovl_s16(vget_low_s16(wu1)))));
+                    acu1 = vmlaq_f32(acu1, su4, vmulq_f32(x3, vcvtq_f32_s32(vmovl_s16(vget_high_s16(wu1)))));
+                }
+            }
+            yg[o] = vaddvq_f32(vaddq_f32(acg0, acg1));
+            yu[o] = vaddvq_f32(vaddq_f32(acu0, acu1));
+        }
+        return;
+    }
+#endif
     #pragma omp parallel for schedule(static)
     for (int o = 0; o < O; o++) {
         const uint8_t *wg = qg + (int64_t)o * rb;
@@ -1280,9 +1337,138 @@ static void pin_hot_experts(Model *m){
 
 /* ---------- full attention (GQA + QK-norm + partial RoPE + output gate) ---------- */
 
+/* RoPE per-thread cache (opt-in QWEN_ROPE_CACHE=1, ChatGPT perf pass).
+ *
+ * The original rope_partial() recomputed powf(theta, -2j/rd) AND cosf/sinf
+ * for every Q/K head of every layer of every token. The frequencies depend
+ * only on geometry, and the trig row depends only on the token position, so
+ * they are cached: 128 powf calls per token become 128 once, and the trig
+ * calls drop from 18 heads x 128 per layer to 128 per token.
+ *
+ * Layout of one allocation (n = rd/2):
+ *   buf[0..n)      inv[j] = theta^(-2j/rd)          — geometry key
+ *   buf[n..2n)     cos(pos * inv[j])              — position key
+ *   buf[2n..3n)    sin(pos * inv[j])
+ *
+ * Thread-local: decode runs on the main thread here, but __thread keeps the
+ * cache safe if multiple host threads/modes are ever driven concurrently.
+ */
+typedef struct {
+    float *buf;
+    int cap;         /* allocated n capacity */
+    int rd;          /* geometry used to build inv[] */
+    float theta;
+    int pos;         /* position used to build cos/sin */
+    int pos_valid;
+} RopeCache;
+
+#if defined(__GNUC__) || defined(__clang__)
+static __thread RopeCache g_rope_cache = { NULL, 0, -1, 0.0f, 0, 0 };
+#else
+static RopeCache g_rope_cache = { NULL, 0, -1, 0.0f, 0, 0 };
+#endif
+
+static int rope_cache_enabled(void){
+    static int initialized = 0, enabled = 0;
+    if (!initialized) {
+        const char *s = getenv("QWEN_ROPE_CACHE");
+        enabled = s && s[0] && strcmp(s, "0") != 0;
+        initialized = 1;
+    }
+    return enabled;
+}
+
+/* Make sure inv[] and the per-position trig row are ready. Returns 1 on
+ * success; 0 on allocation failure -> rope_partial falls back to the
+ * original scalar implementation. */
+static int rope_cache_prepare(RopeCache *rc, int pos, const Cfg *c){
+    int rd = c->rotary_dim, n = rd / 2;
+    if (n <= 0) return 0;
+    if (rc->cap < n) {
+        float *p = (float *)realloc(rc->buf, (size_t)3 * n * sizeof(float));
+        if (!p) return 0;
+        rc->buf = p; rc->cap = n;
+        rc->rd = -1; rc->pos_valid = 0;   /* offsets changed: rebuild */
+    }
+    float *inv = rc->buf, *cs = rc->buf + n, *sn = rc->buf + 2 * n;
+    if (rc->rd != rd || rc->theta != c->theta) {   /* geometry: once */
+        for (int j = 0; j < n; j++)
+            inv[j] = powf(c->theta, -2.0f * (float)j / (float)rd);
+        rc->rd = rd; rc->theta = c->theta; rc->pos_valid = 0;
+    }
+    if (!rc->pos_valid || rc->pos != pos) {        /* position: once */
+        float fp = (float)pos;
+        for (int j = 0; j < n; j++) {
+            float ang = fp * inv[j];
+            cs[j] = cosf(ang); sn[j] = sinf(ang);
+        }
+        rc->pos = pos; rc->pos_valid = 1;
+    }
+    return 1;
+}
+
+/* Explicit per-thread cleanup; optional at process exit. */
+static void rope_cache_free_current_thread(void){
+    RopeCache *rc = &g_rope_cache;
+    free(rc->buf);
+    rc->buf = NULL; rc->cap = 0; rc->rd = -1; rc->theta = 0.0f;
+    rc->pos = 0; rc->pos_valid = 0;
+}
+
+/* Drop-in replacement for the original rope_partial(). Default (env unset or
+ * 0) is the exact original scalar path; QWEN_ROPE_CACHE=1 uses the cached
+ * frequencies + per-position trig row, with NEON/AVX2 rotation where
+ * available. Numerically identical per element (same cs/sn values, same
+ * mul/sub ordering), so token output is unchanged. */
 static void rope_partial(float *v, int pos, const Cfg *c){
-    int rd = c->rotary_dim;
-    for (int j = 0; j < rd / 2; j++) {
+    int rd = c->rotary_dim, n = rd / 2;
+    if (n <= 0) return;
+    if (rope_cache_enabled()) {
+        RopeCache *rc = &g_rope_cache;
+        if (rope_cache_prepare(rc, pos, c)) {
+            const float *cs = rc->buf + n, *sn = rc->buf + 2 * n;
+#ifdef __ARM_NEON
+            int j = 0;
+            for (; j + 4 <= n; j += 4) {   /* a=lo half, b=hi half */
+                float32x4_t a = vld1q_f32(v + j), b = vld1q_f32(v + n + j);
+                float32x4_t cv = vld1q_f32(cs + j), sv = vld1q_f32(sn + j);
+                float32x4_t r0 = vfmsq_f32(vmulq_f32(a, cv), b, sv);
+                float32x4_t r1 = vfmaq_f32(vmulq_f32(b, cv), a, sv);
+                vst1q_f32(v + j, r0); vst1q_f32(v + n + j, r1);
+            }
+            for (; j < n; j++) {
+                float a = v[j], b = v[j + n];
+                v[j] = a * cs[j] - b * sn[j]; v[j + n] = b * cs[j] + a * sn[j];
+            }
+#elif defined(__AVX2__)
+            int j = 0;
+            for (; j + 8 <= n; j += 8) {
+                __m256 a = _mm256_loadu_ps(v + j), b = _mm256_loadu_ps(v + n + j);
+                __m256 cv = _mm256_loadu_ps(cs + j), sv = _mm256_loadu_ps(sn + j);
+#if defined(__FMA__)
+                __m256 r0 = _mm256_fnmadd_ps(b, sv, _mm256_mul_ps(a, cv));
+                __m256 r1 = _mm256_fmadd_ps(a, sv, _mm256_mul_ps(b, cv));
+#else
+                __m256 r0 = _mm256_sub_ps(_mm256_mul_ps(a, cv), _mm256_mul_ps(b, sv));
+                __m256 r1 = _mm256_add_ps(_mm256_mul_ps(b, cv), _mm256_mul_ps(a, sv));
+#endif
+                _mm256_storeu_ps(v + j, r0); _mm256_storeu_ps(v + n + j, r1);
+            }
+            for (; j < n; j++) {
+                float a = v[j], b = v[j + n];
+                v[j] = a * cs[j] - b * sn[j]; v[j + n] = b * cs[j] + a * sn[j];
+            }
+#else
+            for (int j = 0; j < n; j++) {
+                float a = v[j], b = v[j + n];
+                v[j] = a * cs[j] - b * sn[j]; v[j + n] = b * cs[j] + a * sn[j];
+            }
+#endif
+            return;
+        }
+    }
+    /* exact original scalar path (default / cache allocation failure) */
+    for (int j = 0; j < n; j++) {
         float inv = powf(c->theta, -2.0f * j / rd);
         float ang = pos * inv, cs = cosf(ang), sn = sinf(ang);
         float a = v[j], b = v[j + rd / 2];
@@ -1530,6 +1716,34 @@ static void expert_apply(Model *m, Slot *s, const float *x, float *acc){
     }
 }
 
+/* ---------- MoE token loop ---------- */
+
+/* Early next-layer expert I/O pipeline (ChatGPT perf pass, opt-in).
+ * QWEN_PREFETCH=1 QWEN_PREFETCH_PIPE=1: issue layer l+1's predicted expert
+ * loads right after layer l's router top-k is known — BEFORE layer l's own
+ * expert GEMVs — so disk I/O overlaps current-layer compute. Only acts when
+ * MetalIO async is live; the plain pread path falls through to the existing
+ * post-layer lookahead in forward_token (early issue would add latency, not
+ * hide it). Predictor unchanged: l's top-k predicts l+1's (routing is
+ * correlated). Wrong guesses cost one pread, never residency: LRU evicts
+ * them like any cold expert. */
+static void expert_prefetch_next_early(Model *m, int layer, int nr){
+    if (!g_prefetch || !g_prefetch_pipe) return;
+    if (layer + 1 >= m->c.n_layers || nr <= 0 || nr > 64) return;
+#ifdef COLI_METALIO
+    if (!(g_metal_io && metalio_active())) return;   /* pread: stall, not overlap */
+    int old = g_mio_prefetching;
+    g_mio_prefetching = 1;                 /* enqueue loads, DO NOT wait */
+    for (int i = 0; i < nr; i++) {
+        Slot *ps;
+        expert_get(m, layer + 1, m->last_route[i], &ps);
+    }
+    g_mio_prefetching = old;
+#else
+    (void)layer; (void)nr;
+#endif
+}
+
 static void moe_token(Model *m, Layer *l, int layer, const float *x, float *out){
     Cfg *c = &m->c; int E = c->n_experts, K = c->topk, D = c->hidden;
     float *logits = falloc(E);
@@ -1571,6 +1785,10 @@ static void moe_token(Model *m, Layer *l, int layer, const float *x, float *out)
     g_mio_async_issue = 0;
 #endif
     if (K <= 64) { memcpy(m->last_route, idx, (size_t)K * sizeof(int)); m->last_route_k = K; }
+    /* Early pipeline: layer l+1's guesses go in flight BEFORE the layer-l
+     * expert GEMVs below — overlap I/O with compute (MetalIO only). The
+     * old post-layer lookahead in forward_token is disabled in pipe mode. */
+    expert_prefetch_next_early(m, layer, K);
     int gpu_ok = 0;
 #ifdef COLI_METAL
     /* QWEN_METAL_COMPUTE=1: all K routed experts in ONE Metal block
@@ -2180,7 +2398,7 @@ static void forward_token(Model *m, int token, int pos, float *out){
          * l+1's (routing is correlated); QWEN_PREFETCH=1 opt-in, measured
          * via prefetch_misses. Wrong guesses cost one pread, never residency:
          * the LRU evicts them like any cold expert. */
-        if (g_prefetch && l + 1 < c->n_layers && m->last_route_k > 0) {
+        if (g_prefetch && !g_prefetch_pipe && l + 1 < c->n_layers && m->last_route_k > 0) {
             uint64_t before = m->miss;
 #ifdef COLI_METALIO
             /* MetalIO async prefetch: enqueue the loads WITHOUT waiting; the
@@ -2872,6 +3090,7 @@ int main(int argc, char **argv){
      * EXPERT_DROP=0 / DENSE_KEEP_PAGES=1 opt back out for repeated reads. */
     g_expert_drop = getenv("EXPERT_DROP") ? atoi(getenv("EXPERT_DROP")) : 1;
     g_prefetch = getenv("QWEN_PREFETCH") ? atoi(getenv("QWEN_PREFETCH")) : 0;
+    g_prefetch_pipe = getenv("QWEN_PREFETCH_PIPE") ? atoi(getenv("QWEN_PREFETCH_PIPE")) : 0;
     g_chunk = getenv("QWENMOE_CHUNK") ? atoi(getenv("QWENMOE_CHUNK")) : 64;
     if (g_chunk < 1) g_chunk = 1;
     if (g_chunk > QWEN_CHUNK_MAX) g_chunk = QWEN_CHUNK_MAX;
