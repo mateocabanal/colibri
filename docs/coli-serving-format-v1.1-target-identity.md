@@ -2,9 +2,9 @@
 
 Status: **normative amendment to `docs/coli-serving-format-v1.md` v1.1**.
 
-This file closes two identity gaps found during the pre-merge ABI review. Until
-the long-form v1 document is consolidated, the rules below take precedence over
-conflicting text in sections 7, 9, and 10 of that document.
+This file closes identity gaps found during the pre-merge ABI review. Until the
+long-form v1 document is consolidated, the rules below take precedence over
+conflicting text in sections 7, 9, 10, and 22 of that document.
 
 ## 1. Semantic/model ABI is explicit
 
@@ -91,13 +91,62 @@ exactly that many UTF-8 bytes.
 
 `target_flags` participates as the complete serialized value, not a selected
 subset. Consequently accelerator requirements, resident accessibility/staging
-requirements, and any future optional target flag all affect artifact identity.
+requirements, and future optional target flags all affect artifact identity.
 
 The target triple is diagnostic/compatibility identity even when its components
 appear elsewhere; hashing it prevents two byte-distinct descriptors with the
 same numeric capabilities from sharing an artifact cache key.
 
-## 3. Determinism rule
+## 3. Strict readers recompute artifact identity
+
+Every input to `artifact_fingerprint` is present in `manifest.coli`: the source
+fingerprint, compiler/string table, target descriptor, tuning fingerprint and
+optional profile-data bytes. Therefore a strict v1.1 reader MUST recompute the
+canonical artifact fingerprint during package open and compare it with the
+32-byte manifest field before publishing any execution record.
+
+This check does **not** require the source checkpoint. The source fingerprint is
+an input digest already stored in the manifest; the reader is validating that
+the target descriptor/profile data and declared artifact cache identity agree.
+
+Validation order is:
+
+```text
+manifest framing + CRC
+ -> strings
+ -> target descriptor framing + target_desc_crc32c
+ -> profile_data framing + CRC
+ -> recompute/compare artifact_fingerprint
+ -> runtime target/semantic compatibility
+ -> shards / record indexes
+```
+
+A mismatch is a hard `bad artifact fingerprint` failure even if the descriptor
+CRC was updated to match modified descriptor bytes. Checksums remain corruption
+checks rather than signatures; recomputation enforces identity consistency, not
+authenticity.
+
+## 4. Profile-data region is a first-class manifest span
+
+When `profile_data_bytes == 0`:
+
+```text
+profile_data_offset = 0
+profile_data_crc32c = 0
+```
+
+When nonzero, `profile_data_offset` is 16-byte aligned and the exact
+`[offset, offset + bytes)` span MUST:
+
+- be contained in `manifest.coli` using checked arithmetic;
+- not overlap the fixed manifest header, target descriptor, shard table, record
+  table, string table, metadata region, codec-table region, or any other
+  profile-data span defined by the target ABI; and
+- have CRC32C exactly equal to `profile_data_crc32c`.
+
+The SHA-256 of these exact bytes participates in artifact fingerprinting.
+
+## 5. Determinism rule
 
 For deterministic profiles, a conforming writer MUST NOT expose any other
 option that can change emitted target bytes without either:
@@ -105,10 +154,13 @@ option that can change emitted target bytes without either:
 1. changing one of the canonical fingerprint inputs above; or
 2. changing `profile_data` (whose byte length and SHA-256 are fingerprinted).
 
-This is the cache-safety rule for target-compiled `.coli`: if bytes can change,
-artifact identity must change.
+This is the cache-safety rule for target-compiled `.coli`: if compiler options
+can change target output, artifact identity must change. Structural offsets that
+are deterministic consequences of the compiler/profile need not be individually
+hashed; changing their policy requires a compiler/profile/optimization identity
+change.
 
-## 4. Fixture semantic ABI
+## 6. Fixture semantic ABI
 
 The independent target-compatibility fixtures use:
 
