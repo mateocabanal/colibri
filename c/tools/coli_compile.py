@@ -112,7 +112,7 @@ LAYER_RE = re.compile(r"^layers\.(\d+)\.")
 ROLE_SOURCE = ((ROLE_GATE, "w1"), (ROLE_UP, "w3"), (ROLE_DOWN, "w2"))
 
 SIDECARS = (
-    "config.json", "tokenizer.json", "tokenizer_config.json",
+    "config.json", "tokenizer.json", "tokenizer.model", "tokenizer_config.json",
     "chat_template.jinja", "generation_config.json", "special_tokens_map.json",
     "added_tokens.json", "vocab.json", "merges.txt",
 )
@@ -218,7 +218,7 @@ class Plan:
     padding_bytes: int
 
 
-# CRC-32C / Castagnoli.  A table implementation keeps the stdlib-only fallback
+# CRC-32C / Castagnoli. A table implementation keeps the stdlib-only fallback
 # usable for large sequential chunks; a future #6 helper may replace this hot
 # loop without changing any container bytes.
 def _crc_table() -> tuple[int, ...]:
@@ -268,8 +268,10 @@ def align_up(value: int, alignment: int) -> int:
 def product(shape: Iterable[int]) -> int:
     n = 1
     for d in shape:
-        if not isinstance(d, int) or d < 0:
-            raise CompileError(f"invalid tensor dimension {d!r}")
+        # CSF v1's strict reader deliberately rejects zero-sized in-rank
+        # dimensions. Rank-0 scalars remain valid because this loop is empty.
+        if type(d) is not int or d <= 0:
+            raise CompileError(f"invalid/unsupported tensor dimension {d!r}")
         n *= d
     return n
 
@@ -310,6 +312,7 @@ def read_safetensors_header(root: Path, rel: str) -> tuple[dict[str, Tensor], di
     file_size = path.stat().st_size
     tensors: dict[str, Tensor] = {}
     metadata: dict[str, str] = {}
+    spans: list[tuple[int, int, str]] = []
     for name, desc in header.items():
         if name == "__metadata__":
             if desc is None:
@@ -330,7 +333,7 @@ def read_safetensors_header(root: Path, rel: str) -> tuple[dict[str, Tensor], di
             raise CompileError(f"tensor rank > 8 is not representable in CSF v1: {name}")
         numel = product(shape)
         start, end = offsets
-        if not isinstance(start, int) or not isinstance(end, int) or start < 0 or end < start:
+        if type(start) is not int or type(end) is not int or start < 0 or end < start:
             raise CompileError(f"invalid data offsets for {name}")
         nbytes = end - start
         expected = numel * DTYPE_BYTES[dtype]
@@ -340,6 +343,11 @@ def read_safetensors_header(root: Path, rel: str) -> tuple[dict[str, Tensor], di
         if absolute < data_base or absolute + nbytes > file_size:
             raise CompileError(f"tensor {name} lies outside {rel}")
         tensors[name] = Tensor(name, dtype, shape, rel, path, absolute, nbytes)
+        spans.append((start, end, name))
+    spans.sort()
+    for i in range(1, len(spans)):
+        if spans[i][0] < spans[i - 1][1]:
+            raise CompileError(f"overlapping safetensors payloads in {rel}: {spans[i - 1][2]} / {spans[i][2]}")
     return tensors, metadata
 
 
@@ -451,6 +459,14 @@ def classify(tensors: dict[str, Tensor], fmt_stamps: dict[str, str]) -> tuple[li
     for tensor in ordinary:
         if tensor.dtype not in DTYPE_MATH:
             raise CompileError(f"tensor dtype is not representable in portable-v1: {tensor.name} ({tensor.dtype})")
+        # A stamp changes the interpretation of raw bytes. Until a standalone
+        # stamped-tensor mapping is frozen, silently treating those bytes as the
+        # safetensors dtype would be corruption. Routed MXFP4 experts above are
+        # the first explicitly supported stamped case.
+        if tensor.name in fmt_stamps:
+            raise CompileError(
+                f"standalone stamped tensor {tensor.name} ({fmt_stamps[tensor.name]!r}) "
+                "is not yet supported by the portable-v1 compiler")
     return ordinary, experts
 
 
@@ -505,7 +521,6 @@ def plan_shards(records: list[RecordPlan], shard_target: int) -> list[ShardPlan]
     shards: list[ShardPlan] = []
     current = ShardPlan(0)
     cursor = align_up(DATA_HEADER, ALIGNMENT)
-    padding = 0
     for record in records:
         offset = align_up(cursor, ALIGNMENT)
         if current.records and offset + record.stored_bytes > shard_target:
@@ -514,7 +529,6 @@ def plan_shards(records: list[RecordPlan], shard_target: int) -> list[ShardPlan]
             current = ShardPlan(len(shards))
             cursor = align_up(DATA_HEADER, ALIGNMENT)
             offset = cursor
-        padding += offset - cursor
         record.shard = current.shard_id
         record.payload_offset = offset
         current.records.append(record)
@@ -866,8 +880,13 @@ def finalize_output(temp_dir: Path, output: Path, force: bool) -> None:
     if output.exists():
         if not force:
             raise CompileError(f"output already exists (use --force): {output}")
+        if not output.is_dir():
+            raise CompileError(f"existing output is not a directory: {output}")
         if backup.exists():
-            shutil.rmtree(backup)
+            if backup.is_dir():
+                shutil.rmtree(backup)
+            else:
+                backup.unlink()
         os.replace(output, backup)
         try:
             os.replace(temp_dir, output)
@@ -893,7 +912,7 @@ def report(plan: Plan, *, fingerprint: Optional[bytes] = None, stored_bytes: Opt
     print(f"record_alignment={ALIGNMENT}")
     print(f"projected_data_bytes={plan.projected_bytes}")
     print(f"padding_bytes={plan.padding_bytes}")
-    print(f"codec=none")
+    print("codec=none")
     if stored_bytes is not None:
         print(f"stored_package_data_bytes={stored_bytes}")
     if fingerprint is not None:
@@ -913,6 +932,10 @@ def compile_model(model_dir: Path, output: Path, *, shard_size_bytes: int,
         raise CompileError(f"unsupported codec option {codec!r}")
     if codec == "mxfp4-rans256-g0":
         raise CompileError("mxfp4-rans256-g0 compiler integration requires issue #6")
+    if output.exists() and not force:
+        raise CompileError(f"output already exists (use --force): {output}")
+    if output.exists() and not output.is_dir():
+        raise CompileError(f"existing output is not a directory: {output}")
     plan = build_plan(model_dir, shard_size_bytes)
     if dry_run:
         report(plan)
@@ -922,7 +945,10 @@ def compile_model(model_dir: Path, output: Path, *, shard_size_bytes: int,
     parent.mkdir(parents=True, exist_ok=True)
     temp_dir = Path(str(output) + f".tmp.{os.getpid()}")
     if temp_dir.exists():
-        shutil.rmtree(temp_dir)
+        if temp_dir.is_dir():
+            shutil.rmtree(temp_dir)
+        else:
+            temp_dir.unlink()
     temp_dir.mkdir()
     outputs: list[BinaryIO] = []
     installed = False
@@ -960,7 +986,13 @@ def compile_model(model_dir: Path, output: Path, *, shard_size_bytes: int,
             except Exception:
                 pass
         if not installed and temp_dir.exists():
-            shutil.rmtree(temp_dir, ignore_errors=True)
+            if temp_dir.is_dir():
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            else:
+                try:
+                    temp_dir.unlink()
+                except OSError:
+                    pass
 
 
 def parse_strings(manifest: bytes, offset: int, size: int, count: int) -> list[str]:
@@ -991,6 +1023,9 @@ def compare_range(source: Tensor, package_path: Path, package_offset: int) -> No
 
 
 def verify_package(package: Path, plan: Plan, expected_fingerprint: bytes) -> None:
+    # The manifest is deliberately bounded/small. Data shards are not: every
+    # shard/header/payload operation below is an exact or chunked read, so
+    # `--verify` remains O(chunk) memory even for multi-GiB packages.
     manifest = (package / "manifest.coli").read_bytes()
     if len(manifest) < MANIFEST_HEADER or manifest[:8] != MANIFEST_MAGIC:
         raise CompileError("verification: bad manifest")
@@ -1015,8 +1050,9 @@ def verify_package(package: Path, plan: Plan, expected_fingerprint: bytes) -> No
         shard_id, _flags, name_id = struct.unpack_from("<III", manifest, desc)
         file_bytes = struct.unpack_from("<Q", manifest, desc + 16)[0]
         path = package / strings[name_id]
-        raw_header = path.read_bytes()[:DATA_HEADER]
-        if shard_id != i or file_bytes != path.stat().st_size or raw_header[:8] != DATA_MAGIC or raw_header[40:72] != expected_fingerprint:
+        with path.open("rb") as sf:
+            raw_header = sf.read(DATA_HEADER)
+        if len(raw_header) != DATA_HEADER or shard_id != i or file_bytes != path.stat().st_size or raw_header[:8] != DATA_MAGIC or raw_header[40:72] != expected_fingerprint:
             raise CompileError("verification: shard header/descriptor mismatch")
         header_copy = bytearray(raw_header)
         expected = struct.unpack_from("<I", header_copy, 72)[0]
