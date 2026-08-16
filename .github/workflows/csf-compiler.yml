@@ -1,0 +1,55 @@
+name: CSF compiler
+
+on:
+  pull_request:
+    paths:
+      - 'c/coli_format.c'
+      - 'c/coli_format.h'
+      - 'c/Makefile.csf'
+      - 'c/tools/coli_check.c'
+      - 'c/tools/coli_compile.py'
+      - 'c/tools/test_coli_compile.py'
+      - '.github/workflows/csf-compiler.yml'
+  workflow_dispatch:
+
+jobs:
+  compiler:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Build independent C reader
+        run: make -C c -f Makefile.csf test
+      - name: Python syntax
+        run: python -m py_compile c/tools/coli_compile.py c/tools/test_coli_compile.py
+      - name: Compiler tests + C reader round-trip
+        run: cd c && python tools/test_coli_compile.py
+
+  compiler-windows:
+    name: compiler (Windows UCRT64)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: false
+          install: >-
+            make
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-python
+      - name: Build independent C reader
+        run: make -C c -f Makefile.csf test
+      - name: Python syntax
+        run: python -m py_compile c/tools/coli_compile.py c/tools/test_coli_compile.py
+      - name: Compiler tests + C reader round-trip
+        run: cd c && python tools/test_coli_compile.py
