@@ -4244,6 +4244,8 @@ static int v4_moe_batch_union(
 #endif
     const int64_t *table = value(weights, "ffn.gate.tid2eid", NULL);
     const float *bias = value(weights, "ffn.gate.bias", NULL);
+    uint64_t router_began = g_coli_v4_profile_on
+        ? coli_v4_profile_now() : 0;
     int result = weights->plan.uses_hash_router && !table ? -1 : 0;
     for (int item = 0; !result && item < batch; item++) {
         int *item_indices = indices + (size_t)item * topk;
@@ -4273,8 +4275,13 @@ static int v4_moe_batch_union(
                     result = -1;
             }
     }
+    if (router_began)
+        coli_v4_profile_add(COLI_V4_PROF_ROUTER,
+                            coli_v4_profile_now() - router_began);
 
     ColiTensorView w1, w2, w3;
+    uint64_t shared_began = g_coli_v4_profile_on
+        ? coli_v4_profile_now() : 0;
     if (!result &&
         (fp8_view(&w1, weights, "ffn.shared_experts.w1") ||
          fp8_view(&w2, weights, "ffn.shared_experts.w2") ||
@@ -4284,6 +4291,9 @@ static int v4_moe_batch_union(
         result = coli_v4_shared_expert_forward_ref(
             shared + (size_t)item * d, &w1, &w2, &w3,
             inputs + (size_t)item * d, config->swiglu_limit);
+    if (shared_began)
+        coli_v4_profile_add(COLI_V4_PROF_SHARED_EXPERT,
+                            coli_v4_profile_now() - shared_began);
     if (!result)
         memset(outputs, 0, (size_t)batch * d * sizeof(*outputs));
 
@@ -4317,6 +4327,9 @@ static int v4_moe_batch_union(
             break;
         }
         active[slot] = 0;
+        if (g_coli_v4_profile_on && jobs[slot].lookup_ns)
+            coli_v4_profile_add(COLI_V4_PROF_EXPERT_READ_WORK,
+                                jobs[slot].lookup_ns);
         ColiExpertView view = jobs[slot].view;
         int next = current + dual_loader_lanes();
         if (next < key_count) {
@@ -4329,6 +4342,8 @@ static int v4_moe_batch_union(
             else
                 active[slot] = 1;
         }
+        uint64_t compute_began = g_coli_v4_profile_on
+            ? coli_v4_profile_now() : 0;
         int expert = view.key.expert;
         for (int item = 0; !result && item < batch; item++)
             for (int rank = 0; !result && rank < topk; rank++) {
@@ -4342,6 +4357,9 @@ static int v4_moe_batch_union(
                         outputs[(size_t)item * d + column] +=
                             expert_output[column];
             }
+        if (compute_began)
+            coli_v4_profile_add(COLI_V4_PROF_EXPERT_COMPUTE,
+                                coli_v4_profile_now() - compute_began);
         coli_expert_release(store, &view);
     }
     for (int slot = 0; slot < dual_loader_lanes(); slot++)
@@ -4352,10 +4370,17 @@ static int v4_moe_batch_union(
 #else
     for (int current = 0; !result && current < key_count; current++) {
         ColiExpertView view;
+        uint64_t lookup_began = g_coli_v4_profile_on
+            ? coli_v4_profile_now() : 0;
         if (coli_expert_lookup(store, keys[current], &view)) {
             result = -1;
             break;
         }
+        if (lookup_began)
+            coli_v4_profile_add(COLI_V4_PROF_EXPERT_READ_WORK,
+                                coli_v4_profile_now() - lookup_began);
+        uint64_t compute_began = g_coli_v4_profile_on
+            ? coli_v4_profile_now() : 0;
         int expert = keys[current].expert;
         for (int item = 0; !result && item < batch; item++)
             for (int rank = 0; !result && rank < topk; rank++) {
@@ -4369,6 +4394,9 @@ static int v4_moe_batch_union(
                         outputs[(size_t)item * d + column] +=
                             expert_output[column];
             }
+        if (compute_began)
+            coli_v4_profile_add(COLI_V4_PROF_EXPERT_COMPUTE,
+                                coli_v4_profile_now() - compute_began);
         coli_expert_release(store, &view);
     }
 #endif
@@ -4457,37 +4485,14 @@ int coli_v4_block_window_batch_ref(
             weights, config, "ffn", "ffn_norm.weight");
     }
     if (!result) phase = "MoE";
-    if (!result && batch > 1 && v4_expert_union_enabled()) {
-        /* The union does routing + shared-expert work internally (billed here
-         * as one EXPERT_COMPUTE span) but serializes through the same dual
-         * loader that bills EXPERT_LOADER_WAIT; subtract the wait accrued
-         * inside this span so the two owner buckets stay mutually exclusive.
-         * The serial branch below instead bills per-position through
-         * moe_token_pipeline and must NOT also be wrapped. */
-        uint64_t span_began = g_coli_v4_profile_on
-            ? coli_v4_profile_now() : 0;
-        uint64_t wait_before = 0;
-        if (g_coli_v4_profile_on) {
-            ColiV4Profile snap = coli_v4_profile_get();
-            wait_before = snap.ns[COLI_V4_PROF_EXPERT_LOADER_WAIT];
-        }
+    /* v4_moe_batch_union bills ROUTER / SHARED_EXPERT / READ_WORK / COMPUTE /
+     * LOADER_WAIT internally (mutually exclusive); do not wrap it here.
+     * The serial branch bills per-position through moe_token_pipeline. */
+    if (!result && batch > 1 && v4_expert_union_enabled())
         result = v4_moe_batch_union(
             ffn_branch, weights, config, experts,
             ffn_normalized, tokens, batch);
-        if (span_began) {
-            uint64_t wait_after = 0;
-            if (g_coli_v4_profile_on) {
-                ColiV4Profile snap = coli_v4_profile_get();
-                wait_after = snap.ns[COLI_V4_PROF_EXPERT_LOADER_WAIT];
-            }
-            uint64_t span = coli_v4_profile_now() - span_began;
-            uint64_t wait_delta = wait_after > wait_before
-                ? wait_after - wait_before : 0;
-            if (span > wait_delta)
-                coli_v4_profile_add(COLI_V4_PROF_EXPERT_COMPUTE,
-                                    span - wait_delta);
-        }
-    } else
+    else
         for (int item = 0; !result && item < batch; item++)
             result = moe_token_pipeline(
                 ffn_branch + (size_t)item * d, weights, config, experts,
