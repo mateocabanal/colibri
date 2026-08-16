@@ -1,6 +1,6 @@
 # Standalone CSF reader gate for issue #23.
-# Kept separate from the large shared Makefile so the container parser can be
-# built/tested on all supported C hosts without pulling model-engine objects.
+# Kept separate from the large shared Makefile so container/target parsing can
+# be built on all supported C hosts without pulling model-engine objects.
 
 CC ?= cc
 CFLAGS ?= -O2 -Wall -Wextra
@@ -13,17 +13,30 @@ CFLAGS += -D_FILE_OFFSET_BITS=64
 EXE := .exe
 endif
 
-.PHONY: test test-asan clean
+.PHONY: test test-target test-asan test-target-asan clean
 
 tests/test_coli_format$(EXE): tests/test_coli_format.c coli_format.c coli_format.h compat.h
 	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) tests/test_coli_format.c coli_format.c -o $@ -pthread $(EXTRA_LDFLAGS)
 
-test: tests/test_coli_format$(EXE)
+tests/test_coli_target$(EXE): tests/test_coli_target.c coli_target.c coli_target.h coli_format.c coli_format.h compat.h
+	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) tests/test_coli_target.c coli_target.c coli_format.c -o $@ -pthread $(EXTRA_LDFLAGS)
+
+test: tests/test_coli_format$(EXE) tests/test_coli_target$(EXE)
 	./tests/test_coli_format$(EXE)
+
+test-target: tests/test_coli_target$(EXE)
+	@test -n "$(APPLE_FIXTURE)" || (echo "APPLE_FIXTURE is required" >&2; exit 2)
+	@test -n "$(CUDA_FIXTURE)" || (echo "CUDA_FIXTURE is required" >&2; exit 2)
+	./tests/test_coli_target$(EXE) "$(APPLE_FIXTURE)" "$(CUDA_FIXTURE)"
 
 test-asan:
 	$(MAKE) -f Makefile.csf clean
 	$(MAKE) -f Makefile.csf test EXTRA_CFLAGS="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer" EXTRA_LDFLAGS="-fsanitize=address,undefined"
 
+test-target-asan:
+	$(MAKE) -f Makefile.csf clean
+	$(MAKE) -f Makefile.csf tests/test_coli_target$(EXE) EXTRA_CFLAGS="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer" EXTRA_LDFLAGS="-fsanitize=address,undefined"
+	$(MAKE) -f Makefile.csf test-target APPLE_FIXTURE="$(APPLE_FIXTURE)" CUDA_FIXTURE="$(CUDA_FIXTURE)" EXTRA_CFLAGS="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer" EXTRA_LDFLAGS="-fsanitize=address,undefined"
+
 clean:
-	rm -f tests/test_coli_format tests/test_coli_format.exe
+	rm -f tests/test_coli_format tests/test_coli_format.exe tests/test_coli_target tests/test_coli_target.exe
