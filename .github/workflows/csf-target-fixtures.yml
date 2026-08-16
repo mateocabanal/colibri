@@ -1,0 +1,29 @@
+name: CSF target fixtures
+
+on:
+  pull_request:
+    paths:
+      - 'docs/coli-serving-format-v1.md'
+      - 'docs/coli-serving-format-v1.1-target-identity.md'
+      - 'c/tests/fixtures/csf-v1-targets/**'
+      - '.github/workflows/csf-target-fixtures.yml'
+  workflow_dispatch:
+
+jobs:
+  fixtures:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Construct and self-check independent fixtures
+        shell: bash
+        run: |
+          python c/tests/fixtures/csf-v1-targets/make_fixtures.py --output "$RUNNER_TEMP/csf-v1-targets"
+          test -f "$RUNNER_TEMP/csf-v1-targets/apple/manifest.coli"
+          test -f "$RUNNER_TEMP/csf-v1-targets/linux-cuda-sm89/manifest.coli"
