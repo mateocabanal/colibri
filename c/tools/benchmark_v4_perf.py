@@ -391,6 +391,7 @@ def selftest() -> None:
     assert make_prompt(512, 4.0) == make_prompt(512, 4.0)
     assert PROFILES["quick"] == ("decode1", "decode8", "prefill512")
     assert PROFILE_TIMEOUT_SEC["quick"] == 120.0
+    assert text_from_timeout(b"partial") == "partial"
     print("benchmark_v4_perf selftest: ok")
 
 
