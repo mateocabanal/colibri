@@ -34,6 +34,7 @@ jobs:
           make -C c -f Makefile.csf test-target \
             APPLE_FIXTURE="$RUNNER_TEMP/csf-v1-targets/apple" \
             CUDA_FIXTURE="$RUNNER_TEMP/csf-v1-targets/linux-cuda-sm89"
+          # The target execution reader is intentionally dependency-light C.
           cc -O2 -Wall -Wextra -c c/coli_exec_format.c -o "$RUNNER_TEMP/coli_exec_format.o"
       - name: Commit tested compiler integration
         shell: bash
