@@ -18,16 +18,34 @@ jobs:
         with:
           ref: codex/compiler-contracts-p0
           fetch-depth: 0
-      - run: python3 tools/codex_patch.py
-      - name: Commit patch
+      - name: Import existing target reader and profile ABI work
+        shell: bash
+        run: |
+          git checkout origin/feat/csf-target-reader-23-v11 -- \
+            c/coli_target.c c/coli_target.h \
+            c/coli_exec_format.c c/coli_exec_format.h \
+            c/tests/test_coli_target.c \
+            .github/workflows/csf-target-reader.yml
+          git checkout origin/spec/csf-target-profiles-26 -- \
+            c/coli_target_profiles.c c/coli_target_profiles.h \
+            c/tests/test_coli_target_profiles.c \
+            docs/coli-target-profiles-v1.md
+      - name: Reconcile compiler and current main
+        run: python3 tools/codex_patch.py
+      - name: Drop superseded scratch registry and format Rust
+        shell: bash
+        run: |
+          rm -f spec/coli-target-profiles-v1.json tools/generate_target_profiles.py
+          cargo fmt --manifest-path colic/Cargo.toml
+      - name: Commit integration
         shell: bash
         run: |
           git config user.name 'colibri-codex'
           git config user.email 'colibri-codex@users.noreply.github.com'
-          git add colic/src/pipeline.rs colic/src/target/mod.rs colic/src/model/deepseek_v4_semantic.rs
+          git add -A
           if git diff --cached --quiet; then
             echo 'No changes to commit'
           else
-            git commit -m 'fix(colic): reconcile semantic fixtures and verify before publish (#49 #52)'
+            git commit -m 'feat(csf): integrate target ABI and compiler contract fixes (#23 #26 #49 #52)'
             git push origin HEAD:codex/compiler-contracts-p0
           fi
