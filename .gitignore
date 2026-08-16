@@ -7,6 +7,7 @@ web/node_modules/
 web/dist/
 web/*.tsbuildinfo
 desktop/src-tauri/target/
+colic/target/
 desktop/src-tauri/gen/
 
 # binari compilati (si rigenerano con make / coli build)
