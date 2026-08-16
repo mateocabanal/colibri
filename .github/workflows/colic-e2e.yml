@@ -1,6 +1,18 @@
 name: colic end-to-end
 
 on:
+  pull_request:
+    branches: [main, dev]
+    paths:
+      - 'colic/**'
+      - 'c/coli_exec_format.[ch]'
+      - 'c/coli_target.[ch]'
+      - 'c/coli_target_profiles.[ch]'
+      - 'c/tests/test_colic_e2e.c'
+      - 'c/tests/mxfp4_ref.c'
+      - 'docs/coli-serving-format-*.md'
+      - 'docs/coli-target-profiles-v1.md'
+      - '.github/workflows/colic-e2e.yml'
   workflow_dispatch:
 
 permissions:
