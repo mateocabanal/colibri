@@ -590,9 +590,20 @@ int coli_v4_layer_load(ColiV4Engine *engine,
     if (!weights || !effective_config || !index || layer < 0 ||
         layer >= effective_config->num_hidden_layers ||
         layer >= COLI_V4_RESIDENT_MAX_LAYERS_V2) return -1;
-    if (!resident_enabled_v2(engine))
-        return coli_v4_layer_resident_reference_load(
+    if (!resident_enabled_v2(engine)) {
+        uint64_t read_began = g_coli_v4_profile_on
+            ? coli_v4_profile_now() : 0;
+        int ref_result = coli_v4_layer_resident_reference_load(
             NULL, weights, effective_config, index, layer, error, error_size);
+        if (read_began && !ref_result) {
+            coli_v4_profile_add(COLI_V4_PROF_DENSE_READ,
+                                coli_v4_profile_now() - read_began);
+            if (g_coli_v4_profile_on)
+                coli_v4_profile_add_bytes(COLI_V4_PROF_DENSE_READ,
+                                          weights->stats.total_bytes);
+        }
+        return ref_result;
+    }
     if (engine->dense_resident.index && engine->dense_resident.index != index) {
         if (error && error_size)
             snprintf(error, error_size,
@@ -601,12 +612,21 @@ int coli_v4_layer_load(ColiV4Engine *engine,
     }
     engine->dense_resident.index = index;
     if (!engine->dense_resident.ready[layer]) {
+        uint64_t read_began = g_coli_v4_profile_on
+            ? coli_v4_profile_now() : 0;
         if (coli_v4_layer_resident_reference_load(
                 NULL, &engine->dense_resident.layers[layer], effective_config, index,
                 layer, error, error_size)) return -1;
+        if (read_began)
+            coli_v4_profile_add(COLI_V4_PROF_DENSE_READ,
+                                coli_v4_profile_now() - read_began);
         engine->dense_resident.ready[layer] = 1;
         engine->dense_resident.total_bytes +=
             engine->dense_resident.layers[layer].stats.total_bytes;
+        if (g_coli_v4_profile_on)
+            coli_v4_profile_add_bytes(
+                COLI_V4_PROF_DENSE_READ,
+                engine->dense_resident.layers[layer].stats.total_bytes);
         if (layer == effective_config->num_hidden_layers - 1)
             fprintf(stderr, "v4_dense_resident layers=%d bytes=%.3fGiB\n",
                     effective_config->num_hidden_layers,
@@ -843,6 +863,8 @@ int coli_v4_head_cache_load(ColiV4Engine *engine, const char *model_dir,
     ColiSafetensorsIndex *index;
     const ColiSafetensorsTensor *head;
     if (find_head(model_dir, &index, &head, error, error_size)) return -1;
+    uint64_t read_began = g_coli_v4_profile_on
+        ? coli_v4_profile_now() : 0;
     unsigned char *data = malloc((size_t)head->nbytes);
     int shard = coli_st_tensor_shard(index, head);
     if (!data || coli_st_read_at(index, shard, (uint64_t)head->off,
@@ -851,6 +873,12 @@ int coli_v4_head_cache_load(ColiV4Engine *engine, const char *model_dir,
         snprintf(error, error_size, "cannot load resident BF16 head.weight");
         return -1;
     }
+    if (read_began)
+        coli_v4_profile_add(COLI_V4_PROF_HEAD_READ,
+                            coli_v4_profile_now() - read_began);
+    if (g_coli_v4_profile_on)
+        coli_v4_profile_add_bytes(COLI_V4_PROF_HEAD_READ,
+                                  (uint64_t)head->nbytes);
     free(engine->head_cache.data);
     engine->head_cache.data = data;
     engine->head_cache.bytes = head->nbytes;
@@ -1680,6 +1708,9 @@ static int attention_token_impl(float *output,
     float *oa = calloc((size_t)groups * o_rank, sizeof(*oa));
     float *norm_weight = calloc((size_t)(q_rank > head_dim ? q_rank : head_dim),
                                 sizeof(*norm_weight));
+    uint64_t attn_began = g_coli_v4_profile_on
+        ? coli_v4_profile_now() : 0;
+    uint64_t comp_ns = 0, index_ns = 0, sparse_ns = 0;
     float *cosines = calloc((size_t)rope_dim / 2, sizeof(*cosines));
     float *sines = calloc((size_t)rope_dim / 2, sizeof(*sines));
     int *compressed_indices = NULL;
@@ -1703,18 +1734,30 @@ static int attention_token_impl(float *output,
         if (!result && (position + 1) % state->ratio == 0)
             result = grow_compressed_state(state, error, error_size);
         int produced = 0;
-        if (!result) result = coli_v4_compressor_step(
-            state->compressor,
-            state->compressed + (size_t)state->compressed_count * head_dim,
-            &produced, input, position, error, error_size);
+        if (!result) {
+            uint64_t step_began = g_coli_v4_profile_on
+                ? coli_v4_profile_now() : 0;
+            result = coli_v4_compressor_step(
+                state->compressor,
+                state->compressed + (size_t)state->compressed_count * head_dim,
+                &produced, input, position, error, error_size);
+            if (step_began)
+                comp_ns += coli_v4_profile_now() - step_began;
+        }
         if (!result && produced) state->compressed_count++;
         if (!result && state->indexer) {
             compressed_indices = malloc((size_t)config->index_topk *
                                         sizeof(*compressed_indices));
             if (!compressed_indices) result = -1;
-            else compressed_selected = coli_v4_indexer_step(
-                state->indexer, compressed_indices, config->index_topk,
-                qa, input, position, error, error_size);
+            else {
+                uint64_t step_began = g_coli_v4_profile_on
+                    ? coli_v4_profile_now() : 0;
+                compressed_selected = coli_v4_indexer_step(
+                    state->indexer, compressed_indices, config->index_topk,
+                    qa, input, position, error, error_size);
+                if (step_began)
+                    index_ns += coli_v4_profile_now() - step_began;
+            }
             if (compressed_selected < 0) result = -1;
         }
     }
@@ -1800,10 +1843,14 @@ static int attention_token_impl(float *output,
                 int ordinal = state->indexer ? compressed_indices[i] : i;
                 indices[state->window_size + i] = state->window_size + ordinal;
             }
+            uint64_t step_began = g_coli_v4_profile_on
+                ? coli_v4_profile_now() : 0;
             result = coli_v4_sparse_attention_ref(
                 attended, q, kv_values, sinks, indices, heads, head_dim,
                 kv_count, topk,
                 1.0f / sqrtf((float)head_dim));
+            if (step_began)
+                sparse_ns += coli_v4_profile_now() - step_began;
         }
         free(all_kv);
         free(indices);
@@ -1850,6 +1897,16 @@ static int attention_token_impl(float *output,
     free(sines); free(cosines); free(norm_weight); free(oa);
     free(attended); free(kv); free(q); free(qa);
     if (result) return set_error(error, error_size, "attention computation failed");
+    if (attn_began) {
+        uint64_t total_ns = coli_v4_profile_now() - attn_began;
+        uint64_t sub = comp_ns + index_ns + sparse_ns;
+        if (total_ns >= sub) {
+            coli_v4_profile_add(COLI_V4_PROF_ATTN_PROJ, total_ns - sub);
+            coli_v4_profile_add(COLI_V4_PROF_COMPRESSOR, comp_ns);
+            coli_v4_profile_add(COLI_V4_PROF_INDEXER, index_ns);
+            coli_v4_profile_add(COLI_V4_PROF_SPARSE_ATTN, sparse_ns);
+        }
+    }
     return 0;
 }
 
@@ -2069,6 +2126,9 @@ static int attention_token_impl(float *output,
     float *oa = calloc((size_t)groups * o_rank, sizeof(*oa));
     float *norm_weight = calloc((size_t)(q_rank > head_dim ? q_rank : head_dim),
                                 sizeof(*norm_weight));
+    uint64_t attn_began = g_coli_v4_profile_on
+        ? coli_v4_profile_now() : 0;
+    uint64_t comp_ns = 0, index_ns = 0, sparse_ns = 0;
     float *cosines = calloc((size_t)rope_dim / 2, sizeof(*cosines));
     float *sines = calloc((size_t)rope_dim / 2, sizeof(*sines));
     int *compressed_indices = NULL;
@@ -2092,18 +2152,30 @@ static int attention_token_impl(float *output,
         if (!result && (position + 1) % state->ratio == 0)
             result = grow_compressed_state(state, error, error_size);
         int produced = 0;
-        if (!result) result = coli_v4_compressor_step(
-            state->compressor,
-            state->compressed + (size_t)state->compressed_count * head_dim,
-            &produced, input, position, error, error_size);
+        if (!result) {
+            uint64_t step_began = g_coli_v4_profile_on
+                ? coli_v4_profile_now() : 0;
+            result = coli_v4_compressor_step(
+                state->compressor,
+                state->compressed + (size_t)state->compressed_count * head_dim,
+                &produced, input, position, error, error_size);
+            if (step_began)
+                comp_ns += coli_v4_profile_now() - step_began;
+        }
         if (!result && produced) state->compressed_count++;
         if (!result && state->indexer) {
             compressed_indices = malloc((size_t)config->index_topk *
                                         sizeof(*compressed_indices));
             if (!compressed_indices) result = -1;
-            else compressed_selected = coli_v4_indexer_step(
-                state->indexer, compressed_indices, config->index_topk,
-                qa, input, position, error, error_size);
+            else {
+                uint64_t step_began = g_coli_v4_profile_on
+                    ? coli_v4_profile_now() : 0;
+                compressed_selected = coli_v4_indexer_step(
+                    state->indexer, compressed_indices, config->index_topk,
+                    qa, input, position, error, error_size);
+                if (step_began)
+                    index_ns += coli_v4_profile_now() - step_began;
+            }
             if (compressed_selected < 0) result = -1;
         }
     }
@@ -2189,10 +2261,14 @@ static int attention_token_impl(float *output,
                 int ordinal = state->indexer ? compressed_indices[i] : i;
                 indices[state->window_size + i] = state->window_size + ordinal;
             }
+            uint64_t step_began = g_coli_v4_profile_on
+                ? coli_v4_profile_now() : 0;
             result = coli_v4_sparse_attention_ref(
                 attended, q, kv_values, sinks, indices, heads, head_dim,
                 kv_count, topk,
                 1.0f / sqrtf((float)head_dim));
+            if (step_began)
+                sparse_ns += coli_v4_profile_now() - step_began;
         }
         free(all_kv);
         free(indices);
@@ -2239,6 +2315,16 @@ static int attention_token_impl(float *output,
     free(sines); free(cosines); free(norm_weight); free(oa);
     free(attended); free(kv); free(q); free(qa);
     if (result) return set_error(error, error_size, "attention computation failed");
+    if (attn_began) {
+        uint64_t total_ns = coli_v4_profile_now() - attn_began;
+        uint64_t sub = comp_ns + index_ns + sparse_ns;
+        if (total_ns >= sub) {
+            coli_v4_profile_add(COLI_V4_PROF_ATTN_PROJ, total_ns - sub);
+            coli_v4_profile_add(COLI_V4_PROF_COMPRESSOR, comp_ns);
+            coli_v4_profile_add(COLI_V4_PROF_INDEXER, index_ns);
+            coli_v4_profile_add(COLI_V4_PROF_SPARSE_ATTN, sparse_ns);
+        }
+    }
     return 0;
 }
 
@@ -3283,11 +3369,16 @@ static int moe_token(float *output,
         n, d, topk, config->routed_scaling_factor);
 
     ColiTensorView w1, w2, w3;
+    uint64_t shared_began = g_coli_v4_profile_on
+        ? coli_v4_profile_now() : 0;
     if (!result && (fp8_view(&w1, weights, "ffn.shared_experts.w1") ||
                     fp8_view(&w2, weights, "ffn.shared_experts.w2") ||
                     fp8_view(&w3, weights, "ffn.shared_experts.w3"))) result = -1;
     if (!result) result = coli_v4_shared_expert_forward_ref(
         shared_output, &w1, &w2, &w3, input, config->swiglu_limit);
+    if (shared_began)
+        coli_v4_profile_add(COLI_V4_PROF_SHARED_EXPERT,
+                            coli_v4_profile_now() - shared_began);
     if (!result) memset(output, 0, (size_t)d * sizeof(*output));
     for (int expert_id = 0; !result && expert_id < n; expert_id++) {
         int rank = -1;
@@ -3340,21 +3431,37 @@ static int block_token_impl(float *output_hc,
         return set_error(error, error_size, "out of memory in block");
     }
     memcpy(residual, input_hc, hd * sizeof(*residual));
+    uint64_t hc_began = g_coli_v4_profile_on ? coli_v4_profile_now() : 0;
     int result = normalized_hc_pre(reduced, post, comb, normalized, input_hc,
                                    weights, config, "attn", "attn_norm.weight");
+    if (hc_began)
+        coli_v4_profile_add(COLI_V4_PROF_HC_PRE_ATTN,
+                            coli_v4_profile_now() - hc_began);
     if (!result) result = attention
         ? coli_v4_attention_window_token_ref(branch, attention, weights, config,
                                              normalized, position, error, error_size)
         : coli_v4_attention_token_ref(branch, weights, config, normalized,
                                       position, error, error_size);
+    hc_began = g_coli_v4_profile_on ? coli_v4_profile_now() : 0;
     if (!result) result = coli_v4_hc_post(state, branch, residual, post, comb, hc, d);
+    if (hc_began)
+        coli_v4_profile_add(COLI_V4_PROF_HC_POST_ATTN,
+                            coli_v4_profile_now() - hc_began);
     if (!result) coli_bf16_round_array(state, hd);
 
     if (!result) memcpy(residual, state, hd * sizeof(*residual));
+    hc_began = g_coli_v4_profile_on ? coli_v4_profile_now() : 0;
     if (!result) result = normalized_hc_pre(reduced, post, comb, normalized, state,
                                             weights, config, "ffn", "ffn_norm.weight");
+    if (hc_began)
+        coli_v4_profile_add(COLI_V4_PROF_HC_PRE_FFN,
+                            coli_v4_profile_now() - hc_began);
     if (!result) result = moe_token(branch, weights, config, experts, normalized, token);
+    hc_began = g_coli_v4_profile_on ? coli_v4_profile_now() : 0;
     if (!result) result = coli_v4_hc_post(output_hc, branch, residual, post, comb, hc, d);
+    if (hc_began)
+        coli_v4_profile_add(COLI_V4_PROF_HC_POST_FFN,
+                            coli_v4_profile_now() - hc_began);
     if (!result) coli_bf16_round_array(output_hc, hd);
 
     free(comb); free(post); free(branch); free(normalized);
@@ -3398,6 +3505,7 @@ typedef struct {
     ColiExpertKey key;
     ColiExpertView view;
     int result;
+    uint64_t lookup_ns; /* worker-side pread+publish; owner reads after join */
 } ExpertLoadJob;
 
 #ifdef COLI_V4_EXPERIMENTAL_PREFETCH
@@ -3414,7 +3522,10 @@ static int expert_prefetch_enabled(void) {
 
 static void *expert_load_worker(void *argument) {
     ExpertLoadJob *job = argument;
+    uint64_t lookup_began = g_coli_v4_profile_on
+        ? coli_v4_profile_now() : 0;
     job->result = coli_expert_lookup(job->store, job->key, &job->view);
+    if (lookup_began) job->lookup_ns = coli_v4_profile_now() - lookup_began;
     return NULL;
 }
 
@@ -3495,7 +3606,10 @@ static void *dual_expert_loader_worker(void *argument) {
         ExpertLoadJob *job = slot->job;
         slot->pending = 0;
         pthread_mutex_unlock(&dual_loader_pool.mutex);
+        uint64_t lookup_began = g_coli_v4_profile_on
+            ? coli_v4_profile_now() : 0;
         job->result = coli_expert_lookup(job->store, job->key, &job->view);
+        if (lookup_began) job->lookup_ns = coli_v4_profile_now() - lookup_began;
         pthread_mutex_lock(&dual_loader_pool.mutex);
         slot->completed = 1;
         pthread_cond_broadcast(&dual_loader_pool.complete);
@@ -3732,7 +3846,12 @@ static int profiled_expert_load_finish(ExpertLoadHandle *handle) {
 #ifdef COLI_V4_EXPERIMENTAL_BLOCK_OTHER_PROFILE
     double began = coli_v4_block_profile_now();
 #endif
+    uint64_t wait_began = g_coli_v4_profile_on
+        ? coli_v4_profile_now() : 0;
     int result = expert_load_finish(handle);
+    if (wait_began)
+        coli_v4_profile_add(COLI_V4_PROF_EXPERT_LOADER_WAIT,
+                            coli_v4_profile_now() - wait_began);
 #ifdef COLI_V4_EXPERIMENTAL_BLOCK_OTHER_PROFILE
     coli_v4_block_profile_add(COLI_V4_BLOCK_PROFILE_LOADER_WAIT,
                               coli_v4_block_profile_now() - began);
@@ -3790,10 +3909,15 @@ static int moe_token_pipeline(float *output,
         for (int i = 0; i < topk; i++)
             indices[i] = (int)table[(size_t)token * topk + i];
 #ifndef COLI_V4_DISABLE_BF16_ROUTE
+    uint64_t router_began = g_coli_v4_profile_on
+        ? coli_v4_profile_now() : 0;
     if (!result) result = coli_v4_route_bf16(
         route_weights, indices, input, raw_gate, bias,
         weights->plan.uses_hash_router ? indices : NULL,
         n, d, topk, config->routed_scaling_factor);
+    if (router_began)
+        coli_v4_profile_add(COLI_V4_PROF_ROUTER,
+                            coli_v4_profile_now() - router_began);
 #else
     if (!result) result = coli_v4_route(
         route_weights, indices, input, gate, bias,
@@ -3860,11 +3984,16 @@ static int moe_token_pipeline(float *output,
 #endif
 
     ColiTensorView w1, w2, w3;
+    uint64_t shared_began = g_coli_v4_profile_on
+        ? coli_v4_profile_now() : 0;
     if (!result && (fp8_view(&w1, weights, "ffn.shared_experts.w1") ||
                     fp8_view(&w2, weights, "ffn.shared_experts.w2") ||
                     fp8_view(&w3, weights, "ffn.shared_experts.w3"))) result = -1;
     if (!result) result = coli_v4_shared_expert_forward_ref(
         shared_output, &w1, &w2, &w3, input, config->swiglu_limit);
+    if (shared_began)
+        coli_v4_profile_add(COLI_V4_PROF_SHARED_EXPERT,
+                            coli_v4_profile_now() - shared_began);
     if (!result) memset(output, 0, (size_t)d * sizeof(*output));
 
 #ifdef COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
@@ -3876,6 +4005,9 @@ static int moe_token_pipeline(float *output,
         }
         loader_active[slot] = 0;
         if (jobs[slot].result) { result = -1; break; }
+        if (g_coli_v4_profile_on && jobs[slot].lookup_ns)
+            coli_v4_profile_add(COLI_V4_PROF_EXPERT_READ_WORK,
+                                jobs[slot].lookup_ns);
         ColiExpertView expert = jobs[slot].view;
 
         int next = current + dual_loader_lanes();
@@ -3891,9 +4023,16 @@ static int moe_token_pipeline(float *output,
             else
                 loader_active[slot] = 1;
         }
-        if (!result) result = coli_v4_expert_forward_ref(
-            expert_output, &expert, input, expert_weights[current],
-            config->swiglu_limit);
+        {
+            uint64_t compute_began = g_coli_v4_profile_on
+                ? coli_v4_profile_now() : 0;
+            if (!result) result = coli_v4_expert_forward_ref(
+                expert_output, &expert, input, expert_weights[current],
+                config->swiglu_limit);
+            if (compute_began)
+                coli_v4_profile_add(COLI_V4_PROF_EXPERT_COMPUTE,
+                                    coli_v4_profile_now() - compute_began);
+        }
         coli_expert_release(store, &expert);
         if (!result)
             for (int i = 0; i < d; i++) output[i] += expert_output[i];
@@ -3911,6 +4050,9 @@ static int moe_token_pipeline(float *output,
         }
         loader_active = 0;
         if (job.result) { result = -1; break; }
+        if (g_coli_v4_profile_on && job.lookup_ns)
+            coli_v4_profile_add(COLI_V4_PROF_EXPERT_READ_WORK,
+                                job.lookup_ns);
         ColiExpertView expert = job.view;
 
         if (current + 1 < selected) {
@@ -3924,9 +4066,16 @@ static int moe_token_pipeline(float *output,
             else
                 loader_active = 1;
         }
-        if (!result) result = coli_v4_expert_forward_ref(
-            expert_output, &expert, input, expert_weights[current],
-            config->swiglu_limit);
+        {
+            uint64_t compute_began = g_coli_v4_profile_on
+                ? coli_v4_profile_now() : 0;
+            if (!result) result = coli_v4_expert_forward_ref(
+                expert_output, &expert, input, expert_weights[current],
+                config->swiglu_limit);
+            if (compute_began)
+                coli_v4_profile_add(COLI_V4_PROF_EXPERT_COMPUTE,
+                                    coli_v4_profile_now() - compute_began);
+        }
         coli_expert_release(store, &expert);
         if (!result)
             for (int i = 0; i < d; i++) output[i] += expert_output[i];
@@ -3973,24 +4122,40 @@ static int block_token_pipeline(float *output_hc,
         free(reduced); free(state); free(residual); return -1;
     }
     memcpy(residual, input_hc, hd * sizeof(*residual));
+    uint64_t hc_began = g_coli_v4_profile_on ? coli_v4_profile_now() : 0;
     int result = normalized_hc_pre(reduced, post, comb, normalized, input_hc,
                                    weights, config, "attn", "attn_norm.weight");
+    if (hc_began)
+        coli_v4_profile_add(COLI_V4_PROF_HC_PRE_ATTN,
+                            coli_v4_profile_now() - hc_began);
     if (!result) result = attention
         ? coli_v4_attention_window_token_ref(branch, attention, weights, config,
                                              normalized, position, error, error_size)
         : coli_v4_attention_token_ref(branch, weights, config, normalized,
                                       position, error, error_size);
+    hc_began = g_coli_v4_profile_on ? coli_v4_profile_now() : 0;
     if (!result) result = coli_v4_hc_post(state, branch, residual,
                                           post, comb, hc, d);
+    if (hc_began)
+        coli_v4_profile_add(COLI_V4_PROF_HC_POST_ATTN,
+                            coli_v4_profile_now() - hc_began);
     if (!result) coli_bf16_round_array(state, hd);
     if (!result) memcpy(residual, state, hd * sizeof(*residual));
+    hc_began = g_coli_v4_profile_on ? coli_v4_profile_now() : 0;
     if (!result) result = normalized_hc_pre(reduced, post, comb, normalized, state,
                                             weights, config, "ffn",
                                             "ffn_norm.weight");
+    if (hc_began)
+        coli_v4_profile_add(COLI_V4_PROF_HC_PRE_FFN,
+                            coli_v4_profile_now() - hc_began);
     if (!result) result = moe_token_pipeline(branch, weights, config, experts,
                                              normalized, token);
+    hc_began = g_coli_v4_profile_on ? coli_v4_profile_now() : 0;
     if (!result) result = coli_v4_hc_post(output_hc, branch, residual,
                                           post, comb, hc, d);
+    if (hc_began)
+        coli_v4_profile_add(COLI_V4_PROF_HC_POST_FFN,
+                            coli_v4_profile_now() - hc_began);
     if (!result) coli_bf16_round_array(output_hc, hd);
     free(comb); free(post); free(branch); free(normalized);
     free(reduced); free(state); free(residual);
@@ -4079,6 +4244,8 @@ static int v4_moe_batch_union(
 #endif
     const int64_t *table = value(weights, "ffn.gate.tid2eid", NULL);
     const float *bias = value(weights, "ffn.gate.bias", NULL);
+    uint64_t router_began = g_coli_v4_profile_on
+        ? coli_v4_profile_now() : 0;
     int result = weights->plan.uses_hash_router && !table ? -1 : 0;
     for (int item = 0; !result && item < batch; item++) {
         int *item_indices = indices + (size_t)item * topk;
@@ -4108,8 +4275,13 @@ static int v4_moe_batch_union(
                     result = -1;
             }
     }
+    if (router_began)
+        coli_v4_profile_add(COLI_V4_PROF_ROUTER,
+                            coli_v4_profile_now() - router_began);
 
     ColiTensorView w1, w2, w3;
+    uint64_t shared_began = g_coli_v4_profile_on
+        ? coli_v4_profile_now() : 0;
     if (!result &&
         (fp8_view(&w1, weights, "ffn.shared_experts.w1") ||
          fp8_view(&w2, weights, "ffn.shared_experts.w2") ||
@@ -4119,6 +4291,9 @@ static int v4_moe_batch_union(
         result = coli_v4_shared_expert_forward_ref(
             shared + (size_t)item * d, &w1, &w2, &w3,
             inputs + (size_t)item * d, config->swiglu_limit);
+    if (shared_began)
+        coli_v4_profile_add(COLI_V4_PROF_SHARED_EXPERT,
+                            coli_v4_profile_now() - shared_began);
     if (!result)
         memset(outputs, 0, (size_t)batch * d * sizeof(*outputs));
 
@@ -4152,6 +4327,9 @@ static int v4_moe_batch_union(
             break;
         }
         active[slot] = 0;
+        if (g_coli_v4_profile_on && jobs[slot].lookup_ns)
+            coli_v4_profile_add(COLI_V4_PROF_EXPERT_READ_WORK,
+                                jobs[slot].lookup_ns);
         ColiExpertView view = jobs[slot].view;
         int next = current + dual_loader_lanes();
         if (next < key_count) {
@@ -4164,6 +4342,8 @@ static int v4_moe_batch_union(
             else
                 active[slot] = 1;
         }
+        uint64_t compute_began = g_coli_v4_profile_on
+            ? coli_v4_profile_now() : 0;
         int expert = view.key.expert;
         for (int item = 0; !result && item < batch; item++)
             for (int rank = 0; !result && rank < topk; rank++) {
@@ -4177,6 +4357,9 @@ static int v4_moe_batch_union(
                         outputs[(size_t)item * d + column] +=
                             expert_output[column];
             }
+        if (compute_began)
+            coli_v4_profile_add(COLI_V4_PROF_EXPERT_COMPUTE,
+                                coli_v4_profile_now() - compute_began);
         coli_expert_release(store, &view);
     }
     for (int slot = 0; slot < dual_loader_lanes(); slot++)
@@ -4187,10 +4370,17 @@ static int v4_moe_batch_union(
 #else
     for (int current = 0; !result && current < key_count; current++) {
         ColiExpertView view;
+        uint64_t lookup_began = g_coli_v4_profile_on
+            ? coli_v4_profile_now() : 0;
         if (coli_expert_lookup(store, keys[current], &view)) {
             result = -1;
             break;
         }
+        if (lookup_began)
+            coli_v4_profile_add(COLI_V4_PROF_EXPERT_READ_WORK,
+                                coli_v4_profile_now() - lookup_began);
+        uint64_t compute_began = g_coli_v4_profile_on
+            ? coli_v4_profile_now() : 0;
         int expert = keys[current].expert;
         for (int item = 0; !result && item < batch; item++)
             for (int rank = 0; !result && rank < topk; rank++) {
@@ -4204,6 +4394,9 @@ static int v4_moe_batch_union(
                         outputs[(size_t)item * d + column] +=
                             expert_output[column];
             }
+        if (compute_began)
+            coli_v4_profile_add(COLI_V4_PROF_EXPERT_COMPUTE,
+                                coli_v4_profile_now() - compute_began);
         coli_expert_release(store, &view);
     }
 #endif
@@ -4265,9 +4458,16 @@ int coli_v4_block_window_batch_ref(
             inputs_hc + (size_t)item * hd,
             weights, config, "attn", "attn_norm.weight");
     phase = "attention";
-    if (!result) result = coli_v4_attention_window_batch_ref(
-        branches, attention, weights, config, normalized,
-        start_position, batch, error, error_size);
+    {
+        uint64_t span_began = g_coli_v4_profile_on
+            ? coli_v4_profile_now() : 0;
+        if (!result) result = coli_v4_attention_window_batch_ref(
+            branches, attention, weights, config, normalized,
+            start_position, batch, error, error_size);
+        if (span_began)
+            coli_v4_profile_add(COLI_V4_PROF_ATTN_PROJ,
+                                coli_v4_profile_now() - span_began);
+    }
     if (!result) phase = "attention post / FFN hyper-connection";
     for (int item = 0; !result && item < batch; item++) {
         float *state = states + (size_t)item * hd;
@@ -4285,6 +4485,9 @@ int coli_v4_block_window_batch_ref(
             weights, config, "ffn", "ffn_norm.weight");
     }
     if (!result) phase = "MoE";
+    /* v4_moe_batch_union bills ROUTER / SHARED_EXPERT / READ_WORK / COMPUTE /
+     * LOADER_WAIT internally (mutually exclusive); do not wrap it here.
+     * The serial branch bills per-position through moe_token_pipeline. */
     if (!result && batch > 1 && v4_expert_union_enabled())
         result = v4_moe_batch_union(
             ffn_branch, weights, config, experts,
@@ -5140,6 +5343,9 @@ static int attention_token_impl(float *output,
     float *oa = calloc((size_t)groups * o_rank, sizeof(*oa));
     float *norm_weight = calloc((size_t)(q_rank > head_dim ? q_rank : head_dim),
                                 sizeof(*norm_weight));
+    uint64_t attn_began = g_coli_v4_profile_on
+        ? coli_v4_profile_now() : 0;
+    uint64_t comp_ns = 0, index_ns = 0, sparse_ns = 0;
     float *cosines = calloc((size_t)rope_dim / 2, sizeof(*cosines));
     float *sines = calloc((size_t)rope_dim / 2, sizeof(*sines));
     int *compressed_indices = NULL;
@@ -5163,18 +5369,30 @@ static int attention_token_impl(float *output,
         if (!result && (position + 1) % state->ratio == 0)
             result = grow_compressed_state(state, error, error_size);
         int produced = 0;
-        if (!result) result = coli_v4_compressor_step(
-            state->compressor,
-            state->compressed + (size_t)state->compressed_count * head_dim,
-            &produced, input, position, error, error_size);
+        if (!result) {
+            uint64_t step_began = g_coli_v4_profile_on
+                ? coli_v4_profile_now() : 0;
+            result = coli_v4_compressor_step(
+                state->compressor,
+                state->compressed + (size_t)state->compressed_count * head_dim,
+                &produced, input, position, error, error_size);
+            if (step_began)
+                comp_ns += coli_v4_profile_now() - step_began;
+        }
         if (!result && produced) state->compressed_count++;
         if (!result && state->indexer) {
             compressed_indices = malloc((size_t)config->index_topk *
                                         sizeof(*compressed_indices));
             if (!compressed_indices) result = -1;
-            else compressed_selected = coli_v4_indexer_step(
-                state->indexer, compressed_indices, config->index_topk,
-                qa, input, position, error, error_size);
+            else {
+                uint64_t step_began = g_coli_v4_profile_on
+                    ? coli_v4_profile_now() : 0;
+                compressed_selected = coli_v4_indexer_step(
+                    state->indexer, compressed_indices, config->index_topk,
+                    qa, input, position, error, error_size);
+                if (step_began)
+                    index_ns += coli_v4_profile_now() - step_began;
+            }
             if (compressed_selected < 0) result = -1;
         }
     }
@@ -5260,10 +5478,14 @@ static int attention_token_impl(float *output,
                 int ordinal = state->indexer ? compressed_indices[i] : i;
                 indices[state->window_size + i] = state->window_size + ordinal;
             }
+            uint64_t step_began = g_coli_v4_profile_on
+                ? coli_v4_profile_now() : 0;
             result = coli_v4_sparse_attention_ref(
                 attended, q, kv_values, sinks, indices, heads, head_dim,
                 kv_count, topk,
                 1.0f / sqrtf((float)head_dim));
+            if (step_began)
+                sparse_ns += coli_v4_profile_now() - step_began;
         }
         free(all_kv);
         free(indices);
@@ -5310,6 +5532,16 @@ static int attention_token_impl(float *output,
     free(sines); free(cosines); free(norm_weight); free(oa);
     free(attended); free(kv); free(q); free(qa);
     if (result) return set_error(error, error_size, "attention computation failed");
+    if (attn_began) {
+        uint64_t total_ns = coli_v4_profile_now() - attn_began;
+        uint64_t sub = comp_ns + index_ns + sparse_ns;
+        if (total_ns >= sub) {
+            coli_v4_profile_add(COLI_V4_PROF_ATTN_PROJ, total_ns - sub);
+            coli_v4_profile_add(COLI_V4_PROF_COMPRESSOR, comp_ns);
+            coli_v4_profile_add(COLI_V4_PROF_INDEXER, index_ns);
+            coli_v4_profile_add(COLI_V4_PROF_SPARSE_ATTN, sparse_ns);
+        }
+    }
     return 0;
 }
 
@@ -5625,21 +5857,12 @@ static int lookup(ColiExpertStore *store, ColiExpertKey key,
             return -1;
         }
         if (!slot->slab) {
-            /* 16K-aligned + registered: Metal single-GEMV resolves registered
-             * slabs zero-copy, so pointer-keyed handles read LIVE bytes even
-             * when the LRU recycles this slot to another expert. Registration
-             * is idempotent; skipped when Metal is off. */
-            size_t cap = ((size_t)state->record_bytes + 16383u) & ~(size_t)16383u;
-            if (posix_memalign((void **)&slot->slab, 16384, cap)) {
-                slot->slab = NULL;
+            slot->slab = malloc((size_t)state->record_bytes);
+            if (!slot->slab) {
                 pthread_mutex_unlock(&state->mutex);
                 memset(view, 0, sizeof(*view));
                 return -1;
             }
-#ifdef COLI_METAL
-            coli_metal_register(slot->slab, cap);
-#endif
-            slot->aligned_slab = 1;
             state->stats.resident_bytes += state->record_bytes;
         }
         /* A short read must never expose a partially overwritten slot: claim it
@@ -5766,18 +5989,13 @@ static void destroy(ColiExpertStore *store) {
     V4ExpertStoreState *state = store->state;
     if (state) {
         assert(state->active_leases == 0 && "destroy with active expert leases");
-        for (int i = 0; i < state->layers * state->slots_per_layer; i++) {
-#ifdef COLI_METAL
-            if (state->slots[i].slab)
-                coli_metal_unregister(state->slots[i].slab);
-#endif
+        for (int i = 0; i < state->layers * state->slots_per_layer; i++)
             /* aligned_slab means posix_memalign, which on Windows is
              * _aligned_malloc and must not reach free(). */
             if (state->slots[i].aligned_slab)
                 compat_aligned_free(state->slots[i].slab);
             else
                 free(state->slots[i].slab);
-        }
         pthread_mutex_destroy(&state->mutex);
         coli_st_index_close(state->index);
         free(state->records);
@@ -6291,16 +6509,13 @@ static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
         return -1;
     }
     if (!slot->slab) {
-        size_t capacity = ((size_t)state->record_bytes + 8192u + 16383u) & ~(size_t)16383u;
-        if (posix_memalign((void **)&slot->slab, 16384, capacity)) {
+        size_t capacity = (size_t)state->record_bytes + 8192u;
+        if (posix_memalign((void **)&slot->slab, 4096, capacity)) {
             slot->slab = NULL;
             pthread_mutex_unlock(&state->mutex);
             memset(view, 0, sizeof(*view));
             return -1;
         }
-#ifdef COLI_METAL
-        coli_metal_register(slot->slab, capacity);
-#endif
         slot->aligned_slab = 1;
         state->stats.resident_bytes += state->record_bytes;
     }
@@ -7017,6 +7232,10 @@ int coli_v4_engine_open(ColiV4Engine **output,
         return -1;
     }
     *output = NULL;
+    /* Issue #1 phase profiling: V4_PROFILE=1 read exactly once here. The
+     * harness compares runs with profiling on/off, so the gate must not
+     * depend on a -D that changes how the binary was built. */
+    coli_v4_profile_reset();
     ColiV4Engine *engine = calloc(1, sizeof(*engine));
     if (!engine) {
         if (error && error_size)
@@ -7088,20 +7307,6 @@ int coli_v4_engine_open(ColiV4Engine **output,
             engine->runtime.target_expert_cache_bytes;
         *output = engine;
         return 0;
-    }
-#endif
-#ifdef COLI_METAL
-    /* Init Metal BEFORE the expert store opens: slot slabs are registered at
-     * allocation, and registration is a no-op while g_dev is null. The lazy
-     * init in the matvec shim is then a no-op (already initialized). */
-    if (!getenv("V4_METAL_EXPERTS") || atoi(getenv("V4_METAL_EXPERTS")) != 0) {
-        if (coli_metal_init()) {
-#ifdef COLI_METAL_VERBOSE
-            fprintf(stderr, "[metal] v4 expert path enabled (V4_METAL_EXPERTS=0 disables)\n");
-#endif
-        } else {
-            fprintf(stderr, "[metal] unavailable — V4 experts stay on CPU\n");
-        }
     }
 #endif
     if (coli_v4_expert_store_open_planned(
@@ -8363,6 +8568,10 @@ int coli_v4_session_generate(ColiV4Session *session,
         }
 
     double setup_done = spec_now();
+    if (g_coli_v4_profile_on) {
+        coli_v4_profile_mark(2); /* prompt starts after setup */
+        coli_v4_profile_mark_stats(2, experts);
+    }
     if (target_batch(engine, &state, &next, attention, index, config, experts,
                      session->prompt_ids + reuse, reuse, fresh,
                      error, error_size)) {
@@ -8393,6 +8602,13 @@ int coli_v4_session_generate(ColiV4Session *session,
                                   current_logit, last_processed,
                                   generated_count, options->stop_at_sentence);
     double first_at = spec_now();
+    if (g_coli_v4_profile_on) {
+        /* marks[2] (prompt start) stays at tokens=0; the prompt scope
+         * therefore reports prompt_count as its token count. */
+        coli_v4_profile_mark(3); /* decode starts at first emitted token */
+        coli_v4_profile_tokens(3, (uint64_t)prompt_count);
+        coli_v4_profile_mark_stats(3, experts);
+    }
 
     int draft_limit = getenv("V4_DRAFT") ? atoi(getenv("V4_DRAFT")) : 0;
     if (draft_limit < 0) draft_limit = 0;
@@ -8620,10 +8836,18 @@ int coli_v4_session_generate(ColiV4Session *session,
         kv_prefix_record(&session->fed, &current, position, 1);
         session->state = state;
         session->next = next;
-        if (final_hidden(hidden, state, index, config, error, error_size) ||
-            head_argmax(engine, hidden, index, config, &current, &current_logit)) {
-            kv_prefix_taint(&session->fed);
-            return -1;
+        {
+            uint64_t head_began = g_coli_v4_profile_on
+                ? coli_v4_profile_now() : 0;
+            if (final_hidden(hidden, state, index, config, error, error_size) ||
+                head_argmax(engine, hidden, index, config, &current,
+                            &current_logit)) {
+                kv_prefix_taint(&session->fed);
+                return -1;
+            }
+            if (head_began)
+                coli_v4_profile_add(COLI_V4_PROF_HEAD_COMPUTE,
+                                    coli_v4_profile_now() - head_began);
         }
         last_processed = position;
         generated[generated_count++] = current;
@@ -8635,6 +8859,15 @@ int coli_v4_session_generate(ColiV4Session *session,
     }
     if (coli_v4_full_dspark_wanted) v4_dspark_report();
     double ended = spec_now();
+    if (g_coli_v4_profile_on) {
+        /* marks[3].tokens holds prompt_count, so prompt scope tokens =
+         * prompt_count and decode scope tokens = total - prompt_count
+         * (i.e. the generated count). */
+        coli_v4_profile_mark(4); /* run end */
+        coli_v4_profile_tokens(4, (uint64_t)generated_count +
+                                  (uint64_t)prompt_count);
+        coli_v4_profile_mark_stats(4, experts);
+    }
     session->state = state;
     session->next = next;
     session->generated_count = generated_count;
@@ -9191,10 +9424,14 @@ int main(int argc, char **argv) {
             fprintf(stderr, "%s\n", error);
             goto cleanup;
         }
+        if (g_coli_v4_profile_on)
+            coli_v4_profile_mark(0); /* startup scope ends at engine open */
     }
     config = *coli_v4_engine_config(engine);
     index = coli_v4_engine_target_index(engine);
     experts = coli_v4_engine_expert_store(engine);
+    if (g_coli_v4_profile_on)
+        coli_v4_profile_mark_stats(0, experts);
     layers = config.num_hidden_layers;
     snprintf(tokenizer_path, sizeof(tokenizer_path), "%s/tokenizer.json",
              cli.model_dir);
@@ -9329,6 +9566,10 @@ int main(int argc, char **argv) {
     /* clock_gettime inline rather than a helper: the amalgamated build compiles
      * this file once per COLI_V4_UNIT_*, and hot_now() is static to another one. */
     struct timespec tune_a, tune_b;
+    if (g_coli_v4_profile_on) {
+        coli_v4_profile_mark(1); /* run starts now (after engine open marked 0) */
+        coli_v4_profile_mark_stats(1, experts);
+    }
     clock_gettime(CLOCK_MONOTONIC, &tune_a);
     if (coli_v4_session_generate(session, prompt, prompt_length, &gen_opts,
                                  NULL, NULL, &gen_stats, error,
@@ -9371,6 +9612,8 @@ int main(int argc, char **argv) {
     if (out_len) fwrite(out_text, 1, out_len, stderr);
     fprintf(stderr, "\ntiming time_to_first_token=%.3fs after_first=%.3fs\n",
            gen_stats.time_to_first_token_sec, gen_stats.decode_sec);
+    if (g_coli_v4_profile_on)
+        coli_v4_profile_emit(stderr);
 
     /* Alias session buffers for optional record-oracle path.
      * cleanup must destroy the session and must not free these aliases. */
@@ -9449,6 +9692,216 @@ cleanup:
 #endif /* !COLI_V4_SKIP_GENERATE_MAIN */
 
 #endif /* COLI_V4_UNIT_GENERATE_STATS */
+
+#ifdef COLI_V4_UNIT_PROFILE
+/* ######## deepseek_v4_profile.c ########
+ *
+ * Singleton phase-profile accumulator for issue #1 (end-to-end V4 perf
+ * telemetry). Exactly-once definitions for the API declared in
+ * deepseek_v4_internal.h. V4_PROFILE=1 at engine_open enables it; all other
+ * units call the externs below (single branch, zero clocks when off).
+ */
+#include "deepseek_v4_internal.h"
+
+#include <stdlib.h>
+#include <time.h>
+
+static ColiV4Profile g_profile;
+static ColiV4Profile g_marks[5]; /* startup, run-start, prompt-start,
+                                    decode-start, run-end */
+static uint64_t g_wall_base;     /* CLOCK_MONOTONIC at reset (startup begin) */
+#ifdef COLI_METAL
+static uint64_t g_metal_last[4];
+#endif
+int g_coli_v4_profile_on = 0;
+
+void coli_v4_profile_reset(void) {
+    const char *env = getenv("V4_PROFILE");
+    g_coli_v4_profile_on = env && *env && atoi(env) != 0;
+    memset(&g_profile, 0, sizeof(g_profile));
+    memset(g_marks, 0, sizeof(g_marks));
+    g_wall_base = g_coli_v4_profile_on ? coli_v4_profile_now() : 0;
+#ifdef COLI_METAL
+    memset(g_metal_last, 0, sizeof(g_metal_last));
+    coli_metal_profile_set_on(g_coli_v4_profile_on);
+    coli_metal_profile_reset();
+#endif
+}
+
+void coli_v4_profile_add(int kind, uint64_t ns) {
+    if (g_coli_v4_profile_on && kind >= 0 && kind < COLI_V4_PROF_COUNT)
+        g_profile.ns[kind] += ns;
+}
+
+void coli_v4_profile_add_bytes(ColiV4ProfileKind kind, uint64_t bytes) {
+    if (!g_coli_v4_profile_on) return;
+    switch (kind) {
+    case COLI_V4_PROF_DENSE_READ: g_profile.dense_read_bytes += bytes; break;
+    case COLI_V4_PROF_EXPERT_READ_WORK: g_profile.expert_read_bytes += bytes; break;
+    case COLI_V4_PROF_HEAD_READ: g_profile.head_read_bytes += bytes; break;
+    default: break;
+    }
+}
+
+ColiV4Profile coli_v4_profile_get(void) {
+    return g_profile;
+}
+
+struct ColiProfileMarks { /* mirrors g_marks + per-mark store stats */
+    ColiV4Profile pool;
+    ColiExpertStoreStats st;
+};
+static struct ColiProfileMarks g_mark_full[5];
+
+/* Store-stats snapshot helper: called by the CLI/session right after a mark
+ * so each scope line carries its own cache traffic. */
+void coli_v4_profile_mark_stats(int slot, ColiExpertStore *experts) {
+    if (slot < 0 || slot >= 5) return;
+    g_mark_full[slot].pool = g_marks[slot];
+    g_mark_full[slot].st = (ColiExpertStoreStats){0};
+    if (experts && experts->ops && experts->ops->stats)
+        experts->ops->stats(experts, &g_mark_full[slot].st);
+}
+
+/* Emit the four scope lines the benchmark harness parses. Deltas between
+ * adjacent marks: 0=startup (engine open), run=marks[4]-marks[1],
+ * prompt=marks[3]-marks[2], decode=marks[4]-marks[3]. Store stats at each
+ * mark come from the CLI/generate sites (g_mark_full), so bytes and cache
+ * counters are per-scope. */
+static void profile_emit_scope(FILE *out, const char *scope,
+                               const struct ColiProfileMarks *start,
+                               const struct ColiProfileMarks *end) {
+    uint64_t wall = end->pool.wall_ns - start->pool.wall_ns;
+    const ColiV4Profile *st = &start->pool, *en = &end->pool;
+    const ColiExpertStoreStats *sst = &start->st, *est = &end->st;
+    /* Owner-thread wall buckets that reconcile; worker/GPU overlaps are
+     * diagnostics (READ_WORK, METAL_KERNEL): worker pread and Metal wait
+     * already sit inside the expert_compute/attn spans, so they are not
+     * added again. */
+    const int owner_buckets[] = {
+        COLI_V4_PROF_DENSE_READ, COLI_V4_PROF_HC_PRE_ATTN,
+        COLI_V4_PROF_ATTN_PROJ, COLI_V4_PROF_COMPRESSOR,
+        COLI_V4_PROF_INDEXER, COLI_V4_PROF_SPARSE_ATTN,
+        COLI_V4_PROF_HC_POST_ATTN, COLI_V4_PROF_HC_PRE_FFN,
+        COLI_V4_PROF_ROUTER, COLI_V4_PROF_EXPERT_LOADER_WAIT,
+        COLI_V4_PROF_EXPERT_COMPUTE, COLI_V4_PROF_SHARED_EXPERT,
+        COLI_V4_PROF_HC_POST_FFN, COLI_V4_PROF_HEAD_READ,
+        COLI_V4_PROF_HEAD_COMPUTE,
+    };
+    uint64_t accounted = 0;
+    size_t owner_count = sizeof(owner_buckets) / sizeof(owner_buckets[0]);
+    char detail[4096], field[128];
+    detail[0] = 0;
+#define V4_EMIT_MS(name, kind) do { \
+        uint64_t ns = en->ns[kind] - st->ns[kind]; \
+        snprintf(field, sizeof(field), " %s_ms=%.3f", name, ns / 1e6); \
+        strncat(detail, field, sizeof(detail) - strlen(detail) - 1); \
+    } while (0)
+#define V4_EMIT_DELTA(name, expr) do { \
+        uint64_t diff = (uint64_t)((expr)); \
+        snprintf(field, sizeof(field), " %s=%llu", name, \
+                 (unsigned long long)diff); \
+        strncat(detail, field, sizeof(detail) - strlen(detail) - 1); \
+    } while (0)
+    #define V4_EMIT_MS_SUM(name, kind_a, kind_b) do { \
+        uint64_t ns = (en->ns[kind_a] - st->ns[kind_a]) + \
+                      (en->ns[kind_b] - st->ns[kind_b]); \
+        snprintf(field, sizeof(field), " %s_ms=%.3f", name, ns / 1e6); \
+        strncat(detail, field, sizeof(detail) - strlen(detail) - 1); \
+    } while (0)
+    V4_EMIT_MS("dense_read", COLI_V4_PROF_DENSE_READ);
+    V4_EMIT_MS("expert_read_work", COLI_V4_PROF_EXPERT_READ_WORK);
+    V4_EMIT_MS("expert_wait", COLI_V4_PROF_EXPERT_LOADER_WAIT);
+    V4_EMIT_MS("expert_compute", COLI_V4_PROF_EXPERT_COMPUTE);
+    V4_EMIT_MS("shared_expert", COLI_V4_PROF_SHARED_EXPERT);
+    V4_EMIT_MS("router", COLI_V4_PROF_ROUTER);
+    V4_EMIT_MS_SUM("hc_pre", COLI_V4_PROF_HC_PRE_ATTN, COLI_V4_PROF_HC_PRE_FFN);
+    V4_EMIT_MS_SUM("hc_post", COLI_V4_PROF_HC_POST_ATTN, COLI_V4_PROF_HC_POST_FFN);
+    V4_EMIT_MS("attn_proj", COLI_V4_PROF_ATTN_PROJ);
+    V4_EMIT_MS("compressor", COLI_V4_PROF_COMPRESSOR);
+    V4_EMIT_MS("indexer", COLI_V4_PROF_INDEXER);
+    V4_EMIT_MS("sparse_attn", COLI_V4_PROF_SPARSE_ATTN);
+    V4_EMIT_MS("head_read", COLI_V4_PROF_HEAD_READ);
+    V4_EMIT_MS("head_compute", COLI_V4_PROF_HEAD_COMPUTE);
+    V4_EMIT_MS("metal_encode", COLI_V4_PROF_METAL_ENCODE);
+    V4_EMIT_MS("metal_submit", COLI_V4_PROF_METAL_SUBMIT);
+    V4_EMIT_MS("metal_wait", COLI_V4_PROF_METAL_WAIT);
+    V4_EMIT_MS("metal_kernel", COLI_V4_PROF_METAL_KERNEL);
+    V4_EMIT_DELTA("dense_read_bytes", en->dense_read_bytes - st->dense_read_bytes);
+    V4_EMIT_DELTA("expert_read_bytes",
+                  est->bytes_read - sst->bytes_read);
+    V4_EMIT_DELTA("head_read_bytes", en->head_read_bytes - st->head_read_bytes);
+    V4_EMIT_DELTA("expert_requests", est->requests - sst->requests);
+    V4_EMIT_DELTA("expert_hits", est->hits - sst->hits);
+    V4_EMIT_DELTA("expert_misses", est->misses - sst->misses);
+    V4_EMIT_DELTA("expert_resident_bytes", est->resident_bytes);
+    V4_EMIT_DELTA("expert_capacity_bytes", est->capacity_bytes);
+#undef V4_EMIT_MS
+#undef V4_EMIT_DELTA
+    for (size_t i = 0; i < owner_count; i++)
+        accounted += en->ns[owner_buckets[i]] - st->ns[owner_buckets[i]];
+    uint64_t io_wait =
+        (en->ns[COLI_V4_PROF_EXPERT_LOADER_WAIT] -
+         st->ns[COLI_V4_PROF_EXPERT_LOADER_WAIT]) +
+        (en->ns[COLI_V4_PROF_HEAD_READ] - st->ns[COLI_V4_PROF_HEAD_READ]) +
+        (en->ns[COLI_V4_PROF_DENSE_READ] - st->ns[COLI_V4_PROF_DENSE_READ]);
+    /* Signed: exposes over-counting instead of clamping. */
+    int64_t unaccounted = (int64_t)wall - (int64_t)accounted;
+    uint64_t cpu_compute = accounted > io_wait ? accounted - io_wait : 0;
+    fprintf(out,
+            "v4_phases scope=%s tokens=%llu wall_ms=%.3f "
+            "accounted_ms=%.3f unaccounted_ms=%+.3f cpu_compute_ms=%.3f "
+            "io_wait_ms=%.3f%s\n",
+            scope, (unsigned long long)(end->pool.tokens - start->pool.tokens),
+            wall / 1e6, accounted / 1e6, unaccounted / 1e6,
+            cpu_compute / 1e6, io_wait / 1e6, detail);
+}
+
+void coli_v4_profile_mark(int slot) {
+    if (slot < 0 || slot >= 5) return;
+#ifdef COLI_METAL
+    if (g_coli_v4_profile_on) {
+        uint64_t e = 0, s = 0, w = 0, k = 0;
+        coli_metal_profile_get(&e, &s, &w, &k);
+        g_profile.ns[COLI_V4_PROF_METAL_ENCODE] += e - g_metal_last[0];
+        g_profile.ns[COLI_V4_PROF_METAL_SUBMIT] += s - g_metal_last[1];
+        g_profile.ns[COLI_V4_PROF_METAL_WAIT] += w - g_metal_last[2];
+        g_profile.ns[COLI_V4_PROF_METAL_KERNEL] += k - g_metal_last[3];
+        g_metal_last[0] = e; g_metal_last[1] = s;
+        g_metal_last[2] = w; g_metal_last[3] = k;
+    }
+#endif
+    g_marks[slot] = g_profile;
+    g_marks[slot].wall_ns = coli_v4_profile_now();
+}
+
+void coli_v4_profile_tokens(int slot, uint64_t tokens) {
+    if (slot < 0 || slot >= 5) return;
+    g_marks[slot].tokens = tokens;
+}
+
+ColiV4Profile coli_v4_profile_mark_get(int slot) {
+    ColiV4Profile empty = {0};
+    if (slot < 0 || slot >= 5) return empty;
+    return g_marks[slot];
+}
+
+void coli_v4_profile_emit(FILE *stream) {
+    if (!g_coli_v4_profile_on || !stream) return;
+    static struct ColiProfileMarks start_mark;
+    static int start_mark_init;
+    if (!start_mark_init) {
+        memset(&start_mark, 0, sizeof(start_mark));
+        start_mark_init = 1;
+    }
+    start_mark.pool.wall_ns = g_wall_base; /* startup begins at engine open */
+    profile_emit_scope(stream, "startup", &start_mark, &g_mark_full[0]);
+    profile_emit_scope(stream, "run", &g_mark_full[1], &g_mark_full[4]);
+    profile_emit_scope(stream, "prompt", &g_mark_full[2], &g_mark_full[3]);
+    profile_emit_scope(stream, "decode", &g_mark_full[3], &g_mark_full[4]);
+}
+
+#endif /* COLI_V4_UNIT_PROFILE */
 
 #ifdef COLI_V4_UNIT_KV_CACHE
 /* ######## deepseek_v4_kv_cache.c ######## */
@@ -9934,21 +10387,12 @@ static int lookup(ColiExpertStore *store, ColiExpertKey key,
             return -1;
         }
         if (!slot->slab) {
-            /* 16K-aligned + registered: Metal single-GEMV resolves registered
-             * slabs zero-copy, so pointer-keyed handles read LIVE bytes even
-             * when the LRU recycles this slot to another expert. Registration
-             * is idempotent; skipped when Metal is off. */
-            size_t cap = ((size_t)state->record_bytes + 16383u) & ~(size_t)16383u;
-            if (posix_memalign((void **)&slot->slab, 16384, cap)) {
-                slot->slab = NULL;
+            slot->slab = malloc((size_t)state->record_bytes);
+            if (!slot->slab) {
                 pthread_mutex_unlock(&state->mutex);
                 memset(view, 0, sizeof(*view));
                 return -1;
             }
-#ifdef COLI_METAL
-            coli_metal_register(slot->slab, cap);
-#endif
-            slot->aligned_slab = 1;
             state->stats.resident_bytes += state->record_bytes;
         }
         /* A short read must never expose a partially overwritten slot: claim it
@@ -10075,16 +10519,11 @@ static void destroy(ColiExpertStore *store) {
     V4ExpertStoreState *state = store->state;
     if (state) {
         assert(state->active_leases == 0 && "destroy with active expert leases");
-        for (int i = 0; i < state->layers * state->slots_per_layer; i++) {
-#ifdef COLI_METAL
-            if (state->slots[i].slab)
-                coli_metal_unregister(state->slots[i].slab);
-#endif
-            if (state->slots[i].aligned_slab)  /* posix_memalign; see above */
-                compat_aligned_free(state->slots[i].slab);
-            else
-                free(state->slots[i].slab);
-        }
+        for (int i = 0; i < state->layers * state->slots_per_layer; i++)
+            free(state->slots[i].slab);   /* this store allocates slabs with
+                                           * malloc only; the aligned path and
+                                           * its compat_aligned_free live in the
+                                           * hot rows16 store above. */
         pthread_mutex_destroy(&state->mutex);
         coli_st_index_close(state->index);
         free(state->records);
