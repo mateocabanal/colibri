@@ -17,8 +17,6 @@ rep("colic/src/target/mod.rs", 'name: "linux-x86_64-avx2-v1",', 'name: "linux-x8
 
 p = Path("colic/src/target/mod.rs")
 t = p.read_text()
-t = t.replace("put_u16(&mut payload, 10, 0);", "put_u16(&mut payload, 10, 1);")
-t = t.replace("put_u16(&mut header, 10, 0);", "put_u16(&mut header, 10, 1);")
 t = t.replace("expert_math_format(&matrix.source.dtype)?", "math_format_for_semantics(matrix.quantization.math_format)")
 t = t.replace("scale_format(&scale.dtype)?", "scale_format_for_semantics(matrix.quantization.scale_format)")
 t = t.replace(
@@ -56,10 +54,56 @@ fn stream_expert_with_layout<W: Write + Seek>(
     layout: Option<u16>,
     output: &mut W,
 ) -> Result<u32> {''', 1)
+expert_header = '''    header[..8].copy_from_slice(b"COLIEXPT");
+    put_u16(&mut header, 8, 1);
+    put_u32(&mut header, 12, HEADER_BYTES as u32);'''
+if expert_header not in t:
+    raise SystemExit("streamed expert header anchor missing")
+t = t.replace(expert_header, '''    header[..8].copy_from_slice(b"COLIEXPT");
+    put_u16(&mut header, 8, 1);
+    put_u16(&mut header, 10, u16::from(layout.is_some()));
+    put_u32(&mut header, 12, HEADER_BYTES as u32);''', 1)
 anchor = "        put_u16(&mut header, desc + 6, scale_id);\n        put_u64(&mut header, desc + 16, matrix.rows as u64);"
 if anchor not in t:
     raise SystemExit("streamed expert descriptor anchor missing")
 t = t.replace(anchor, "        put_u16(&mut header, desc + 6, scale_id);\n        put_u16(&mut header, desc + 12, layout.unwrap_or(0));\n        put_u64(&mut header, desc + 16, matrix.rows as u64);", 1)
+
+# Preserve v1.0 tooling helpers but add a v1.1 production tensor streamer.
+tensor_sig = '''pub fn stream_exact_tensor<W: Write + Seek>(
+    tensor: &source::TensorRef,
+    output: &mut W,
+) -> Result<(u32, u32)> {'''
+if tensor_sig not in t:
+    raise SystemExit("stream_exact_tensor signature missing")
+t = t.replace(tensor_sig, '''pub fn stream_exact_tensor<W: Write + Seek>(
+    tensor: &source::TensorRef,
+    output: &mut W,
+) -> Result<(u32, u32)> {
+    stream_tensor_version(tensor, 0, output)
+}
+
+pub fn stream_target_tensor<W: Write + Seek>(
+    tensor: &source::TensorRef,
+    output: &mut W,
+) -> Result<(u32, u32)> {
+    stream_tensor_version(tensor, 1, output)
+}
+
+fn stream_tensor_version<W: Write + Seek>(
+    tensor: &source::TensorRef,
+    minor: u16,
+    output: &mut W,
+) -> Result<(u32, u32)> {''', 1)
+tensor_header = '''    header[0..8].copy_from_slice(b"COLITENS");
+    put_u16(&mut header, 8, 1);
+    put_u32(&mut header, 12, TENSOR_HEADER_BYTES as u32);'''
+if tensor_header not in t:
+    raise SystemExit("streamed tensor header anchor missing")
+t = t.replace(tensor_header, '''    header[0..8].copy_from_slice(b"COLITENS");
+    put_u16(&mut header, 8, 1);
+    put_u16(&mut header, 10, minor);
+    put_u32(&mut header, 12, TENSOR_HEADER_BYTES as u32);''', 1)
+
 start = t.find("fn expert_math_format(dtype: &str) -> Result<u16> {")
 end = t.find("fn put_u16(buffer:", start)
 if start < 0 or end < 0:
@@ -181,7 +225,14 @@ rep(
     source: &ExactSource,
     profile: target::TargetProfile,
 ) -> Result<ManifestRecord> {''')
-# Production tensor branch: context is unique to stream_payload.
+rep(
+    "colic/src/pipeline.rs",
+'''            let checksums = writer.write_record_stream(planned, |file| {
+                target::stream_exact_tensor(tensor, file)
+            })?;''',
+'''            let checksums = writer.write_record_stream(planned, |file| {
+                target::stream_target_tensor(tensor, file)
+            })?;''')
 rep(
     "colic/src/pipeline.rs",
 '''                math_format: target::math_format_for_dtype(&tensor.dtype)?,
