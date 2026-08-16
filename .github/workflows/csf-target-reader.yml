@@ -5,11 +5,19 @@ on:
     paths:
       - 'c/coli_format.c'
       - 'c/coli_format.h'
+      - 'c/coli_exec_format.c'
+      - 'c/coli_exec_format.h'
       - 'c/coli_target.c'
       - 'c/coli_target.h'
+      - 'c/coli_target_profiles.c'
+      - 'c/coli_target_profiles.h'
       - 'c/Makefile.csf'
       - 'c/tests/test_coli_target.c'
+      - 'c/tests/test_coli_target_profiles.c'
       - 'c/tests/fixtures/csf-v1-targets/**'
+      - 'docs/coli-serving-format-v1.md'
+      - 'docs/coli-serving-format-v1.1-target-identity.md'
+      - 'docs/coli-target-profiles-v1.md'
       - '.github/workflows/csf-target-reader.yml'
   workflow_dispatch:
 
