@@ -18,8 +18,27 @@ pub struct VerificationSummary {
     pub records: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerificationProgress {
+    pub completed_records: u64,
+    pub total_records: u64,
+    pub verified_bytes: u64,
+    pub current_shard: u32,
+    pub total_shards: u32,
+}
+
 /// Validates final package bytes without using compiler planning state.
 pub fn verify_package(package: &Path) -> Result<VerificationSummary> {
+    verify_package_with_progress(package, &mut |_| {})
+}
+
+/// Validates final package bytes and reports bounded-rate progress. The
+/// verifier deliberately reports after integrity checks, not merely after
+/// metadata parsing, so reported bytes correspond to completed validation.
+pub fn verify_package_with_progress(
+    package: &Path,
+    progress: &mut dyn FnMut(VerificationProgress),
+) -> Result<VerificationSummary> {
     let manifest_path = package.join("manifest.coli");
     let manifest = fs::read(&manifest_path).map_err(|source| ColicError::Io {
         path: manifest_path,
@@ -126,6 +145,7 @@ pub fn verify_package(package: &Path) -> Result<VerificationSummary> {
         shard_paths.push(package.join(format!("data-{shard_id:05}.coli")));
     }
     let mut ids = BTreeSet::new();
+    let mut verified_bytes = 0_u64;
     for index in 0..records {
         let desc = record_table.start + index as usize * 96;
         let id = u64_at(&manifest, desc)?;
@@ -177,6 +197,19 @@ pub fn verify_package(package: &Path) -> Result<VerificationSummary> {
                 codec,
             )?,
             _ => {}
+        }
+        verified_bytes = verified_bytes
+            .checked_add(stored)
+            .ok_or_else(|| usage("verified byte total overflows"))?;
+        let completed_records = index + 1;
+        if completed_records % 64 == 0 || completed_records == records {
+            progress(VerificationProgress {
+                completed_records,
+                total_records: records,
+                verified_bytes,
+                current_shard: shard_id as u32,
+                total_shards: shards,
+            });
         }
     }
     Ok(VerificationSummary { shards, records })
@@ -467,12 +500,23 @@ mod tests {
         )
         .unwrap();
         std::fs::write(package.join("manifest.coli"), manifest).unwrap();
+        let mut progress = Vec::new();
         assert_eq!(
-            verify_package(&package).unwrap(),
+            verify_package_with_progress(&package, &mut |update| progress.push(update)).unwrap(),
             VerificationSummary {
                 shards: 1,
                 records: 1
             }
+        );
+        assert_eq!(
+            progress,
+            vec![VerificationProgress {
+                completed_records: 1,
+                total_records: 1,
+                verified_bytes: 1,
+                current_shard: 0,
+                total_shards: 1,
+            }]
         );
         let mut corrupt = std::fs::read(&shard).unwrap();
         corrupt[plan.records[0].payload_offset as usize] ^= 1;

@@ -4,17 +4,40 @@ use colic::{
     cli::{self, Command, USAGE},
     pipeline::{self, ProgressSink, Stage},
     source::DiscoveryProgress,
+    verify::VerificationProgress,
 };
 
 struct ConsoleProgress {
     emission_started: Option<Instant>,
+    verification_started: Option<Instant>,
 }
 
 impl ConsoleProgress {
     fn new() -> Self {
         Self {
             emission_started: None,
+            verification_started: None,
         }
+    }
+}
+
+impl ConsoleProgress {
+    fn verification(&mut self, update: VerificationProgress) {
+        let started = self.verification_started.get_or_insert_with(Instant::now);
+        let elapsed = started.elapsed().as_secs_f64();
+        let throughput = if elapsed == 0.0 {
+            0.0
+        } else {
+            update.verified_bytes as f64 / elapsed / (1024.0 * 1024.0)
+        };
+        eprintln!(
+            "colic: verify {}/{} records, {} checked, shard {}/{} ({throughput:.1} MiB/s)",
+            update.completed_records,
+            update.total_records,
+            human_bytes(update.verified_bytes),
+            update.current_shard + 1,
+            update.total_shards,
+        );
     }
 }
 
@@ -113,7 +136,11 @@ fn run() -> colic::Result<()> {
             Ok(())
         }
         Command::Verify { package } => {
-            let summary = colic::verify::verify_package(&package)?;
+            eprintln!("colic: verification...");
+            let mut progress = ConsoleProgress::new();
+            let summary = colic::verify::verify_package_with_progress(&package, &mut |update| {
+                progress.verification(update);
+            })?;
             println!("package={}", package.display());
             println!("shards={}", summary.shards);
             println!("records={}", summary.records);
