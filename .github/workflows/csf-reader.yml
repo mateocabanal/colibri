@@ -24,3 +24,21 @@ jobs:
         run: make -C c -f Makefile.csf test
       - name: ASan + UBSan
         run: make -C c -f Makefile.csf test-asan
+
+  csf-reader-windows:
+    name: csf-reader (Windows UCRT64)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: false
+          install: >-
+            make
+            mingw-w64-ucrt-x86_64-gcc
+      - name: Build and test
+        run: make -C c -f Makefile.csf test
