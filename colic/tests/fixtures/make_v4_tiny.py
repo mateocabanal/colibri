@@ -121,6 +121,12 @@ def main() -> int:
     ]:
         add(name, dtype, shape)
 
+    # Optional draft tensors are valid V4 semantic records. Four bounded records
+    # make the package exceed a 1 MiB test shard without creating an oversized
+    # single record, so #52 can prove real multi-shard compiler/loader behavior.
+    for index in range(4):
+        add(f"mtp.fixture_padding.{index}", "BF16", [200_000])
+
     # E2M1 code 2 is +1.0 and code 0 is +0.0. Scale exponent 127 is 1.0.
     # Expert 0 gives gate/up rows [x0, x1, x0+x1], then down selects h0,h1.
     expert0 = {
