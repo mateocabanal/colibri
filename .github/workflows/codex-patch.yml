@@ -1,0 +1,33 @@
+name: codex branch patch
+
+on:
+  push:
+    branches: [codex/compiler-contracts-p0]
+    paths:
+      - 'tools/codex_patch.py'
+      - '.github/workflows/codex-patch.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/compiler-contracts-p0
+          fetch-depth: 0
+      - run: python3 tools/codex_patch.py
+      - name: Commit patch
+        shell: bash
+        run: |
+          git config user.name 'colibri-codex'
+          git config user.email 'colibri-codex@users.noreply.github.com'
+          git add colic/src/pipeline.rs colic/src/target/mod.rs colic/src/model/deepseek_v4_semantic.rs
+          if git diff --cached --quiet; then
+            echo 'No changes to commit'
+          else
+            git commit -m 'fix(colic): reconcile semantic fixtures and verify before publish (#49 #52)'
+            git push origin HEAD:codex/compiler-contracts-p0
+          fi
