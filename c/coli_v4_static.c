@@ -1,0 +1,17 @@
+#include "coli_v4_static.h"
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+static int bad(char*e,size_t n,const char*f,const char*s){if(e&&n)snprintf(e,n,f,s);return -1;}
+static uint16_t fmt(ColiSafetensorsDType d){switch(d){case COLI_ST_BF16:return COLI_CSF_MATH_BF16;case COLI_ST_F32:return COLI_CSF_MATH_F32;case COLI_ST_F8_E4M3:return COLI_CSF_MATH_FP8_E4M3FN;case COLI_ST_F8_E8M0:return COLI_CSF_MATH_FP8_E5M2;case COLI_ST_I64:return COLI_CSF_MATH_I64;default:return COLI_CSF_MATH_INVALID;}}
+int coli_v4_coli_layer_load(ColiExecutor*x,ColiDeepSeekV4LayerWeights*w,const ColiDeepSeekV4Config*c,int layer,char*e,size_t n){
+ if(!x||!w||coli_v4_layer_plan(&w->plan,c,layer,e,n))return -1;memset(w->data,0,sizeof(w->data));memset(&w->stats,0,sizeof(w->stats));
+ for(size_t i=0;i<w->plan.tensor_count;i++){ColiDeepSeekV4TensorSpec*s=&w->plan.tensors[i];const ColiRecordInfo*r=coli_executor_record_by_name(x,s->name);ColiTensorInfo t;unsigned char*b;
+  if(!r||coli_package_tensor_info(coli_executor_package(x),r,&t,e,n)||t.rank!=(uint16_t)s->rank||r->math_format!=fmt(s->dtype))goto fail;
+  for(int d=0;d<s->rank;d++)if(t.dims[d]!=(uint64_t)s->shape[d]){bad(e,n,"COLI static shape mismatch: %s",s->name);goto fail;}
+  if(r->stored_bytes>SIZE_MAX||t.data_offset>r->stored_bytes||t.data_stored_bytes>r->stored_bytes-t.data_offset){bad(e,n,"COLI static span invalid: %s",s->name);goto fail;}
+  b=malloc((size_t)r->stored_bytes);if(!b){bad(e,n,"COLI static allocation failed: %s",s->name);goto fail;}if(coli_executor_load_record(x,r,b,(size_t)r->stored_bytes,e,n)){free(b);goto fail;}
+  if(s->dtype==COLI_ST_F8_E8M0){size_t k=(size_t)t.data_stored_bytes;float*out=malloc(k*sizeof(*out));if(!out){free(b);goto fail;}for(size_t q=0;q<k;q++)out[q]=b[t.data_offset+q]==255?NAN:ldexpf(1.f,(int)b[t.data_offset+q]-127);free(b);w->data[i]=out;w->stats.fp8_scale_bytes+=k*sizeof(*out);w->stats.total_bytes+=k*sizeof(*out);}else{memmove(b,b+t.data_offset,(size_t)t.data_stored_bytes);w->data[i]=b;w->stats.total_bytes+=t.data_stored_bytes;}
+  w->stats.tensor_count++;
+ }return 0;fail:coli_v4_layer_free(NULL,w);return -1;}

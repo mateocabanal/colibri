@@ -9,6 +9,7 @@
 
 #include "tensor.h"
 #include "expert_store.h"
+#include "coli_executor.h"
 #include "coli_v4_expert_store.h"
 #include "native_quant.h"
 #include "native_quant_batch.h"
@@ -747,6 +748,7 @@ struct ColiV4Engine {
     ColiDeepSeekV4Config config;
     ColiDeepSeekV4RuntimeOptions runtime;
     ColiSafetensorsIndex *target_index;
+    ColiExecutor *coli_static;
     ColiExpertStore *experts;
     ColiV4EngineMemorySummary summary;
     struct {

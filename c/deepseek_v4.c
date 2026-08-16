@@ -580,6 +580,8 @@ static int resident_enabled_v2(ColiV4Engine *engine) {
     return engine && engine->runtime.dense_resident;
 }
 
+int coli_v4_coli_layer_load(ColiExecutor *, ColiDeepSeekV4LayerWeights *, const ColiDeepSeekV4Config *, int, char *, size_t);
+
 int coli_v4_layer_load(ColiV4Engine *engine,
                        ColiDeepSeekV4LayerWeights *weights,
                        const ColiDeepSeekV4Config *config,
@@ -587,6 +589,8 @@ int coli_v4_layer_load(ColiV4Engine *engine,
                        char *error, size_t error_size) {
     const ColiDeepSeekV4Config *effective_config =
         engine ? &engine->config : config;
+    if (engine && engine->coli_static)
+        return coli_v4_coli_layer_load(engine->coli_static, weights, effective_config, layer, error, error_size);
     if (!weights || !effective_config || !index || layer < 0 ||
         layer >= effective_config->num_hidden_layers ||
         layer >= COLI_V4_RESIDENT_MAX_LAYERS_V2) return -1;
@@ -7226,6 +7230,7 @@ void coli_v4_engine_destroy(ColiV4Engine *engine) {
         coli_st_index_close(engine->target_index);
     }
     engine->target_index = NULL;
+    coli_executor_close(engine->coli_static); engine->coli_static = NULL;
     engine->runtime.target_model_dir = NULL;
     free(engine->owned_target_model_dir);
     engine->owned_target_model_dir = NULL;
@@ -7275,6 +7280,8 @@ int coli_v4_engine_open(ColiV4Engine **output,
                            error_size))
         goto fail;
     engine->owns_index = 1;
+    if (options->coli_model_dir && coli_executor_open(&engine->coli_static, options->coli_model_dir,
+            &(ColiExecutorOpenOptions){"macos-arm64-metal-apple8-v1", COLI_CSF_CHECKSUM_RECORD_ON_READ, 0}, error, error_size)) goto fail;
     const ColiSafetensorsTensor *dspark_w1 = NULL, *dspark_w2 = NULL;
     int requested_full_dspark = v4_dspark_full_wanted(options);
     int want_full_dspark = requested_full_dspark &&

@@ -101,7 +101,7 @@ include Makefile.deepseek-v4.units
 
 TARGET_OBJS = $(addsuffix .o,$(V4_TARGET_UNITS))
 TEST_UNIT_OBJS = $(addsuffix .o,$(V4_TEST_UNITS))
-V4_COLI_OBJS = coli_v4_expert_store.o coli_executor.o coli_format.o
+V4_COLI_OBJS = coli_v4_expert_store.o coli_v4_static.o coli_executor.o coli_format.o
 V4_OBJS = $(TARGET_OBJS) $(V4_COLI_OBJS) $(V4_METAL_OBJS)
 
 .PHONY: deepseek-v4 deepseek-v4-clean deepseek-v4-test-objs
@@ -109,6 +109,8 @@ deepseek-v4: $(V4_BINARY)
 
 coli_v4_expert_store.o: coli_v4_expert_store.c coli_v4_expert_store.h coli_executor.h coli_format.h expert_store.h tensor.h
 	$(CC) $(CFLAGS) -c coli_v4_expert_store.c -o $@
+coli_v4_static.o: coli_v4_static.c coli_v4_static.h coli_executor.h coli_format.h deepseek_v4_internal.h
+	$(CC) $(CFLAGS) -c coli_v4_static.c -o $@
 coli_executor.o: coli_executor.c coli_executor.h coli_format.h
 	$(CC) $(CFLAGS) -c coli_executor.c -o $@
 coli_format.o: coli_format.c coli_format.h compat.h
