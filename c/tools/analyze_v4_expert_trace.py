@@ -2,16 +2,15 @@
 """Analyze V4 routed-expert JSONL traces without third-party dependencies.
 
 The runtime trace is intentionally cheap: logical expert requests plus residency
-transitions. This tool turns the request stream into the policy inputs needed by
-#3/#56/#57: activation skew, LRU/reuse distance, hypothetical cache curves,
-co-routing/adjacent-token locality, and persistent/transient hit attribution.
+transitions. This tool turns the request stream into policy inputs for
+#3/#56/#57: activation skew, exact reuse distance, hypothetical cache curves,
+co-routing/adjacent-token locality, and residency attribution.
 
-The current v1 runtime trace does not yet carry explicit token IDs. For the V4
-single-request execution order, requests for one layer are contiguous and layer
-numbers advance monotonically before wrapping to the next token. The analyzer
-therefore reconstructs token ordinals from layer wraps. Results derived this way
-are marked as inferred and should be replaced by explicit runtime token/request
-IDs before #56 is finally closed.
+Trace schema v1 contains only ordered `(layer, expert)` requests. For the current
+single-request V4 execution order, token ordinals can be reconstructed from
+layer-number wraps; those results are explicitly marked as inferred. Schema v2
+adds authoritative request/token/phase/rank/weight context. The analyzer accepts
+both so older traces remain useful while #56 migrates to explicit identity.
 """
 
 from __future__ import annotations
@@ -50,9 +49,19 @@ class Fenwick:
         return total
 
 
+@dataclass(frozen=True)
+class RequestContext:
+    request_id: int
+    token_position: int
+    phase: str | None
+    route_rank: int | None
+    route_weight: float | None
+
+
 @dataclass
 class TraceAnalysis:
     requests: list[tuple[int, int]]
+    request_contexts: list[RequestContext | None]
     event_counts: Counter[str]
     tier_hits: Counter[str]
     layer_frequency: dict[int, Counter[int]]
@@ -60,6 +69,7 @@ class TraceAnalysis:
     cold_requests: int
     record_bytes: int
     dropped: int
+    schema: str
 
 
 @dataclass(frozen=True)
@@ -67,6 +77,8 @@ class RouteGroup:
     token: int
     layer: int
     experts: tuple[int, ...]
+    request_id: int = 0
+    phase: str | None = None
 
 
 def read_jsonl(path: Path) -> Iterable[dict]:
@@ -86,12 +98,10 @@ def read_jsonl(path: Path) -> Iterable[dict]:
 
 def exact_reuse_distances(requests: list[tuple[int, int]]) -> tuple[list[int], int]:
     """Return exact LRU stack distance for each repeated expert request."""
-
     bit = Fenwick(len(requests) + 1)
     last: dict[tuple[int, int], int] = {}
     distances: list[int] = []
     cold = 0
-
     for position, key in enumerate(requests):
         previous = last.get(key)
         if previous is None:
@@ -106,16 +116,50 @@ def exact_reuse_distances(requests: list[tuple[int, int]]) -> tuple[list[int], i
     return distances, cold
 
 
+def _request_context(item: dict) -> RequestContext | None:
+    if "token_position" not in item:
+        return None
+    try:
+        token_position = int(item["token_position"])
+        request_id = int(item.get("request_id", 0))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("request context has invalid request/token identity") from exc
+    if token_position < 0:
+        return None
+    phase = item.get("phase")
+    if phase is not None:
+        phase = str(phase)
+        if phase not in {"prefill", "decode", "unknown"}:
+            raise ValueError(f"invalid request phase: {phase}")
+    rank = item.get("route_rank")
+    if rank is not None:
+        try:
+            rank = int(rank)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("request context has invalid route_rank") from exc
+    weight = item.get("route_weight")
+    if weight is not None:
+        try:
+            weight = float(weight)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("request context has invalid route_weight") from exc
+    return RequestContext(request_id, token_position, phase, rank, weight)
+
+
 def analyze(path: Path) -> TraceAnalysis:
     requests: list[tuple[int, int]] = []
+    request_contexts: list[RequestContext | None] = []
     event_counts: Counter[str] = Counter()
     tier_hits: Counter[str] = Counter()
     layer_frequency: dict[int, Counter[int]] = defaultdict(Counter)
     record_bytes = 0
     dropped = 0
+    schema = "unknown"
 
     for item in read_jsonl(path):
-        if item.get("schema") == "colibri.v4.expert_trace.v1":
+        declared = item.get("schema")
+        if declared in {"colibri.v4.expert_trace.v1", "colibri.v4.expert_trace.v2"}:
+            schema = str(declared)
             record_bytes = int(item.get("record_bytes", 0) or 0)
             dropped = int(item.get("dropped", 0) or 0)
             continue
@@ -129,6 +173,7 @@ def analyze(path: Path) -> TraceAnalysis:
             except (KeyError, TypeError, ValueError) as exc:
                 raise ValueError("request event missing integer layer/expert") from exc
             requests.append(key)
+            request_contexts.append(_request_context(item))
             layer_frequency[key[0]][key[1]] += 1
         elif event == "hit":
             tier = item.get("tier")
@@ -137,6 +182,7 @@ def analyze(path: Path) -> TraceAnalysis:
     distances, cold = exact_reuse_distances(requests)
     return TraceAnalysis(
         requests=requests,
+        request_contexts=request_contexts,
         event_counts=event_counts,
         tier_hits=tier_hits,
         layer_frequency=dict(layer_frequency),
@@ -144,6 +190,7 @@ def analyze(path: Path) -> TraceAnalysis:
         cold_requests=cold,
         record_bytes=record_bytes,
         dropped=dropped,
+        schema=schema,
     )
 
 
@@ -156,7 +203,6 @@ def percentile(values: list[int], q: float) -> float:
 
 
 def capacity_curve(analysis: TraceAnalysis, capacities: list[int]) -> list[dict]:
-    """Hypothetical global LRU over logical `(layer, expert)` identities."""
     total = len(analysis.requests)
     rows = []
     for capacity in capacities:
@@ -181,13 +227,10 @@ def _layer_request_streams(analysis: TraceAnalysis) -> dict[int, list[tuple[int,
 
 
 def per_layer_lru_curve(analysis: TraceAnalysis, capacities: list[int]) -> list[dict]:
-    """Model N independent persistent LRU slots in every observed layer."""
-
     streams = _layer_request_streams(analysis)
     layer_distances: dict[int, list[int]] = {}
     for layer, requests in streams.items():
         layer_distances[layer], _ = exact_reuse_distances(requests)
-
     total = len(analysis.requests)
     layers = len(streams)
     rows = []
@@ -220,8 +263,6 @@ def per_layer_lru_curve(analysis: TraceAnalysis, capacities: list[int]) -> list[
 def per_layer_frequency_oracle_curve(
     analysis: TraceAnalysis, capacities: list[int]
 ) -> list[dict]:
-    """Upper bound for perfectly chosen hot experts in each layer."""
-
     total = len(analysis.requests)
     layers = len(analysis.layer_frequency)
     rows = []
@@ -257,8 +298,6 @@ def per_layer_frequency_oracle_curve(
 def global_frequency_oracle_curve(
     analysis: TraceAnalysis, capacities: list[int]
 ) -> list[dict]:
-    """Upper bound for a globally allocated persistent hot-expert tier."""
-
     total = len(analysis.requests)
     frequency = Counter(analysis.requests)
     rows = []
@@ -286,16 +325,9 @@ def global_frequency_oracle_curve(
 
 
 def infer_route_groups(requests: list[tuple[int, int]]) -> list[RouteGroup]:
-    """Infer `(token, layer)` groups from the v1 single-request request stream.
-
-    Consecutive requests for the same layer are one routed group. A decrease in
-    layer number starts the next token. This deliberately does not fabricate
-    route rank/weight; those require explicit runtime instrumentation.
-    """
-
+    """Infer `(token, layer)` groups from a v1 single-request stream."""
     if not requests:
         return []
-
     groups: list[RouteGroup] = []
     token = 0
     current_layer = requests[0][0]
@@ -320,20 +352,73 @@ def infer_route_groups(requests: list[tuple[int, int]]) -> list[RouteGroup]:
     return groups
 
 
+def explicit_route_groups(analysis: TraceAnalysis) -> list[RouteGroup] | None:
+    """Use authoritative request/token identity when every request has it."""
+    if not analysis.requests or len(analysis.request_contexts) != len(analysis.requests):
+        return None
+    if any(context is None for context in analysis.request_contexts):
+        return None
+    grouped: dict[tuple[int, int, int], list[int]] = {}
+    phases: dict[tuple[int, int, int], str | None] = {}
+    order: list[tuple[int, int, int]] = []
+    for (layer, expert), optional_context in zip(
+        analysis.requests, analysis.request_contexts
+    ):
+        assert optional_context is not None
+        context = optional_context
+        key = (context.request_id, context.token_position, layer)
+        if key not in grouped:
+            grouped[key] = []
+            order.append(key)
+        grouped[key].append(expert)
+        phases[key] = context.phase
+    return [
+        RouteGroup(token, layer, tuple(grouped[key]), request_id, phases[key])
+        for key in order
+        for request_id, token, layer in [key]
+    ]
+
+
+def _phase_summary_from_explicit(analysis: TraceAnalysis) -> dict | None:
+    contexts = [context for context in analysis.request_contexts if context is not None]
+    if len(contexts) != len(analysis.requests) or not contexts:
+        return None
+    request_counts = Counter(context.phase or "unknown" for context in contexts)
+    token_sets: dict[str, set[tuple[int, int]]] = defaultdict(set)
+    for context in contexts:
+        token_sets[context.phase or "unknown"].add(
+            (context.request_id, context.token_position)
+        )
+    return {
+        "source": "explicit",
+        "prefill_tokens": len(token_sets.get("prefill", set())),
+        "decode_tokens": len(token_sets.get("decode", set())),
+        "unknown_tokens": len(token_sets.get("unknown", set())),
+        "prefill_requests": request_counts.get("prefill", 0),
+        "decode_requests": request_counts.get("decode", 0),
+        "unknown_requests": request_counts.get("unknown", 0),
+    }
+
+
 def routing_locality_summary(
     analysis: TraceAnalysis, top_n: int, prompt_tokens: int | None = None
 ) -> dict:
-    groups = infer_route_groups(analysis.requests)
-    token_count = max((group.token for group in groups), default=-1) + 1
-    per_token: dict[int, set[tuple[int, int]]] = defaultdict(set)
-    per_layer_token: dict[int, dict[int, set[int]]] = defaultdict(dict)
+    explicit = explicit_route_groups(analysis)
+    groups = explicit if explicit is not None else infer_route_groups(analysis.requests)
+    token_source = "explicit" if explicit is not None else "inferred-from-layer-wraps"
+
+    per_token: dict[tuple[int, int], set[tuple[int, int]]] = defaultdict(set)
+    per_layer_token: dict[tuple[int, int], dict[int, set[int]]] = defaultdict(dict)
     pair_counts: Counter[tuple[int, int, int]] = Counter()
+    token_identities: set[tuple[int, int]] = set()
 
     for group in groups:
+        token_key = (group.request_id, group.token)
+        token_identities.add(token_key)
         experts = set(group.experts)
         for expert in experts:
-            per_token[group.token].add((group.layer, expert))
-        per_layer_token[group.layer][group.token] = experts
+            per_token[token_key].add((group.layer, expert))
+        per_layer_token[(group.request_id, group.layer)][group.token] = experts
         for first, second in combinations(sorted(experts), 2):
             pair_counts[(group.layer, first, second)] += 1
 
@@ -341,11 +426,9 @@ def routing_locality_summary(
     adjacent_shared = 0
     adjacent_union = 0
     jaccard_total = 0.0
-    per_layer_overlap: dict[str, dict] = {}
-    for layer, token_sets in sorted(per_layer_token.items()):
-        layer_samples = 0
-        layer_shared = 0
-        layer_jaccard = 0.0
+    per_layer_accum: dict[int, list[tuple[int, int, float]]] = defaultdict(list)
+    for (request_id, layer), token_sets in sorted(per_layer_token.items()):
+        del request_id
         tokens = sorted(token_sets)
         for previous, current in zip(tokens, tokens[1:]):
             if current != previous + 1:
@@ -358,39 +441,53 @@ def routing_locality_summary(
             adjacent_shared += shared
             adjacent_union += union
             jaccard_total += score
-            layer_samples += 1
-            layer_shared += shared
-            layer_jaccard += score
+            per_layer_accum[layer].append((shared, union, score))
+
+    per_layer_overlap: dict[str, dict] = {}
+    for layer, samples in sorted(per_layer_accum.items()):
         per_layer_overlap[str(layer)] = {
-            "samples": layer_samples,
-            "mean_shared": layer_shared / layer_samples if layer_samples else 0.0,
-            "mean_jaccard": layer_jaccard / layer_samples if layer_samples else 0.0,
+            "samples": len(samples),
+            "mean_shared": sum(item[0] for item in samples) / len(samples),
+            "mean_jaccard": sum(item[2] for item in samples) / len(samples),
         }
 
     top_pairs = [
         {"layer": layer, "experts": [first, second], "co_routes": count}
         for (layer, first, second), count in pair_counts.most_common(top_n)
     ]
-
     unique_per_token = [len(per_token[token]) for token in sorted(per_token)]
-    phase = None
-    if prompt_tokens is not None:
+
+    phase = _phase_summary_from_explicit(analysis)
+    if phase is None and prompt_tokens is not None:
         if prompt_tokens < 0:
             raise ValueError("prompt token count must be non-negative")
         prompt_request_count = sum(
-            len(group.experts) for group in groups if group.token < prompt_tokens
+            len(group.experts)
+            for group in groups
+            if group.request_id == 0 and group.token < prompt_tokens
         )
         phase = {
-            "prompt_tokens": min(prompt_tokens, token_count),
-            "decode_tokens": max(0, token_count - prompt_tokens),
-            "prompt_requests": prompt_request_count,
+            "source": "inferred",
+            "prefill_tokens": min(prompt_tokens, len(token_identities)),
+            "decode_tokens": max(0, len(token_identities) - prompt_tokens),
+            "unknown_tokens": 0,
+            "prefill_requests": prompt_request_count,
             "decode_requests": len(analysis.requests) - prompt_request_count,
+            "unknown_requests": 0,
         }
 
+    contexts = [context for context in analysis.request_contexts if context is not None]
+    rank_coverage = sum(context.route_rank is not None for context in contexts)
+    weight_coverage = sum(context.route_weight is not None for context in contexts)
+
     return {
-        "token_ids": "inferred-from-layer-wraps",
-        "token_count": token_count,
+        "token_ids": token_source,
+        "token_count": len(token_identities),
+        "request_count": len({group.request_id for group in groups}),
         "route_groups": len(groups),
+        "explicit_context_requests": len(contexts),
+        "route_rank_coverage": rank_coverage,
+        "route_weight_coverage": weight_coverage,
         "unique_logical_experts_per_token": {
             "min": min(unique_per_token) if unique_per_token else 0,
             "max": max(unique_per_token) if unique_per_token else 0,
@@ -419,7 +516,6 @@ def summary_dict(
 ) -> dict:
     if persistent_capacities is None:
         persistent_capacities = [1, 2, 4, 8]
-
     top_layers = {}
     for layer in sorted(analysis.layer_frequency):
         total = sum(analysis.layer_frequency[layer].values())
@@ -435,13 +531,12 @@ def summary_dict(
                 for expert, count in top
             ],
         }
-
     layer_count = len(analysis.layer_frequency)
     equal_budget_global_capacities = sorted(
         {layer_count * capacity for capacity in persistent_capacities if layer_count}
     )
-
     return {
+        "schema": analysis.schema,
         "requests": len(analysis.requests),
         "unique_experts": len(set(analysis.requests)),
         "cold_requests": analysis.cold_requests,
@@ -522,10 +617,11 @@ def _print_global_hot_curve(rows: list[dict]) -> None:
 def print_human(summary: dict, top_n: int) -> None:
     print(
         "v4 expert trace: "
-        f"requests={summary['requests']} unique={summary['unique_experts']} "
-        f"loads={summary['physical_loads']} hits={summary['runtime_hits']} "
-        f"joins={summary['inflight_joins']} evictions={summary['evictions']} "
-        f"slot_waits={summary['slot_waits']} dropped={summary['dropped_events']}"
+        f"schema={summary['schema']} requests={summary['requests']} "
+        f"unique={summary['unique_experts']} loads={summary['physical_loads']} "
+        f"hits={summary['runtime_hits']} joins={summary['inflight_joins']} "
+        f"evictions={summary['evictions']} slot_waits={summary['slot_waits']} "
+        f"dropped={summary['dropped_events']}"
     )
     rd = summary["reuse_distance"]
     if rd["samples"]:
@@ -542,18 +638,21 @@ def print_human(summary: dict, top_n: int) -> None:
     overlap = routing["adjacent_token_overlap"]
     print(
         "routing locality "
-        f"token_ids={routing['token_ids']} tokens={routing['token_count']} "
-        f"groups={routing['route_groups']} unique/token={unique['mean']:.1f} "
+        f"token_ids={routing['token_ids']} requests={routing['request_count']} "
+        f"tokens={routing['token_count']} groups={routing['route_groups']} "
+        f"unique/token={unique['mean']:.1f} "
         f"adjacent_jaccard={overlap['mean_jaccard']:.3f} "
-        f"adjacent_shared={overlap['mean_shared']:.2f}"
+        f"adjacent_shared={overlap['mean_shared']:.2f} "
+        f"rank_context={routing['route_rank_coverage']}/{summary['requests']} "
+        f"weight_context={routing['route_weight_coverage']}/{summary['requests']}"
     )
     if routing["phase"]:
         phase = routing["phase"]
         print(
             "routing phases "
-            f"prompt_tokens={phase['prompt_tokens']} "
+            f"source={phase['source']} prefill_tokens={phase['prefill_tokens']} "
             f"decode_tokens={phase['decode_tokens']} "
-            f"prompt_requests={phase['prompt_requests']} "
+            f"prefill_requests={phase['prefill_requests']} "
             f"decode_requests={phase['decode_requests']}"
         )
     if routing["top_co_routing_pairs"]:
@@ -561,8 +660,8 @@ def print_human(summary: dict, top_n: int) -> None:
         for pair in routing["top_co_routing_pairs"]:
             first, second = pair["experts"]
             print(
-                f"  layer {pair['layer']:2d}: "
-                f"e{first}+e{second} = {pair['co_routes']}"
+                f"  layer {pair['layer']:2d}: e{first}+e{second} = "
+                f"{pair['co_routes']}"
             )
 
     print("\nGlobal LRU working-set curve:")
@@ -573,7 +672,6 @@ def print_human(summary: dict, top_n: int) -> None:
             f"  {row['capacity']:5d}      {100.0 * row['hit_rate']:6.2f}%  "
             f"{row['hits']:10d}   {gib:8.2f} GiB"
         )
-
     _print_persistent_curve(
         "Per-layer persistent LRU value",
         summary["persistent_per_layer_lru_curve"],
@@ -611,8 +709,8 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         default=None,
         help=(
-            "optional prompt-token count; tags reconstructed token ordinals as "
-            "prompt/decode until the runtime trace carries explicit phase IDs"
+            "v1 fallback only: prompt-token count used to tag inferred token "
+            "ordinals until the trace contains explicit phase identity"
         ),
     )
     parser.add_argument("--top", type=int, default=5, help="experts/pairs shown")
