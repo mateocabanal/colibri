@@ -24,6 +24,10 @@ typedef struct {
     ColiTensorView down;
     ColiTensorView up;
     void *lease;
+    /* Physical slots are reusable. generation identifies the exact published
+     * contents pinned by this lease so stale releases/handles cannot silently
+     * alias a later expert after slot reuse. */
+    uint64_t generation;
 } ColiExpertView;
 
 typedef struct {
@@ -35,6 +39,13 @@ typedef struct {
     uint64_t bytes_read;
     uint64_t resident_bytes;
     uint64_t capacity_bytes;
+
+    /* Residency lifecycle telemetry. Existing stores may leave these zero. */
+    uint64_t inflight_joins;
+    uint64_t loads_started;
+    uint64_t loads_failed;
+    uint64_t evictions;
+    uint64_t peak_inflight_bytes;
 } ColiExpertStoreStats;
 
 /*
@@ -44,6 +55,9 @@ typedef struct {
  *   on the same view (same store). Do not copy ColiExpertView; the lease is
  *   not shareable. Do not pass a view that already holds an active lease to
  *   lookup().
+ * - A successful lease pins one physical slot generation. Slot reuse must not
+ *   invalidate the view before release(), and release() must reject/ignore a
+ *   generation mismatch rather than decrementing a newer expert's refcount.
  * - On lookup failure the view is cleared; the caller must not use it and
  *   must not call release().
  * - release() clears the entire view. release() on an already-cleared or
