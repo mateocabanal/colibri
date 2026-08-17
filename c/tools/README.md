@@ -20,6 +20,11 @@ not runtime dependencies of the C engine.
   runner parses stable V4 CLI diagnostics and emits JSONL/CSV with TTFT,
   generated throughput, expert-cache traffic, wall time, git SHA, platform, and
   relevant environment.
+- `analyze_v4_expert_trace.py`: offline analysis for `V4_EXPERT_TRACE` JSONL.
+  Reports activation skew, hottest experts per layer, exact LRU stack/reuse
+  distance, physical residency events, and a hypothetical LRU hit-rate / bytes-
+  avoided curve for configurable expert-cache capacities. It uses a Fenwick
+  tree for O(n log n) reuse-distance analysis and has no third-party dependency.
 - `gen_unicode.py`: tokenizer table generation
 
 Run them from `c/`, for example:
@@ -45,6 +50,11 @@ python3 tools/benchmark_v4_perf.py --profile full --model /path/to/v4 \
 # Target a specific path while retaining a hard wall-time cap.
 python3 tools/benchmark_v4_perf.py --model /path/to/v4 \
   --cases prefill2k --timeout-sec 120
+
+# Capture and inspect routed-expert locality without writing from the hot path.
+V4_EXPERT_TRACE=/tmp/v4-experts.jsonl ./deepseek_v4 /path/to/model.coli hi
+python3 tools/analyze_v4_expert_trace.py /tmp/v4-experts.jsonl \
+  --capacities 1,2,4,8,16,32,64,128
 ```
 
 The V4 runner forces `--no-dspark` so results measure the exact target path.
