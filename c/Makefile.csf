@@ -1,4 +1,4 @@
-# Standalone CSF reader gate for issue #23.
+# Standalone CSF reader/tooling gate for issues #23/#24.
 # Kept separate from the large shared Makefile so the container parser can be
 # built/tested on all supported C hosts without pulling model-engine objects.
 
@@ -18,7 +18,10 @@ endif
 tests/test_coli_format$(EXE): tests/test_coli_format.c coli_format.c coli_executor.c coli_format.h coli_executor.h compat.h
 	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) tests/test_coli_format.c coli_format.c coli_executor.c -o $@ -pthread $(EXTRA_LDFLAGS)
 
-test: tests/test_coli_format$(EXE)
+tools/coli_check$(EXE): tools/coli_check.c coli_format.c coli_format.h compat.h
+	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) tools/coli_check.c coli_format.c -o $@ -pthread $(EXTRA_LDFLAGS)
+
+test: tests/test_coli_format$(EXE) tools/coli_check$(EXE)
 	./tests/test_coli_format$(EXE)
 
 test-asan:
@@ -26,4 +29,4 @@ test-asan:
 	$(MAKE) -f Makefile.csf test EXTRA_CFLAGS="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer" EXTRA_LDFLAGS="-fsanitize=address,undefined"
 
 clean:
-	rm -f tests/test_coli_format tests/test_coli_format.exe
+	rm -f tests/test_coli_format tests/test_coli_format.exe tools/coli_check tools/coli_check.exe
