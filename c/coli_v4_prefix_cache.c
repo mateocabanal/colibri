@@ -5,6 +5,7 @@
 #include "deepseek_v4_internal.h"
 #include "coli_v4_prefix_cache.h"
 
+#include <limits.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -113,6 +114,20 @@ static void remove_index_locked(size_t index, int eviction) {
     entry_free(entry);
 }
 
+static size_t oldest_evictable_locked(void) {
+    size_t victim = SIZE_MAX;
+    uint64_t oldest = UINT64_MAX;
+    for (size_t index = 0; index < g_prefix_cache.count; index++) {
+        ColiV4PrefixCacheEntry *entry = g_prefix_cache.entries[index];
+        if (!entry || entry->refs) continue;
+        if (entry->last_used < oldest) {
+            oldest = entry->last_used;
+            victim = index;
+        }
+    }
+    return victim;
+}
+
 static size_t find_entry_index_locked(const ColiV4PrefixCacheEntry *needle) {
     for (size_t index = 0; index < g_prefix_cache.count; index++)
         if (g_prefix_cache.entries[index] == needle) return index;
@@ -195,24 +210,16 @@ failed:
 }
 
 static int evict_until_fits_locked(size_t bytes) {
-    while (bytes > g_prefix_cache.budget_bytes -
-                   (g_prefix_cache.resident_bytes > g_prefix_cache.budget_bytes
-                        ? g_prefix_cache.budget_bytes
-                        : g_prefix_cache.resident_bytes)) {
-        size_t victim = SIZE_MAX;
-        uint64_t oldest = UINT64_MAX;
-        for (size_t index = 0; index < g_prefix_cache.count; index++) {
-            ColiV4PrefixCacheEntry *entry = g_prefix_cache.entries[index];
-            if (!entry || entry->refs) continue;
-            if (entry->last_used < oldest) {
-                oldest = entry->last_used;
-                victim = index;
-            }
-        }
+    for (;;) {
+        size_t used = g_prefix_cache.resident_bytes;
+        int bytes_fit = used <= g_prefix_cache.budget_bytes &&
+                        bytes <= g_prefix_cache.budget_bytes - used;
+        int count_fit = g_prefix_cache.count < COLI_V4_PREFIX_CACHE_MAX_ENTRIES;
+        if (bytes_fit && count_fit) return 1;
+        size_t victim = oldest_evictable_locked();
         if (victim == SIZE_MAX) return 0;
         remove_index_locked(victim, 1);
     }
-    return 1;
 }
 
 void coli_v4_prefix_cache_store(ColiV4Session *session) {
@@ -229,9 +236,10 @@ void coli_v4_prefix_cache_store(ColiV4Session *session) {
         return;
     }
 
+    int stored_tokens = entry->token_count;
+    size_t stored_bytes = entry->bytes;
     pthread_mutex_lock(&g_prefix_cache.mutex);
-    if (g_prefix_cache.count >= COLI_V4_PREFIX_CACHE_MAX_ENTRIES ||
-        !evict_until_fits_locked(entry->bytes)) {
+    if (!evict_until_fits_locked(entry->bytes)) {
         pthread_mutex_unlock(&g_prefix_cache.mutex);
         entry_free(entry);
         return;
@@ -247,7 +255,7 @@ void coli_v4_prefix_cache_store(ColiV4Session *session) {
     if (getenv("V4_PREFIX_LOG"))
         fprintf(stderr,
                 "[PREFIX-CACHE] store tokens=%d bytes=%.2fMiB entries=%zu resident=%.2fMiB\n",
-                entry->token_count, (double)entry->bytes / (1024.0 * 1024.0),
+                stored_tokens, (double)stored_bytes / (1024.0 * 1024.0),
                 entries, (double)resident / (1024.0 * 1024.0));
 }
 
