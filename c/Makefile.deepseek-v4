@@ -50,6 +50,7 @@ CFLAGS = -D_GNU_SOURCE -D_FILE_OFFSET_BITS=64 -O3 -march=$(ARCH) -fopenmp \
 	-DCOLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
 LDFLAGS = -lm -fopenmp -static -pthread
 V4_BINARY := deepseek_v4.exe
+V4_PREFIX_TEST_BINARY := test_v4_prefix_cache_sessions.exe
 else ifeq ($(UNAME_S),Darwin)
 CC = clang
 OMPDIR := $(shell brew --prefix libomp 2>/dev/null)
@@ -69,6 +70,7 @@ CFLAGS = -D_GNU_SOURCE -O3 $(OMPC) -pthread -include pthread.h \
 	-DCOLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
 LDFLAGS = -lm $(OMPL) -pthread
 V4_BINARY := deepseek_v4
+V4_PREFIX_TEST_BINARY := test_v4_prefix_cache_sessions
 METAL ?= 1
 V4_METAL_OBJS =
 ifeq ($(METAL),1)
@@ -90,6 +92,7 @@ CFLAGS = -D_GNU_SOURCE -O3 -march=$(ARCH) -fopenmp -pthread -include pthread.h \
 	-DCOLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
 LDFLAGS = -lm -fopenmp -pthread
 V4_BINARY := deepseek_v4
+V4_PREFIX_TEST_BINARY := test_v4_prefix_cache_sessions
 endif
 
 V4_GIT_SHA := $(shell git rev-parse --short=12 HEAD 2>/dev/null || printf unknown)
@@ -144,18 +147,24 @@ V4_AMALGAMATED_OBJS = $(filter-out $(V4_SPLIT_OBJS),$(sort $(TARGET_OBJS) $(TEST
 V4_COLI_OBJS = coli_v4_expert_store.o coli_v4_static.o coli_executor.o coli_format.o \
 	coli_v4_prefix_cache.o $(V4_TRACE_EXEC_OBJS)
 V4_OBJS = $(TARGET_OBJS) $(V4_COLI_OBJS) $(V4_METAL_OBJS)
+V4_PREFIX_TEST_RUNTIME_OBJ = COLI_V4_UNIT_RUNTIME_PREFIX_TEST.o
+V4_PREFIX_TEST_OBJS = $(filter-out COLI_V4_UNIT_RUNTIME.o,$(V4_OBJS)) \
+	$(V4_PREFIX_TEST_RUNTIME_OBJ)
 V4_BUILD_CONFIG = .deepseek-v4-build-config
 
-.PHONY: deepseek-v4 deepseek-v4-clean deepseek-v4-test-objs FORCE
+.PHONY: deepseek-v4 deepseek-v4-clean deepseek-v4-test-objs \
+	deepseek-v4-prefix-cache-test FORCE
 FORCE:
 
 $(V4_BUILD_CONFIG): FORCE
 	@printf '%s\n' 'CC=$(CC)' 'CFLAGS=$(CFLAGS)' 'LDFLAGS=$(LDFLAGS)' 'METAL=$(METAL)' 'LTO=$(LTO)' 'V4_TRACE_ROUTE=$(V4_TRACE_ROUTE)' 'V4_TRACE_EXEC=$(V4_TRACE_EXEC)' 'V4_LAYER_RESIDENT_CFLAGS=$(V4_LAYER_RESIDENT_CFLAGS)' > $@.tmp
 	@if test -f $@ && cmp -s $@.tmp $@; then rm -f $@.tmp; else mv -f $@.tmp $@; fi
 
-$(V4_OBJS) $(TEST_UNIT_OBJS): $(V4_BUILD_CONFIG)
+$(V4_OBJS) $(TEST_UNIT_OBJS) $(V4_PREFIX_TEST_RUNTIME_OBJ): $(V4_BUILD_CONFIG)
 
 deepseek-v4: $(V4_BINARY)
+
+deepseek-v4-prefix-cache-test: $(V4_PREFIX_TEST_BINARY)
 
 coli_v4_expert_store.o: coli_v4_expert_store.c coli_v4_expert_store.h coli_v4_residency.h coli_executor.h coli_format.h expert_store.h tensor.h compat.h
 	$(CC) $(CFLAGS) -c coli_v4_expert_store.c -o $@
@@ -182,6 +191,11 @@ COLI_V4_UNIT_ATTENTION_TRANSACTION.o: coli_v4_attention_snapshot_size.c deepseek
 	$(CC) $(CFLAGS) -DCOLI_V4_UNIT_ATTENTION_TRANSACTION -c coli_v4_attention_snapshot_size.c -o $@
 COLI_V4_UNIT_RUNTIME.o: coli_v4_runtime_prefix_cache.c deepseek_v4.c deepseek_v4.h deepseek_v4_internal.h coli_v4_prefix_cache.h
 	$(CC) $(CFLAGS) -DCOLI_V4_UNIT_RUNTIME -c coli_v4_runtime_prefix_cache.c -o $@
+# Test-only clone of the runtime API. Renaming the CLI main lets a tiny C
+# harness create two real sessions that share one engine/cache without changing
+# the production SERVE protocol, which remains intentionally single-session.
+$(V4_PREFIX_TEST_RUNTIME_OBJ): coli_v4_runtime_prefix_cache.c deepseek_v4.c deepseek_v4.h deepseek_v4_internal.h coli_v4_prefix_cache.h
+	$(CC) $(CFLAGS) -Dmain=coli_v4_cli_main_unused -DCOLI_V4_UNIT_RUNTIME -c coli_v4_runtime_prefix_cache.c -o $@
 COLI_V4_UNIT_GENERATE_STATS.o: coli_v4_generate_stats_cache.c deepseek_v4.c deepseek_v4.h deepseek_v4_internal.h coli_v4_prefix_cache.h kv_prefix.h
 	$(CC) $(CFLAGS) -DCOLI_V4_UNIT_GENERATE_STATS -c coli_v4_generate_stats_cache.c -o $@
 
@@ -200,6 +214,9 @@ endif
 $(V4_BINARY): $(V4_OBJS)
 	$(CC) $(V4_OBJS) -o $@ $(LDFLAGS)
 
+$(V4_PREFIX_TEST_BINARY): tests/test_v4_prefix_cache_sessions.c $(V4_PREFIX_TEST_OBJS)
+	$(CC) $(CFLAGS) tests/test_v4_prefix_cache_sessions.c $(V4_PREFIX_TEST_OBJS) -o $@ $(LDFLAGS)
+
 $(V4_AMALGAMATED_OBJS): %.o: deepseek_v4.c deepseek_v4.h \
 	deepseek_v4_internal.h deepseek_v4_dspark.inc st.h json.h compat.h tensor.h quant.h \
 	native_quant.h native_quant_batch.h native_quant_dual.h \
@@ -209,4 +226,6 @@ $(V4_AMALGAMATED_OBJS): %.o: deepseek_v4.c deepseek_v4.h \
 deepseek-v4-test-objs: $(TEST_UNIT_OBJS)
 
 deepseek-v4-clean:
-	rm -f $(V4_BINARY) $(V4_OBJS) $(TEST_UNIT_OBJS) coli_v4_expert_execute_trace.o $(V4_BUILD_CONFIG)
+	rm -f $(V4_BINARY) $(V4_OBJS) $(TEST_UNIT_OBJS) \
+		$(V4_PREFIX_TEST_RUNTIME_OBJ) $(V4_PREFIX_TEST_BINARY) \
+		coli_v4_expert_execute_trace.o $(V4_BUILD_CONFIG)
