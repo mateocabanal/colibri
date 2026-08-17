@@ -117,6 +117,29 @@ static inline void qwen_prefix_cache_init(QwenPrefixCache *c,
     c->initialized = 1;
 }
 
+/* Qwen's legacy RAM_GB policy treats one expert slot per sparse layer as
+ * roughly 2 decimal GB. Reserve the prompt-cache bytes before applying
+ * that same heuristic so an implicit RAM budget remains a total budget.
+ * Explicit CACHE/positional caps are intentionally outside this helper. */
+static inline int qwen_prefix_cache_ram_cap(const char *value,
+                                            size_t prefix_budget_bytes,
+                                            int *valid) {
+    if (valid) *valid = 0;
+    if (!value || !*value) return 0;
+    char *end = NULL;
+    long double gib = strtold(value, &end);
+    /* Keep RAM_GB's historical permissive trailing-text behavior while
+     * rejecting NaN/inf/negative values before any integer conversion. */
+    if (end == value || !(gib > 0.0L) || gib > 1000000.0L) return 0;
+    if (valid) *valid = 1;
+    const long double gb = 1000000000.0L;
+    long double bytes = gib * gb;
+    if (bytes <= (long double)prefix_budget_bytes) return 0;
+    long double slots = (bytes - (long double)prefix_budget_bytes) / (2.0L * gb);
+    if (slots >= (long double)INT_MAX) return INT_MAX;
+    return slots > 0.0L ? (int)slots : 0;
+}
+
 static inline size_t qwen_prefix_cache_budget_from_env(void) {
     const char *value = getenv("QWEN_PREFIX_CACHE_MB");
     if (!value || !*value) return 0;

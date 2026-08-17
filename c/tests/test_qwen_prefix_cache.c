@@ -173,6 +173,16 @@ static void test_restore(int kv_f16) {
     fixture_free(&f);
 }
 
+static void test_ram_cap_reservation(void) {
+    int valid = 0;
+    assert(qwen_prefix_cache_ram_cap(NULL, 0, &valid) == 0 && !valid);
+    assert(qwen_prefix_cache_ram_cap("garbage", 0, &valid) == 0 && !valid);
+    assert(qwen_prefix_cache_ram_cap("4", 0, &valid) == 2 && valid);
+    assert(qwen_prefix_cache_ram_cap("4", 1, &valid) == 1 && valid);
+    assert(qwen_prefix_cache_ram_cap("4.5", 500000000, &valid) == 2 && valid);
+    assert(qwen_prefix_cache_ram_cap("1", 2ULL * 1000000000ULL, &valid) == 0 && valid);
+}
+
 static void test_hard_budget(void) {
     Fixture f;
     fixture_init(&f, 1);
@@ -201,6 +211,7 @@ static void test_hard_budget(void) {
 int main(void) {
     test_restore(1);
     test_restore(0);
+    test_ram_cap_reservation();
     test_hard_budget();
     puts("qwen prefix cache: ok");
     return 0;

@@ -3403,7 +3403,8 @@ int main(int argc, char **argv){
     rt_trace_open();
     const char *snap;
     int cap;
-    if (getenv("SERVE") && getenv("SERVE")[0] == '1') {
+    int serving = getenv("SERVE") && getenv("SERVE")[0] == '1';
+    if (serving) {
         /* serve protocol (openai_server.py): argv[1] is the cap sentinel and
          * SNAP env carries the model dir — same convention as olmoe.c. */
         snap = getenv("SNAP");
@@ -3413,12 +3414,23 @@ int main(int argc, char **argv){
         cap = argc > 2 ? atoi(argv[2]) : (getenv("CACHE") ? atoi(getenv("CACHE")) : 0);
     }
     if (!snap || !*snap) { fprintf(stderr, "set SNAP=<snapshot directory>\n"); return 1; }
+    int explicit_cap = cap != 0;
+    size_t prefix_budget = serving ? qwen_prefix_cache_budget_from_env() : 0;
     if (cap == 0) {
         /* Default: ONLY the experts currently in use stay resident — one
          * cache slot per selected expert per layer (topk). Everything else
-         * is streamed from disk on demand. Raise CACHE/RAM_GB for more. */
-        if (getenv("RAM_GB") && atoi(getenv("RAM_GB")) > 0) {
-            cap = atoi(getenv("RAM_GB")) / 2;
+         * is streamed from disk on demand. Raise CACHE/RAM_GB for more.
+         *
+         * RAM_GB is a total host/UMA budget. Its existing expert-residency
+         * heuristic is 2 decimal GB per cache slot/layer, so reserve the
+         * opt-in prompt cache before deriving that cap. */
+        int ram_valid = 0;
+        cap = qwen_prefix_cache_ram_cap(getenv("RAM_GB"), prefix_budget, &ram_valid);
+        if (ram_valid) {
+            if (prefix_budget)
+                fprintf(stderr,
+                        "[QWEN-PREFIX] RAM_GB reserves %.2fMiB for prompt snapshots; expert cap=%d under 2GB/slot heuristic\n",
+                        (double)prefix_budget / (1024.0 * 1024.0), cap);
         } else {
             Cfg cfg0;
             if (getenv("COLI_CONFIG")) load_cfg(&cfg0, getenv("COLI_CONFIG"));
@@ -3426,6 +3438,10 @@ int main(int argc, char **argv){
             cap = cfg0.topk;
             free(cfg0.layer_is_gdn);
         }
+    } else if (serving && explicit_cap && prefix_budget) {
+        fprintf(stderr,
+                "[QWEN-PREFIX] explicit expert cap=%d; %.2fMiB prompt-cache budget is additive to expert residency\n",
+                cap, (double)prefix_budget / (1024.0 * 1024.0));
     }
     if (cap < 1 || cap > 4096) { fprintf(stderr, "CACHE must be 1..4096 (got %d)\n", cap); return 1; }
     /* page-cache discipline: DONTNEED after every file read (experts and
