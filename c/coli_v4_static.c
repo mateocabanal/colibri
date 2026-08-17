@@ -1,9 +1,48 @@
 #include "coli_v4_static.h"
+#include "coli_v4_residency.h"
 
 #include <math.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/*
+ * Tensor-granular deterministic residency for package-only V4.
+ *
+ * The ordinary layer API owns and frees every pointer returned in weights->data,
+ * so the persistent cache keeps a private immutable copy and materializes a
+ * caller-owned copy on a hit. That preserves the existing ownership contract
+ * while removing the recurring SSD read. A later #10 execution-view change can
+ * let resident tensors be referenced directly and remove this memcpy too.
+ */
+typedef struct {
+    char name[COLI_V4_MAX_TENSOR_NAME];
+    unsigned char *data;
+    uint64_t resident_bytes;
+    uint64_t stored_bytes_avoided;
+    uint64_t hits;
+} DenseCacheEntry;
+
+typedef struct {
+    pthread_mutex_t mutex;
+    DenseCacheEntry *entries;
+    size_t count;
+    size_t capacity;
+    uint64_t budget_bytes;
+    uint64_t resident_bytes;
+    uint64_t hits;
+    uint64_t misses;
+    uint64_t admissions;
+    uint64_t rejected_bytes;
+    uint64_t bytes_avoided;
+    double minimum_benefit;
+} DenseCache;
+
+static DenseCache g_dense_cache = {
+    .mutex = PTHREAD_MUTEX_INITIALIZER,
+    .minimum_benefit = 0.75,
+};
 
 static int bad(char *e, size_t n, const char *f, const char *s) {
     if (e && n) snprintf(e, n, f, s);
@@ -22,6 +61,195 @@ static uint16_t fmt(ColiSafetensorsDType d) {
     }
 }
 
+static DenseCacheEntry *dense_cache_find_locked(const char *name) {
+    for (size_t i = 0; i < g_dense_cache.count; i++)
+        if (!strcmp(g_dense_cache.entries[i].name, name))
+            return &g_dense_cache.entries[i];
+    return NULL;
+}
+
+static void dense_cache_clear_locked(void) {
+    for (size_t i = 0; i < g_dense_cache.count; i++)
+        free(g_dense_cache.entries[i].data);
+    free(g_dense_cache.entries);
+    g_dense_cache.entries = NULL;
+    g_dense_cache.count = 0;
+    g_dense_cache.capacity = 0;
+    g_dense_cache.resident_bytes = 0;
+}
+
+void coli_v4_dense_cache_configure(uint64_t budget_bytes) {
+    pthread_mutex_lock(&g_dense_cache.mutex);
+    dense_cache_clear_locked();
+    g_dense_cache.budget_bytes = budget_bytes;
+    g_dense_cache.hits = 0;
+    g_dense_cache.misses = 0;
+    g_dense_cache.admissions = 0;
+    g_dense_cache.rejected_bytes = 0;
+    g_dense_cache.bytes_avoided = 0;
+    g_dense_cache.minimum_benefit = 0.75;
+    {
+        const char *value = getenv("V4_DENSE_CACHE_MIN_BENEFIT");
+        if (value && *value) {
+            char *end = NULL;
+            double parsed = strtod(value, &end);
+            if (end != value && parsed >= 0.0 && parsed <= 8.0)
+                g_dense_cache.minimum_benefit = parsed;
+        }
+    }
+    pthread_mutex_unlock(&g_dense_cache.mutex);
+
+    if (budget_bytes) {
+        fprintf(stderr,
+                "v4_dense_cache status=configured budget=%.2fGiB "
+                "policy=tensor-greedy min_benefit=%.2f\n",
+                budget_bytes / (1024.0 * 1024.0 * 1024.0),
+                g_dense_cache.minimum_benefit);
+    }
+}
+
+void coli_v4_dense_cache_reset(void) {
+    ColiV4DenseCacheStats snapshot = {0};
+    pthread_mutex_lock(&g_dense_cache.mutex);
+    snapshot.budget_bytes = g_dense_cache.budget_bytes;
+    snapshot.resident_bytes = g_dense_cache.resident_bytes;
+    snapshot.entries = g_dense_cache.count;
+    snapshot.hits = g_dense_cache.hits;
+    snapshot.misses = g_dense_cache.misses;
+    snapshot.admissions = g_dense_cache.admissions;
+    snapshot.rejected_bytes = g_dense_cache.rejected_bytes;
+    snapshot.bytes_avoided = g_dense_cache.bytes_avoided;
+    dense_cache_clear_locked();
+    g_dense_cache.budget_bytes = 0;
+    pthread_mutex_unlock(&g_dense_cache.mutex);
+
+    if (snapshot.budget_bytes) {
+        fprintf(stderr,
+                "v4_dense_cache status=done resident=%.2fGiB budget=%.2fGiB "
+                "entries=%llu hits=%llu misses=%llu admissions=%llu "
+                "bytes_avoided=%.2fGiB rejected=%.2fGiB\n",
+                snapshot.resident_bytes / (1024.0 * 1024.0 * 1024.0),
+                snapshot.budget_bytes / (1024.0 * 1024.0 * 1024.0),
+                (unsigned long long)snapshot.entries,
+                (unsigned long long)snapshot.hits,
+                (unsigned long long)snapshot.misses,
+                (unsigned long long)snapshot.admissions,
+                snapshot.bytes_avoided / (1024.0 * 1024.0 * 1024.0),
+                snapshot.rejected_bytes / (1024.0 * 1024.0 * 1024.0));
+    }
+}
+
+void coli_v4_dense_cache_stats(ColiV4DenseCacheStats *out) {
+    if (!out) return;
+    pthread_mutex_lock(&g_dense_cache.mutex);
+    *out = (ColiV4DenseCacheStats){
+        .budget_bytes = g_dense_cache.budget_bytes,
+        .resident_bytes = g_dense_cache.resident_bytes,
+        .entries = g_dense_cache.count,
+        .hits = g_dense_cache.hits,
+        .misses = g_dense_cache.misses,
+        .admissions = g_dense_cache.admissions,
+        .rejected_bytes = g_dense_cache.rejected_bytes,
+        .bytes_avoided = g_dense_cache.bytes_avoided,
+    };
+    pthread_mutex_unlock(&g_dense_cache.mutex);
+}
+
+/* Return 1 and a caller-owned copy on hit, 0 on miss. Cache entries are never
+ * evicted during a configured generation, so the immutable source pointer can
+ * safely be copied after dropping the mutex. */
+static int dense_cache_copy(const char *name, uint64_t resident_bytes,
+                            void **output) {
+    if (!name || !output || resident_bytes > SIZE_MAX) return 0;
+    *output = NULL;
+
+    const unsigned char *source = NULL;
+    uint64_t stored_bytes_avoided = 0;
+    pthread_mutex_lock(&g_dense_cache.mutex);
+    DenseCacheEntry *entry = dense_cache_find_locked(name);
+    if (entry && entry->resident_bytes == resident_bytes) {
+        entry->hits++;
+        g_dense_cache.hits++;
+        g_dense_cache.bytes_avoided += entry->stored_bytes_avoided;
+        source = entry->data;
+        stored_bytes_avoided = entry->stored_bytes_avoided;
+    } else {
+        g_dense_cache.misses++;
+    }
+    pthread_mutex_unlock(&g_dense_cache.mutex);
+
+    (void)stored_bytes_avoided;
+    if (!source) return 0;
+    void *copy = malloc((size_t)resident_bytes);
+    if (!copy) return 0;
+    memcpy(copy, source, (size_t)resident_bytes);
+    *output = copy;
+    return 1;
+}
+
+/* Admit an immutable final execution representation. Failure to cache is never
+ * an inference failure. benefit is recurring stored bytes avoided / resident
+ * bytes consumed, so compact E8M0 scales that expand to FP32 naturally rank
+ * below large 1:1 FP8 weight payloads. */
+static void dense_cache_admit(const char *name, const void *data,
+                              uint64_t resident_bytes,
+                              uint64_t stored_bytes_avoided) {
+    if (!name || !data || !resident_bytes || resident_bytes > SIZE_MAX) return;
+
+    double benefit = (double)stored_bytes_avoided / (double)resident_bytes;
+    pthread_mutex_lock(&g_dense_cache.mutex);
+    if (!g_dense_cache.budget_bytes ||
+        benefit < g_dense_cache.minimum_benefit ||
+        resident_bytes > g_dense_cache.budget_bytes -
+                         (g_dense_cache.resident_bytes <= g_dense_cache.budget_bytes
+                              ? g_dense_cache.resident_bytes : g_dense_cache.budget_bytes) ||
+        dense_cache_find_locked(name)) {
+        if (g_dense_cache.budget_bytes &&
+            benefit >= g_dense_cache.minimum_benefit &&
+            !dense_cache_find_locked(name))
+            g_dense_cache.rejected_bytes += resident_bytes;
+        pthread_mutex_unlock(&g_dense_cache.mutex);
+        return;
+    }
+
+    if (g_dense_cache.count == g_dense_cache.capacity) {
+        size_t next = g_dense_cache.capacity ? g_dense_cache.capacity * 2 : 64;
+        if (next < g_dense_cache.capacity ||
+            next > SIZE_MAX / sizeof(*g_dense_cache.entries)) {
+            g_dense_cache.rejected_bytes += resident_bytes;
+            pthread_mutex_unlock(&g_dense_cache.mutex);
+            return;
+        }
+        DenseCacheEntry *grown = realloc(
+            g_dense_cache.entries, next * sizeof(*g_dense_cache.entries));
+        if (!grown) {
+            g_dense_cache.rejected_bytes += resident_bytes;
+            pthread_mutex_unlock(&g_dense_cache.mutex);
+            return;
+        }
+        g_dense_cache.entries = grown;
+        g_dense_cache.capacity = next;
+    }
+
+    unsigned char *copy = malloc((size_t)resident_bytes);
+    if (!copy) {
+        g_dense_cache.rejected_bytes += resident_bytes;
+        pthread_mutex_unlock(&g_dense_cache.mutex);
+        return;
+    }
+    memcpy(copy, data, (size_t)resident_bytes);
+
+    DenseCacheEntry *entry = &g_dense_cache.entries[g_dense_cache.count++];
+    memset(entry, 0, sizeof(*entry));
+    snprintf(entry->name, sizeof(entry->name), "%s", name);
+    entry->data = copy;
+    entry->resident_bytes = resident_bytes;
+    entry->stored_bytes_avoided = stored_bytes_avoided;
+    g_dense_cache.resident_bytes += resident_bytes;
+    g_dense_cache.admissions++;
+    pthread_mutex_unlock(&g_dense_cache.mutex);
+}
+
 int coli_v4_coli_layer_load(ColiExecutor *x, ColiDeepSeekV4LayerWeights *w,
                             const ColiDeepSeekV4Config *c, int layer,
                             char *e, size_t n) {
@@ -37,7 +265,8 @@ int coli_v4_coli_layer_load(ColiExecutor *x, ColiDeepSeekV4LayerWeights *w,
         ColiDeepSeekV4TensorSpec *s = &w->plan.tensors[i];
         const ColiRecordInfo *r = coli_executor_record_by_name(x, s->name);
         ColiTensorInfo t;
-        unsigned char *b;
+        unsigned char *b = NULL;
+        uint64_t resident_bytes;
 
         if (!r || coli_package_tensor_info(coli_executor_package(x), r, &t, e, n) ||
             t.rank != (uint16_t)s->rank || r->math_format != fmt(s->dtype))
@@ -51,6 +280,28 @@ int coli_v4_coli_layer_load(ColiExecutor *x, ColiDeepSeekV4LayerWeights *w,
             t.data_stored_bytes > r->stored_bytes - t.data_offset) {
             bad(e, n, "COLI static span invalid: %s", s->name);
             goto fail;
+        }
+
+        resident_bytes = t.data_stored_bytes;
+        if (s->dtype == COLI_ST_F8_E8M0) {
+            if (resident_bytes > UINT64_MAX / sizeof(float)) {
+                bad(e, n, "COLI static scale size overflow: %s", s->name);
+                goto fail;
+            }
+            resident_bytes *= sizeof(float);
+        }
+        if (resident_bytes > SIZE_MAX) {
+            bad(e, n, "COLI static resident span invalid: %s", s->name);
+            goto fail;
+        }
+
+        if (dense_cache_copy(s->name, resident_bytes, (void **)&b)) {
+            w->data[i] = b;
+            if (s->dtype == COLI_ST_F8_E8M0)
+                w->stats.fp8_scale_bytes += resident_bytes;
+            w->stats.total_bytes += resident_bytes;
+            w->stats.tensor_count++;
+            continue;
         }
 
         b = malloc((size_t)r->stored_bytes);
@@ -75,13 +326,15 @@ int coli_v4_coli_layer_load(ColiExecutor *x, ColiDeepSeekV4LayerWeights *w,
                 out[q] = b[t.data_offset + q] == 255
                     ? NAN : ldexpf(1.f, (int)b[t.data_offset + q] - 127);
             free(b);
+            dense_cache_admit(s->name, out, resident_bytes, r->stored_bytes);
             w->data[i] = out;
-            w->stats.fp8_scale_bytes += k * sizeof(*out);
-            w->stats.total_bytes += k * sizeof(*out);
+            w->stats.fp8_scale_bytes += resident_bytes;
+            w->stats.total_bytes += resident_bytes;
         } else {
             memmove(b, b + t.data_offset, (size_t)t.data_stored_bytes);
+            dense_cache_admit(s->name, b, resident_bytes, r->stored_bytes);
             w->data[i] = b;
-            w->stats.total_bytes += t.data_stored_bytes;
+            w->stats.total_bytes += resident_bytes;
         }
         w->stats.tensor_count++;
     }
