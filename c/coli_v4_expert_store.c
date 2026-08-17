@@ -11,6 +11,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef __APPLE__
+/* Consumed by the V4-local pread interposition in coli_v4_macos_uncached_io.h.
+ * Loader threads set this only while reading a routed-expert record. */
+__thread int coli_v4_expert_io_active;
+#endif
+
 typedef struct { const ColiRecordInfo *record; ColiExpertInfo info; } Record;
 /* A slot remains unavailable from selection until its positioned read and CRC
  * have completed. refs alone is insufficient: loader lanes acquire before a
@@ -18,7 +24,7 @@ typedef struct { const ColiRecordInfo *record; ColiExpertInfo info; } Record;
 typedef struct { int expert; unsigned refs, loading; unsigned char *data; } Slot;
 typedef struct {
     ColiExecutor *executor; int layers, experts, slots_per_layer;
-    uint64_t record_bytes, clock; Record *records; Slot *slots;
+    uint64_t record_bytes, slot_bytes, clock; Record *records; Slot *slots;
     unsigned active_leases; ColiExpertStoreStats stats; pthread_mutex_t mutex;
 } State;
 
@@ -52,14 +58,23 @@ static int lookup(ColiExpertStore *store, ColiExpertKey key, ColiExpertView *vie
     for(int i=0;i<s->slots_per_layer;i++) if(!slots[i].loading&&slots[i].data&&slots[i].expert==key.expert){slot=&slots[i];s->stats.hits++;break;}
     if(!slot) { for(int i=0;i<s->slots_per_layer;i++) if(!slots[i].refs&&!slots[i].loading&&(!slot||!slots[i].data)) slot=&slots[i];
         if(!slot) { pthread_mutex_unlock(&s->mutex); memset(view,0,sizeof(*view)); return -1; }
-        if(!slot->data) { /* Apple shared-memory buffers are safest at the VM page size (16 KiB). */
-            if(posix_memalign((void**)&slot->data,16384,(size_t)s->record_bytes)){pthread_mutex_unlock(&s->mutex);memset(view,0,sizeof(*view));return -1;}
+        if(!slot->data) {
+            if(s->slot_bytes>SIZE_MAX||posix_memalign((void**)&slot->data,16384,(size_t)s->slot_bytes)){pthread_mutex_unlock(&s->mutex);memset(view,0,sizeof(*view));return -1;}
 #ifdef COLI_METAL
-            if(coli_metal_init())coli_metal_register(slot->data,(size_t)s->record_bytes);
+            /* bytesNoCopy requires an Apple-page-aligned base and page-rounded span. */
+            if(coli_metal_init())coli_metal_register(slot->data,(size_t)s->slot_bytes);
 #endif
-            s->stats.resident_bytes+=s->record_bytes; }
+            s->stats.resident_bytes+=s->slot_bytes; }
         slot->expert=-1; slot->loading=1; pthread_mutex_unlock(&s->mutex);
-        char error[256]; int bad=coli_executor_load_expert(s->executor,key.layer,key.expert,slot->data,(size_t)s->record_bytes,error,sizeof(error));
+        char error[256];
+#ifdef __APPLE__
+        const char *direct=getenv("COLI_V4_DIRECT");
+        coli_v4_expert_io_active=!direct||atoi(direct)!=0;
+#endif
+        int bad=coli_executor_load_expert(s->executor,key.layer,key.expert,slot->data,(size_t)s->record_bytes,error,sizeof(error));
+#ifdef __APPLE__
+        coli_v4_expert_io_active=0;
+#endif
         pthread_mutex_lock(&s->mutex); slot->loading=0; if(bad){fprintf(stderr,"v4_coli expert-load failed layer=%d expert=%d: %s\n",key.layer,key.expert,error);pthread_mutex_unlock(&s->mutex);memset(view,0,sizeof(*view));return -1;} slot->expert=key.expert;s->stats.misses++;s->stats.bytes_read+=s->record_bytes;
     }
     slot->refs++; s->active_leases++; int bad=fill(view,key,r,slot); if(bad){fprintf(stderr,"v4_coli expert-view invalid layer=%d expert=%d\n",key.layer,key.expert);slot->refs--;s->active_leases--;} pthread_mutex_unlock(&s->mutex); return bad?-1:0;
@@ -83,7 +98,8 @@ int coli_v4_coli_expert_store_open(const ColiV4ColiExpertStoreOptions*o,ColiExpe
     if(coli_executor_open(&s->executor,o->package_dir,&xo,e,n))goto bad;s->layers=o->layers;s->experts=o->experts_per_layer;
     s->records=calloc((size_t)s->layers*s->experts,sizeof(*s->records));if(!s->records){fail(e,n,"out of memory indexing COLI experts");goto bad;}
     for(int l=0;l<s->layers;l++)for(int x=0;x<s->experts;x++){Record*r=&s->records[(size_t)l*s->experts+x];r->record=coli_executor_expert(s->executor,l,x);if(!r->record||coli_executor_expert_info(s->executor,l,x,&r->info,e,n)){fail(e,n,"COLI package is missing/invalid expert (%d,%d)",l,x);goto bad;}if(!s->record_bytes)s->record_bytes=r->record->stored_bytes;if(r->record->stored_bytes!=s->record_bytes){fail(e,n,"COLI experts have non-uniform stored sizes");goto bad;}}
+    if(s->record_bytes>UINT64_MAX-16383u){fail(e,n,"COLI expert slot size overflow");goto bad;}s->slot_bytes=(s->record_bytes+16383u)&~UINT64_C(16383);if(s->slot_bytes>SIZE_MAX){fail(e,n,"COLI expert slot exceeds address space");goto bad;}
     s->slots_per_layer=(int)(o->cache_bytes/((uint64_t)s->layers*s->record_bytes));if(s->slots_per_layer<1){fail(e,n,"COLI cache budget cannot hold one expert per layer");goto bad;}if(s->slots_per_layer>s->experts)s->slots_per_layer=s->experts;
-    s->slots=calloc((size_t)s->layers*s->slots_per_layer,sizeof(*s->slots));if(!s->slots){fail(e,n,"out of memory creating COLI expert slots");goto bad;}for(int i=0;i<s->layers*s->slots_per_layer;i++)s->slots[i].expert=-1;s->stats.capacity_bytes=(uint64_t)s->layers*s->slots_per_layer*s->record_bytes;store->ops=&ops;store->state=s;*out=store;return 0;
+    s->slots=calloc((size_t)s->layers*s->slots_per_layer,sizeof(*s->slots));if(!s->slots){fail(e,n,"out of memory creating COLI expert slots");goto bad;}for(int i=0;i<s->layers*s->slots_per_layer;i++)s->slots[i].expert=-1;s->stats.capacity_bytes=(uint64_t)s->layers*s->slots_per_layer*s->slot_bytes;store->ops=&ops;store->state=s;*out=store;return 0;
 bad:destroy(store);return -1;
 }
