@@ -35,6 +35,12 @@ not runtime dependencies of the C engine.
   co-routing, unique logical experts/token and adjacent-token overlap. Old v1
   traces still fall back to layer-wrap token inference; explicit v2 route traces
   use authoritative request/token/phase identity.
+- `analyze_v4_request_overlap.py`: schema-v2 serving-locality view for #56.
+  It keeps analysis linear in request count by comparing consecutive generation
+  requests instead of doing an O(requests²) all-pairs sweep. It reports shared
+  logical experts, Jaccard overlap, previous-working-set retention, next-request
+  reuse, and per-layer adjacent-request overlap. Duplicate route selections do
+  not inflate the working set.
 - `analyze_v4_residency_value.py`: offline policy-reference tool for #3. It
   compares deterministic residency and global hot-expert capacity using
   estimated **exposed I/O milliseconds avoided per resident GiB**. Repeated
@@ -80,6 +86,11 @@ python3 tools/analyze_v4_expert_trace.py /tmp/v4-experts.jsonl \
 # Analyze authoritative logical route selections (schema v2).
 python3 tools/analyze_v4_expert_trace.py \
   /tmp/v4-experts.jsonl.routes.jsonl --top 10
+
+# For a multi-request/serve trace, quantify how much of each request's logical
+# expert working set is reused by the next request.
+python3 tools/analyze_v4_request_overlap.py \
+  /tmp/v4-experts.jsonl.routes.jsonl --top-layers 10
 
 # Optional explicit route-sidecar controls. Request ids are assigned
 # monotonically at the session-generate boundary. V4_ROUTE_REQUEST_ID changes
