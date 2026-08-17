@@ -74,6 +74,8 @@ typedef struct {
     size_t x_cap, y_cap, gate_cap, up_cap;
     uint8_t *qx; float *qscale;
     size_t qx_cap, qscale_cap;
+    void *mx_weights, *mx_scales;
+    size_t mx_weights_cap, mx_scales_cap;
     float *host_x,*host_y,*host_kv; size_t host_x_cap,host_y_cap,host_kv_cap;
     float *aq,*al,*ar,*ac; size_t aq_cap,al_cap,ar_cap,ac_cap;
     float *pipe_buf[27]; size_t pipe_cap[27];   /* scratch persistenti del resident pipeline */
@@ -999,6 +1001,8 @@ extern "C" void coli_cuda_shutdown(void) {
         if (ctx->up) cudaFree(ctx->up);
         if (ctx->qx) cudaFree(ctx->qx);
         if (ctx->qscale) cudaFree(ctx->qscale);
+        if (ctx->mx_weights) cudaFree(ctx->mx_weights);
+        if (ctx->mx_scales) cudaFree(ctx->mx_scales);
         if(ctx->aq)cudaFree(ctx->aq);if(ctx->al)cudaFree(ctx->al);if(ctx->ar)cudaFree(ctx->ar);if(ctx->ac)cudaFree(ctx->ac);
         for(int b=0;b<27;b++) if(ctx->pipe_buf[b]) cudaFree(ctx->pipe_buf[b]);
         if (ctx->host_x) cudaFreeHost(ctx->host_x);
@@ -1017,10 +1021,12 @@ extern "C" void coli_cuda_shutdown(void) {
 #endif
         ctx->x = ctx->y = ctx->gate = ctx->up = nullptr;
         ctx->qx=nullptr; ctx->qscale=nullptr;
+        ctx->mx_weights=ctx->mx_scales=nullptr;
         ctx->aq=ctx->al=ctx->ar=ctx->ac=nullptr;
         ctx->host_x=ctx->host_y=ctx->host_kv=nullptr;ctx->stream=nullptr;
         ctx->x_cap = ctx->y_cap = ctx->gate_cap = ctx->up_cap = 0;
         ctx->qx_cap=ctx->qscale_cap=0;
+        ctx->mx_weights_cap=ctx->mx_scales_cap=0;
         ctx->aq_cap=ctx->al_cap=ctx->ar_cap=ctx->ac_cap=0;
         ctx->host_x_cap=ctx->host_y_cap=ctx->host_kv_cap=0;
         ctx->group_desc=nullptr; ctx->group_desc_cap=0;
@@ -1413,6 +1419,84 @@ extern "C" int coli_cuda_matmul_mxfp4(float *y, const float *x,
     cudaFree(dw);
     cudaFree(ds);
     return ok;
+}
+
+extern "C" int coli_cuda_expert_mlp_mxfp4(
+        float *y, const float *x,
+        const uint8_t *gate, const uint8_t *gate_e8,
+        const uint8_t *up, const uint8_t *up_e8,
+        const uint8_t *down, const uint8_t *down_e8,
+        int S, int D, int I) {
+    if (fault_injected()) return 0;
+    if (!y || !x || !gate || !gate_e8 || !up || !up_e8 || !down || !down_e8 ||
+        S < 1 || D < 1 || I < 1 || g_nctx < 1) return 0;
+    DeviceContext *ctx = &g_ctx[0];
+    if (!select_ctx(ctx)) return 0;
+
+    const size_t grb = (size_t)(D + 1) / 2;
+    const size_t drb = (size_t)(I + 1) / 2;
+    const size_t gng = (size_t)(D + 31) / 32;
+    const size_t dng = (size_t)(I + 31) / 32;
+    const size_t gwb = (size_t)I * grb;
+    const size_t dwb = (size_t)D * drb;
+    const size_t gsb = (size_t)I * gng;
+    const size_t dsb = (size_t)D * dng;
+    if (gwb > SIZE_MAX - gwb || 2 * gwb > SIZE_MAX - dwb ||
+        gsb > SIZE_MAX - gsb || 2 * gsb > SIZE_MAX - dsb) return 0;
+    const size_t weights_bytes = 2 * gwb + dwb;
+    const size_t scales_bytes = 2 * gsb + dsb;
+    const size_t xb = (size_t)S * D * sizeof(float);
+    const size_t ib = (size_t)S * I * sizeof(float);
+    const size_t yb = (size_t)S * D * sizeof(float);
+
+    if (!reserve_bytes(&ctx->mx_weights, &ctx->mx_weights_cap, weights_bytes) ||
+        !reserve_bytes(&ctx->mx_scales, &ctx->mx_scales_cap, scales_bytes) ||
+        !reserve(&ctx->x, &ctx->x_cap, xb) ||
+        !reserve(&ctx->gate, &ctx->gate_cap, ib) ||
+        !reserve(&ctx->up, &ctx->up_cap, ib) ||
+        !reserve(&ctx->y, &ctx->y_cap, yb) ||
+        !reserve_pinned(&ctx->host_y, &ctx->host_y_cap, yb)) return 0;
+
+    uint8_t *wg = static_cast<uint8_t *>(ctx->mx_weights);
+    uint8_t *wu = wg + gwb;
+    uint8_t *wd = wu + gwb;
+    uint8_t *sg = static_cast<uint8_t *>(ctx->mx_scales);
+    uint8_t *su = sg + gsb;
+    uint8_t *sd = su + gsb;
+
+#define MXCPY(dst, src, bytes, label) \
+    do { if (!cuda_ok(cudaMemcpyAsync((dst), (src), (bytes), cudaMemcpyHostToDevice, ctx->stream), (label))) return 0; } while (0)
+    MXCPY(wg, gate, gwb, "MXFP4 gate upload");
+    MXCPY(wu, up, gwb, "MXFP4 up upload");
+    MXCPY(wd, down, dwb, "MXFP4 down upload");
+    MXCPY(sg, gate_e8, gsb, "MXFP4 gate scales upload");
+    MXCPY(su, up_e8, gsb, "MXFP4 up scales upload");
+    MXCPY(sd, down_e8, dsb, "MXFP4 down scales upload");
+    MXCPY(ctx->x, x, xb, "MXFP4 expert input upload");
+#undef MXCPY
+
+    dim3 hidden_grid((unsigned)I, (unsigned)S);
+    dim3 output_grid((unsigned)D, (unsigned)S);
+    quant_matmul<<<hidden_grid, 256, 0, ctx->stream>>>(
+        ctx->gate, ctx->x, wg, reinterpret_cast<const float *>(sg),
+        7, S, D, I, grb, 32, (int)gng);
+    if (!cuda_ok(cudaGetLastError(), "MXFP4 gate launch")) return 0;
+    quant_matmul<<<hidden_grid, 256, 0, ctx->stream>>>(
+        ctx->up, ctx->x, wu, reinterpret_cast<const float *>(su),
+        7, S, D, I, grb, 32, (int)gng);
+    if (!cuda_ok(cudaGetLastError(), "MXFP4 up launch")) return 0;
+    const size_t n = (size_t)S * I;
+    silu_mul<<<(unsigned)((n + 255) / 256), 256, 0, ctx->stream>>>(ctx->gate, ctx->up, n);
+    if (!cuda_ok(cudaGetLastError(), "MXFP4 SwiGLU launch")) return 0;
+    quant_matmul<<<output_grid, 256, 0, ctx->stream>>>(
+        ctx->y, ctx->gate, wd, reinterpret_cast<const float *>(sd),
+        7, S, I, D, drb, 32, (int)dng);
+    if (!cuda_ok(cudaGetLastError(), "MXFP4 down launch") ||
+        !cuda_ok(cudaMemcpyAsync(ctx->host_y, ctx->y, yb, cudaMemcpyDeviceToHost, ctx->stream),
+                 "MXFP4 expert output download") ||
+        !cuda_ok(cudaStreamSynchronize(ctx->stream), "MXFP4 expert synchronize")) return 0;
+    std::memcpy(y, ctx->host_y, yb);
+    return 1;
 }
 
 extern "C" int coli_cuda_expert_mlp(ColiCudaTensor *gate, ColiCudaTensor *up,

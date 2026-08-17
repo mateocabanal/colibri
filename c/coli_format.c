@@ -1166,15 +1166,50 @@ const char *coli_package_compiler(const ColiPackage *p) { return p ? p->compiler
 const uint8_t *coli_package_source_fingerprint(const ColiPackage *p) { return p ? p->source_fingerprint : NULL; }
 uint32_t coli_package_record_alignment(const ColiPackage *p) { return p ? p->record_alignment : 0; }
 
-int coli_package_read_range(const ColiPackage *p, const ColiRecordInfo *r,
-                            uint64_t record_offset, void *destination, size_t bytes,
-                            char *error, size_t error_size) {
-    uint64_t end;
-    if (!p || !r || (!destination && bytes) || checked_add_u64(record_offset, bytes, &end) || end > r->stored_bytes || r->shard_id >= p->shard_count) {
+int coli_package_read_range_ex(const ColiPackage *p, const ColiRecordInfo *r,
+                               uint64_t record_offset, void *destination, size_t bytes,
+                               uint32_t read_flags, char *error, size_t error_size) {
+    uint64_t end, source_offset;
+    const ColiCsfShard *shard;
+    int fd, rc;
+    if (read_flags & ~COLI_CSF_READ_UNCACHED) {
+        csf_error(error, error_size, "unsupported COLI read flags 0x%x", read_flags);
+        return -1;
+    }
+    if (!p || !r || (!destination && bytes) ||
+        checked_add_u64(record_offset, bytes, &end) || end > r->stored_bytes ||
+        r->shard_id >= p->shard_count ||
+        checked_add_u64(r->payload_offset, record_offset, &source_offset)) {
         csf_error(error, error_size, "record range is invalid"); return -1;
     }
     if (!bytes) return 0;
-    return pread_full(p->shards[r->shard_id].fd, destination, bytes, r->payload_offset + record_offset, error, error_size);
+    shard = &p->shards[r->shard_id];
+    fd = shard->fd;
+#ifdef __APPLE__
+    /* F_NOCACHE has no alignment requirement, unlike Linux O_DIRECT, so the
+     * compiler's naturally ragged MXFP4 matrix spans can use it directly. */
+    if ((read_flags & COLI_CSF_READ_UNCACHED) && shard->direct_fd >= 0)
+        fd = shard->direct_fd;
+#endif
+    rc = pread_full(fd, destination, bytes, source_offset, error, error_size);
+#if !defined(__APPLE__) && !defined(_WIN32)
+    /* Arbitrary matrix subspans are not guaranteed to satisfy O_DIRECT's
+     * address/offset/length alignment. Keep correctness first and make the
+     * retention policy best-effort through DONTNEED instead. */
+    if (rc == 0 && (read_flags & COLI_CSF_READ_UNCACHED) &&
+        source_offset <= (uint64_t)INT64_MAX && bytes <= (size_t)(INT64_MAX - source_offset))
+        (void)posix_fadvise(shard->fd, (off_t)source_offset, (off_t)bytes, POSIX_FADV_DONTNEED);
+#else
+    (void)shard;
+#endif
+    return rc;
+}
+
+int coli_package_read_range(const ColiPackage *p, const ColiRecordInfo *r,
+                            uint64_t record_offset, void *destination, size_t bytes,
+                            char *error, size_t error_size) {
+    return coli_package_read_range_ex(p, r, record_offset, destination, bytes,
+                                      COLI_CSF_READ_DEFAULT, error, error_size);
 }
 
 int coli_package_read_record(const ColiPackage *p, const ColiRecordInfo *r,

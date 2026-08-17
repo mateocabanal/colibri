@@ -2,9 +2,10 @@ use std::{fs, io::Read, path::PathBuf};
 
 use crate::{
     error::{ColicError, Result},
-    ir::SemanticModel,
+    ir::{Architecture, SemanticModel},
     model::deepseek_v4::DeepSeekV4Frontend,
     model::qwen_moe::QwenMoeFrontend,
+    quant::mxfp4_record,
     source,
     storage::{self, LoweredRecord, ManifestRecord, StoragePlan},
     target, verify,
@@ -76,6 +77,12 @@ impl QuantRequest {
             Ok(Self::Profile(value.into()))
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExpertQuantization {
+    Exact,
+    Mxfp4,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -172,6 +179,28 @@ pub fn build_semantic_ir(inventory: &source::SourceInventory) -> Result<Option<S
     }
 }
 
+fn resolve_expert_quantization(
+    request: &CompileRequest,
+    model: &SemanticModel,
+) -> Result<ExpertQuantization> {
+    match &request.quant {
+        QuantRequest::Exact => Ok(ExpertQuantization::Exact),
+        QuantRequest::Profile(profile) if profile == "mxfp4" => {
+            if model.architecture != Architecture::Qwen3_5MoeMoE {
+                return Err(ColicError::unsupported(
+                    Stage::TargetPlanning.as_str(),
+                    "`--quant mxfp4` currently supports Qwen3.5/3.6/3.7 MoE routed experts only",
+                ));
+            }
+            Ok(ExpertQuantization::Mxfp4)
+        }
+        QuantRequest::Profile(profile) => Err(ColicError::unsupported(
+            Stage::TargetPlanning.as_str(),
+            format!("quantization profile `{profile}` is not implemented"),
+        )),
+    }
+}
+
 pub fn dry_run(request: &CompileRequest) -> Result<DryRunSummary> {
     validate_supported_options(request)?;
     let inventory = source::discover(&request.source)?;
@@ -181,8 +210,9 @@ pub fn dry_run(request: &CompileRequest) -> Result<DryRunSummary> {
             "no supported architecture frontend matched this source model",
         )
     })?;
+    let quantization = resolve_expert_quantization(request, &model)?;
     let target = target::resolve(&request.target, target::HostCapabilities::current())?;
-    let records = exact_record_inventory(&model)?;
+    let records = record_inventory(&model, quantization)?;
     let plan = storage::plan_records(&records, target, 4 * 1024 * 1024 * 1024)?;
     Ok(DryRunSummary {
         target_name: target.name,
@@ -194,6 +224,13 @@ pub fn dry_run(request: &CompileRequest) -> Result<DryRunSummary> {
 
 /// Stable v1 record order: globals, layer-static tensors, then pageable experts.
 pub fn exact_record_inventory(model: &SemanticModel) -> Result<Vec<LoweredRecord>> {
+    record_inventory(model, ExpertQuantization::Exact)
+}
+
+fn record_inventory(
+    model: &SemanticModel,
+    expert_quantization: ExpertQuantization,
+) -> Result<Vec<LoweredRecord>> {
     let mut records = Vec::new();
     let mut id = 1_u64;
     for tensor in model.global_tensors.values() {
@@ -207,12 +244,21 @@ pub fn exact_record_inventory(model: &SemanticModel) -> Result<Vec<LoweredRecord
         }
     }
     for expert in model.routed_experts.values() {
-        let payload_bytes = target::exact_expert_stored_bytes(expert)?;
+        let (stored_bytes, decoded_bytes) = match expert_quantization {
+            ExpertQuantization::Exact => (
+                target::exact_expert_stored_bytes(expert)?,
+                target::exact_expert_decoded_bytes(expert)?,
+            ),
+            ExpertQuantization::Mxfp4 => (
+                mxfp4_record::stored_bytes(expert)?,
+                mxfp4_record::resident_bytes(expert)?,
+            ),
+        };
         records.push(LoweredRecord {
             id,
             kind: 2,
-            stored_bytes: payload_bytes,
-            decoded_bytes: target::exact_expert_decoded_bytes(expert)?,
+            stored_bytes,
+            decoded_bytes,
         });
         id = next_record_id(id)?;
     }
@@ -378,10 +424,13 @@ enum ExactSource {
         layer: i32,
         tensor: source::TensorRef,
     },
-    Expert(Box<crate::ir::RoutedExpert>),
+    Expert {
+        expert: Box<crate::ir::RoutedExpert>,
+        quantization: ExpertQuantization,
+    },
 }
 
-fn exact_sources(model: &SemanticModel) -> Vec<ExactSource> {
+fn exact_sources(model: &SemanticModel, expert_quantization: ExpertQuantization) -> Vec<ExactSource> {
     let mut sources = Vec::new();
     sources.extend(
         model
@@ -400,13 +449,12 @@ fn exact_sources(model: &SemanticModel) -> Vec<ExactSource> {
             tensor: tensor.clone(),
         }));
     }
-    sources.extend(
-        model
-            .routed_experts
-            .values()
-            .cloned()
-            .map(|expert| ExactSource::Expert(Box::new(expert))),
-    );
+    sources.extend(model.routed_experts.values().cloned().map(|expert| {
+        ExactSource::Expert {
+            expert: Box::new(expert),
+            quantization: expert_quantization,
+        }
+    }));
     sources.extend(
         model
             .resident_tensors
@@ -452,12 +500,26 @@ fn stream_payload(
                 codec_table_id: 0,
             })
         }
-        ExactSource::Expert(expert) => {
-            let mut crc = 0;
-            writer.write_record_stream(planned, |file| {
-                crc = target::stream_exact_expert(expert, file)?;
-                Ok(planned.record.stored_bytes)
-            })?;
+        ExactSource::Expert {
+            expert,
+            quantization,
+        } => {
+            let crc = match quantization {
+                ExpertQuantization::Exact => {
+                    let mut crc = 0;
+                    writer.write_record_stream(planned, |file| {
+                        crc = target::stream_exact_expert(expert, file)?;
+                        Ok(planned.record.stored_bytes)
+                    })?;
+                    crc
+                }
+                ExpertQuantization::Mxfp4 => {
+                    let bytes = mxfp4_record::lower_expert(expert)?;
+                    let crc = storage::crc32c(&bytes);
+                    writer.write_record(planned, &bytes)?;
+                    crc
+                }
+            };
             Ok(ManifestRecord {
                 id: planned.record.id,
                 name: Some(format!(
@@ -547,6 +609,7 @@ pub fn compile(request: &CompileRequest, progress: &mut dyn ProgressSink) -> Res
             "no supported architecture frontend matched this source model",
         )
     })?;
+    let expert_quantization = resolve_expert_quantization(request, &model)?;
     progress.stage(Stage::TargetPlanning);
     let target = target::resolve(&request.target, target::HostCapabilities::current())?;
     let output = request
@@ -554,8 +617,8 @@ pub fn compile(request: &CompileRequest, progress: &mut dyn ProgressSink) -> Res
         .as_ref()
         .ok_or_else(|| ColicError::Usage("compile requires an output package path".into()))?;
     progress.stage(Stage::StoragePlanning);
-    let sources = exact_sources(&model);
-    let records = exact_record_inventory(&model)?;
+    let sources = exact_sources(&model, expert_quantization);
+    let records = record_inventory(&model, expert_quantization)?;
     let plan = storage::plan_records(&records, target, 4 * 1024 * 1024 * 1024)?;
     let fingerprint = source::fingerprint_bytes(&inventory.source_fingerprint)?;
     let temporary = storage::temporary_package_path(output)?;
@@ -635,11 +698,15 @@ pub fn compile(request: &CompileRequest, progress: &mut dyn ProgressSink) -> Res
 }
 
 fn validate_supported_options(request: &CompileRequest) -> Result<()> {
-    if !matches!(request.quant, QuantRequest::Exact) {
-        return Err(ColicError::unsupported(
-            Stage::TargetPlanning.as_str(),
-            "quantization profiles are not implemented; use `--quant exact`",
-        ));
+    match &request.quant {
+        QuantRequest::Exact => {}
+        QuantRequest::Profile(profile) if profile == "mxfp4" => {}
+        QuantRequest::Profile(profile) => {
+            return Err(ColicError::unsupported(
+                Stage::TargetPlanning.as_str(),
+                format!("quantization profile `{profile}` is not implemented"),
+            ));
+        }
     }
     if !matches!(request.codec, CodecRequest::None) {
         return Err(ColicError::unsupported(
@@ -874,6 +941,66 @@ mod tests {
     }
 
     #[test]
+    fn mxfp4_inventory_reduces_qwen_expert_resident_bytes() {
+        let matrix = Matrix {
+            source: TensorRef {
+                source: "fixture.safetensors".into(),
+                offset: 0,
+                len: 2 * 2 * 32,
+                dtype: "BF16".into(),
+                shape: vec![2, 32],
+            },
+            rows: 2,
+            columns: 32,
+            scale: None,
+        };
+        let mut experts = BTreeMap::new();
+        experts.insert(
+            (0, 0),
+            RoutedExpert {
+                layer: 0,
+                expert: 0,
+                gate: matrix.clone(),
+                up: matrix.clone(),
+                down: matrix,
+            },
+        );
+        let model = SemanticModel {
+            architecture: Architecture::Qwen3_5MoeMoE,
+            geometry: ModelGeometry {
+                hidden_size: 32,
+                layers: 1,
+                routed_experts_per_layer: 1,
+                moe_intermediate_size: 2,
+                vocab_size: 1,
+                hc_mult: 0,
+                num_hash_layers: 0,
+                experts_per_token: 1,
+                attention_heads: 1,
+                head_dim: 32,
+                num_key_value_heads: 1,
+                linear_key_head_dim: 0,
+                q_lora_rank: 0,
+                o_groups: 0,
+                o_lora_rank: 0,
+                index_heads: 0,
+                index_head_dim: 0,
+                compression_ratios: Vec::new(),
+            },
+            routed_experts: experts,
+            global_tensors: BTreeMap::new(),
+            layer_static_tensors: BTreeMap::new(),
+            resident_tensors: BTreeMap::new(),
+        };
+        let exact = record_inventory(&model, ExpertQuantization::Exact).unwrap();
+        let mxfp4 = record_inventory(&model, ExpertQuantization::Mxfp4).unwrap();
+        assert_eq!(exact.len(), 1);
+        assert_eq!(mxfp4.len(), 1);
+        assert!(mxfp4[0].decoded_bytes < exact[0].decoded_bytes);
+        assert!(mxfp4[0].stored_bytes < exact[0].stored_bytes);
+    }
+
+    #[test]
     fn json_metadata_copy_omits_source_weight_indexes() {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -976,7 +1103,7 @@ mod tests {
             Err(ColicError::Unsupported { .. })
         ));
         request.codec = CodecRequest::None;
-        request.quant = QuantRequest::Profile("mxfp4".into());
+        request.quant = QuantRequest::Profile("not-a-format".into());
         assert!(matches!(
             dry_run(&request),
             Err(ColicError::Unsupported { .. })

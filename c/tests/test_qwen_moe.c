@@ -301,7 +301,69 @@ static void test_arena_plan(void){
 	CHECK(n == 65, "65 distinct planned: %d", n);
 }
 
+
+static void test_mxfp4_expert_dispatch(void){
+    Model m;
+    Slot s;
+    ColiMxfp4ExpertLayout layout = {
+        .gate_weight_bytes = 2, .gate_scale_bytes = 2,
+        .up_weight_bytes = 2, .up_scale_bytes = 2,
+        .down_weight_bytes = 2, .down_scale_bytes = 2,
+        .resident_bytes = 12,
+    };
+    memset(&m, 0, sizeof(m));
+    memset(&s, 0, sizeof(s));
+    m.c.hidden = 2;
+    m.c.moe_inter = 2;
+    slot_alloc_mxfp4(&s, &layout);
+    CHECK(s.fmt == 7, "MXFP4 slot format is %d, want 7", s.fmt);
+    CHECK(s.mxu == s.mxg + 2 && s.mxd == s.mxg + 4,
+          "MXFP4 weight spans are not contiguous");
+    CHECK(s.mxus == s.mxgs + 2 && s.mxds == s.mxgs + 4,
+          "MXFP4 scale spans are not contiguous");
+
+    /* E2M1 code 2 is +1.0; low nibble is the even column. Three identity
+     * matrices make expert_apply(x) = silu(x) * x elementwise. */
+    const uint8_t ident[2] = { 0x02, 0x20 };
+    memcpy(s.mxg, ident, 2); memcpy(s.mxu, ident, 2); memcpy(s.mxd, ident, 2);
+    memset(s.mxgs, 127, 2); memset(s.mxus, 127, 2); memset(s.mxds, 127, 2);
+    float x[2] = { 1.f, 2.f }, out[2] = { 0.f, 0.f };
+    expert_apply(&m, &s, x, out);
+    float want0 = silu(1.f), want1 = silu(2.f) * 2.f;
+    CHECK(fabsf(out[0] - want0) < 1e-5f,
+          "MXFP4 dispatch out[0]=%g want %g", out[0], want0);
+    CHECK(fabsf(out[1] - want1) < 1e-5f,
+          "MXFP4 dispatch out[1]=%g want %g", out[1], want1);
+    free(s.mxg); free(s.mxgs);
+}
+
+
+static void test_slot_resident_bytes(void){
+    Cfg c; Slot s;
+    memset(&c, 0, sizeof(c)); memset(&s, 0, sizeof(s));
+    c.hidden = 65; c.moe_inter = 33;
+    const uint64_t D = 65, I = 33;
+
+    s.fmt = 7;
+    uint64_t mx_weights = 2u * I * ((D + 1u) / 2u) + D * ((I + 1u) / 2u);
+    uint64_t mx_scales = 2u * I * ((D + 31u) / 32u) + D * ((I + 31u) / 32u);
+    CHECK(qwen_slot_resident_bytes(&c, &s) == mx_weights + mx_scales,
+          "MXFP4 slot residency bytes mismatch: got %llu want %llu",
+          (unsigned long long)qwen_slot_resident_bytes(&c, &s),
+          (unsigned long long)(mx_weights + mx_scales));
+
+    s.fmt = 16;
+    CHECK(qwen_slot_resident_bytes(&c, &s) == 3u * D * I * 2u,
+          "BF16 slot residency bytes mismatch");
+
+    s.fmt = 8;
+    CHECK(qwen_slot_resident_bytes(&c, &s) == 3u * D * I + (2u * I + D) * 4u,
+          "q8 slot residency bytes mismatch");
+}
+
 int main(void){
+    test_slot_resident_bytes();
+    test_mxfp4_expert_dispatch();
 	test_padded_vocab_selection();
 	test_lifetime_exits();
 	test_hostile_shapes();
