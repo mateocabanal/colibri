@@ -67,6 +67,7 @@
 #endif
 #include "omp_tune.h"
 #include "route_trace.h"
+#include "qwen_prefix_cache.h"
 #ifdef COLI_METALIO
 #include "metalio.h"
 #endif
@@ -290,6 +291,7 @@ typedef struct {
     int kv_len, max_t;
     float **gdn_S;                 /* [n_layers][v_heads*k_dim*v_dim] state */
     float **gdn_conv;              /* [n_layers][conv_dim*(k-1)] conv state */
+    QwenPrefixCache prefix_cache;  /* exact end-of-prefill hybrid snapshots */
     uint32_t **freq;               /* route_trace heatmap alias */
     int hot_pinned, hot_n, warmup_tokens, token_count;
     uint8_t *is_pinned;            /* [n_layers*n_experts] */
@@ -366,6 +368,22 @@ static uint16_t f32_to_f16(float x){
 }
 
 static int g_kv_f16 = 1;             /* QWEN_KV_F16=0 disables (f32 KV) */
+
+static QwenPrefixStateView qwen_prefix_state_view(Model *m){
+    QwenPrefixStateView view = {
+        .layer_count = m->c.n_layers,
+        .layer_is_gdn = m->c.layer_is_gdn,
+        .n_kv_heads = m->c.n_kv_heads,
+        .head_dim = m->c.head_dim,
+        .max_t = m->max_t,
+        .kv_f16 = g_kv_f16,
+        .K = m->K, .V = m->V, .K16 = m->K16, .V16 = m->V16,
+        .gdn_S = m->gdn_S, .gdn_conv = m->gdn_conv,
+        .gdn_state_elems = gdn_state_count(&m->c),
+        .gdn_conv_elems = gdn_conv_count(&m->c),
+    };
+    return view;
+}
 
 static void kv_store_row(Model *m, int layer, int g, int pos, const float *row, int hd){
     int64_t off = ((int64_t)g * m->max_t + pos) * hd;
@@ -3094,13 +3112,12 @@ static int mode_chat(Model *m, Tok *T){
  * full above its own SUBMIT handling) so the shared openai_server.py gateway
  * drives this engine unchanged.
  *
- * v1 scope, same as olmoe: one request in flight, full re-prefill every turn,
- * no cross-request KV reuse. The payload arrives already rendered by
- * openai_server.py's render_chat_qwen — this engine tokenizes it as-is.
- * Expert-cache contents, route counts, and immutable weights persist.  Before
- * each prefill we clear GDN recurrence/conv state; KV storage need not be
- * cleared because position-zero prefill overwrites every position attention
- * reads for the new request. */
+ * One request is in flight at a time. With QWEN_PREFIX_CACHE_MB>0, exact
+ * end-of-prefill snapshots can reuse the longest strict token prefix across
+ * requests; snapshots include both full-attention KV and GDN recurrence/conv
+ * state. A miss keeps the old full re-prefill behavior. The payload arrives
+ * already rendered by openai_server.py's render_chat_qwen and is tokenized
+ * as-is. Expert-cache contents, route counts, and immutable weights persist. */
 typedef struct { char id[64]; int max_tok; float temp, top_p; char *payload; int plen; } SReq;
 #define SRV_QMAX 16
 static SReq g_q[SRV_QMAX]; static int g_qn = 0;
@@ -3152,8 +3169,14 @@ static void serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
      * long prefill no longer looks like a dead client and draws a spurious
      * CANCEL that would arrive mid-turn and truncate the reply. */
     printf("ACCEPT %s %d\n", q->id, np); fflush(stdout);
-    request_state_reset(m);
-    float *logit = step(m, ids, np, 0);
+    QwenPrefixStateView prefix_view = qwen_prefix_state_view(m);
+    int prefix_reused = qwen_prefix_cache_restore(&m->prefix_cache,
+                                                   &prefix_view, ids, np);
+    if (!prefix_reused) request_state_reset(m);
+    float *logit = step(m, ids + prefix_reused, np - prefix_reused,
+                        prefix_reused);
+    /* Capture before decode advances the live state past the prompt. */
+    qwen_prefix_cache_store(&m->prefix_cache, &prefix_view, ids, np);
     int hist_len = np, gen = 0, limited = 1, cancelled = 0;
     char buf[512];
     for (int s = 0; s < q->max_tok && !cancelled; s++) {
@@ -3513,6 +3536,7 @@ int main(int argc, char **argv){
         metalio_shutdown();
     }
 #endif
+    qwen_prefix_cache_clear(&m.prefix_cache);
     tok_free(&T);
     return rc;
 }

@@ -742,7 +742,7 @@ olmoe$(EXE): olmoe.c st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unico
 # (QWEN_METAL_IO=1) for async expert streaming — CPU compute reads the
 # shared-storage buffers in place; MetalIO is never mandatory.
 QMOE_COLI_OBJS = coli_executor.o coli_format.o
-qwen_moe$(EXE): qwen_moe.c st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h $(QMOE_COLI_OBJS) $(MIO_OBJ) $(METAL_OBJ)
+qwen_moe$(EXE): qwen_moe.c qwen_prefix_cache.h st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h $(QMOE_COLI_OBJS) $(MIO_OBJ) $(METAL_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $(MIO_CFLAGS) qwen_moe.c $(QMOE_COLI_OBJS) $(MIO_OBJ) $(METAL_OBJ) -o qwen_moe$(EXE) $(NOCUDA_LDFLAGS) $(MIO_LDFLAGS) $(filter -framework Metal -framework Foundation -lc++,$(LDFLAGS))
 
 inkling$(EXE): inkling.c st.h json.h compat.h $(INK_CUDA_OBJ) $(METAL_OBJ)
