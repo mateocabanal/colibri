@@ -101,6 +101,11 @@ static inline uint64_t coli_v4_residency_candidate_value(
         : candidate->expected_bytes_avoided;
 }
 
+static inline uint64_t coli_v4_residency_saturating_add(uint64_t a,
+                                                        uint64_t b) {
+    return UINT64_MAX - a < b ? UINT64_MAX : a + b;
+}
+
 /* Deterministic greedy optional-residency allocator.
  *
  * Mandatory runtime/KV/scratch and the minimum transient expert pool are
@@ -169,9 +174,15 @@ static inline int coli_v4_residency_select(
         const ColiV4ResidencyCandidate *chosen = &candidates[best];
         selected[best] = 1;
         remaining -= chosen->resident_bytes;
+        /* Resident accounting is bounded by `budget_bytes`; expected-benefit
+         * telemetry is advisory and saturates rather than wrapping on extreme
+         * synthetic/fuzz inputs. */
         out->selected_resident_bytes += chosen->resident_bytes;
-        out->expected_bytes_avoided += chosen->expected_bytes_avoided;
-        out->expected_exposed_ns_avoided += chosen->expected_exposed_ns_avoided;
+        out->expected_bytes_avoided = coli_v4_residency_saturating_add(
+            out->expected_bytes_avoided, chosen->expected_bytes_avoided);
+        out->expected_exposed_ns_avoided = coli_v4_residency_saturating_add(
+            out->expected_exposed_ns_avoided,
+            chosen->expected_exposed_ns_avoided);
         out->selected_count++;
     }
     return 0;
