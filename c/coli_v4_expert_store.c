@@ -572,7 +572,8 @@ int coli_v4_coli_expert_store_open(const ColiV4ColiExpertStoreOptions *o,
     if (max_slots > s->experts) max_slots = s->experts;
 
     int loader_lanes = env_int("V4_LOADER_LANES", 3, 1, 16);
-    int min_slots = env_int("V4_TRANSIENT_EXPERT_SLOTS", loader_lanes, 1, 16);
+    int default_floor = loader_lanes < 16 ? loader_lanes + 1 : 16;
+    int min_slots = env_int("V4_TRANSIENT_EXPERT_SLOTS", default_floor, 1, 16);
     if (min_slots > max_slots) min_slots = max_slots;
 
     uint64_t min_expert_bytes = (uint64_t)min_slots * per_layer_slot_bytes;
