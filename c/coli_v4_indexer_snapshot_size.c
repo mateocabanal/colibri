@@ -2,11 +2,10 @@
 #define _GNU_SOURCE
 #endif
 
-#include "deepseek_v4_internal.h"
-#include "coli_v4_prefix_cache.h"
-
-/* Existing implementation + private-layout byte accounting. */
+/* Keep the unit's symbol-remapping include order intact; private snapshot
+ * layout is visible after the amalgamated unit has compiled. */
 #include "deepseek_v4.c"
+#include "coli_v4_prefix_cache.h"
 
 size_t coli_v4_indexer_snapshot_bytes(const ColiV4IndexerSnapshot *snapshot) {
     if (!snapshot) return 0;
