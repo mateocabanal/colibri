@@ -1,6 +1,6 @@
 //! Target-independent semantic model representation.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, path::PathBuf};
 
 use crate::source::TensorRef;
 
@@ -8,6 +8,38 @@ use crate::source::TensorRef;
 pub enum Architecture {
     DeepSeekV4Flash,
     Qwen3_5MoeMoE,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MathFormat {
+    Fp8E4M3,
+    MxFp4E2M1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceRepresentation {
+    NativeFp8,
+    PackedMxFp4Nibbles,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScaleFormat {
+    Ue8m0,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Quantization {
+    pub math_format: MathFormat,
+    pub source_representation: SourceRepresentation,
+    pub scale_format: ScaleFormat,
+    pub scale_block_rows: u32,
+    pub scale_block_columns: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Activation {
+    /// DeepSeek routed experts compute SiLU(gate) * up before the down projection.
+    SwiGlu,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,6 +70,9 @@ pub struct Matrix {
     pub rows: u32,
     pub columns: u32,
     pub scale: Option<TensorRef>,
+    /// Semantic quantization contract. Target lowering must use this rather
+    /// than rediscovering the relationship from Hugging Face tensor names.
+    pub quantization: Quantization,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,6 +82,13 @@ pub struct RoutedExpert {
     pub gate: Matrix,
     pub up: Matrix,
     pub down: Matrix,
+    pub activation: Activation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ModelAssets {
+    pub config: Option<PathBuf>,
+    pub tokenizer: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,7 +101,8 @@ pub struct SemanticModel {
     /// Per-layer static execution roles, keyed by layer then canonical role name.
     /// Routed experts are stored separately because they are independently pageable.
     pub layer_static_tensors: BTreeMap<u32, BTreeMap<String, TensorRef>>,
-    /// Non-expert source tensors retained as target-independent static roles
-    /// until detailed attention classification is added.
+    /// Must be empty for a fully classified supported architecture. Kept as a
+    /// diagnostic channel so inspect-source can report the classification invariant.
     pub resident_tensors: BTreeMap<String, TensorRef>,
+    pub assets: ModelAssets,
 }

@@ -21,6 +21,7 @@ pub struct CompileRequest {
     pub dry_run: bool,
     pub verify: bool,
     pub force: bool,
+    pub shard_size_bytes: u64,
 }
 
 impl CompileRequest {
@@ -35,6 +36,7 @@ impl CompileRequest {
             dry_run: false,
             verify: false,
             force: false,
+            shard_size_bytes: 4 * 1024 * 1024 * 1024,
         }
     }
 }
@@ -183,7 +185,7 @@ pub fn dry_run(request: &CompileRequest) -> Result<DryRunSummary> {
     })?;
     let target = target::resolve(&request.target, target::HostCapabilities::current())?;
     let records = exact_record_inventory(&model)?;
-    let plan = storage::plan_records(&records, target, 4 * 1024 * 1024 * 1024)?;
+    let plan = storage::plan_records(&records, target, request.shard_size_bytes)?;
     Ok(DryRunSummary {
         target_name: target.name,
         source_tensors: inventory.tensors.len(),
@@ -424,6 +426,7 @@ fn stream_payload(
     writer: &mut storage::DataShardWriter,
     planned: &storage::PlannedRecord,
     source: &ExactSource,
+    profile: target::TargetProfile,
 ) -> Result<ManifestRecord> {
     match source {
         ExactSource::Tensor {
@@ -433,7 +436,7 @@ fn stream_payload(
         } => {
             let mut checksums = (0, 0);
             writer.write_record_stream(planned, |file| {
-                checksums = target::stream_exact_tensor(tensor, file)?;
+                checksums = target::stream_target_tensor(tensor, file)?;
                 Ok(planned.record.stored_bytes)
             })?;
             Ok(ManifestRecord {
@@ -445,7 +448,7 @@ fn stream_payload(
                 codec: 0,
                 math_format: target::math_format_for_dtype(&tensor.dtype)?,
                 scale_format: 0,
-                layout: 0,
+                layout: target::identity::for_profile(profile)?.linear_layout,
                 flags: 0b10,
                 stored_crc32c: checksums.1,
                 logical_crc32c: checksums.0,
@@ -455,7 +458,7 @@ fn stream_payload(
         ExactSource::Expert(expert) => {
             let mut crc = 0;
             writer.write_record_stream(planned, |file| {
-                crc = target::stream_exact_expert(expert, file)?;
+                crc = target::stream_target_expert(profile, expert, file)?;
                 Ok(planned.record.stored_bytes)
             })?;
             Ok(ManifestRecord {
@@ -556,7 +559,7 @@ pub fn compile(request: &CompileRequest, progress: &mut dyn ProgressSink) -> Res
     progress.stage(Stage::StoragePlanning);
     let sources = exact_sources(&model);
     let records = exact_record_inventory(&model)?;
-    let plan = storage::plan_records(&records, target, 4 * 1024 * 1024 * 1024)?;
+    let plan = storage::plan_records(&records, target, request.shard_size_bytes)?;
     let fingerprint = source::fingerprint_bytes(&inventory.source_fingerprint)?;
     let temporary = storage::temporary_package_path(output)?;
     progress.stage(Stage::Emission);
@@ -566,7 +569,7 @@ pub fn compile(request: &CompileRequest, progress: &mut dyn ProgressSink) -> Res
         let mut completed_bytes = 0_u64;
         for shard_id in 0..plan.shards {
             let path = temporary.join(format!("data-{shard_id:05}.coli"));
-            let mut writer = storage::DataShardWriter::create(
+            let mut writer = storage::DataShardWriter::create_v11(
                 &path,
                 shard_id,
                 plan.record_alignment,
@@ -579,7 +582,7 @@ pub fn compile(request: &CompileRequest, progress: &mut dyn ProgressSink) -> Res
                 .filter(|(_, record)| record.shard_id == shard_id)
             {
                 let source = &sources[index];
-                let manifest = stream_payload(&mut writer, planned, source)?;
+                let manifest = stream_payload(&mut writer, planned, source, target)?;
                 completed_bytes += planned.record.stored_bytes;
                 metadata.push(manifest);
                 progress.emission(
@@ -603,12 +606,17 @@ pub fn compile(request: &CompileRequest, progress: &mut dyn ProgressSink) -> Res
                 })?;
             header_crcs.push(u32::from_le_bytes(header[72..76].try_into().unwrap()));
         }
-        let manifest = storage::encode_manifest_with_records(
+        let profile_data = storage::v11::storage_profile_data(request.shard_size_bytes);
+        let manifest = storage::v11::encode_manifest(
             &plan,
-            target.name,
+            target,
             fingerprint,
             &metadata,
             &header_crcs,
+            storage::v11::ArtifactOptions {
+                profile_data: &profile_data,
+                ..storage::v11::ArtifactOptions::default()
+            },
         )?;
         let manifest_path = temporary.join("manifest.coli");
         fs::write(&manifest_path, manifest).map_err(|source| ColicError::Io {
@@ -622,19 +630,31 @@ pub fn compile(request: &CompileRequest, progress: &mut dyn ProgressSink) -> Res
         let _ = fs::remove_dir_all(&temporary);
         return Err(error);
     }
+    if let Err(error) = verify::verify_package_structure(&temporary) {
+        let _ = fs::remove_dir_all(&temporary);
+        return Err(error);
+    }
+    if request.verify {
+        progress.stage(Stage::Verification);
+        if let Err(error) = verify::verify_package(&temporary) {
+            let _ = fs::remove_dir_all(&temporary);
+            return Err(error);
+        }
+    }
     if request.force {
         storage::replace_package(&temporary, output)
     } else {
         storage::publish_package(&temporary, output)
     }?;
-    if request.verify {
-        progress.stage(Stage::Verification);
-        let _summary = verify::verify_package(output)?;
-    }
     Ok(())
 }
 
 fn validate_supported_options(request: &CompileRequest) -> Result<()> {
+    if request.shard_size_bytes == 0 {
+        return Err(ColicError::Usage(
+            "shard size must be greater than zero".into(),
+        ));
+    }
     if !matches!(request.quant, QuantRequest::Exact) {
         return Err(ColicError::unsupported(
             Stage::TargetPlanning.as_str(),
@@ -666,7 +686,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        ir::{Architecture, Matrix, ModelGeometry, RoutedExpert},
+        ir::{
+            Activation, Architecture, MathFormat, Matrix, ModelAssets, ModelGeometry, Quantization,
+            RoutedExpert, ScaleFormat, SourceRepresentation,
+        },
         source::TensorRef,
     };
 
@@ -709,16 +732,16 @@ mod tests {
             specs.insert(name, (dtype, shape));
         };
         for expert in 0..2 {
-            for (role, shape) in [("w1", vec![3, 2]), ("w2", vec![2, 3]), ("w3", vec![3, 2])] {
+            for (role, rows, columns) in [("w1", 3_u64, 2_u64), ("w2", 2, 3), ("w3", 3, 2)] {
                 add(
                     format!("layers.0.ffn.experts.{expert}.{role}.weight"),
-                    "F8_E4M3FN",
-                    shape,
+                    "I8",
+                    vec![rows, columns.div_ceil(2)],
                 );
                 add(
                     format!("layers.0.ffn.experts.{expert}.{role}.scale"),
                     "F8_E8M0",
-                    vec![1, 1],
+                    vec![rows, columns.div_ceil(32)],
                 );
             }
         }
@@ -790,7 +813,7 @@ mod tests {
         let mut payload = Vec::new();
         for (name, (dtype, shape)) in specs {
             let size = match dtype {
-                "U8" | "F8_E4M3FN" | "F8_E8M0" => 1,
+                "U8" | "I8" | "F8_E4M3FN" | "F8_E8M0" => 1,
                 "BF16" => 2,
                 "F32" => 4,
                 "I64" => 8,
@@ -815,6 +838,13 @@ mod tests {
             rows: 1,
             columns: 1,
             scale: None,
+            quantization: Quantization {
+                math_format: MathFormat::MxFp4E2M1,
+                source_representation: SourceRepresentation::PackedMxFp4Nibbles,
+                scale_format: ScaleFormat::Ue8m0,
+                scale_block_rows: 1,
+                scale_block_columns: 32,
+            },
         };
         let mut globals = BTreeMap::new();
         globals.insert("embed.weight".into(), tensor(2));
@@ -832,6 +862,7 @@ mod tests {
                 gate: matrix.clone(),
                 up: matrix.clone(),
                 down: matrix,
+                activation: Activation::SwiGlu,
             },
         );
         let model = SemanticModel {
@@ -860,6 +891,7 @@ mod tests {
             global_tensors: globals,
             layer_static_tensors: layers,
             resident_tensors: BTreeMap::new(),
+            assets: ModelAssets::default(),
         };
         let records = exact_record_inventory(&model).unwrap();
         assert_eq!(

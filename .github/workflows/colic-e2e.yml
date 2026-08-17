@@ -1,0 +1,25 @@
+name: colic end-to-end
+
+on:
+  pull_request:
+    branches:
+      - main
+      - dev
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: colic-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compiled-fixture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run source-to-kernel compiled-path gate
+        shell: bash
+        run: bash tools/colic_e2e.sh

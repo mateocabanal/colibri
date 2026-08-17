@@ -1,0 +1,75 @@
+name: CSF target reader
+
+on:
+  pull_request:
+    paths:
+      - 'c/coli_format.c'
+      - 'c/coli_format.h'
+      - 'c/coli_exec_format.c'
+      - 'c/coli_exec_format.h'
+      - 'c/coli_target.c'
+      - 'c/coli_target.h'
+      - 'c/coli_target_profiles.c'
+      - 'c/coli_target_profiles.h'
+      - 'c/Makefile.csf'
+      - 'c/tests/test_coli_target.c'
+      - 'c/tests/test_coli_target_profiles.c'
+      - 'c/tests/fixtures/csf-v1-targets/**'
+      - 'docs/coli-serving-format-v1.md'
+      - 'docs/coli-serving-format-v1.1-target-identity.md'
+      - 'docs/coli-target-profiles-v1.md'
+      - '.github/workflows/csf-target-reader.yml'
+  workflow_dispatch:
+
+jobs:
+  target-reader:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Construct independent v1.1 fixtures
+        run: python c/tests/fixtures/csf-v1-targets/make_fixtures.py --output "$RUNNER_TEMP/csf-v1-targets"
+      - name: Existing v1.0 reader regression
+        run: make -C c -f Makefile.csf test
+      - name: Target identity and compatibility
+        run: >-
+          make -C c -f Makefile.csf test-target
+          APPLE_FIXTURE="$RUNNER_TEMP/csf-v1-targets/apple"
+          CUDA_FIXTURE="$RUNNER_TEMP/csf-v1-targets/linux-cuda-sm89"
+      - name: Target ASan + UBSan
+        run: >-
+          make -C c -f Makefile.csf test-target-asan
+          APPLE_FIXTURE="$RUNNER_TEMP/csf-v1-targets/apple"
+          CUDA_FIXTURE="$RUNNER_TEMP/csf-v1-targets/linux-cuda-sm89"
+
+  target-reader-windows:
+    name: target-reader (Windows UCRT64)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: false
+          install: >-
+            make
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-python
+      - name: Construct independent v1.1 fixtures
+        run: python c/tests/fixtures/csf-v1-targets/make_fixtures.py --output "$RUNNER_TEMP/csf-v1-targets"
+      - name: Existing v1.0 reader regression
+        run: make -C c -f Makefile.csf test
+      - name: Target identity and compatibility
+        run: >-
+          make -C c -f Makefile.csf test-target
+          APPLE_FIXTURE="$RUNNER_TEMP/csf-v1-targets/apple"
+          CUDA_FIXTURE="$RUNNER_TEMP/csf-v1-targets/linux-cuda-sm89"

@@ -1,5 +1,7 @@
 //! Deterministic physical record planning and artifact publication.
 
+pub mod v11;
+
 use std::{
     fs::{self, File},
     io::{Seek, SeekFrom, Write},
@@ -169,13 +171,42 @@ pub fn encode_data_shard_header(
     record_alignment: u64,
     source_fingerprint: [u8; 32],
 ) -> Result<[u8; DATA_SHARD_HEADER_BYTES as usize]> {
+    encode_data_shard_header_version(
+        shard_id,
+        file_bytes,
+        record_alignment,
+        source_fingerprint,
+        0,
+    )
+}
+pub fn encode_data_shard_header_v11(
+    shard_id: u32,
+    file_bytes: u64,
+    record_alignment: u64,
+    source_fingerprint: [u8; 32],
+) -> Result<[u8; DATA_SHARD_HEADER_BYTES as usize]> {
+    encode_data_shard_header_version(
+        shard_id,
+        file_bytes,
+        record_alignment,
+        source_fingerprint,
+        1,
+    )
+}
+fn encode_data_shard_header_version(
+    shard_id: u32,
+    file_bytes: u64,
+    record_alignment: u64,
+    source_fingerprint: [u8; 32],
+    minor: u16,
+) -> Result<[u8; DATA_SHARD_HEADER_BYTES as usize]> {
     let alignment: u32 = record_alignment
         .try_into()
         .map_err(|_| ColicError::Usage("record alignment cannot fit COLI v1 data header".into()))?;
     let mut header = [0_u8; DATA_SHARD_HEADER_BYTES as usize];
     header[0..8].copy_from_slice(DATA_MAGIC);
     put_u16(&mut header, 8, 1);
-    put_u16(&mut header, 10, 0);
+    put_u16(&mut header, 10, minor);
     put_u32(&mut header, 12, DATA_SHARD_HEADER_BYTES as u32);
     put_u32(&mut header, 20, shard_id);
     put_u32(&mut header, 24, alignment);
@@ -458,6 +489,7 @@ pub struct DataShardWriter {
     shard_id: u32,
     alignment: u64,
     source_fingerprint: [u8; 32],
+    minor: u16,
     file: File,
     file_bytes: u64,
 }
@@ -469,6 +501,23 @@ impl DataShardWriter {
         alignment: u64,
         source_fingerprint: [u8; 32],
     ) -> Result<Self> {
+        Self::create_version(path, shard_id, alignment, source_fingerprint, 0)
+    }
+    pub fn create_v11(
+        path: &Path,
+        shard_id: u32,
+        alignment: u64,
+        source_fingerprint: [u8; 32],
+    ) -> Result<Self> {
+        Self::create_version(path, shard_id, alignment, source_fingerprint, 1)
+    }
+    fn create_version(
+        path: &Path,
+        shard_id: u32,
+        alignment: u64,
+        source_fingerprint: [u8; 32],
+        minor: u16,
+    ) -> Result<Self> {
         let file = File::create(path).map_err(|source| ColicError::Io {
             path: path.to_owned(),
             source,
@@ -478,6 +527,7 @@ impl DataShardWriter {
             shard_id,
             alignment,
             source_fingerprint,
+            minor,
             file,
             file_bytes: align_up(DATA_SHARD_HEADER_BYTES, alignment)?,
         })
@@ -548,11 +598,12 @@ impl DataShardWriter {
                 path: self.path.clone(),
                 source,
             })?;
-        let header = encode_data_shard_header(
+        let header = encode_data_shard_header_version(
             self.shard_id,
             self.file_bytes,
             self.alignment,
             self.source_fingerprint,
+            self.minor,
         )?;
         self.file
             .seek(SeekFrom::Start(0))

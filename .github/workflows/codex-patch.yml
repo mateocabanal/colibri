@@ -1,0 +1,37 @@
+name: compiler contract validation
+
+on:
+  push:
+    branches: [codex/compiler-contracts-p0]
+    paths:
+      - '.github/workflows/codex-patch.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Rust compiler tests
+        run: cargo test --locked --manifest-path colic/Cargo.toml --all-targets
+      - name: Rust formatting
+        run: cargo fmt --manifest-path colic/Cargo.toml -- --check
+      - name: Existing reader and target-profile tests
+        run: make -C c -f Makefile.csf test
+      - name: Construct independent v1.1 fixtures
+        run: python c/tests/fixtures/csf-v1-targets/make_fixtures.py --output "$RUNNER_TEMP/csf-v1-targets"
+      - name: Strict target identity compatibility tests
+        run: >-
+          make -C c -f Makefile.csf test-target
+          APPLE_FIXTURE="$RUNNER_TEMP/csf-v1-targets/apple"
+          CUDA_FIXTURE="$RUNNER_TEMP/csf-v1-targets/linux-cuda-sm89"
+      - name: Target execution reader compiles warning-clean
+        run: >-
+          cc -O2 -Wall -Wextra -Werror -c
+          c/coli_exec_format.c -o "$RUNNER_TEMP/coli_exec_format.o"

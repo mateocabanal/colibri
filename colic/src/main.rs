@@ -128,10 +128,40 @@ fn run() -> colic::Result<()> {
                 println!("semantic_layers={}", model.geometry.layers);
                 println!("semantic_routed_experts={}", model.routed_experts.len());
                 println!(
+                    "semantic_routed_experts_per_layer={}",
+                    model.geometry.routed_experts_per_layer
+                );
+                println!(
                     "semantic_static_layers={}",
                     model.layer_static_tensors.len()
                 );
                 println!("semantic_resident_tensors={}", model.resident_tensors.len());
+                println!(
+                    "semantic_unclassified_tensors={}",
+                    model.resident_tensors.len()
+                );
+                println!(
+                    "semantic_assets={}",
+                    model.assets.tokenizer.len() + model.assets.config.is_some() as usize
+                );
+                let mut has_fp8 = false;
+                let mut has_mxfp4 = false;
+                for expert in model.routed_experts.values() {
+                    for matrix in [&expert.gate, &expert.up, &expert.down] {
+                        match matrix.quantization.math_format {
+                            colic::ir::MathFormat::Fp8E4M3 => has_fp8 = true,
+                            colic::ir::MathFormat::MxFp4E2M1 => has_mxfp4 = true,
+                        }
+                    }
+                }
+                let mut formats = Vec::new();
+                if has_fp8 {
+                    formats.push("fp8-e4m3");
+                }
+                if has_mxfp4 {
+                    formats.push("mxfp4-e2m1");
+                }
+                println!("semantic_expert_quant_formats={}", formats.join(","));
             }
             Ok(())
         }
