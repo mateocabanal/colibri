@@ -73,7 +73,9 @@ jobs:
       - name: Install pinned tiny-fixture dependencies
         run: python -m pip install -r c/tools/requirements-deepseek-v4-tiny.txt
       - name: Generate fixture and run target oracle
-        run: make -C c deepseek-v4-tiny-check
+        # Normal builds leave expert-forward untouched. The generated target is
+        # the dedicated correctness gate for the optional #56 execution hook.
+        run: make -C c deepseek-v4-tiny-check V4_TRACE_EXEC=1
 
   macos:
     # clang; libomp for the threaded path (Makefile falls back to
