@@ -77,6 +77,17 @@ static int view_is_cleared(const ColiExpertView *view) {
 }
 
 static int test_residency_value_selector(void) {
+    uint64_t slot_bytes = 0;
+    if (coli_v4_expert_slot_bytes(1, &slot_bytes) || slot_bytes != 16384)
+        return 1;
+    if (coli_v4_expert_slot_bytes(16384, &slot_bytes) || slot_bytes != 16384)
+        return 1;
+    if (coli_v4_expert_slot_bytes(16385, &slot_bytes) || slot_bytes != 32768)
+        return 1;
+    if (coli_v4_expert_slot_bytes(0, &slot_bytes) == 0 ||
+        coli_v4_expert_slot_bytes(UINT64_MAX, &slot_bytes) == 0)
+        return 1;
+
     /* The ratio comparator must not rely on uint64 cross multiplication. */
     if (coli_v4_residency_ratio_compare(6, 3, 4, 2) != 0) return 1;
     if (coli_v4_residency_ratio_compare(
@@ -138,6 +149,20 @@ static int test_residency_value_selector(void) {
             tied_selected, &plan) != 0)
         return 1;
     if (tied_selected[0] || !tied_selected[1]) return 1;
+
+    /* Predicted-benefit totals saturate rather than wrapping. */
+    static const ColiV4ResidencyCandidate saturating[] = {
+        {COLI_V4_RESIDENCY_DENSE_TENSOR, 1, 1, UINT64_MAX, UINT64_MAX},
+        {COLI_V4_RESIDENCY_DENSE_TENSOR, 2, 1, 2, 2},
+    };
+    unsigned char saturating_selected[2];
+    if (coli_v4_residency_select(
+            saturating, 2, 2, COLI_V4_RESIDENCY_VALUE_BYTES,
+            saturating_selected, &plan) != 0)
+        return 1;
+    if (plan.expected_bytes_avoided != UINT64_MAX ||
+        plan.expected_exposed_ns_avoided != UINT64_MAX)
+        return 1;
 
     if (coli_v4_residency_select(
             NULL, 1, 50, COLI_V4_RESIDENCY_VALUE_BYTES,
