@@ -1,0 +1,34 @@
+name: Qwen prefix RAM integration
+
+on:
+  push:
+    branches: [feat/qwen-prompt-prefix-cache]
+
+permissions:
+  contents: write
+
+jobs:
+  integrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: feat/qwen-prompt-prefix-cache
+          fetch-depth: 0
+      - name: Apply exact source edits
+        run: python3 c/tools/apply_qwen_prefix_ram_budget_patch.py
+      - name: Check patch formatting
+        run: git diff --check
+      - name: Run prefix cache unit
+        run: cd c && python3 -m unittest tests.test_qwen_prefix_cache -v
+      - name: Build Qwen engine
+        run: cd c && make qwen_moe ARCH=x86-64-v3
+      - name: Commit real integration
+        run: |
+          git rm .github/workflows/qwen-prefix-ram-integration.yml c/tools/apply_qwen_prefix_ram_budget_patch.py
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add c/qwen_moe.c c/qwen_prefix_cache.h c/tests/test_qwen_prefix_cache.c
+          git commit -m "fix(qwen): keep prompt snapshots inside implicit RAM budget"
+          git push origin HEAD:feat/qwen-prompt-prefix-cache
