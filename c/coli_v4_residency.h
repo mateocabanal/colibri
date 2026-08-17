@@ -29,6 +29,11 @@ typedef struct {
     uint64_t admissions;
     uint64_t rejected_bytes;
     uint64_t bytes_avoided;
+    /* Diagnostic only: bytes/time spent materializing caller-owned copies from
+     * persistent dense residency. This gives #10's zero-copy view work a clean
+     * measured upper bound. */
+    uint64_t copy_bytes;
+    uint64_t copy_ns;
 } ColiV4DenseCacheStats;
 
 /* Reconfigure the process-local COLI dense/static cache. This is called during
