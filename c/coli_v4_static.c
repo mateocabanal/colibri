@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 /*
  * Tensor-granular deterministic residency for package-only V4.
@@ -36,6 +37,8 @@ typedef struct {
     uint64_t admissions;
     uint64_t rejected_bytes;
     uint64_t bytes_avoided;
+    uint64_t copy_bytes;
+    uint64_t copy_ns;
     double minimum_benefit;
 } DenseCache;
 
@@ -59,6 +62,12 @@ static uint16_t fmt(ColiSafetensorsDType d) {
     case COLI_ST_I64: return COLI_CSF_MATH_I64;
     default: return COLI_CSF_MATH_INVALID;
     }
+}
+
+static uint64_t dense_cache_now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec;
 }
 
 static DenseCacheEntry *dense_cache_find_locked(const char *name) {
@@ -87,6 +96,8 @@ void coli_v4_dense_cache_configure(uint64_t budget_bytes) {
     g_dense_cache.admissions = 0;
     g_dense_cache.rejected_bytes = 0;
     g_dense_cache.bytes_avoided = 0;
+    g_dense_cache.copy_bytes = 0;
+    g_dense_cache.copy_ns = 0;
     g_dense_cache.minimum_benefit = 0.75;
     {
         const char *value = getenv("V4_DENSE_CACHE_MIN_BENEFIT");
@@ -119,15 +130,24 @@ void coli_v4_dense_cache_reset(void) {
     snapshot.admissions = g_dense_cache.admissions;
     snapshot.rejected_bytes = g_dense_cache.rejected_bytes;
     snapshot.bytes_avoided = g_dense_cache.bytes_avoided;
+    snapshot.copy_bytes = g_dense_cache.copy_bytes;
+    snapshot.copy_ns = g_dense_cache.copy_ns;
     dense_cache_clear_locked();
     g_dense_cache.budget_bytes = 0;
+    g_dense_cache.copy_bytes = 0;
+    g_dense_cache.copy_ns = 0;
     pthread_mutex_unlock(&g_dense_cache.mutex);
 
     if (snapshot.budget_bytes) {
+        double copy_gib = snapshot.copy_bytes / (1024.0 * 1024.0 * 1024.0);
+        double copy_ms = snapshot.copy_ns / 1000000.0;
+        double copy_gib_s = snapshot.copy_ns
+            ? copy_gib / ((double)snapshot.copy_ns / 1000000000.0) : 0.0;
         fprintf(stderr,
                 "v4_dense_cache status=done resident=%.2fGiB budget=%.2fGiB "
                 "entries=%llu hits=%llu misses=%llu admissions=%llu "
-                "bytes_avoided=%.2fGiB rejected=%.2fGiB\n",
+                "bytes_avoided=%.2fGiB rejected=%.2fGiB "
+                "copy=%.2fGiB copy_ms=%.3f copy_bw=%.2fGiB/s\n",
                 snapshot.resident_bytes / (1024.0 * 1024.0 * 1024.0),
                 snapshot.budget_bytes / (1024.0 * 1024.0 * 1024.0),
                 (unsigned long long)snapshot.entries,
@@ -135,7 +155,8 @@ void coli_v4_dense_cache_reset(void) {
                 (unsigned long long)snapshot.misses,
                 (unsigned long long)snapshot.admissions,
                 snapshot.bytes_avoided / (1024.0 * 1024.0 * 1024.0),
-                snapshot.rejected_bytes / (1024.0 * 1024.0 * 1024.0));
+                snapshot.rejected_bytes / (1024.0 * 1024.0 * 1024.0),
+                copy_gib, copy_ms, copy_gib_s);
     }
 }
 
@@ -151,6 +172,8 @@ void coli_v4_dense_cache_stats(ColiV4DenseCacheStats *out) {
         .admissions = g_dense_cache.admissions,
         .rejected_bytes = g_dense_cache.rejected_bytes,
         .bytes_avoided = g_dense_cache.bytes_avoided,
+        .copy_bytes = g_dense_cache.copy_bytes,
+        .copy_ns = g_dense_cache.copy_ns,
     };
     pthread_mutex_unlock(&g_dense_cache.mutex);
 }
@@ -177,6 +200,7 @@ static int dense_cache_copy(const char *name, uint64_t resident_bytes,
     pthread_mutex_unlock(&g_dense_cache.mutex);
     if (!source) return 0;
 
+    const uint64_t copy_began = g_coli_v4_profile_on ? dense_cache_now_ns() : 0;
     void *copy = malloc((size_t)resident_bytes);
     if (!copy) {
         pthread_mutex_lock(&g_dense_cache.mutex);
@@ -185,6 +209,7 @@ static int dense_cache_copy(const char *name, uint64_t resident_bytes,
         return 0;
     }
     memcpy(copy, source, (size_t)resident_bytes);
+    const uint64_t copy_ns = copy_began ? dense_cache_now_ns() - copy_began : 0;
 
     pthread_mutex_lock(&g_dense_cache.mutex);
     entry = dense_cache_find_locked(name);
@@ -192,6 +217,10 @@ static int dense_cache_copy(const char *name, uint64_t resident_bytes,
         entry->hits++;
     g_dense_cache.hits++;
     g_dense_cache.bytes_avoided += stored_bytes_avoided;
+    if (copy_began) {
+        g_dense_cache.copy_bytes += resident_bytes;
+        g_dense_cache.copy_ns += copy_ns;
+    }
     pthread_mutex_unlock(&g_dense_cache.mutex);
 
     *output = copy;
