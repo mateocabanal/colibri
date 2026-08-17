@@ -21,6 +21,15 @@ jobs:
       - uses: actions/checkout@v4
       - name: Apply staged fix
         run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('.github/scripts/qwen_residency_fix.py')
+          s = p.read_text()
+          old = 'b = g_slabs[i].buf; g_slabs[i].buf=nil; g_slabs.erase(g_slabs.begin()+i); break;\\n    }\\n  }\\n'
+          new = 'b = g_slabs[i].buf; g_slabs[i].buf=nil; g_slabs.erase(g_slabs.begin()+i); break; }\\n  }\\n'
+          if old not in s: raise SystemExit('staging-script unregister pattern not found')
+          p.write_text(s.replace(old, new, 1))
+          PY
           python3 .github/scripts/qwen_residency_fix.py
           git diff --check
       - name: Build focused CPU tests
@@ -81,6 +90,15 @@ jobs:
           fetch-depth: 0
       - name: Apply and commit
         run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('.github/scripts/qwen_residency_fix.py')
+          s = p.read_text()
+          old = 'b = g_slabs[i].buf; g_slabs[i].buf=nil; g_slabs.erase(g_slabs.begin()+i); break;\\n    }\\n  }\\n'
+          new = 'b = g_slabs[i].buf; g_slabs[i].buf=nil; g_slabs.erase(g_slabs.begin()+i); break; }\\n  }\\n'
+          if old not in s: raise SystemExit('staging-script unregister pattern not found')
+          p.write_text(s.replace(old, new, 1))
+          PY
           python3 .github/scripts/qwen_residency_fix.py
           git diff --check
           rm .github/scripts/qwen_residency_fix.py
