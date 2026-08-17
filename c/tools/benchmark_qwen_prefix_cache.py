@@ -442,6 +442,57 @@ def run_mode_reused(
     return records
 
 
+def run_correctness_smoke(
+    *,
+    binary: Path,
+    model: Path,
+    prefix: bytes,
+    extended: bytes,
+    memory_gb: float,
+    cache_mb: float,
+    min_prefix_tokens: int,
+    context: int,
+    max_tokens: int,
+    ready_timeout_sec: float,
+    heartbeat_sec: float,
+    show_engine_stderr: bool,
+) -> dict[str, object]:
+    """Reproduce cache correctness with one model startup.
+
+    Sequence: cold P+X (no reusable strict prefix), warm P, then cached P+X.
+    Because equal-length snapshots are not eligible strict prefixes, the final
+    request should restore exactly P and produce byte-identical output to cold.
+    """
+    serve = Serve(
+        binary,
+        model,
+        label="correctness",
+        memory_gb=memory_gb,
+        cache_mb=cache_mb,
+        min_prefix_tokens=min_prefix_tokens,
+        context=context,
+        ready_timeout_sec=ready_timeout_sec,
+        heartbeat_sec=heartbeat_sec,
+        show_engine_stderr=show_engine_stderr,
+    )
+    began = time.perf_counter()
+    try:
+        cold = serve.request("cold", extended, max_tokens)
+        warm = serve.request("warm", prefix, max_tokens)
+        cached = serve.request("cached", extended, max_tokens)
+    finally:
+        stderr = serve.close()
+    return {
+        "cold": cold,
+        "warm": warm,
+        "cached": cached,
+        "cold_metric": metric_for(stderr, "cold"),
+        "warm_metric": metric_for(stderr, "warm"),
+        "cached_metric": metric_for(stderr, "cached"),
+        "wall_sec": time.perf_counter() - began,
+    }
+
+
 def output_preview(record: dict[str, object]) -> str:
     raw = bytes.fromhex(str(record["measure"]["output_hex"]))
     text = raw.decode("utf-8", "replace")
@@ -581,6 +632,13 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--correctness-smoke", action="store_true",
+        help=(
+            "one-process correctness check: cold P+X, warm P, cached P+X; "
+            "fastest way to diagnose cache output divergence"
+        ),
+    )
+    parser.add_argument(
         "--heartbeat-sec", type=float, default=15.0,
         help="print a progress heartbeat while model load/prefill is quiet (0 disables)",
     )
@@ -629,6 +687,76 @@ def main() -> int:
     if not prefix or not tail:
         parser.error("prefix and tail must both be non-empty")
     extended = prefix + tail
+
+    if args.correctness_smoke:
+        execution_mode = "single_process_correctness_smoke"
+        progress(
+            "starting one-process correctness smoke: cold P+X -> warm P -> cached P+X"
+        )
+        smoke = run_correctness_smoke(
+            binary=binary, model=model, prefix=prefix, extended=extended,
+            memory_gb=args.memory_gb, cache_mb=args.cache_mb,
+            min_prefix_tokens=args.min_prefix_tokens, context=args.context,
+            max_tokens=args.max_tokens, ready_timeout_sec=args.ready_timeout,
+            heartbeat_sec=args.heartbeat_sec,
+            show_engine_stderr=args.show_engine_stderr,
+        )
+        cold_m = smoke["cold_metric"]
+        warm_m = smoke["warm_metric"]
+        cached_m = smoke["cached_metric"]
+        warm_tokens = int(warm_m["prompt"])
+        error = None
+        if int(cold_m.get("matched", -1)) != 0:
+            error = f"cold request unexpectedly matched {cold_m.get('matched')} tokens"
+        elif int(warm_m.get("matched", -1)) != 0:
+            error = f"warm P unexpectedly matched {warm_m.get('matched')} tokens"
+        elif int(cached_m.get("matched", -1)) != warm_tokens:
+            error = (
+                f"cached P+X matched {cached_m.get('matched')} of "
+                f"{warm_tokens} warm-prefix tokens"
+            )
+        elif smoke["cold"]["output_hex"] != smoke["cached"]["output_hex"]:
+            error = "cached P+X output differs from cold P+X"
+
+        result = {
+            "schema": "colibri.qwen.prefix_cache_correctness_smoke.v1",
+            "execution_mode": execution_mode,
+            "git_sha": git_sha(repo),
+            "platform": platform.platform(),
+            "machine": platform.machine(),
+            "binary": str(binary),
+            "model": str(model),
+            "memory_gb": args.memory_gb,
+            "cache_mb": args.cache_mb,
+            "min_prefix_tokens": args.min_prefix_tokens,
+            "context": args.context,
+            "max_tokens": args.max_tokens,
+            "prompt_bytes": len(prefix),
+            "tail_bytes": len(tail),
+            "error": error,
+            **smoke,
+        }
+        encoded = json.dumps(result, indent=2, sort_keys=True)
+        if args.output:
+            path = Path(args.output).expanduser()
+            path.write_text(encoded + "\n", encoding="utf-8")
+            progress(f"correctness diagnostic written to {path}")
+        if error:
+            cold_text = bytes.fromhex(smoke["cold"]["output_hex"]).decode(
+                "utf-8", "replace"
+            )
+            cached_text = bytes.fromhex(smoke["cached"]["output_hex"]).decode(
+                "utf-8", "replace"
+            )
+            progress(f"CORRECTNESS FAILURE: {error}")
+            progress(f"cold   output: {cold_text!r}")
+            progress(f"cached output: {cached_text!r}")
+            raise RuntimeError(
+                error + (f"; diagnostic: {Path(args.output).expanduser()}" if args.output else "")
+            )
+        print(encoded)
+        progress("correctness smoke PASS")
+        return 0
 
     execution_mode = "reused_processes" if args.reuse_processes else "fresh_process_pairs"
     progress(
