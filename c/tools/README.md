@@ -20,15 +20,19 @@ not runtime dependencies of the C engine.
   runner parses stable V4 CLI diagnostics and emits JSONL/CSV with TTFT,
   generated throughput, expert-cache traffic, wall time, git SHA, platform, and
   relevant environment.
-- `analyze_v4_expert_trace.py`: offline analysis for `V4_EXPERT_TRACE` JSONL.
-  Reports activation skew, hottest experts per layer, exact LRU stack/reuse
-  distance, physical residency events, hypothetical global/per-layer LRU and
-  persistent-hot-tier curves, plus inferred per-token co-routing and
-  adjacent-token route overlap. The current v1 trace has no explicit token ID;
-  for the single-request V4 execution stream the analyzer marks token ordinals
-  as **inferred** from layer-number wraps. `--prompt-tokens N` can split those
-  ordinals into prompt/decode summaries. Explicit runtime request/token/rank
-  metadata is still required before #56 is complete.
+- `analyze_v4_expert_trace.py`: offline routed-expert analysis. The physical
+  lifecycle trace at `V4_EXPERT_TRACE` remains schema v1 and reports request,
+  hit/inflight/load/evict/release activity with stable `(layer, expert, tier,
+  generation)` identity. When detailed tracing is enabled, the V4 block runtime
+  also emits an explicit logical-route schema-v2 sidecar at
+  `<V4_EXPERT_TRACE>.routes.jsonl` (or `V4_ROUTE_TRACE=<path>`). That sidecar
+  records every top-k route selection before batch-union lookups collapse many
+  logical selections into one physical lease, including request id, token
+  position, layer, expert, route rank and route weight. Both schemas are accepted
+  by the analyzer. It reports activation skew, exact LRU stack/reuse distance,
+  hypothetical cache curves, co-routing, unique logical experts/token and
+  adjacent-token overlap. Old v1 traces still fall back to layer-wrap token
+  inference; explicit v2 route traces use authoritative token identity.
 - `analyze_v4_residency_value.py`: offline policy-reference tool for #3. It
   compares deterministic residency and global hot-expert capacity using
   estimated **exposed I/O milliseconds avoided per resident GiB**. Repeated
@@ -61,12 +65,27 @@ python3 tools/benchmark_v4_perf.py --profile full --model /path/to/v4 \
 python3 tools/benchmark_v4_perf.py --model /path/to/v4 \
   --cases prefill2k --timeout-sec 120
 
-# Capture and inspect routed-expert locality without writing from the hot path.
+# Capture physical residency lifecycle plus explicit logical route identity.
+# The second file is created automatically as /tmp/v4-experts.jsonl.routes.jsonl.
 V4_EXPERT_TRACE=/tmp/v4-experts.jsonl ./deepseek_v4 /path/to/model.coli hi
+
+# Analyze physical cache/load behavior (schema v1).
 python3 tools/analyze_v4_expert_trace.py /tmp/v4-experts.jsonl \
   --capacities 1,2,4,8,16,32,64,128 \
   --persistent-capacities 1,2,4,8 \
   --prompt-tokens 5
+
+# Analyze authoritative logical route selections (schema v2).
+python3 tools/analyze_v4_expert_trace.py \
+  /tmp/v4-experts.jsonl.routes.jsonl --top 10
+
+# Optional explicit route-sidecar controls. V4_ROUTE_REQUEST_ID is the current
+# single-request CLI/session id override; server integration should supply real
+# request/session ids rather than relying on this compatibility knob.
+V4_ROUTE_TRACE=/tmp/v4-routes.jsonl \
+V4_ROUTE_TRACE_CAP=131072 \
+V4_ROUTE_REQUEST_ID=42 \
+./deepseek_v4 /path/to/model.coli hi
 
 # Compare residency classes in the #3 policy metric. This example uses one
 # dense point; repeat --dense-point with SAME-WORKLOAD fixed-memory A/B points
