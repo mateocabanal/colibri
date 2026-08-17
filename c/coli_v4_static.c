@@ -6,16 +6,20 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 
 /*
  * Tensor-granular deterministic residency for package-only V4.
  *
- * The ordinary layer API owns and frees every pointer returned in weights->data,
- * so the persistent cache keeps a private immutable copy and materializes a
- * caller-owned copy on a hit. That preserves the existing ownership contract
- * while removing the recurring SSD read. A later #10 execution-view change can
- * let resident tensors be referenced directly and remove this memcpy too.
+ * Cache entries are immutable for a configured engine generation. Package-only
+ * layer loads therefore borrow resident payload pointers directly instead of
+ * materializing caller-owned memcpy copies on every token. The separately
+ * compiled layer-resident unit routes payload free() through
+ * coli_v4_layer_payload_free(), which leaves cache-owned pointers alone and
+ * delegates ordinary streamed/safetensors allocations to libc free().
+ *
+ * This is deliberately an ownership bridge for the current layer API. A future
+ * typed mixed-residency execution view can make borrowed ownership explicit in
+ * the data structure instead of at the payload-release boundary.
  */
 typedef struct {
     char name[COLI_V4_MAX_TENSOR_NAME];
@@ -37,6 +41,8 @@ typedef struct {
     uint64_t admissions;
     uint64_t rejected_bytes;
     uint64_t bytes_avoided;
+    /* Retained in the stable diagnostics contract. Zero-copy borrowing keeps
+     * these at zero; a non-zero value would indicate materialization regressed. */
     uint64_t copy_bytes;
     uint64_t copy_ns;
     double minimum_benefit;
@@ -64,17 +70,28 @@ static uint16_t fmt(ColiSafetensorsDType d) {
     }
 }
 
-static uint64_t dense_cache_now_ns(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec;
-}
-
 static DenseCacheEntry *dense_cache_find_locked(const char *name) {
     for (size_t i = 0; i < g_dense_cache.count; i++)
         if (!strcmp(g_dense_cache.entries[i].name, name))
             return &g_dense_cache.entries[i];
     return NULL;
+}
+
+static int dense_cache_owns_locked(const void *pointer) {
+    for (size_t i = 0; i < g_dense_cache.count; i++)
+        if (g_dense_cache.entries[i].data == pointer) return 1;
+    return 0;
+}
+
+/* Used only by the COLI_V4_UNIT_LAYER_RESIDENT object through a target-local
+ * `free` macro. This keeps the legacy layer cleanup contract intact while a
+ * package-only layer is borrowing immutable resident tensor storage. */
+void coli_v4_layer_payload_free(void *pointer) {
+    if (!pointer) return;
+    pthread_mutex_lock(&g_dense_cache.mutex);
+    int borrowed = dense_cache_owns_locked(pointer);
+    pthread_mutex_unlock(&g_dense_cache.mutex);
+    if (!borrowed) free(pointer);
 }
 
 static void dense_cache_clear_locked(void) {
@@ -113,7 +130,7 @@ void coli_v4_dense_cache_configure(uint64_t budget_bytes) {
     if (budget_bytes) {
         fprintf(stderr,
                 "v4_dense_cache status=configured budget=%.2fGiB "
-                "policy=tensor-greedy min_benefit=%.2f\n",
+                "policy=tensor-greedy-zero-copy min_benefit=%.2f\n",
                 budget_bytes / (1024.0 * 1024.0 * 1024.0),
                 g_dense_cache.minimum_benefit);
     }
@@ -178,63 +195,37 @@ void coli_v4_dense_cache_stats(ColiV4DenseCacheStats *out) {
     pthread_mutex_unlock(&g_dense_cache.mutex);
 }
 
-/* Return 1 and a caller-owned copy on hit, 0 on miss. Cache entries are never
- * evicted during a configured generation, so the immutable source pointer can
- * safely be copied after dropping the mutex. A failed caller allocation is a
- * real fallback/miss: do not overstate cache hits or bytes avoided. */
-static int dense_cache_copy(const char *name, uint64_t resident_bytes,
-                            void **output) {
+/* Return 1 and an immutable borrowed pointer on hit, 0 on miss. Cache entries
+ * are never evicted during a configured engine generation, so the pointer is
+ * valid until cache reset after inference/session teardown. */
+static int dense_cache_borrow(const char *name, uint64_t resident_bytes,
+                              void **output) {
     if (!name || !output || resident_bytes > SIZE_MAX) return 0;
     *output = NULL;
 
-    const unsigned char *source = NULL;
-    uint64_t stored_bytes_avoided = 0;
     pthread_mutex_lock(&g_dense_cache.mutex);
     DenseCacheEntry *entry = dense_cache_find_locked(name);
-    if (entry && entry->resident_bytes == resident_bytes) {
-        source = entry->data;
-        stored_bytes_avoided = entry->stored_bytes_avoided;
-    } else {
-        g_dense_cache.misses++;
-    }
-    pthread_mutex_unlock(&g_dense_cache.mutex);
-    if (!source) return 0;
-
-    const uint64_t copy_began = g_coli_v4_profile_on ? dense_cache_now_ns() : 0;
-    void *copy = malloc((size_t)resident_bytes);
-    if (!copy) {
-        pthread_mutex_lock(&g_dense_cache.mutex);
+    if (!entry || entry->resident_bytes != resident_bytes) {
         g_dense_cache.misses++;
         pthread_mutex_unlock(&g_dense_cache.mutex);
         return 0;
     }
-    memcpy(copy, source, (size_t)resident_bytes);
-    const uint64_t copy_ns = copy_began ? dense_cache_now_ns() - copy_began : 0;
-
-    pthread_mutex_lock(&g_dense_cache.mutex);
-    entry = dense_cache_find_locked(name);
-    if (entry && entry->data == source && entry->resident_bytes == resident_bytes)
-        entry->hits++;
+    entry->hits++;
     g_dense_cache.hits++;
-    g_dense_cache.bytes_avoided += stored_bytes_avoided;
-    if (copy_began) {
-        g_dense_cache.copy_bytes += resident_bytes;
-        g_dense_cache.copy_ns += copy_ns;
-    }
+    g_dense_cache.bytes_avoided += entry->stored_bytes_avoided;
+    *output = entry->data;
     pthread_mutex_unlock(&g_dense_cache.mutex);
-
-    *output = copy;
     return 1;
 }
 
-/* Admit an immutable final execution representation. Failure to cache is never
- * an inference failure. benefit is recurring stored bytes avoided / resident
- * bytes consumed, so compact E8M0 scales that expand to FP32 naturally rank
- * below large 1:1 FP8 weight payloads. */
-static void dense_cache_admit(const char *name, const void *data,
-                              uint64_t resident_bytes,
-                              uint64_t stored_bytes_avoided) {
-    if (!name || !data || !resident_bytes || resident_bytes > SIZE_MAX) return;
+/* Transfer ownership of an already-materialized immutable execution payload to
+ * the cache. This avoids the old first-touch duplicate memcpy as well as all
+ * subsequent hit copies. Returns 1 when the cache owns `data`; on 0 the caller
+ * retains ownership and must release it normally. */
+static int dense_cache_admit_take(const char *name, unsigned char *data,
+                                  uint64_t resident_bytes,
+                                  uint64_t stored_bytes_avoided) {
+    if (!name || !data || !resident_bytes || resident_bytes > SIZE_MAX) return 0;
 
     double benefit = (double)stored_bytes_avoided / (double)resident_bytes;
     pthread_mutex_lock(&g_dense_cache.mutex);
@@ -248,7 +239,7 @@ static void dense_cache_admit(const char *name, const void *data,
             benefit >= g_dense_cache.minimum_benefit && !existing && no_room)
             g_dense_cache.rejected_bytes += resident_bytes;
         pthread_mutex_unlock(&g_dense_cache.mutex);
-        return;
+        return 0;
     }
 
     if (g_dense_cache.count == g_dense_cache.capacity) {
@@ -257,36 +248,29 @@ static void dense_cache_admit(const char *name, const void *data,
             next > SIZE_MAX / sizeof(*g_dense_cache.entries)) {
             g_dense_cache.rejected_bytes += resident_bytes;
             pthread_mutex_unlock(&g_dense_cache.mutex);
-            return;
+            return 0;
         }
         DenseCacheEntry *grown = realloc(
             g_dense_cache.entries, next * sizeof(*g_dense_cache.entries));
         if (!grown) {
             g_dense_cache.rejected_bytes += resident_bytes;
             pthread_mutex_unlock(&g_dense_cache.mutex);
-            return;
+            return 0;
         }
         g_dense_cache.entries = grown;
         g_dense_cache.capacity = next;
     }
 
-    unsigned char *copy = malloc((size_t)resident_bytes);
-    if (!copy) {
-        g_dense_cache.rejected_bytes += resident_bytes;
-        pthread_mutex_unlock(&g_dense_cache.mutex);
-        return;
-    }
-    memcpy(copy, data, (size_t)resident_bytes);
-
     DenseCacheEntry *entry = &g_dense_cache.entries[g_dense_cache.count++];
     memset(entry, 0, sizeof(*entry));
     snprintf(entry->name, sizeof(entry->name), "%s", name);
-    entry->data = copy;
+    entry->data = data;
     entry->resident_bytes = resident_bytes;
     entry->stored_bytes_avoided = stored_bytes_avoided;
     g_dense_cache.resident_bytes += resident_bytes;
     g_dense_cache.admissions++;
     pthread_mutex_unlock(&g_dense_cache.mutex);
+    return 1;
 }
 
 int coli_v4_coli_layer_load(ColiExecutor *x, ColiDeepSeekV4LayerWeights *w,
@@ -334,7 +318,7 @@ int coli_v4_coli_layer_load(ColiExecutor *x, ColiDeepSeekV4LayerWeights *w,
             goto fail;
         }
 
-        if (dense_cache_copy(s->name, resident_bytes, (void **)&b)) {
+        if (dense_cache_borrow(s->name, resident_bytes, (void **)&b)) {
             w->data[i] = b;
             if (s->dtype == COLI_ST_F8_E8M0)
                 w->stats.fp8_scale_bytes += resident_bytes;
@@ -365,13 +349,31 @@ int coli_v4_coli_layer_load(ColiExecutor *x, ColiDeepSeekV4LayerWeights *w,
                 out[q] = b[t.data_offset + q] == 255
                     ? NAN : ldexpf(1.f, (int)b[t.data_offset + q] - 127);
             free(b);
-            dense_cache_admit(s->name, out, resident_bytes, r->stored_bytes);
-            w->data[i] = out;
+            b = (unsigned char *)out;
+            (void)dense_cache_admit_take(
+                s->name, b, resident_bytes, r->stored_bytes);
+            w->data[i] = b;
             w->stats.fp8_scale_bytes += resident_bytes;
             w->stats.total_bytes += resident_bytes;
         } else {
             memmove(b, b + t.data_offset, (size_t)t.data_stored_bytes);
-            dense_cache_admit(s->name, b, resident_bytes, r->stored_bytes);
+            /* Package records include metadata around the execution payload.
+             * Shrink before transferring ownership so resident accounting is
+             * also an allocated-byte bound. If shrinking fails, keep the
+             * caller-owned record and simply skip admission for this tensor. */
+            unsigned char *resident = b;
+            int exact_allocation = r->stored_bytes == resident_bytes;
+            if (!exact_allocation) {
+                unsigned char *shrunk = realloc(b, (size_t)resident_bytes);
+                if (shrunk) {
+                    resident = shrunk;
+                    exact_allocation = 1;
+                }
+            }
+            b = resident;
+            if (exact_allocation)
+                (void)dense_cache_admit_take(
+                    s->name, b, resident_bytes, r->stored_bytes);
             w->data[i] = b;
             w->stats.total_bytes += resident_bytes;
         }
