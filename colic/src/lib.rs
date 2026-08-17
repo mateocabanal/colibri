@@ -9,6 +9,7 @@ pub mod ir;
 pub mod model;
 pub mod passes;
 pub mod pipeline;
+pub mod quant;
 pub mod source;
 pub mod storage;
 pub mod target;
