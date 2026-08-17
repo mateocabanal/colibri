@@ -13,14 +13,16 @@ extern "C" {
 #define COLI_PROFILE_MAX_COUNTERS 24
 #define COLI_PROFILE_MAX_MARKS 8
 
-/* A phase with ACCOUNTED contributes to the owner-thread wall reconciliation.
- * IO_WAIT is a subset of wall time to subtract when reporting cpu_compute_ms.
- * Diagnostic phases (worker/GPU/nested work) simply omit ACCOUNTED; they may
- * still carry IO_WAIT when useful, e.g. a synchronous expert load nested inside
- * an accounted MoE span. */
+/* ACCOUNTED contributes to owner-thread wall reconciliation.
+ * IO_WAIT is blocking I/O time and therefore also CPU-wait time.
+ * CPU_WAIT marks other synchronous waits where the owner thread is blocked
+ * rather than computing (for example waiting on a GPU command buffer).
+ * Diagnostic phases may omit ACCOUNTED while still carrying either wait flag
+ * when they are nested inside an accounted owner span. */
 enum {
     COLI_PROFILE_ACCOUNTED = 1u << 0,
     COLI_PROFILE_IO_WAIT   = 1u << 1,
+    COLI_PROFILE_CPU_WAIT  = 1u << 2,
 };
 
 typedef struct {
