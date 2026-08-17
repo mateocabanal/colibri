@@ -40,7 +40,6 @@ static uint16_t fmt(ColiSafetensorsDType d) {
     case COLI_ST_BF16: return COLI_CSF_MATH_BF16;
     case COLI_ST_F32: return COLI_CSF_MATH_F32;
     case COLI_ST_F8_E4M3: return COLI_CSF_MATH_FP8_E4M3FN;
-    /* E8M0 is an exponent byte, not a floating-point tensor payload. */
     case COLI_ST_F8_E8M0: return COLI_CSF_MATH_U8;
     case COLI_ST_I64: return COLI_CSF_MATH_I64;
     default: return COLI_CSF_MATH_INVALID;
@@ -95,17 +94,9 @@ static void cache_recompute_min_score_locked(void) {
     g_dense_cache.min_score = value;
 }
 
-/*
- * Dense/static access is a deterministic scan over the same layer records on
- * every token. Ordinary LRU is pathological when the working set is larger
- * than the cache: the next scan evicts exactly the objects that would have
- * been reused later in that scan. Residency is therefore an admission
- * problem, not a recency problem.
- *
- * Once the budget is full, a candidate may displace only an object with a
- * STRICTLY lower recurring-I/O-saved/resident-byte score. Equal-value objects
- * remain pinned. This makes the cache scan-resistant after its warmup pass.
- */
+/* Deterministic dense/static scans are hostile to ordinary LRU when the
+ * working set exceeds RAM. Once full, only a STRICTLY higher benefit/byte
+ * candidate may displace a resident object. Equal-value objects stay pinned. */
 static DenseCacheEntry *cache_lower_value_victim_locked(long double candidate_score) {
     if (g_dense_cache.entries && candidate_score <= g_dense_cache.min_score)
         return NULL;
@@ -181,16 +172,17 @@ void coli_v4_dense_cache_shutdown(void) {
     }
     g_dense_cache.entries = NULL;
     memset(g_dense_cache.buckets, 0, sizeof(g_dense_cache.buckets));
-    g_dense_cache.stats.resident_bytes = 0;
+    memset(&g_dense_cache.stats, 0, sizeof(g_dense_cache.stats));
+    g_dense_cache.clock = 0;
     g_dense_cache.min_score = 0.0L;
     g_dense_cache.hit_copy_bytes = 0;
     g_dense_cache.hit_copy_ns = 0;
     pthread_mutex_unlock(&g_dense_cache.mutex);
 }
 
-/* Returns 1 on hit, 0 on miss. output is always caller-owned for now.
- * Copy cost is measured under V4_PROFILE so the next A/B quantifies exactly
- * how much zero-copy borrowed views can recover. */
+/* Returns 1 on hit, 0 on miss. output is caller-owned for this A/B tranche.
+ * V4_PROFILE also measures the copy so the zero-copy follow-up has a clean
+ * upper bound. */
 static int cache_get(const char *name, uint64_t expected_bytes,
                      uint64_t stored_bytes, unsigned char **output) {
     *output = NULL;
