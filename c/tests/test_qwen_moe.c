@@ -337,7 +337,32 @@ static void test_mxfp4_expert_dispatch(void){
     free(s.mxg); free(s.mxgs);
 }
 
+
+static void test_slot_resident_bytes(void){
+    Cfg c; Slot s;
+    memset(&c, 0, sizeof(c)); memset(&s, 0, sizeof(s));
+    c.hidden = 65; c.moe_inter = 33;
+    const uint64_t D = 65, I = 33;
+
+    s.fmt = 7;
+    uint64_t mx_weights = 2u * I * ((D + 1u) / 2u) + D * ((I + 1u) / 2u);
+    uint64_t mx_scales = 2u * I * ((D + 31u) / 32u) + D * ((I + 31u) / 32u);
+    CHECK(qwen_slot_resident_bytes(&c, &s) == mx_weights + mx_scales,
+          "MXFP4 slot residency bytes mismatch: got %llu want %llu",
+          (unsigned long long)qwen_slot_resident_bytes(&c, &s),
+          (unsigned long long)(mx_weights + mx_scales));
+
+    s.fmt = 16;
+    CHECK(qwen_slot_resident_bytes(&c, &s) == 3u * D * I * 2u,
+          "BF16 slot residency bytes mismatch");
+
+    s.fmt = 8;
+    CHECK(qwen_slot_resident_bytes(&c, &s) == 3u * D * I + (2u * I + D) * 4u,
+          "q8 slot residency bytes mismatch");
+}
+
 int main(void){
+    test_slot_resident_bytes();
     test_mxfp4_expert_dispatch();
 	test_padded_vocab_selection();
 	test_lifetime_exits();

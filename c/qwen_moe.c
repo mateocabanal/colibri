@@ -3353,16 +3353,53 @@ static void serve_hwinfo(Model *m) {
     fflush(stdout);
 }
 
+static uint64_t qwen_slot_resident_bytes(const Cfg *c, const Slot *s) {
+    const uint64_t D = (uint64_t)c->hidden;
+    const uint64_t I = (uint64_t)c->moe_inter;
+    const uint64_t params = 3u * D * I;
+    switch (s->fmt) {
+        case 0:  return params * sizeof(float);
+        case 16: return params * sizeof(uint16_t);
+        case 8:  return params + (2u * I + D) * sizeof(float);
+        case 4: {
+            const uint64_t weights = 2u * I * ((D + 1u) / 2u) + D * ((I + 1u) / 2u);
+            const uint64_t scales = (2u * I * ((D + 63u) / 64u) +
+                                     D * ((I + 63u) / 64u)) * sizeof(float);
+            return weights + scales;
+        }
+        case 5: {
+            const uint64_t weights = 2u * I * (uint64_t)qm_i3_rowbytes((int)D) +
+                                     D * (uint64_t)qm_i3_rowbytes((int)I);
+            const uint64_t scales = (2u * I * ((D + 63u) / 64u) +
+                                     D * ((I + 63u) / 64u)) * sizeof(float);
+            return weights + scales;
+        }
+        case 7: {
+            const uint64_t weights = 2u * I * ((D + 1u) / 2u) + D * ((I + 1u) / 2u);
+            const uint64_t scales = 2u * I * ((D + 31u) / 32u) +
+                                    D * ((I + 31u) / 32u);
+            return weights + scales;
+        }
+        default: return 0;
+    }
+}
+
 static void serve_tiers_emap(Model *m) {
     Cfg *c = &m->c; int E = c->n_experts;
     int filled = 0;
-    for (int i = 0; i < c->n_layers; i++) filled += m->cache[i].n;
-    int64_t I = c->moe_inter, D = c->hidden;
-    /* per-expert resident bytes: int8 gate/up/down + one f32 scale per row */
-    int64_t slotb = coli_mode ? 3*I*D*2 : 3*I*D + (2*I+D)*4;
+    uint64_t ram_bytes = 0;
+    for (int i = 0; i < c->n_layers; i++) {
+        LCache *lc = &m->cache[i];
+        for (int z = 0; z < lc->n; z++) {
+            Slot *slot = &lc->slots[z];
+            if (slot->eid < 0) continue; /* in-flight loads are not published residency */
+            filled++;
+            ram_bytes += qwen_slot_resident_bytes(c, slot);
+        }
+    }
     int64_t total_experts = (int64_t)c->n_layers * E;
     printf("TIERS 0 %d %lld 0.00 %.2f\n", filled,
-           (long long)(total_experts - filled), filled*(double)slotb/1e9);
+           (long long)(total_experts - filled), (double)ram_bytes/1e9);
     /* EMAP: 1 byte/expert hex — tier(2b: 0=disk 1=RAM)<<6 | heat(6b: log2 usage) */
     size_t hex_n = size_mul_or_die((size_t)c->n_layers, E, "expert map");
     hex_n = size_mul_or_die(hex_n, 2, "expert map hex");
