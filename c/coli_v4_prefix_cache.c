@@ -11,6 +11,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+int coli_v4_attention_snapshot_restore_fresh(
+    ColiDeepSeekV4WindowAttentionState *state,
+    const ColiV4AttentionSnapshot *snapshot,
+    const ColiDeepSeekV4Config *config, int layer);
+
 #define COLI_V4_PREFIX_CACHE_MAX_ENTRIES 64
 #define COLI_V4_PREFIX_CACHE_DEFAULT_MIN_TOKENS 256
 
@@ -408,8 +413,9 @@ int coli_v4_prefix_cache_restore(ColiV4Session *session,
     uint64_t began = coli_v4_profile_now();
     int ok = 1;
     for (int layer = 0; layer < entry->layer_count; layer++)
-        if (coli_v4_attention_snapshot_restore(session->attention[layer],
-                                               entry->attention[layer])) {
+        if (coli_v4_attention_snapshot_restore_fresh(
+                session->attention[layer], entry->attention[layer],
+                &session->config, layer)) {
             ok = 0;
             break;
         }
