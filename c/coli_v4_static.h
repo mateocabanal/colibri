@@ -17,7 +17,10 @@ typedef struct {
  * execution payloads and, for this tranche, returns caller-owned copies so the
  * existing layer free contract remains unchanged. Admission is scan-resistant:
  * equal benefit/byte tensors do not evict one another during deterministic
- * layer walks. A zero budget disables and empties the cache. */
+ * layer walks. A zero budget disables and empties the cache.
+ *
+ * NOTE: this experimental branch is superseded by the global-transient-pool
+ * implementation in feat/v4-residency-tiers / PR #64. */
 void coli_v4_dense_cache_configure(uint64_t budget_bytes);
 void coli_v4_dense_cache_stats(ColiV4DenseCacheStats *stats);
 void coli_v4_dense_cache_shutdown(void);
@@ -27,9 +30,6 @@ int coli_v4_coli_layer_load(ColiExecutor *executor, ColiDeepSeekV4LayerWeights *
                             char *error, size_t error_size);
 int coli_v4_coli_layer_bytes(ColiExecutor *executor, const ColiDeepSeekV4Config *config,
                              int layer, uint64_t *bytes, char *error, size_t error_size);
-/* Load a cold non-layer BF16/F32 tensor directly from its typed COLI record.
- * This is deliberately a loader helper rather than a generic runtime tensor
- * abstraction: the caller owns the converted float buffer. */
 int coli_v4_coli_tensor_load_f32(ColiExecutor *executor, ColiFloatTensor *output,
                                  const char *name, char *error, size_t error_size);
 #endif
