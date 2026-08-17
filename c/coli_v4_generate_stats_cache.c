@@ -11,8 +11,12 @@
  * snapshot and return the restored prefix length. The original caller then
  * executes only the fresh prompt tail exactly as it already does today.
  *
- * The public session_generate wrapper stores a snapshot only after successful
- * generation, so a cache entry always describes the same state as session->fed.
+ * Admission happens at the generation unit's canonical end-of-prefill
+ * `kv_prefix_record()` call, before decode mutates the state. This distinction
+ * matters: a cache entry must represent the request prefix itself so unrelated
+ * requests can share system/tool/project context. Capturing after generation
+ * would instead key the snapshot by the previous answer and only help strict
+ * conversation continuation.
  */
 #define coli_v4_session_generate coli_v4_session_generate_uncached
 #include "deepseek_v4_internal.h"
@@ -54,14 +58,32 @@ static int coli_v4_cached_kv_prefix_reuse(const kv_prefix *prefix,
     return reused;
 }
 
-/* deepseek_v4_internal.h already included kv_prefix.h, so the helper macro
- * rewrites only call sites in the generation unit, not kv_prefix_reuse's inline
- * definition. Rename the public generation implementation so we can append a
- * successful snapshot store without modifying the amalgamated source. */
+static void coli_v4_cached_kv_prefix_record(kv_prefix *prefix,
+                                             const int *ids,
+                                             int position, int count) {
+    kv_prefix_record(prefix, ids, position, count);
+    ColiV4Session *session = session_from_prefix(prefix);
+    if (!session || !ids || count <= 0 || !session->prompt_ids ||
+        session->prompt_count <= 0)
+        return;
+
+    /* The end-of-prefill record is uniquely the slice of session->prompt_ids
+     * beginning at the reused position, and after kv_prefix_record the exact
+     * state coverage equals prompt_count. Decode/speculative records point at
+     * generated/input temporaries instead and therefore cannot admit here. */
+    if (ids == session->prompt_ids + position &&
+        prefix->len == session->prompt_count && !prefix->tainted)
+        coli_v4_prefix_cache_store(session);
+}
+
+/* deepseek_v4_internal.h already included kv_prefix.h, so these macros rewrite
+ * only call sites in the generation unit, not the inline helper definitions. */
 #define kv_prefix_reuse coli_v4_cached_kv_prefix_reuse
+#define kv_prefix_record coli_v4_cached_kv_prefix_record
 #define coli_v4_session_generate coli_v4_session_generate_uncached
 #include "deepseek_v4.c"
 #undef coli_v4_session_generate
+#undef kv_prefix_record
 #undef kv_prefix_reuse
 
 static uint64_t delta_u64(uint64_t after, uint64_t before) {
@@ -81,7 +103,6 @@ int coli_v4_session_generate(ColiV4Session *session,
     int result = coli_v4_session_generate_uncached(
         session, prompt, prompt_length, options, on_token, user_data,
         stats, error, error_size);
-    if (!result) coli_v4_prefix_cache_store(session);
 
     coli_v4_prefix_cache_stats(&after);
     if (after.budget_bytes) {
