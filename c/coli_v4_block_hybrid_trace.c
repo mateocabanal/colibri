@@ -28,6 +28,16 @@
 #define COLI_V4_GIT_SHA "unknown"
 #endif
 
+#ifndef COLI_V4_DISABLE_BF16_ROUTE
+/* The BF16 route entry point is intentionally block-local in the amalgamation
+ * and is not declared by deepseek_v4_internal.h. Declare the original symbol
+ * before the overlay macro rewrites the block unit's local prototype/calls. */
+int coli_v4_route_bf16(float *weights, int *indices, const float *hidden,
+                       const uint16_t *gate, const float *bias,
+                       const int *forced_indices, int experts, int dimension,
+                       int topk, float route_scale);
+#endif
+
 typedef struct {
     uint64_t seq;
     uint64_t request_id;
