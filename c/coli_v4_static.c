@@ -1,9 +1,26 @@
 #include "coli_v4_static.h"
 
 #include <math.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+typedef struct DenseCacheEntry {
+    char *name;
+    unsigned char *data;
+    uint64_t resident_bytes;
+    uint64_t stored_bytes;
+    uint64_t last_used;
+    struct DenseCacheEntry *next;
+} DenseCacheEntry;
+
+static struct {
+    pthread_mutex_t mutex;
+    DenseCacheEntry *entries;
+    ColiV4DenseCacheStats stats;
+    uint64_t clock;
+} g_dense_cache = { PTHREAD_MUTEX_INITIALIZER, NULL, {0}, 0 };
 
 static int bad(char *e, size_t n, const char *f, const char *s) {
     if (e && n) snprintf(e, n, f, s);
@@ -22,12 +39,156 @@ static uint16_t fmt(ColiSafetensorsDType d) {
     }
 }
 
+static long double cache_score(uint64_t stored, uint64_t resident) {
+    return resident ? (long double)stored / (long double)resident : 0.0L;
+}
+
+static void cache_entry_free(DenseCacheEntry *entry) {
+    if (!entry) return;
+    free(entry->name);
+    free(entry->data);
+    free(entry);
+}
+
+static DenseCacheEntry *cache_find_locked(const char *name) {
+    for (DenseCacheEntry *entry = g_dense_cache.entries; entry; entry = entry->next)
+        if (strcmp(entry->name, name) == 0) return entry;
+    return NULL;
+}
+
+static DenseCacheEntry *cache_victim_locked(long double candidate_score) {
+    DenseCacheEntry *best = NULL;
+    long double best_score = 0.0L;
+    for (DenseCacheEntry *entry = g_dense_cache.entries; entry; entry = entry->next) {
+        long double score = cache_score(entry->stored_bytes, entry->resident_bytes);
+        if (score > candidate_score) continue;
+        if (!best || score < best_score ||
+            (score == best_score && entry->last_used < best->last_used)) {
+            best = entry;
+            best_score = score;
+        }
+    }
+    return best;
+}
+
+static void cache_remove_locked(DenseCacheEntry *victim) {
+    DenseCacheEntry **link = &g_dense_cache.entries;
+    while (*link && *link != victim) link = &(*link)->next;
+    if (!*link) return;
+    *link = victim->next;
+    if (g_dense_cache.stats.resident_bytes >= victim->resident_bytes)
+        g_dense_cache.stats.resident_bytes -= victim->resident_bytes;
+    else
+        g_dense_cache.stats.resident_bytes = 0;
+    g_dense_cache.stats.evictions++;
+    cache_entry_free(victim);
+}
+
+void coli_v4_dense_cache_configure(uint64_t budget_bytes) {
+    pthread_mutex_lock(&g_dense_cache.mutex);
+    g_dense_cache.stats.budget_bytes = budget_bytes;
+    while (g_dense_cache.stats.resident_bytes > budget_bytes && g_dense_cache.entries) {
+        DenseCacheEntry *victim = NULL;
+        for (DenseCacheEntry *entry = g_dense_cache.entries; entry; entry = entry->next)
+            if (!victim || entry->last_used < victim->last_used) victim = entry;
+        cache_remove_locked(victim);
+    }
+    pthread_mutex_unlock(&g_dense_cache.mutex);
+}
+
+void coli_v4_dense_cache_stats(ColiV4DenseCacheStats *stats) {
+    if (!stats) return;
+    pthread_mutex_lock(&g_dense_cache.mutex);
+    *stats = g_dense_cache.stats;
+    pthread_mutex_unlock(&g_dense_cache.mutex);
+}
+
+void coli_v4_dense_cache_shutdown(void) {
+    pthread_mutex_lock(&g_dense_cache.mutex);
+    DenseCacheEntry *entry = g_dense_cache.entries;
+    while (entry) {
+        DenseCacheEntry *next = entry->next;
+        cache_entry_free(entry);
+        entry = next;
+    }
+    g_dense_cache.entries = NULL;
+    g_dense_cache.stats.resident_bytes = 0;
+    pthread_mutex_unlock(&g_dense_cache.mutex);
+}
+
+/* Returns 1 on hit, 0 on miss. output is always caller-owned. */
+static int cache_get(const char *name, uint64_t expected_bytes,
+                     uint64_t stored_bytes, unsigned char **output) {
+    *output = NULL;
+    pthread_mutex_lock(&g_dense_cache.mutex);
+    DenseCacheEntry *entry = cache_find_locked(name);
+    if (!entry || entry->resident_bytes != expected_bytes) {
+        g_dense_cache.stats.misses++;
+        pthread_mutex_unlock(&g_dense_cache.mutex);
+        return 0;
+    }
+    unsigned char *copy = malloc((size_t)entry->resident_bytes);
+    if (!copy) {
+        g_dense_cache.stats.misses++;
+        pthread_mutex_unlock(&g_dense_cache.mutex);
+        return 0;
+    }
+    memcpy(copy, entry->data, (size_t)entry->resident_bytes);
+    entry->last_used = ++g_dense_cache.clock;
+    g_dense_cache.stats.hits++;
+    g_dense_cache.stats.stored_bytes_avoided += stored_bytes;
+    pthread_mutex_unlock(&g_dense_cache.mutex);
+    *output = copy;
+    return 1;
+}
+
+static void cache_put(const char *name, const unsigned char *data,
+                      uint64_t resident_bytes, uint64_t stored_bytes) {
+    if (!name || !data || !resident_bytes || resident_bytes > SIZE_MAX) return;
+    pthread_mutex_lock(&g_dense_cache.mutex);
+    const uint64_t budget = g_dense_cache.stats.budget_bytes;
+    if (!budget || resident_bytes > budget || cache_find_locked(name)) {
+        pthread_mutex_unlock(&g_dense_cache.mutex);
+        return;
+    }
+
+    const long double candidate_score = cache_score(stored_bytes, resident_bytes);
+    while (g_dense_cache.stats.resident_bytes > budget - resident_bytes) {
+        DenseCacheEntry *victim = cache_victim_locked(candidate_score);
+        if (!victim) {
+            pthread_mutex_unlock(&g_dense_cache.mutex);
+            return;
+        }
+        cache_remove_locked(victim);
+    }
+
+    DenseCacheEntry *entry = calloc(1, sizeof(*entry));
+    if (!entry) {
+        pthread_mutex_unlock(&g_dense_cache.mutex);
+        return;
+    }
+    entry->name = strdup(name);
+    entry->data = malloc((size_t)resident_bytes);
+    if (!entry->name || !entry->data) {
+        cache_entry_free(entry);
+        pthread_mutex_unlock(&g_dense_cache.mutex);
+        return;
+    }
+    memcpy(entry->data, data, (size_t)resident_bytes);
+    entry->resident_bytes = resident_bytes;
+    entry->stored_bytes = stored_bytes;
+    entry->last_used = ++g_dense_cache.clock;
+    entry->next = g_dense_cache.entries;
+    g_dense_cache.entries = entry;
+    g_dense_cache.stats.resident_bytes += resident_bytes;
+    g_dense_cache.stats.inserts++;
+    pthread_mutex_unlock(&g_dense_cache.mutex);
+}
+
 int coli_v4_coli_layer_load(ColiExecutor *x, ColiDeepSeekV4LayerWeights *w,
                             const ColiDeepSeekV4Config *c, int layer,
                             char *e, size_t n) {
     const int profiling = g_coli_v4_profile_on;
-    const uint64_t began = profiling ? coli_v4_profile_now() : 0;
-    uint64_t stored_bytes_read = 0;
 
     if (!x || !w || coli_v4_layer_plan(&w->plan, c, layer, e, n)) return -1;
     memset(w->data, 0, sizeof(w->data));
@@ -37,7 +198,8 @@ int coli_v4_coli_layer_load(ColiExecutor *x, ColiDeepSeekV4LayerWeights *w,
         ColiDeepSeekV4TensorSpec *s = &w->plan.tensors[i];
         const ColiRecordInfo *r = coli_executor_record_by_name(x, s->name);
         ColiTensorInfo t;
-        unsigned char *b;
+        unsigned char *b = NULL;
+        uint64_t resident_bytes;
 
         if (!r || coli_package_tensor_info(coli_executor_package(x), r, &t, e, n) ||
             t.rank != (uint16_t)s->rank || r->math_format != fmt(s->dtype))
@@ -53,54 +215,65 @@ int coli_v4_coli_layer_load(ColiExecutor *x, ColiDeepSeekV4LayerWeights *w,
             goto fail;
         }
 
-        b = malloc((size_t)r->stored_bytes);
-        if (!b) {
+        resident_bytes = t.data_stored_bytes;
+        if (s->dtype == COLI_ST_F8_E8M0) {
+            if (resident_bytes > SIZE_MAX / sizeof(float)) {
+                bad(e, n, "COLI static scale span invalid: %s", s->name);
+                goto fail;
+            }
+            resident_bytes *= sizeof(float);
+        }
+
+        if (cache_get(s->name, resident_bytes, r->stored_bytes, &b)) {
+            w->data[i] = b;
+            if (s->dtype == COLI_ST_F8_E8M0)
+                w->stats.fp8_scale_bytes += resident_bytes;
+            w->stats.total_bytes += resident_bytes;
+            w->stats.tensor_count++;
+            continue;
+        }
+
+        unsigned char *record = malloc((size_t)r->stored_bytes);
+        if (!record) {
             bad(e, n, "COLI static allocation failed: %s", s->name);
             goto fail;
         }
-        if (coli_executor_load_record(x, r, b, (size_t)r->stored_bytes, e, n)) {
-            free(b);
+        uint64_t began = profiling ? coli_v4_profile_now() : 0;
+        if (coli_executor_load_record(x, r, record, (size_t)r->stored_bytes, e, n)) {
+            free(record);
             goto fail;
         }
-        stored_bytes_read += r->stored_bytes;
+        if (profiling) {
+            coli_v4_profile_add(COLI_V4_PROF_DENSE_READ,
+                                coli_v4_profile_now() - began);
+            coli_v4_profile_add_bytes(COLI_V4_PROF_DENSE_READ, r->stored_bytes);
+        }
 
         if (s->dtype == COLI_ST_F8_E8M0) {
             size_t k = (size_t)t.data_stored_bytes;
             float *out = malloc(k * sizeof(*out));
             if (!out) {
-                free(b);
+                free(record);
                 goto fail;
             }
             for (size_t q = 0; q < k; q++)
-                out[q] = b[t.data_offset + q] == 255
-                    ? NAN : ldexpf(1.f, (int)b[t.data_offset + q] - 127);
-            free(b);
-            w->data[i] = out;
-            w->stats.fp8_scale_bytes += k * sizeof(*out);
-            w->stats.total_bytes += k * sizeof(*out);
+                out[q] = record[t.data_offset + q] == 255
+                    ? NAN : ldexpf(1.f, (int)record[t.data_offset + q] - 127);
+            free(record);
+            b = (unsigned char *)out;
+            w->stats.fp8_scale_bytes += resident_bytes;
         } else {
-            memmove(b, b + t.data_offset, (size_t)t.data_stored_bytes);
-            w->data[i] = b;
-            w->stats.total_bytes += t.data_stored_bytes;
+            memmove(record, record + t.data_offset, (size_t)t.data_stored_bytes);
+            b = record;
         }
+        w->data[i] = b;
+        w->stats.total_bytes += resident_bytes;
         w->stats.tensor_count++;
-    }
-
-    if (profiling) {
-        coli_v4_profile_add(COLI_V4_PROF_DENSE_READ,
-                            coli_v4_profile_now() - began);
-        coli_v4_profile_add_bytes(COLI_V4_PROF_DENSE_READ,
-                                  stored_bytes_read);
+        cache_put(s->name, b, resident_bytes, r->stored_bytes);
     }
     return 0;
 
 fail:
-    if (profiling) {
-        coli_v4_profile_add(COLI_V4_PROF_DENSE_READ,
-                            coli_v4_profile_now() - began);
-        coli_v4_profile_add_bytes(COLI_V4_PROF_DENSE_READ,
-                                  stored_bytes_read);
-    }
     coli_v4_layer_free(NULL, w);
     return -1;
 }
