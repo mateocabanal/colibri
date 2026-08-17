@@ -3,8 +3,15 @@
 
 The runtime trace is intentionally cheap: logical expert requests plus residency
 transitions. This tool turns the request stream into the policy inputs needed by
-#3/#56/#57: activation skew, LRU stack/reuse distance, hypothetical cache hit
-curves, physical load counts, and persistent/transient hit attribution.
+#3/#56/#57: activation skew, LRU/reuse distance, hypothetical cache curves,
+co-routing/adjacent-token locality, and persistent/transient hit attribution.
+
+The current v1 runtime trace does not yet carry explicit token IDs. For the V4
+single-request execution order, requests for one layer are contiguous and layer
+numbers advance monotonically before wrapping to the next token. The analyzer
+therefore reconstructs token ordinals from layer wraps. Results derived this way
+are marked as inferred and should be replaced by explicit runtime token/request
+IDs before #56 is finally closed.
 """
 
 from __future__ import annotations
@@ -15,6 +22,7 @@ import math
 import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass
+from itertools import combinations
 from pathlib import Path
 from typing import Iterable
 
@@ -54,6 +62,13 @@ class TraceAnalysis:
     dropped: int
 
 
+@dataclass(frozen=True)
+class RouteGroup:
+    token: int
+    layer: int
+    experts: tuple[int, ...]
+
+
 def read_jsonl(path: Path) -> Iterable[dict]:
     with path.open("r", encoding="utf-8") as handle:
         for line_number, raw in enumerate(handle, 1):
@@ -70,13 +85,7 @@ def read_jsonl(path: Path) -> Iterable[dict]:
 
 
 def exact_reuse_distances(requests: list[tuple[int, int]]) -> tuple[list[int], int]:
-    """Return exact LRU stack distance for each repeated expert request.
-
-    Distance is the number of distinct experts referenced more recently than the
-    prior reference to this same logical `(layer, expert)` key. Therefore an LRU
-    cache of capacity C would hit exactly when distance < C. First references
-    are cold and excluded from the distance list.
-    """
+    """Return exact LRU stack distance for each repeated expert request."""
 
     bit = Fenwick(len(requests) + 1)
     last: dict[tuple[int, int], int] = {}
@@ -172,14 +181,7 @@ def _layer_request_streams(analysis: TraceAnalysis) -> dict[int, list[tuple[int,
 
 
 def per_layer_lru_curve(analysis: TraceAnalysis, capacities: list[int]) -> list[dict]:
-    """Model N independent persistent LRU slots in every observed layer.
-
-    This matches the RAM geometry of `V4_PERSISTENT_EXPERT_SLOTS_PER_LAYER`
-    much better than the global LRU curve. The value ratio is measured over the
-    complete trace: recurring expert bytes avoided divided by persistent bytes
-    reserved. It can be compared directly with the same trace-level ratio for
-    deterministic dense residency.
-    """
+    """Model N independent persistent LRU slots in every observed layer."""
 
     streams = _layer_request_streams(analysis)
     layer_distances: dict[int, list[int]] = {}
@@ -218,15 +220,7 @@ def per_layer_lru_curve(analysis: TraceAnalysis, capacities: list[int]) -> list[
 def per_layer_frequency_oracle_curve(
     analysis: TraceAnalysis, capacities: list[int]
 ) -> list[dict]:
-    """Upper bound for perfectly chosen hot experts in each layer.
-
-    For each layer, choose the N most frequent experts using knowledge of the
-    entire trace. A selected expert still misses on its first request and only
-    subsequent requests count as avoided loads. The real online hysteresis
-    policy cannot beat this curve on the same request sequence, so this is a
-    useful rejection test: if even the oracle's bytes-saved/resident-byte is
-    below dense residency, persistent expert RAM is not competitive.
-    """
+    """Upper bound for perfectly chosen hot experts in each layer."""
 
     total = len(analysis.requests)
     layers = len(analysis.layer_frequency)
@@ -263,14 +257,7 @@ def per_layer_frequency_oracle_curve(
 def global_frequency_oracle_curve(
     analysis: TraceAnalysis, capacities: list[int]
 ) -> list[dict]:
-    """Upper bound for a globally allocated persistent hot-expert tier.
-
-    Unlike the per-layer oracle, this may spend all persistent slots on the
-    hottest logical `(layer, expert)` pairs and spend nothing on diffuse layers.
-    This models the best possible value of a future global persistent tier for a
-    fixed slot budget. A selected expert still pays its first load, so only
-    `count - 1` requests are credited as avoided reads.
-    """
+    """Upper bound for a globally allocated persistent hot-expert tier."""
 
     total = len(analysis.requests)
     frequency = Counter(analysis.requests)
@@ -298,11 +285,137 @@ def global_frequency_oracle_curve(
     return rows
 
 
+def infer_route_groups(requests: list[tuple[int, int]]) -> list[RouteGroup]:
+    """Infer `(token, layer)` groups from the v1 single-request request stream.
+
+    Consecutive requests for the same layer are one routed group. A decrease in
+    layer number starts the next token. This deliberately does not fabricate
+    route rank/weight; those require explicit runtime instrumentation.
+    """
+
+    if not requests:
+        return []
+
+    groups: list[RouteGroup] = []
+    token = 0
+    current_layer = requests[0][0]
+    current_experts: list[int] = []
+    previous_group_layer: int | None = None
+
+    def finish_group() -> None:
+        nonlocal previous_group_layer
+        if current_experts:
+            groups.append(RouteGroup(token, current_layer, tuple(current_experts)))
+            previous_group_layer = current_layer
+
+    for layer, expert in requests:
+        if layer != current_layer:
+            finish_group()
+            if previous_group_layer is not None and layer < previous_group_layer:
+                token += 1
+            current_layer = layer
+            current_experts = []
+        current_experts.append(expert)
+    finish_group()
+    return groups
+
+
+def routing_locality_summary(
+    analysis: TraceAnalysis, top_n: int, prompt_tokens: int | None = None
+) -> dict:
+    groups = infer_route_groups(analysis.requests)
+    token_count = max((group.token for group in groups), default=-1) + 1
+    per_token: dict[int, set[tuple[int, int]]] = defaultdict(set)
+    per_layer_token: dict[int, dict[int, set[int]]] = defaultdict(dict)
+    pair_counts: Counter[tuple[int, int, int]] = Counter()
+
+    for group in groups:
+        experts = set(group.experts)
+        for expert in experts:
+            per_token[group.token].add((group.layer, expert))
+        per_layer_token[group.layer][group.token] = experts
+        for first, second in combinations(sorted(experts), 2):
+            pair_counts[(group.layer, first, second)] += 1
+
+    adjacent_samples = 0
+    adjacent_shared = 0
+    adjacent_union = 0
+    jaccard_total = 0.0
+    per_layer_overlap: dict[str, dict] = {}
+    for layer, token_sets in sorted(per_layer_token.items()):
+        layer_samples = 0
+        layer_shared = 0
+        layer_jaccard = 0.0
+        tokens = sorted(token_sets)
+        for previous, current in zip(tokens, tokens[1:]):
+            if current != previous + 1:
+                continue
+            left, right = token_sets[previous], token_sets[current]
+            shared = len(left & right)
+            union = len(left | right)
+            score = shared / union if union else 1.0
+            adjacent_samples += 1
+            adjacent_shared += shared
+            adjacent_union += union
+            jaccard_total += score
+            layer_samples += 1
+            layer_shared += shared
+            layer_jaccard += score
+        per_layer_overlap[str(layer)] = {
+            "samples": layer_samples,
+            "mean_shared": layer_shared / layer_samples if layer_samples else 0.0,
+            "mean_jaccard": layer_jaccard / layer_samples if layer_samples else 0.0,
+        }
+
+    top_pairs = [
+        {"layer": layer, "experts": [first, second], "co_routes": count}
+        for (layer, first, second), count in pair_counts.most_common(top_n)
+    ]
+
+    unique_per_token = [len(per_token[token]) for token in sorted(per_token)]
+    phase = None
+    if prompt_tokens is not None:
+        if prompt_tokens < 0:
+            raise ValueError("prompt token count must be non-negative")
+        prompt_request_count = sum(
+            len(group.experts) for group in groups if group.token < prompt_tokens
+        )
+        phase = {
+            "prompt_tokens": min(prompt_tokens, token_count),
+            "decode_tokens": max(0, token_count - prompt_tokens),
+            "prompt_requests": prompt_request_count,
+            "decode_requests": len(analysis.requests) - prompt_request_count,
+        }
+
+    return {
+        "token_ids": "inferred-from-layer-wraps",
+        "token_count": token_count,
+        "route_groups": len(groups),
+        "unique_logical_experts_per_token": {
+            "min": min(unique_per_token) if unique_per_token else 0,
+            "max": max(unique_per_token) if unique_per_token else 0,
+            "mean": sum(unique_per_token) / len(unique_per_token) if unique_per_token else 0.0,
+        },
+        "adjacent_token_overlap": {
+            "samples": adjacent_samples,
+            "mean_shared": adjacent_shared / adjacent_samples if adjacent_samples else 0.0,
+            "mean_jaccard": jaccard_total / adjacent_samples if adjacent_samples else 0.0,
+            "aggregate_intersection_over_union": (
+                adjacent_shared / adjacent_union if adjacent_union else 0.0
+            ),
+        },
+        "per_layer_adjacent_overlap": per_layer_overlap,
+        "top_co_routing_pairs": top_pairs,
+        "phase": phase,
+    }
+
+
 def summary_dict(
     analysis: TraceAnalysis,
     capacities: list[int],
     top_n: int,
     persistent_capacities: list[int] | None = None,
+    prompt_tokens: int | None = None,
 ) -> dict:
     if persistent_capacities is None:
         persistent_capacities = [1, 2, 4, 8]
@@ -348,6 +461,9 @@ def summary_dict(
             "p95": percentile(analysis.reuse_distances, 0.95),
             "p99": percentile(analysis.reuse_distances, 0.99),
         },
+        "routing_locality": routing_locality_summary(
+            analysis, top_n, prompt_tokens=prompt_tokens
+        ),
         "lru_capacity_curve": capacity_curve(analysis, capacities),
         "persistent_per_layer_lru_curve": per_layer_lru_curve(
             analysis, persistent_capacities
@@ -421,6 +537,34 @@ def print_human(summary: dict, top_n: int) -> None:
     else:
         print("reuse distance: no repeated expert requests")
 
+    routing = summary["routing_locality"]
+    unique = routing["unique_logical_experts_per_token"]
+    overlap = routing["adjacent_token_overlap"]
+    print(
+        "routing locality "
+        f"token_ids={routing['token_ids']} tokens={routing['token_count']} "
+        f"groups={routing['route_groups']} unique/token={unique['mean']:.1f} "
+        f"adjacent_jaccard={overlap['mean_jaccard']:.3f} "
+        f"adjacent_shared={overlap['mean_shared']:.2f}"
+    )
+    if routing["phase"]:
+        phase = routing["phase"]
+        print(
+            "routing phases "
+            f"prompt_tokens={phase['prompt_tokens']} "
+            f"decode_tokens={phase['decode_tokens']} "
+            f"prompt_requests={phase['prompt_requests']} "
+            f"decode_requests={phase['decode_requests']}"
+        )
+    if routing["top_co_routing_pairs"]:
+        print(f"\nTop {top_n} co-routing pairs:")
+        for pair in routing["top_co_routing_pairs"]:
+            first, second = pair["experts"]
+            print(
+                f"  layer {pair['layer']:2d}: "
+                f"e{first}+e{second} = {pair['co_routes']}"
+            )
+
     print("\nGlobal LRU working-set curve:")
     print("  slots      hit-rate        hits     avoided")
     for row in summary["lru_capacity_curve"]:
@@ -462,21 +606,36 @@ def main(argv: list[str] | None = None) -> int:
         default="1,2,4,8",
         help="comma-separated persistent expert slots to model per layer",
     )
-    parser.add_argument("--top", type=int, default=5, help="experts shown per layer")
+    parser.add_argument(
+        "--prompt-tokens",
+        type=int,
+        default=None,
+        help=(
+            "optional prompt-token count; tags reconstructed token ordinals as "
+            "prompt/decode until the runtime trace carries explicit phase IDs"
+        ),
+    )
+    parser.add_argument("--top", type=int, default=5, help="experts/pairs shown")
     parser.add_argument("--json", action="store_true", help="emit machine-readable summary")
     args = parser.parse_args(argv)
 
     if args.top < 1:
         parser.error("--top must be positive")
+    if args.prompt_tokens is not None and args.prompt_tokens < 0:
+        parser.error("--prompt-tokens must be non-negative")
     try:
         capacities = parse_capacities(args.capacities)
         persistent_capacities = parse_capacities(args.persistent_capacities)
         analysis = analyze(args.trace)
+        summary = summary_dict(
+            analysis,
+            capacities,
+            args.top,
+            persistent_capacities,
+            prompt_tokens=args.prompt_tokens,
+        )
     except (OSError, ValueError) as exc:
         parser.error(str(exc))
-    summary = summary_dict(
-        analysis, capacities, args.top, persistent_capacities
-    )
     if args.json:
         json.dump(summary, sys.stdout, sort_keys=True, indent=2)
         sys.stdout.write("\n")
