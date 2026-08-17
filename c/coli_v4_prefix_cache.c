@@ -301,6 +301,12 @@ static void release_snapshot_reservation_locked(size_t bytes) {
         g_prefix_cache.reserved_entries--;
 }
 
+static void release_snapshot_reservation(size_t bytes) {
+    pthread_mutex_lock(&g_prefix_cache.mutex);
+    release_snapshot_reservation_locked(bytes);
+    pthread_mutex_unlock(&g_prefix_cache.mutex);
+}
+
 void coli_v4_prefix_cache_store(ColiV4Session *session) {
     prefix_cache_init();
     if (!g_prefix_cache.budget_bytes || !session || !session->fed.fed ||
@@ -314,10 +320,12 @@ void coli_v4_prefix_cache_store(ColiV4Session *session) {
 
     ColiV4PrefixCacheEntry *entry = capture_entry(session);
     if (!entry || !entry->bytes || entry->bytes > reserved) {
-        pthread_mutex_lock(&g_prefix_cache.mutex);
-        release_snapshot_reservation_locked(reserved);
-        pthread_mutex_unlock(&g_prefix_cache.mutex);
+        /* Keep the reservation charged until every byte cloned under it is
+         * physically gone. Otherwise a concurrent admission can reuse this
+         * budget between reservation release and entry_free(), transiently
+         * exceeding the hard UMA/RAM cap. */
         entry_free(entry);
+        release_snapshot_reservation(reserved);
         return;
     }
 
@@ -332,23 +340,32 @@ void coli_v4_prefix_cache_store(ColiV4Session *session) {
      * duplicates and wasting the byte budget. */
     ColiV4PrefixCacheEntry *duplicate = find_exact_locked(
         entry->engine, entry->tokens, entry->token_count);
-    release_snapshot_reservation_locked(reserved);
     if (duplicate) {
         duplicate->last_used = ++g_prefix_cache.clock;
     } else {
-        /* Replacing our reservation with an equal-or-smaller resident entry is
-         * guaranteed to preserve both the byte and entry-count budgets. Keep a
-         * defensive check so a future snapshot-layout change fails closed. */
+        /* Evaluate the post-insert geometry while excluding only this clone's
+         * own reservation. If accepted, reservation -> resident is one atomic
+         * accounting transition under the mutex. Other concurrent clone
+         * reservations remain charged throughout. */
+        int own_reservation_valid =
+            reserved <= g_prefix_cache.reserved_bytes &&
+            g_prefix_cache.reserved_entries > 0;
+        size_t other_reserved = own_reservation_valid
+            ? g_prefix_cache.reserved_bytes - reserved : SIZE_MAX;
         size_t remaining = g_prefix_cache.resident_bytes <= g_prefix_cache.budget_bytes
             ? g_prefix_cache.budget_bytes - g_prefix_cache.resident_bytes : 0;
-        if (g_prefix_cache.reserved_bytes <= remaining)
-            remaining -= g_prefix_cache.reserved_bytes;
+        if (other_reserved <= remaining)
+            remaining -= other_reserved;
         else
             remaining = 0;
-        int count_ok = g_prefix_cache.count < COLI_V4_PREFIX_CACHE_MAX_ENTRIES &&
-            g_prefix_cache.reserved_entries <
+        size_t other_reserved_entries = own_reservation_valid
+            ? g_prefix_cache.reserved_entries - 1 : SIZE_MAX;
+        int count_ok = own_reservation_valid &&
+            g_prefix_cache.count < COLI_V4_PREFIX_CACHE_MAX_ENTRIES &&
+            other_reserved_entries <
                 COLI_V4_PREFIX_CACHE_MAX_ENTRIES - g_prefix_cache.count;
         if (entry->bytes <= remaining && count_ok) {
+            release_snapshot_reservation_locked(reserved);
             entry->last_used = ++g_prefix_cache.clock;
             g_prefix_cache.entries[g_prefix_cache.count++] = entry;
             g_prefix_cache.resident_bytes += entry->bytes;
@@ -361,7 +378,11 @@ void coli_v4_prefix_cache_store(ColiV4Session *session) {
     pthread_mutex_unlock(&g_prefix_cache.mutex);
 
     if (!inserted) {
+        /* Duplicate/rejected clones are still covered by their reservation at
+         * this point. Free first, then make those bytes available to another
+         * admission. */
         entry_free(entry);
+        release_snapshot_reservation(reserved);
         return;
     }
 
