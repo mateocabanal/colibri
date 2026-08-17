@@ -1,0 +1,97 @@
+name: Stage Qwen COLI residency fixes v3
+
+on:
+  push:
+    branches: [feat/qwen36-mxfp4]
+    paths: [.github/workflows/qwen-residency-fix-stage-v3.yml]
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply staged fix
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('.github/scripts/qwen_residency_fix.py'); s=p.read_text()
+          old='b = g_slabs[i].buf; g_slabs[i].buf=nil; g_slabs.erase(g_slabs.begin()+i); break;\\n    }\\n  }\\n'
+          new='b = g_slabs[i].buf; g_slabs[i].buf=nil; g_slabs.erase(g_slabs.begin()+i); break; }\\n  }\\n'
+          if old not in s: raise SystemExit('unregister staging pattern missing')
+          p.write_text(s.replace(old,new,1))
+          PY
+          python3 .github/scripts/qwen_residency_fix.py
+          git diff --check
+      - name: Build and run portable tests
+        run: |
+          cc -O2 -Wall -Wextra -I c c/tests/test_coli_format.c c/coli_format.c c/coli_executor.c -lpthread -o /tmp/test_coli_format
+          cc -O2 -Wall -Wextra -I c c/tests/test_mxfp4_expert.c c/mxfp4_expert.c c/coli_format.c -lpthread -o /tmp/test_mxfp4_expert
+          /tmp/test_coli_format
+          /tmp/test_mxfp4_expert
+          make -C c clean
+          make -C c tests/test_qwen_moe -j2
+          ./c/tests/test_qwen_moe
+      - name: Build Qwen Metal
+        if: runner.os == 'macOS'
+        run: |
+          make -C c clean
+          make -C c qwen_moe METAL=1 -j2
+      - name: Exercise Metal slab registry
+        if: runner.os == 'macOS'
+        run: |
+          cat > /tmp/test_slab_registry.mm <<'EOF'
+          #include "backend_metal.h"
+          #include <cstdio>
+          #include <cstdlib>
+          #include <cstring>
+          int main(){
+            if(!coli_metal_init()) return 77;
+            const int N=128; void *p[N]={};
+            for(int i=0;i<N;i++){
+              if(posix_memalign(&p[i],16384,16384)!=0||!p[i]) return 2;
+              memset(p[i],i,16384); coli_metal_register(p[i],16384);
+              if(!coli_metal_ptr_registered(p[i])||!coli_metal_ptr_registered((char*)p[i]+8192)) return 3;
+            }
+            for(int i=0;i<N;i+=2){coli_metal_unregister(p[i]); if(coli_metal_ptr_registered(p[i])) return 4;}
+            for(int i=1;i<N;i+=2) if(!coli_metal_ptr_registered((char*)p[i]+16383)) return 5;
+            for(int i=1;i<N;i+=2) coli_metal_unregister(p[i]);
+            for(int i=0;i<N;i++) free(p[i]);
+            coli_metal_shutdown(); std::puts("PASS metal slab registry"); return 0;
+          }
+          EOF
+          clang++ -x objective-c++ -std=gnu++17 -fobjc-arc -O2 -I c /tmp/test_slab_registry.mm c/backend_metal.o \
+            -framework Metal -framework Foundation -lc++ -o /tmp/test_slab_registry
+          /tmp/test_slab_registry
+
+  commit:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 0}
+      - name: Apply and commit
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('.github/scripts/qwen_residency_fix.py'); s=p.read_text()
+          old='b = g_slabs[i].buf; g_slabs[i].buf=nil; g_slabs.erase(g_slabs.begin()+i); break;\\n    }\\n  }\\n'
+          new='b = g_slabs[i].buf; g_slabs[i].buf=nil; g_slabs.erase(g_slabs.begin()+i); break; }\\n  }\\n'
+          if old not in s: raise SystemExit('unregister staging pattern missing')
+          p.write_text(s.replace(old,new,1))
+          PY
+          python3 .github/scripts/qwen_residency_fix.py
+          git diff --check
+          rm -f .github/scripts/qwen_residency_fix.py
+          rm -f .github/workflows/qwen-residency-fix-stage.yml .github/workflows/qwen-residency-fix-stage-v2.yml .github/workflows/qwen-residency-fix-stage-v3.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A c/coli_format.h c/coli_format.c c/mxfp4_expert.h c/mxfp4_expert.c c/qwen_moe.c c/backend_metal.mm c/tests/test_coli_format.c .github
+          git commit -m 'perf: keep streamed COLI experts out of page cache'
+          git push origin HEAD:feat/qwen36-mxfp4
