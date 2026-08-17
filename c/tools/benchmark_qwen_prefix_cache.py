@@ -9,9 +9,10 @@ total host/UMA envelope fixed.
 
 The engine's QWEN-PREFIX request telemetry is authoritative for token counts,
 matched tokens, snapshot bytes, restore time, tail-prefill time, and capture
-time. First-byte latency is measured by this driver at the serve protocol
-boundary. Trials alternate cache-off/cache-on process order to reduce systematic
-OS/storage warming bias.
+time. Protocol-boundary first-token latency, first-to-second-token gap, and
+completion latency are all measured: moving snapshot capture after the first
+DATA frame must not be mistaken for eliminating its cost. Trials alternate
+cache-off/cache-on process order to reduce systematic OS/storage warming bias.
 """
 from __future__ import annotations
 
@@ -92,11 +93,6 @@ class Serve:
         context: int,
     ) -> None:
         env = os.environ.copy()
-        # CACHE would override RAM_GB inside Qwen and defeat fixed-total-memory
-        # accounting, so reject it rather than silently benchmarking another
-        # residency policy.
-        if env.get("CACHE"):
-            raise RuntimeError("unset CACHE: benchmark requires Qwen RAM_GB auto sizing")
         env.update(
             SERVE="1",
             SNAP=str(model),
@@ -106,8 +102,9 @@ class Serve:
             QWEN_PREFIX_CACHE_MIN_TOKENS=str(min_prefix_tokens),
             QWEN_PREFIX_LOG="1",
         )
-        # argv cap=0 deliberately selects Qwen's CACHE -> RAM_GB -> topk auto
-        # path. Passing a positive cap would make prefix memory additive.
+        # argv cap=0 deliberately bypasses any inherited CACHE setting and
+        # selects Qwen's RAM_GB -> topk path. Passing a positive positional cap
+        # would make prefix memory additive instead of fixed-total-memory.
         self.process = subprocess.Popen(
             [str(binary), "0"],
             stdin=subprocess.PIPE,
@@ -144,7 +141,7 @@ class Serve:
         self.process.stdin.flush()
 
         output: list[bytes] = []
-        first_byte_sec: float | None = None
+        data_times: list[float] = []
         done_fields: list[str] | None = None
         while True:
             line = self.process.stdout.readline()
@@ -160,8 +157,7 @@ class Serve:
             if kind == "ERROR":
                 raise RuntimeError(f"engine ERROR during {request_id}: {line!r}")
             if kind == "DATA" and len(fields) == 3:
-                if first_byte_sec is None:
-                    first_byte_sec = time.perf_counter() - began
+                data_times.append(time.perf_counter() - began)
                 size = int(fields[2])
                 output.append(self.process.stdout.read(size))
                 self.process.stdout.read(1)  # DATA payload trailing newline
@@ -171,13 +167,17 @@ class Serve:
             # ACCEPT/PROF/STAT/HWINFO/TIERS/EMAP are protocol metadata.
 
         done_sec = time.perf_counter() - began
-        if first_byte_sec is None:
-            # A stop token can produce DONE without DATA. Keep a comparable
-            # first-response latency instead of discarding the trial.
-            first_byte_sec = done_sec
+        first_response_sec = data_times[0] if data_times else done_sec
+        second_response_sec = data_times[1] if len(data_times) > 1 else None
         return {
             "request_id": request_id,
-            "first_response_sec": first_byte_sec,
+            "first_response_sec": first_response_sec,
+            "second_response_sec": second_response_sec,
+            "first_to_second_sec": (
+                second_response_sec - first_response_sec
+                if second_response_sec is not None else None
+            ),
+            "data_frames": len(data_times),
             "done_sec": done_sec,
             "output_hex": b"".join(output).hex(),
             "done_fields": done_fields,
@@ -263,7 +263,7 @@ def main() -> int:
     parser.add_argument("--min-prefix-tokens", type=int, default=256)
     parser.add_argument("--memory-gb", type=float, required=True)
     parser.add_argument("--context", type=int, default=8192)
-    parser.add_argument("--max-tokens", type=int, default=1)
+    parser.add_argument("--max-tokens", type=int, default=2)
     parser.add_argument("--trials", type=int, default=3)
     parser.add_argument("--repo")
     parser.add_argument("--output")
@@ -271,8 +271,8 @@ def main() -> int:
 
     if args.memory_gb <= 0 or args.cache_mb <= 0:
         parser.error("--memory-gb and --cache-mb must be positive")
-    if args.min_prefix_tokens < 1 or args.context < 2 or args.max_tokens < 1 or args.trials < 1:
-        parser.error("min-prefix/context/max-tokens/trials must be positive")
+    if args.min_prefix_tokens < 1 or args.context < 2 or args.max_tokens < 2 or args.trials < 1:
+        parser.error("min-prefix/trials must be positive, context >=2, and max-tokens >=2")
     if args.prefix_tokens < 1 or args.chars_per_token <= 0:
         parser.error("--prefix-tokens and --chars-per-token must be positive")
 
@@ -332,9 +332,16 @@ def main() -> int:
             )
         if off["measure"]["output_hex"] != on["measure"]["output_hex"]:
             raise RuntimeError(f"trial {trial}: cache-on output differs from cache-off")
+        if off["measure"]["second_response_sec"] is None or on["measure"]["second_response_sec"] is None:
+            raise RuntimeError(
+                f"trial {trial}: benchmark needs at least two emitted tokens to measure "
+                "the post-first-token capture stall; choose a prompt/tail that does not stop early"
+            )
 
         off_ttft = float(off["measure"]["first_response_sec"])
         on_ttft = float(on["measure"]["first_response_sec"])
+        off_gap = float(off["measure"]["first_to_second_sec"])
+        on_gap = float(on["measure"]["first_to_second_sec"])
         pair = {
             "trial": trial,
             "order": order,
@@ -344,12 +351,21 @@ def main() -> int:
             "ttft_on_sec": on_ttft,
             "ttft_saved_sec": off_ttft - on_ttft,
             "ttft_speedup": off_ttft / on_ttft if on_ttft > 0 else None,
+            "first_to_second_off_sec": off_gap,
+            "first_to_second_on_sec": on_gap,
+            "first_to_second_penalty_sec": on_gap - off_gap,
+            "completion_off_sec": float(off["measure"]["done_sec"]),
+            "completion_on_sec": float(on["measure"]["done_sec"]),
         }
         pairs.append(pair)
 
     off_values = [float(p["ttft_off_sec"]) for p in pairs]
     on_values = [float(p["ttft_on_sec"]) for p in pairs]
     speedups = [float(p["ttft_speedup"]) for p in pairs if p["ttft_speedup"] is not None]
+    gap_off_values = [float(p["first_to_second_off_sec"]) for p in pairs]
+    gap_on_values = [float(p["first_to_second_on_sec"]) for p in pairs]
+    completion_off_values = [float(p["completion_off_sec"]) for p in pairs]
+    completion_on_values = [float(p["completion_on_sec"]) for p in pairs]
     sample_metric = pairs[0]["cache_on"]["measure_metric"]
     result = {
         "schema": "colibri.qwen.prefix_cache_benchmark.v1",
@@ -374,6 +390,16 @@ def main() -> int:
             "ttft_on_median_sec": statistics.median(on_values),
             "ttft_saved_median_sec": statistics.median(off_values) - statistics.median(on_values),
             "ttft_speedup_median": statistics.median(speedups),
+            "first_to_second_off_median_sec": statistics.median(gap_off_values),
+            "first_to_second_on_median_sec": statistics.median(gap_on_values),
+            "first_to_second_penalty_median_sec": (
+                statistics.median(gap_on_values) - statistics.median(gap_off_values)
+            ),
+            "completion_off_median_sec": statistics.median(completion_off_values),
+            "completion_on_median_sec": statistics.median(completion_on_values),
+            "completion_delta_median_sec": (
+                statistics.median(completion_on_values) - statistics.median(completion_off_values)
+            ),
             "restore_ms_median": statistics.median(float(p["cache_on"]["measure_metric"]["restore_ms"]) for p in pairs),
             "tail_prefill_ms_median": statistics.median(float(p["cache_on"]["measure_metric"]["prefill_ms"]) for p in pairs),
             "capture_ms_median": statistics.median(float(p["cache_on"]["measure_metric"]["capture_ms"]) for p in pairs),
