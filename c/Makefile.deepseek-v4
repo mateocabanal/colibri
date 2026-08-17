@@ -113,6 +113,17 @@ CFLAGS += -flto
 LDFLAGS += -flto
 endif
 
+# Expert execution events are intentionally compile-gated. Detailed route and
+# lookup tracing remains runtime-gated, but putting a wrapper around every
+# expert-forward call in the normal binary would make the disabled-overhead
+# acceptance criterion harder to guarantee. CI enables this flag for the tiny
+# target oracle so the special tracing build is still continuously exercised.
+V4_TRACE_EXEC ?= 0
+V4_TRACE_EXEC_OBJS =
+ifeq ($(V4_TRACE_EXEC),1)
+V4_TRACE_EXEC_OBJS = coli_v4_expert_execute_trace.o
+endif
+
 include Makefile.deepseek-v4.units
 
 # Package-only dense residency borrows immutable cache pointers. The public V4
@@ -133,7 +144,7 @@ V4_SPLIT_OBJS = COLI_V4_UNIT_RESOURCE_PLAN.o \
 	COLI_V4_UNIT_BLOCK_HYBRID.o \
 	COLI_V4_UNIT_GENERATE_STATS.o
 V4_AMALGAMATED_OBJS = $(filter-out $(V4_SPLIT_OBJS),$(sort $(TARGET_OBJS) $(TEST_UNIT_OBJS)))
-V4_COLI_OBJS = coli_v4_expert_store.o coli_v4_static.o coli_executor.o coli_format.o
+V4_COLI_OBJS = coli_v4_expert_store.o coli_v4_static.o coli_executor.o coli_format.o $(V4_TRACE_EXEC_OBJS)
 V4_OBJS = $(TARGET_OBJS) $(V4_COLI_OBJS) $(V4_METAL_OBJS)
 V4_BUILD_CONFIG = .deepseek-v4-build-config
 
@@ -143,9 +154,11 @@ FORCE:
 # C/Objective-C++ objects share names across METAL=0 and METAL=1 builds.  Make
 # does not otherwise see a changed command line, so a CPU-only build could be
 # accidentally reused by a later default Metal build.  Track the effective
-# configuration and make every V4 object depend on it.
+# configuration and make every V4 object depend on it. V4_TRACE_EXEC is part of
+# the stamp because it changes the block-unit call target and linked support
+# object even when every ordinary compiler flag is otherwise identical.
 $(V4_BUILD_CONFIG): FORCE
-	@printf '%s\n' 'CC=$(CC)' 'CFLAGS=$(CFLAGS)' 'LDFLAGS=$(LDFLAGS)' 'METAL=$(METAL)' 'LTO=$(LTO)' 'V4_LAYER_RESIDENT_CFLAGS=$(V4_LAYER_RESIDENT_CFLAGS)' > $@.tmp
+	@printf '%s\n' 'CC=$(CC)' 'CFLAGS=$(CFLAGS)' 'LDFLAGS=$(LDFLAGS)' 'METAL=$(METAL)' 'LTO=$(LTO)' 'V4_TRACE_EXEC=$(V4_TRACE_EXEC)' 'V4_LAYER_RESIDENT_CFLAGS=$(V4_LAYER_RESIDENT_CFLAGS)' > $@.tmp
 	@if test -f $@ && cmp -s $@.tmp $@; then rm -f $@.tmp; else mv -f $@.tmp $@; fi
 
 $(V4_OBJS) $(TEST_UNIT_OBJS): $(V4_BUILD_CONFIG)
@@ -160,6 +173,8 @@ coli_executor.o: coli_executor.c coli_executor.h coli_format.h
 	$(CC) $(CFLAGS) -c coli_executor.c -o $@
 coli_format.o: coli_format.c coli_format.h compat.h coli_v4_macos_uncached_io.h
 	$(CC) $(CFLAGS) -include coli_v4_macos_uncached_io.h -c coli_format.c -o $@
+coli_v4_expert_execute_trace.o: coli_v4_expert_execute_trace.c deepseek_v4_internal.h expert_store.h tensor.h
+	$(CC) $(CFLAGS) -c coli_v4_expert_execute_trace.c -o $@
 
 # Split out of deepseek_v4.c so #3 can change planner semantics without a
 # whole-amalgamation rewrite. These sources export the exact same symbols as the
@@ -173,6 +188,9 @@ COLI_V4_UNIT_EXPERT_STORE_AUTO.o: coli_v4_expert_store_auto.c deepseek_v4_intern
 # collapse many logical selections into one physical expert lease. Compile the
 # existing block unit through a small source overlay instead of duplicating or
 # rewriting the large amalgamated implementation.
+ifeq ($(V4_TRACE_EXEC),1)
+COLI_V4_UNIT_BLOCK_HYBRID.o: CFLAGS += -Dcoli_v4_expert_forward_ref=coli_v4_trace_expert_forward_ref
+endif
 COLI_V4_UNIT_BLOCK_HYBRID.o: coli_v4_block_hybrid_trace.c deepseek_v4.c deepseek_v4.h \
 	deepseek_v4_internal.h expert_store.h tensor.h
 	$(CC) $(CFLAGS) -DCOLI_V4_UNIT_BLOCK_HYBRID -c coli_v4_block_hybrid_trace.c -o $@
@@ -196,4 +214,4 @@ $(V4_AMALGAMATED_OBJS): %.o: deepseek_v4.c deepseek_v4.h \
 deepseek-v4-test-objs: $(TEST_UNIT_OBJS)
 
 deepseek-v4-clean:
-	rm -f $(V4_BINARY) $(V4_OBJS) $(TEST_UNIT_OBJS) $(V4_BUILD_CONFIG)
+	rm -f $(V4_BINARY) $(V4_OBJS) $(TEST_UNIT_OBJS) coli_v4_expert_execute_trace.o $(V4_BUILD_CONFIG)
