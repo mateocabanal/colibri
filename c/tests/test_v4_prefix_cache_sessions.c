@@ -242,10 +242,10 @@ int main(int argc, char **argv) {
     }
     ColiV4EngineMemorySummary memory = {0};
     coli_v4_engine_memory_summary(cold_engine, &memory);
-    if (reserve > explicit_limit ||
+    if (!memory.projected_bytes || reserve > explicit_limit ||
         memory.projected_bytes > explicit_limit - reserve) {
         fprintf(stderr,
-                "prefix-cache memory envelope exceeded: projected=%llu reserve=%llu limit=%llu\n",
+                "prefix-cache memory envelope invalid: projected=%llu reserve=%llu limit=%llu\n",
                 (unsigned long long)memory.projected_bytes,
                 (unsigned long long)reserve,
                 (unsigned long long)explicit_limit);

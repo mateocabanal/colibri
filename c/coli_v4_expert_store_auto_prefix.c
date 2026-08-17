@@ -34,9 +34,9 @@ static uint64_t coli_v4_prefix_reserved_available_memory(void) {
 
 /* The standalone planner computes the right final resource plan but historically
  * returned it only through diagnostics; engine->summary retained just the
- * dense/head/expert-cache booleans and bytes. Capture the plan pointer when the
- * resource calculation starts, then copy its final (post-tier/post-head) value
- * at the actual expert-store open call while the planner stack frame is still
+ * dense/head/expert-cache fields. Capture the plan pointer when the resource
+ * calculation starts, then copy its final (post-tier/post-head) projection at
+ * the actual expert-store open call while the planner stack frame is still
  * alive. This adds no second inventory pass and gives #1/#12 an authoritative
  * machine-readable projected-memory value. Thread-local state keeps concurrent
  * engine opens independent. */
@@ -117,12 +117,8 @@ int coli_v4_expert_store_open_planned(
         engine, options, output, error, error_size);
     engine->runtime.memory_limit_bytes = original_limit;
 
-    if (!result && coli_v4_prefix_final_plan_valid) {
-        engine->summary.available_bytes = coli_v4_prefix_final_plan.os_available_bytes;
-        engine->summary.planner_available_bytes =
-            coli_v4_prefix_final_plan.planner_available_bytes;
+    if (!result && coli_v4_prefix_final_plan_valid)
         engine->summary.projected_bytes = coli_v4_prefix_final_plan.projected_bytes;
-    }
     coli_v4_prefix_active_plan = NULL;
     coli_v4_prefix_final_plan_valid = 0;
 
