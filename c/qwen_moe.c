@@ -299,6 +299,7 @@ typedef struct {
     float *g4s, *u4s, *d4s;        /* packed: per-64-input-group f32 scales */
     uint8_t *mxg, *mxu, *mxd;       /* MXFP4 E2M1 packed gate/up/down weights */
     uint8_t *mxgs, *mxus, *mxds;    /* MXFP4 raw E8M0 scales, one per 32 columns */
+    uint8_t *mxbase;                 /* owner for coalesced on-disk MXFP4 slab, else NULL */
     uint64_t used;
 } Slot;
 typedef struct { Slot *slots; int n, cap; } LCache;
@@ -1009,18 +1010,28 @@ static void load_expert_coli(Model *m, int layer, int eid, Slot *s){
             exit(1);
         }
         slot_alloc_mxfp4(s, &layout);
-        ColiMxfp4ExpertBuffers buffers = {
-            .gate_weights = s->mxg, .gate_weight_capacity = layout.gate_weight_bytes,
-            .gate_scales = s->mxgs, .gate_scale_capacity = layout.gate_scale_bytes,
-            .up_weights = s->mxu, .up_weight_capacity = layout.up_weight_bytes,
-            .up_scales = s->mxus, .up_scale_capacity = layout.up_scale_bytes,
-            .down_weights = s->mxd, .down_weight_capacity = layout.down_weight_bytes,
-            .down_scales = s->mxds, .down_scale_capacity = layout.down_scale_bytes,
-        };
         const ColiPackage *pkg = coli_executor_package(m->coli);
         uint32_t read_flags = g_expert_drop ? COLI_CSF_READ_UNCACHED : COLI_CSF_READ_DEFAULT;
-        if (coli_mxfp4_expert_load_ex(pkg, erec, cc->hidden, cc->moe_inter,
-                                      &buffers, &layout, read_flags, err, sizeof(err))) {
+        int load_rc = 0;
+        if (s->mxbase) {
+            /* Fast path: compiler-style layout, one direct record-range read. */
+            load_rc = coli_package_read_range_ex(pkg, erec, layout.record_span_offset,
+                                                  s->mxbase, layout.record_span_bytes,
+                                                  read_flags, err, sizeof(err));
+        } else {
+            ColiMxfp4ExpertBuffers buffers = {
+                .gate_weights = s->mxg, .gate_weight_capacity = layout.gate_weight_bytes,
+                .gate_scales = s->mxgs, .gate_scale_capacity = layout.gate_scale_bytes,
+                .up_weights = s->mxu, .up_weight_capacity = layout.up_weight_bytes,
+                .up_scales = s->mxus, .up_scale_capacity = layout.up_scale_bytes,
+                .down_weights = s->mxd, .down_weight_capacity = layout.down_weight_bytes,
+                .down_scales = s->mxds, .down_scale_capacity = layout.down_scale_bytes,
+            };
+            load_rc = coli_mxfp4_expert_load_ex(pkg, erec, cc->hidden, cc->moe_inter,
+                                                 &buffers, &layout, read_flags,
+                                                 err, sizeof(err));
+        }
+        if (load_rc) {
             fprintf(stderr, "qwen coli: read MXFP4 expert (%d,%d) failed: %s\n",
                     layer, eid, err[0] ? err : "read failed");
             exit(1);
@@ -1495,6 +1506,30 @@ static void slot_alloc_bf16(Slot *s, int64_t ng, int64_t nd){
 
 static void slot_alloc_mxfp4(Slot *s, const ColiMxfp4ExpertLayout *layout){
     if (s->mxg) return;
+
+    /* colic currently emits the six executable regions almost contiguously
+     * (16-byte alignment only). Preserve that physical layout in RAM so one
+     * pread can populate the whole expert and one Metal registration covers
+     * every interior pointer. Keep a conservative padding guard so arbitrary
+     * valid COLIEXPT records still use the generic two-slab/six-read path. */
+    if (layout->record_span_bytes >= layout->resident_bytes &&
+        layout->record_span_bytes - layout->resident_bytes <= 4096) {
+        size_t span_alloc = moe_slab_bytes(layout->record_span_bytes);
+        s->mxbase = moe_slab_alloc(span_alloc);
+        s->mxg  = s->mxbase + layout->gate_weight_span_offset;
+        s->mxgs = s->mxbase + layout->gate_scale_span_offset;
+        s->mxu  = s->mxbase + layout->up_weight_span_offset;
+        s->mxus = s->mxbase + layout->up_scale_span_offset;
+        s->mxd  = s->mxbase + layout->down_weight_span_offset;
+        s->mxds = s->mxbase + layout->down_scale_span_offset;
+        s->pinned = 0;
+        s->fmt = 7;
+#ifdef COLI_METAL
+        if (g_metal_compute) coli_metal_register(s->mxbase, span_alloc);
+#endif
+        return;
+    }
+
     size_t weight_bytes = 0, scale_bytes = 0;
     if (!size_add_ok(layout->gate_weight_bytes, layout->up_weight_bytes, &weight_bytes) ||
         !size_add_ok(weight_bytes, layout->down_weight_bytes, &weight_bytes) ||
@@ -2677,12 +2712,12 @@ static void arena_free(ArenaSlot *a, int n){
     for (int i = 0; i < n; i++) {
         Slot *s = &a[i].s;
 #ifdef COLI_METAL
-        if (g_metal_compute) { coli_metal_unregister(s->g); coli_metal_unregister(s->g4); coli_metal_unregister(s->gs); coli_metal_unregister(s->g4s); coli_metal_unregister(s->mxg); coli_metal_unregister(s->mxgs); }
+        if (g_metal_compute) { coli_metal_unregister(s->g); coli_metal_unregister(s->g4); coli_metal_unregister(s->gs); coli_metal_unregister(s->g4s); if (s->mxbase) coli_metal_unregister(s->mxbase); else { coli_metal_unregister(s->mxg); coli_metal_unregister(s->mxgs); } }
 #endif
         free(s->gu); free(s->bgu); free(s->g); free(s->g4); free(s->g4s);
-        free(s->mxg); free(s->mxgs);
+        if (s->mxbase) free(s->mxbase); else { free(s->mxg); free(s->mxgs); }
         s->gu = NULL; s->bgu = NULL; s->bd = NULL; s->g = NULL; s->g4 = NULL; s->g4s = NULL;
-        s->mxg = s->mxu = s->mxd = NULL; s->mxgs = s->mxus = s->mxds = NULL;
+        s->mxg = s->mxu = s->mxd = NULL; s->mxgs = s->mxus = s->mxds = NULL; s->mxbase = NULL;
     }
 }
 
@@ -2894,10 +2929,10 @@ qwen_mxfp4_batch_done:
             Slot *s = &wave[a];
             if (s->mio_resident) continue;
 #ifdef COLI_METAL
-            if (g_metal_compute) { coli_metal_unregister(s->g4); coli_metal_unregister(s->g4s); coli_metal_unregister(s->mxg); coli_metal_unregister(s->mxgs); }
+            if (g_metal_compute) { coli_metal_unregister(s->g4); coli_metal_unregister(s->g4s); if (s->mxbase) coli_metal_unregister(s->mxbase); else { coli_metal_unregister(s->mxg); coli_metal_unregister(s->mxgs); } }
 #endif
             free(s->gu); free(s->bgu); free(s->g); free(s->gs); free(s->g4); free(s->g4s);
-            free(s->mxg); free(s->mxgs);
+            if (s->mxbase) free(s->mxbase); else { free(s->mxg); free(s->mxgs); }
         }
     }
     free(uniq); free(eid_slot); free(wave); free(xscratch); free(yscratch);

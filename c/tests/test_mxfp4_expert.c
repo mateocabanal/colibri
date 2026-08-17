@@ -31,6 +31,14 @@ static int expect_valid(void) {
     info.matrices[0] = matrix(COLI_MXFP4_EXPERT_ROLE_DOWN, 64, 32);
     info.matrices[1] = matrix(COLI_MXFP4_EXPERT_ROLE_GATE, 32, 64);
     info.matrices[2] = matrix(COLI_MXFP4_EXPERT_ROLE_UP, 32, 64);
+    /* Compiler order is gate W/S, up W/S, down W/S; descriptor order is
+     * intentionally shuffled above to prove roles, not indices, drive it. */
+    info.matrices[1].weight_offset = 448;
+    info.matrices[1].scale_offset = 1472;
+    info.matrices[2].weight_offset = 1536;
+    info.matrices[2].scale_offset = 2560;
+    info.matrices[0].weight_offset = 2624;
+    info.matrices[0].scale_offset = 3648;
     info.logical_bytes = 3264;
 
     ColiMxfp4ExpertLayout layout;
@@ -43,7 +51,14 @@ static int expect_valid(void) {
     if (layout.gate_weight_bytes != 1024 || layout.gate_scale_bytes != 64 ||
         layout.up_weight_bytes != 1024 || layout.up_scale_bytes != 64 ||
         layout.down_weight_bytes != 1024 || layout.down_scale_bytes != 64 ||
-        layout.resident_bytes != 3264) {
+        layout.resident_bytes != 3264 ||
+        layout.record_span_offset != 448 || layout.record_span_bytes != 3264 ||
+        layout.gate_weight_span_offset != 0 ||
+        layout.gate_scale_span_offset != 1024 ||
+        layout.up_weight_span_offset != 1088 ||
+        layout.up_scale_span_offset != 2112 ||
+        layout.down_weight_span_offset != 2176 ||
+        layout.down_scale_span_offset != 3200) {
         fprintf(stderr, "unexpected MXFP4 layout size: %zu\n",
                 layout.resident_bytes);
         return 1;

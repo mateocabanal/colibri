@@ -24,6 +24,19 @@ typedef struct ColiMxfp4ExpertLayout {
     size_t down_weight_bytes;
     size_t down_scale_bytes;
     size_t resident_bytes;
+
+    /* Smallest record-relative span covering all six executable regions.
+     * The *_span_offset fields are relative to record_span_offset. A runtime
+     * may read record_span_bytes once when padding overhead is acceptable;
+     * the generic six-span loader remains valid for arbitrary layouts. */
+    uint64_t record_span_offset;
+    size_t record_span_bytes;
+    size_t gate_weight_span_offset;
+    size_t gate_scale_span_offset;
+    size_t up_weight_span_offset;
+    size_t up_scale_span_offset;
+    size_t down_weight_span_offset;
+    size_t down_scale_span_offset;
 } ColiMxfp4ExpertLayout;
 
 typedef struct ColiMxfp4ExpertBuffers {

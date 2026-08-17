@@ -160,6 +160,46 @@ int coli_mxfp4_expert_validate_info(const ColiExpertInfo *info,
 #undef ADD_FIELD
     layout->resident_bytes = total;
 
+    /* Build a record-relative coalesced span view for runtimes that want one
+     * physical read. coli_package_expert_info() already validates record bounds
+     * and overlap; keep overflow checks here because validate_info() is also a
+     * public helper and can be exercised on caller-constructed metadata. */
+    const uint64_t span_offsets[6] = {
+        gate->weight_offset, gate->scale_offset, up->weight_offset,
+        up->scale_offset, down->weight_offset, down->scale_offset,
+    };
+    const size_t span_sizes[6] = {
+        layout->gate_weight_bytes, layout->gate_scale_bytes,
+        layout->up_weight_bytes, layout->up_scale_bytes,
+        layout->down_weight_bytes, layout->down_scale_bytes,
+    };
+    uint64_t span_lo = UINT64_MAX, span_hi = 0;
+    for (size_t i = 0; i < 6; ++i) {
+        if ((uint64_t)span_sizes[i] > UINT64_MAX - span_offsets[i])
+            return fail(error, error_size, "MXFP4 executable span overflows u64");
+        const uint64_t end = span_offsets[i] + (uint64_t)span_sizes[i];
+        if (span_offsets[i] < span_lo) span_lo = span_offsets[i];
+        if (end > span_hi) span_hi = end;
+    }
+    if (span_hi < span_lo || span_hi - span_lo > (uint64_t)SIZE_MAX)
+        return fail(error, error_size, "MXFP4 coalesced span does not fit size_t");
+    layout->record_span_offset = span_lo;
+    layout->record_span_bytes = (size_t)(span_hi - span_lo);
+#define SET_REL(field, absolute) \
+    do { \
+        uint64_t delta = (absolute) - span_lo; \
+        if (delta > (uint64_t)SIZE_MAX) \
+            return fail(error, error_size, "MXFP4 span offset does not fit size_t"); \
+        layout->field = (size_t)delta; \
+    } while (0)
+    SET_REL(gate_weight_span_offset, gate->weight_offset);
+    SET_REL(gate_scale_span_offset, gate->scale_offset);
+    SET_REL(up_weight_span_offset, up->weight_offset);
+    SET_REL(up_scale_span_offset, up->scale_offset);
+    SET_REL(down_weight_span_offset, down->weight_offset);
+    SET_REL(down_scale_span_offset, down->scale_offset);
+#undef SET_REL
+
     if (info->logical_bytes != (uint64_t)total)
         return fail(error, error_size,
                     "MXFP4 expert logical_bytes=%llu, expected %llu from matrix spans",
