@@ -1,0 +1,66 @@
+name: Promote Qwen batched GDN head gates
+
+on:
+  push:
+    branches: [fix/qwen-batched-gdn-head-gates]
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-validate:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/qwen-batched-gdn-head-gates
+          fetch-depth: 0
+
+      - name: Apply exact per-head GDN fix
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('c/qwen_moe.c')
+          s = p.read_text()
+          replacements = [
+              (
+                  '''static void gdn_token_core(Model *m, Layer *l, int layer,\n                           const float *qkv_row, float a, float b,\n                           const float *z_row, float *y_out){''',
+                  '''static void gdn_token_core(Model *m, Layer *l, int layer,\n                           const float *qkv_row,\n                           const float *a_row, const float *b_row,\n                           const float *z_row, float *y_out){''',
+              ),
+              (
+                  '''        float ga = -expf(l->A_log[h]) * logf(1.f + expf(a + l->dt_bias[h]));\n        float gt = expf(ga);\n        float bt = 1.f / (1.f + expf(-b));''',
+                  '''        float ga = -expf(l->A_log[h]) * logf(1.f + expf(a_row[h] + l->dt_bias[h]));\n        float gt = expf(ga);\n        float bt = 1.f / (1.f + expf(-b_row[h]));''',
+              ),
+              (
+                  '''        gdn_token_core(m, l, layer, qkv + (int64_t)g * Cdim, a[g], b[g],\n                       z + (int64_t)g * vdim, y + (int64_t)g * vdim);''',
+                  '''        gdn_token_core(m, l, layer, qkv + (int64_t)g * Cdim,\n                       a + (int64_t)g * vheads,\n                       b + (int64_t)g * vheads,\n                       z + (int64_t)g * vdim, y + (int64_t)g * vdim);''',
+              ),
+          ]
+          for old, new in replacements:
+              count = s.count(old)
+              if count != 1:
+                  raise SystemExit(f'expected exactly one patch anchor, found {count}: {old[:80]!r}')
+              s = s.replace(old, new)
+          p.write_text(s)
+          PY
+          git diff --check
+          git diff -- c/qwen_moe.c
+
+      - name: Build Qwen
+        run: make -C c qwen_moe ARCH=x86-64-v3
+
+      - name: C regression suite
+        run: make -C c test-c
+
+      - name: Publish validated fix and self-clean
+        shell: bash
+        run: |
+          rm .github/workflows/qwen-gdn-head-gates-promote-temp.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add c/qwen_moe.c .github/workflows/qwen-gdn-head-gates-promote-temp.yml
+          git diff --cached --check
+          git commit -m 'fix(qwen): preserve per-head gates in batched GDN'
+          git push origin HEAD:fix/qwen-batched-gdn-head-gates
