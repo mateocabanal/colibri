@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 from pathlib import Path
+import subprocess
 
 
 def replace_once(text: str, old: str, new: str, label: str) -> str:
@@ -103,3 +104,11 @@ static void test_slot_resident_bytes(void){
 '''
     t = replace_once(t, "int main(void){\n", test + "int main(void){\n    test_slot_resident_bytes();\n", "Qwen test main")
 p.write_text(t)
+
+# Stage our own temporary files for deletion so the workflow's later commit
+# contains only the real source/test changes and leaves the feature branch clean.
+subprocess.run([
+    "git", "rm",
+    "tools/apply_qwen_mxfp4_cache_accounting.py",
+    ".github/workflows/qwen-mxfp4-accounting-stage.yml",
+], check=True)
