@@ -480,6 +480,56 @@ fn stream_payload(
     }
 }
 
+fn is_source_weight_index_json(name: &str) -> bool {
+    name.ends_with(".safetensors.index.json")
+        || name.ends_with(".bin.index.json")
+        || name.ends_with(".msgpack.index.json")
+        || name.ends_with(".h5.index.json")
+}
+
+/// Copy runtime/model metadata JSON verbatim into the compiled package.
+/// Weight index JSON is intentionally omitted because its shard paths refer
+/// to source checkpoint files that are not part of a COLI package.
+fn copy_package_json_metadata(
+    source_root: &std::path::Path,
+    package_root: &std::path::Path,
+) -> Result<()> {
+    let entries = fs::read_dir(source_root).map_err(|source| ColicError::Io {
+        path: source_root.to_path_buf(),
+        source,
+    })?;
+    let mut files = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|source| ColicError::Io {
+            path: source_root.to_path_buf(),
+            source,
+        })?;
+        let source_path = entry.path();
+        let Some(name) = source_path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.ends_with(".json") || is_source_weight_index_json(name) {
+            continue;
+        }
+        let metadata = fs::metadata(&source_path).map_err(|source| ColicError::Io {
+            path: source_path.clone(),
+            source,
+        })?;
+        if metadata.is_file() {
+            files.push((name.to_owned(), source_path));
+        }
+    }
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    for (name, source_path) in files {
+        let destination = package_root.join(name);
+        fs::copy(&source_path, &destination).map_err(|source| ColicError::Io {
+            path: source_path,
+            source,
+        })?;
+    }
+    Ok(())
+}
+
 pub fn compile(request: &CompileRequest, progress: &mut dyn ProgressSink) -> Result<()> {
     if request.dry_run {
         let _summary = dry_run(request)?;
@@ -565,6 +615,7 @@ pub fn compile(request: &CompileRequest, progress: &mut dyn ProgressSink) -> Res
             path: manifest_path,
             source,
         })?;
+        copy_package_json_metadata(&inventory.root, &temporary)?;
         Ok(())
     })();
     if let Err(error) = write_result {
@@ -636,6 +687,23 @@ mod tests {
             r#"{"model_type":"deepseek_v4","hidden_size":2,"num_hidden_layers":1,"n_routed_experts":2,"moe_intermediate_size":3,"vocab_size":4,"hc_mult":2,"num_hash_layers":1,"num_experts_per_tok":1,"num_attention_heads":1,"head_dim":2,"q_lora_rank":1,"o_groups":1,"o_lora_rank":1,"index_n_heads":1,"index_head_dim":1,"compress_ratios":[0]}"#,
         )
         .unwrap();
+        fs::write(root.join("tokenizer.json"), br#"{"model":{"type":"BPE"}}"#).unwrap();
+        fs::write(
+            root.join("tokenizer_config.json"),
+            br#"{"chat_template":"fixture"}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("generation_config.json"),
+            br#"{"eos_token_id":3}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("special_tokens_map.json"),
+            br#"{"eos_token":"</s>"}"#,
+        )
+        .unwrap();
+        fs::write(root.join("model_metadata.json"), br#"{"fixture":true}"#).unwrap();
         let mut specs = BTreeMap::<String, (&str, Vec<u64>)>::new();
         let mut add = |name: String, dtype: &'static str, shape: Vec<u64>| {
             specs.insert(name, (dtype, shape));
@@ -806,6 +874,56 @@ mod tests {
     }
 
     #[test]
+    fn json_metadata_copy_omits_source_weight_indexes() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "colic-json-metadata-{}-{nonce}",
+            std::process::id()
+        ));
+        let source = root.join("source");
+        let package = root.join("package");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&package).unwrap();
+        fs::write(source.join("tokenizer.json"), b"tokenizer-bytes").unwrap();
+        fs::write(source.join("custom_runtime.json"), b"runtime-bytes").unwrap();
+        fs::write(source.join("README.md"), b"not metadata json").unwrap();
+        for name in [
+            "model.safetensors.index.json",
+            "pytorch_model.bin.index.json",
+            "flax_model.msgpack.index.json",
+            "tf_model.h5.index.json",
+        ] {
+            fs::write(source.join(name), b"stale weight index").unwrap();
+        }
+
+        copy_package_json_metadata(&source, &package).unwrap();
+        assert_eq!(
+            fs::read(package.join("tokenizer.json")).unwrap(),
+            b"tokenizer-bytes"
+        );
+        assert_eq!(
+            fs::read(package.join("custom_runtime.json")).unwrap(),
+            b"runtime-bytes"
+        );
+        assert!(!package.join("README.md").exists());
+        for name in [
+            "model.safetensors.index.json",
+            "pytorch_model.bin.index.json",
+            "flax_model.msgpack.index.json",
+            "tf_model.h5.index.json",
+        ] {
+            assert!(
+                !package.join(name).exists(),
+                "copied stale weight index {name}"
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn compile_and_verify_synthetic_v4_package() {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -820,6 +938,20 @@ mod tests {
         request.target = TargetRequest::Profile("macos-arm64-metal-apple8-v1".into());
         request.verify = true;
         compile(&request, &mut NoProgress).unwrap();
+        for name in [
+            "config.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "generation_config.json",
+            "special_tokens_map.json",
+            "model_metadata.json",
+        ] {
+            assert_eq!(
+                fs::read(output.join(name)).unwrap(),
+                fs::read(request.source.join(name)).unwrap(),
+                "compiled package did not preserve {name} verbatim"
+            );
+        }
         assert_eq!(verify::verify_package(&output).unwrap().records, 37);
         let second_output = root.join("compiled-again.coli");
         let mut second_request = request.clone();
