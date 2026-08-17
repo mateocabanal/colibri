@@ -17,7 +17,9 @@ jobs:
         with:
           fetch-depth: 0
       - name: Apply integration
-        run: python3 tools/stage_generic_profile.py
+        run: |
+          python3 tools/stage_generic_profile.py
+          python3 tools/stage_profile_metal_decl.py
       - name: Check patch
         run: git diff --check
       - name: Build and test generic and Qwen profiling
@@ -27,9 +29,7 @@ jobs:
           ./c/tests/test_profile
           ./c/tests/test_qwen_moe
       - name: Build DeepSeek V4 against generic profiler
-        run: |
-          make -C c deepseek-v4-tiny-generate
-          make -C c -f Makefile.deepseek-v4 METAL=0 deepseek-v4 -j2
+        run: make -C c -f Makefile.deepseek-v4 METAL=0 deepseek-v4 -j2
       - name: Commit integration
         run: |
           git config user.name 'github-actions[bot]'
