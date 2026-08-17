@@ -88,6 +88,11 @@ static void prefix_cache_init(void) {
     (void)pthread_once(&g_prefix_cache_once, prefix_cache_init_once);
 }
 
+size_t coli_v4_prefix_cache_budget_bytes(void) {
+    prefix_cache_init();
+    return g_prefix_cache.budget_bytes;
+}
+
 static void entry_free(ColiV4PrefixCacheEntry *entry) {
     if (!entry) return;
     if (entry->attention) {
