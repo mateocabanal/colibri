@@ -902,7 +902,12 @@ int coli_v4_coli_expert_store_open(const ColiV4ColiExpertStoreOptions *o,
             goto bad;
         }
 
-        int requested_persistent = 1;
+        /* Dense deterministic tensors have measured benefit/byte near 1.0:
+         * every resident byte avoids roughly one recurring disk byte per token.
+         * The measured 5-slot/layer expert cache saved only ~0.15 recurring
+         * bytes per resident byte, so balanced mode starts dense-first and lets
+         * #56 traces justify persistent expert capacity explicitly. */
+        int requested_persistent = 0;
         {
             const char *value = getenv("V4_PERSISTENT_EXPERT_SLOTS_PER_LAYER");
             if (value && *value) requested_persistent = atoi(value);
