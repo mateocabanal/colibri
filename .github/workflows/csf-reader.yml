@@ -11,37 +11,7 @@ on:
       - '.github/workflows/csf-reader.yml'
   workflow_dispatch:
 
-permissions:
-  contents: write
-
 jobs:
-  qwen-mxfp4-integrate:
-    if: github.head_ref == 'feat/qwen36-mxfp4'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: feat/qwen36-mxfp4
-          fetch-depth: 0
-          persist-credentials: true
-      - name: Apply runtime integration
-        run: python3 tools/apply_qwen_mxfp4_runtime.py
-      - name: Build and test runtime integration
-        run: |
-          make -C c -f Makefile.csf tests/test_mxfp4_runtime tests/test_mxfp4_expert
-          make -C c tests/test_qwen_moe
-          ./c/tests/test_mxfp4_runtime
-          ./c/tests/test_mxfp4_expert
-          ./c/tests/test_qwen_moe
-      - name: Commit integration
-        run: |
-          if git diff --quiet; then exit 0; fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add c/qwen_moe.c c/Makefile c/tests/test_qwen_moe.c
-          git commit -m "feat(qwen): wire MXFP4 COLI experts into runtime"
-          git push origin HEAD:feat/qwen36-mxfp4
-
   csf-reader:
     strategy:
       fail-fast: false
