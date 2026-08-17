@@ -6,6 +6,7 @@ from pathlib import Path
 from tools.analyze_v4_expert_trace import (
     analyze,
     capacity_curve,
+    global_frequency_oracle_curve,
     per_layer_frequency_oracle_curve,
     per_layer_lru_curve,
     summary_dict,
@@ -103,12 +104,57 @@ class V4ExpertTraceAnalysisTest(unittest.TestCase):
         self.assertEqual(oracle[0]["trace_value_per_resident_byte"], 1.5)
         self.assertEqual(oracle[1]["hits"], 4)
 
+        global_oracle = global_frequency_oracle_curve(result, [2, 4])
+        self.assertEqual(global_oracle[0]["resident_slots"], 2)
+        self.assertEqual(global_oracle[0]["hits"], 3)
+        self.assertEqual(global_oracle[0]["trace_value_per_resident_byte"], 1.5)
+        self.assertEqual(global_oracle[1]["resident_slots"], 3)
+        self.assertEqual(global_oracle[1]["hits"], 4)
+        self.assertAlmostEqual(
+            global_oracle[1]["trace_value_per_resident_byte"], 4.0 / 3.0
+        )
+
         summary = summary_dict(result, [2], 2, [1, 2])
         self.assertEqual(
             summary["persistent_per_layer_lru_curve"][0]["hits"], 2
         )
         self.assertEqual(
             summary["persistent_per_layer_frequency_oracle_curve"][0]["hits"], 3
+        )
+        self.assertEqual(
+            summary["persistent_global_frequency_oracle_curve"][0]["capacity"], 2
+        )
+        self.assertEqual(
+            summary["persistent_global_frequency_oracle_curve"][0]["hits"], 3
+        )
+
+    def test_global_hot_oracle_avoids_diffuse_layer_waste(self):
+        # Equal per-layer allocation wastes one of two slots on layer 0, whose
+        # requests are all cold. A global two-slot budget can spend both slots
+        # on layer 1's two repeatedly used experts instead.
+        rows = [
+            {"event": "request", "layer": 0, "expert": 1},
+            {"event": "request", "layer": 0, "expert": 2},
+            {"event": "request", "layer": 0, "expert": 3},
+            {"event": "request", "layer": 1, "expert": 7},
+            {"event": "request", "layer": 1, "expert": 8},
+            {"event": "request", "layer": 1, "expert": 7},
+            {"event": "request", "layer": 1, "expert": 8},
+            {"event": "request", "layer": 1, "expert": 7},
+            {"event": "request", "layer": 1, "expert": 8},
+        ]
+        temp, path = self.write_trace(rows)
+        self.addCleanup(temp.cleanup)
+        result = analyze(path)
+
+        per_layer = per_layer_frequency_oracle_curve(result, [1])[0]
+        global_hot = global_frequency_oracle_curve(result, [2])[0]
+        self.assertEqual(per_layer["resident_slots"], global_hot["resident_slots"])
+        self.assertEqual(per_layer["hits"], 2)
+        self.assertEqual(global_hot["hits"], 4)
+        self.assertGreater(
+            global_hot["trace_value_per_resident_byte"],
+            per_layer["trace_value_per_resident_byte"],
         )
 
     def test_invalid_request_event_is_rejected(self):
