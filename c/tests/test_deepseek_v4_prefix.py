@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""KV prefix reuse on the DeepSeek V4 serve path.
+"""KV/prompt prefix reuse on the DeepSeek V4 serve path.
 
-The property under test is not "it is faster" -- it is that reusing the
-attention state produces the bytes a cold prefill would have produced. So each
-case runs the same second turn twice: once as the continuation of a warm
-session, once against a freshly started engine, and requires the two to agree
-token for token.
+The property under test is not "it is faster" -- it is that reusing or
+restoring attention state produces the bytes a cold prefill would have
+produced. Same-session cases exercise the existing `kv_prefix` path. The #12
+case uses two distinct session slots inside one engine process so only the
+process-local multi-prefix cache can provide the second request's state.
 
 Speaking the SUBMIT/DATA/DONE protocol directly rather than through
 openai_server.Engine keeps the test on the engine's own contract, including the
@@ -18,7 +18,6 @@ import json
 import os
 import re
 import subprocess
-import sys
 from pathlib import Path
 
 
@@ -32,23 +31,33 @@ def parse_tokens(text: str) -> list[int]:
 
 
 class Serve:
-    """One persistent `SERVE=1` engine process."""
+    """One persistent `SERVE=1` engine process with multiple session slots."""
 
-    def __init__(self, binary: Path, model: Path, ctx: str = "128") -> None:
+    def __init__(self, binary: Path, model: Path, ctx: str = "128",
+                 prefix_cache_mb: int | None = None) -> None:
         env = dict(os.environ, SERVE="1", SNAP=str(model), CTX=ctx,
                    V4_PREFIX_LOG="1")
+        if prefix_cache_mb is not None:
+            env["V4_PREFIX_CACHE_MB"] = str(prefix_cache_mb)
+            # Tiny fixture prompts are intentionally short; production keeps
+            # the much more conservative default admission threshold.
+            env["V4_PREFIX_CACHE_MIN_TOKENS"] = "1"
+        else:
+            env.pop("V4_PREFIX_CACHE_MB", None)
+            env.pop("V4_PREFIX_CACHE_MIN_TOKENS", None)
         self.process = subprocess.Popen(
             [str(binary)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, env=env,
         )
         self.counter = 0
 
-    def submit(self, prompt: str, max_tokens: int) -> tuple[str, int]:
-        """Returns the generated text and the DONE frame's reuse count."""
+    def submit(self, prompt: str, max_tokens: int,
+               slot: int = 0) -> tuple[str, int]:
+        """Returns generated text and the DONE frame's reused-prefix count."""
         self.counter += 1
         request_id = f"r{self.counter}"
         payload = prompt.encode("utf-8")
-        header = (f"SUBMIT {request_id} 0 {len(payload)} {max_tokens} "
+        header = (f"SUBMIT {request_id} {slot} {len(payload)} {max_tokens} "
                   f"0.0 1.0 0\n").encode("ascii")
         assert self.process.stdin is not None
         self.process.stdin.write(header + payload + b"\n")
@@ -97,9 +106,21 @@ class Serve:
             self.process.kill()
 
 
+def extended_prompt(first_ids: list[int], first_text: str) -> list[int]:
+    """Build a strict extension of exactly the target state left by a turn."""
+    reply = parse_tokens(first_text)
+    if len(reply) < 2:
+        raise AssertionError(f"first turn produced too little: {first_text!r}")
+    # The final emitted token has not yet been fed through the target. The state
+    # therefore represents prompt + reply[:-1]. This mirrors a continuation at
+    # the exact reusable boundary rather than pretending an unseen token exists
+    # in KV/recurrent state.
+    return first_ids + reply[:-1] + [first_ids[0]]
+
+
 def check_growing_conversation(binary: Path, model: Path,
                                case: dict[str, object]) -> None:
-    """Turn 2 extends turn 1: the state is reused, the output does not change."""
+    """Turn 2 extends turn 1: same-session reuse stays token-exact."""
     first_ids = list(case["prompt_ids"])            # type: ignore[arg-type]
     max_new = 4
 
@@ -111,15 +132,7 @@ def check_growing_conversation(binary: Path, model: Path,
                 f"first turn of a fresh session reused {first_reuse} tokens; "
                 "there was nothing to reuse"
             )
-        # What the engine feeds is the prompt plus every generated token except
-        # the last, which is emitted but never fed back. Turn 2 has to be a
-        # STRICT extension of that, which is what a chat produces: the previous
-        # prompt, the reply, then the new user text.
-        reply = parse_tokens(first_text)
-        if len(reply) < 2:
-            raise AssertionError(f"first turn produced too little: {first_text!r}")
-        fed = first_ids + reply[:-1]
-        second_ids = fed + [first_ids[0]]
+        second_ids = extended_prompt(first_ids, first_text)
         second_text, second_reuse = warm.submit(token_prompt(second_ids), max_new)
     finally:
         warm.close()
@@ -147,8 +160,52 @@ def check_growing_conversation(binary: Path, model: Path,
             f"reused only {second_reuse} tokens, expected at least the "
             f"{len(first_ids)} prompt tokens of the previous turn"
         )
-    print(f"PASS prefix reuse: {second_reuse} tokens reused, "
+    print(f"PASS same-session prefix reuse: {second_reuse} tokens reused, "
           f"output identical to a cold prefill")
+
+
+def check_cross_session_cache(binary: Path, model: Path,
+                              case: dict[str, object]) -> None:
+    """A distinct session restores the longest exact prefix from #12 cache."""
+    first_ids = list(case["prompt_ids"])            # type: ignore[arg-type]
+    max_new = 4
+
+    shared = Serve(binary, model, prefix_cache_mb=64)
+    try:
+        first_text, first_reuse = shared.submit(
+            token_prompt(first_ids), max_new, slot=0)
+        if first_reuse != 0:
+            raise AssertionError(
+                f"first cached turn unexpectedly reported reuse={first_reuse}"
+            )
+        second_ids = extended_prompt(first_ids, first_text)
+        # Slot 1 has never run. A positive reuse count here cannot come from its
+        # own kv_prefix; it must be a process-local cross-session cache hit.
+        restored_text, restored_reuse = shared.submit(
+            token_prompt(second_ids), max_new, slot=1)
+    finally:
+        shared.close()
+
+    cold = Serve(binary, model)
+    try:
+        cold_text, cold_reuse = cold.submit(token_prompt(second_ids), max_new)
+    finally:
+        cold.close()
+
+    if cold_reuse != 0:
+        raise AssertionError(f"cold comparison engine reported reuse={cold_reuse}")
+    if restored_reuse < len(first_ids):
+        raise AssertionError(
+            "cross-session cache did not restore the first request state: "
+            f"reuse={restored_reuse}, first_prompt={len(first_ids)}"
+        )
+    if restored_text != cold_text:
+        raise AssertionError(
+            "cross-session restored state diverged from cold prefill:\n"
+            f"  restored: {restored_text!r}\n  cold: {cold_text!r}"
+        )
+    print(f"PASS cross-session prefix cache: {restored_reuse} tokens restored, "
+          "output identical to a cold prefill")
 
 
 def check_divergent_prompt_resets(binary: Path, model: Path,
@@ -215,9 +272,10 @@ def main() -> int:
     case = reference["cases"]["short"]
 
     check_growing_conversation(arguments.binary, arguments.fixture, case)
+    check_cross_session_cache(arguments.binary, arguments.fixture, case)
     check_repeated_prompt(arguments.binary, arguments.fixture, case)
     check_divergent_prompt_resets(arguments.binary, arguments.fixture, case)
-    print("PASS DeepSeek V4 KV prefix reuse: all checks completed")
+    print("PASS DeepSeek V4 prefix reuse/cache: all checks completed")
     return 0
 
 
