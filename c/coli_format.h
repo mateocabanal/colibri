@@ -21,6 +21,8 @@ extern "C" {
 #define COLI_CSF_PROFILE_PORTABLE_V1 "portable-v1"
 #define COLI_CSF_PROFILE_MACOS_ARM64_METAL_APPLE8_V1 \
     "macos-arm64-metal-apple8-v1"
+#define COLI_CSF_PROFILE_LINUX_X86_64_AVX2_V1 \
+    "linux-x86_64-avx2-v1"
 
 /* Container record kinds. These are CSF IDs, not QT.fmt ordinals. */
 enum {
