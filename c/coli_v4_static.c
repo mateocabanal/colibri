@@ -56,19 +56,31 @@ static DenseCacheEntry *cache_find_locked(const char *name) {
     return NULL;
 }
 
-static DenseCacheEntry *cache_victim_locked(long double candidate_score) {
-    DenseCacheEntry *best = NULL;
-    long double best_score = 0.0L;
+/*
+ * Dense/static access is a deterministic scan over the same layer records on
+ * every token. Ordinary LRU is pathological when the working set is larger
+ * than the cache: the next scan evicts exactly the objects that would have
+ * been reused later in that scan.  Residency is therefore an admission
+ * problem, not a recency problem.
+ *
+ * Once the budget is full, a candidate may displace only an object with a
+ * STRICTLY lower recurring-I/O-saved/resident-byte score. Equal-value objects
+ * remain pinned. This makes the cache scan-resistant after its warmup pass and
+ * is the online equivalent of keeping a stable greedy prefix of the ranking.
+ */
+static DenseCacheEntry *cache_lower_value_victim_locked(long double candidate_score) {
+    DenseCacheEntry *victim = NULL;
+    long double victim_score = 0.0L;
     for (DenseCacheEntry *entry = g_dense_cache.entries; entry; entry = entry->next) {
         long double score = cache_score(entry->stored_bytes, entry->resident_bytes);
-        if (score > candidate_score) continue;
-        if (!best || score < best_score ||
-            (score == best_score && entry->last_used < best->last_used)) {
-            best = entry;
-            best_score = score;
+        if (!(score < candidate_score)) continue;
+        if (!victim || score < victim_score ||
+            (score == victim_score && entry->last_used < victim->last_used)) {
+            victim = entry;
+            victim_score = score;
         }
     }
-    return best;
+    return victim;
 }
 
 static void cache_remove_locked(DenseCacheEntry *victim) {
@@ -116,7 +128,10 @@ void coli_v4_dense_cache_shutdown(void) {
     pthread_mutex_unlock(&g_dense_cache.mutex);
 }
 
-/* Returns 1 on hit, 0 on miss. output is always caller-owned. */
+/* Returns 1 on hit, 0 on miss. output is always caller-owned for now.
+ * A follow-up converts selected resident tensors to borrowed zero-copy views;
+ * keeping this ownership boundary unchanged in this tranche makes the A/B
+ * isolate scan-resistance from that lifetime refactor. */
 static int cache_get(const char *name, uint64_t expected_bytes,
                      uint64_t stored_bytes, unsigned char **output) {
     *output = NULL;
@@ -154,7 +169,7 @@ static void cache_put(const char *name, const unsigned char *data,
 
     const long double candidate_score = cache_score(stored_bytes, resident_bytes);
     while (g_dense_cache.stats.resident_bytes > budget - resident_bytes) {
-        DenseCacheEntry *victim = cache_victim_locked(candidate_score);
+        DenseCacheEntry *victim = cache_lower_value_victim_locked(candidate_score);
         if (!victim) {
             pthread_mutex_unlock(&g_dense_cache.mutex);
             return;
