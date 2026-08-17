@@ -5,10 +5,14 @@
 //! the compiler side of that contract so target lowering does not need to
 //! rediscover or reimplement the quantization rules.
 
+use std::{
+    fs::File,
+    io::{Read, Seek, SeekFrom},
+};
+
 use crate::{
     error::{ColicError, Result},
     ir::Matrix,
-    source,
 };
 
 pub const GROUP_SIZE: usize = 32;
@@ -40,8 +44,8 @@ impl PackedMatrix {
 }
 
 /// Quantize one semantic BF16 matrix without materializing its safetensors
-/// shard. Source payload is read one matrix row at a time, so working memory is
-/// bounded by O(columns) plus the final packed matrix.
+/// shard. The source tensor span is opened/seeks once and then consumed one
+/// matrix row at a time, so hot-path I/O remains sequential.
 pub fn quantize_matrix(matrix: &Matrix) -> Result<PackedMatrix> {
     if matrix.source.dtype != "BF16" {
         return Err(ColicError::unsupported(
@@ -87,17 +91,25 @@ pub fn quantize_matrix(matrix: &Matrix) -> Result<PackedMatrix> {
         .checked_mul(scale_row_bytes)
         .ok_or_else(|| ColicError::Usage("MXFP4 scale matrix size overflows usize".into()))?;
 
+    let mut file = File::open(&matrix.source.source).map_err(|source| ColicError::Io {
+        path: matrix.source.source.clone(),
+        source,
+    })?;
+    file.seek(SeekFrom::Start(matrix.source.offset))
+        .map_err(|source| ColicError::Io {
+            path: matrix.source.source.clone(),
+            source,
+        })?;
+
     let mut weights = Vec::with_capacity(weight_capacity);
     let mut scales = Vec::with_capacity(scale_capacity);
     let mut source_row = vec![0_u8; row_bytes];
-    for row in 0..matrix.rows as u64 {
-        let start = row
-            .checked_mul(row_source_bytes)
-            .ok_or_else(|| ColicError::Usage("MXFP4 source row offset overflows u64".into()))?;
-        let end = start
-            .checked_add(row_source_bytes)
-            .ok_or_else(|| ColicError::Usage("MXFP4 source row end overflows u64".into()))?;
-        source::read_range(&matrix.source, start..end, &mut source_row)?;
+    for _ in 0..matrix.rows {
+        file.read_exact(&mut source_row)
+            .map_err(|source| ColicError::Io {
+                path: matrix.source.source.clone(),
+                source,
+            })?;
         quantize_bf16_row(&source_row, &mut weights, &mut scales)?;
     }
 
@@ -160,8 +172,7 @@ pub fn quantize_bf16_row(
 
 /// Choose the smallest representable power-of-two scale that can hold the
 /// largest magnitude without E2M1 saturation. This is a deterministic PTQ
-/// policy; the resulting bytes are standard MXFP4 regardless of how the scale
-/// was selected.
+/// policy; the resulting bytes use the runtime's native MXFP4 representation.
 fn choose_scale(values: &[f32]) -> (u8, f32) {
     let max_abs = values
         .iter()
@@ -292,6 +303,31 @@ mod tests {
         assert_eq!(packed.scale_bytes_per_row(), 2);
         assert_eq!(packed.weights.len(), 34);
         assert_eq!(packed.scales, vec![125, 125, 129, 129]);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn sliced_matrix_starts_at_tensor_offset() {
+        let path = std::env::temp_dir().join(format!("colic-mxfp4-offset-{}", std::process::id()));
+        let prefix = bf16_bytes(&vec![64.0; 32]);
+        let wanted = bf16_bytes(&vec![1.0; 32]);
+        let mut source = prefix.clone();
+        source.extend_from_slice(&wanted);
+        fs::write(&path, &source).unwrap();
+        let matrix = Matrix {
+            source: TensorRef {
+                source: path.clone(),
+                offset: prefix.len() as u64,
+                len: wanted.len() as u64,
+                dtype: "BF16".into(),
+                shape: vec![1, 32],
+            },
+            rows: 1,
+            columns: 32,
+            scale: None,
+        };
+        let packed = quantize_matrix(&matrix).unwrap();
+        assert_eq!(packed.scales, vec![125]);
         fs::remove_file(path).unwrap();
     }
 
