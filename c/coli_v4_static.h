@@ -14,8 +14,10 @@ typedef struct {
 } ColiV4DenseCacheStats;
 
 /* Configure the process-local immutable tensor cache. The cache stores decoded
- * execution payloads and returns caller-owned copies, so existing layer free
- * semantics remain unchanged. A zero budget disables and empties the cache. */
+ * execution payloads and, for this tranche, returns caller-owned copies so the
+ * existing layer free contract remains unchanged. Admission is scan-resistant:
+ * equal benefit/byte tensors do not evict one another during deterministic
+ * layer walks. A zero budget disables and empties the cache. */
 void coli_v4_dense_cache_configure(uint64_t budget_bytes);
 void coli_v4_dense_cache_stats(ColiV4DenseCacheStats *stats);
 void coli_v4_dense_cache_shutdown(void);
