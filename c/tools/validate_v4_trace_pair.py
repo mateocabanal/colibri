@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
-"""Validate a V4 physical-v1 + logical-v2 trace pair.
+"""Validate V4 physical-v1, logical-v2, and optional execution traces.
 
 This is the exact-COLI closure gate for #56. The logical sidecar records one
 route selection per `(request, token, layer, rank)`, while the physical store
 records residency/load lifecycle events. Successful exact-COLI leases carry a
 non-zero generation. `(layer, expert, generation)` is therefore the stable join
-key between the two streams even when one physical lookup serves many logical
-routes during batch-union prefill.
+key between the streams even when one physical lookup serves many logical routes
+during batch-union prefill.
 
-The validator intentionally does not infer cold-vs-hit from generation alone:
-a resident expert can be hit repeatedly under the same generation. It proves
-identity/correlation, not a lifecycle state the physical trace did not attach
-to the logical lookup id.
+When a V4_TRACE_EXEC=1 build also supplies an execution trace, the validator
+requires one successful expert-forward execution for every logical route
+selection, grouped by that same stable lease identity. It deliberately does not
+invent per-route exposed wait from worker lookup duration: owner-thread wait and
+worker storage/compute overlap are different measurements.
 """
 
 from __future__ import annotations
@@ -52,15 +53,121 @@ def as_nonnegative_int(value: Any, field: str, where: str) -> int:
     return value
 
 
-def identity(row: dict[str, Any], where: str) -> Identity:
+def identity(row: dict[str, Any], where: str, generation_field: str = "generation") -> Identity:
     return (
         as_nonnegative_int(row.get("layer"), "layer", where),
         as_nonnegative_int(row.get("expert"), "expert", where),
-        as_nonnegative_int(row.get("generation"), "generation", where),
+        as_nonnegative_int(row.get(generation_field), generation_field, where),
     )
 
 
-def validate_pair(physical_path: Path, logical_path: Path) -> dict[str, Any]:
+def validate_execution_trace(
+    execution_path: Path,
+    logical_events: list[dict[str, Any]],
+    expected_build: Any,
+) -> dict[str, Any]:
+    rows = read_jsonl(execution_path)
+    header = rows[0]
+    if header.get("schema") != "colibri.v4.expert_execute_trace.v1":
+        raise ValueError(
+            "execution trace must use colibri.v4.expert_execute_trace.v1"
+        )
+    if header.get("source") not in (None, "expert_execute"):
+        raise ValueError(f"execution trace has unexpected source={header.get('source')!r}")
+    build = header.get("build")
+    if expected_build and build and expected_build != build:
+        raise ValueError(
+            f"execution build mismatch: expected={expected_build} execution={build}"
+        )
+    dropped = as_nonnegative_int(header.get("dropped", 0), "dropped", "execution header")
+    if dropped:
+        raise ValueError(f"execution trace is incomplete: dropped={dropped}")
+
+    logical_counts: Counter[Identity] = Counter(
+        identity(row, "logical route", "lease_generation")
+        for row in logical_events
+    )
+    execution_counts: Counter[Identity] = Counter()
+    total_execute_ns = 0
+    execution_rows = 0
+    resident_bytes: set[int] = set()
+    for line_number, row in enumerate(rows[1:], 2):
+        if row.get("event") != "execute":
+            raise ValueError(
+                f"execution line {line_number}: expected event='execute'"
+            )
+        where = f"execution line {line_number}"
+        key = identity(row, where)
+        if key[2] == 0:
+            raise ValueError(
+                f"{where}: exact-COLI execution has zero generation for "
+                f"layer={key[0]} expert={key[1]}"
+            )
+        if row.get("result") != 0:
+            raise ValueError(f"{where}: result={row.get('result')!r}")
+        elapsed = as_nonnegative_int(row.get("execute_ns"), "execute_ns", where)
+        bytes_here = as_nonnegative_int(
+            row.get("resident_bytes"), "resident_bytes", where
+        )
+        if bytes_here == 0:
+            raise ValueError(f"{where}: resident_bytes must be non-zero")
+        for field in ("gate_format", "down_format", "up_format"):
+            as_nonnegative_int(row.get(field), field, where)
+        execution_counts[key] += 1
+        total_execute_ns += elapsed
+        resident_bytes.add(bytes_here)
+        execution_rows += 1
+
+    header_events = header.get("events")
+    if isinstance(header_events, int) and header_events != execution_rows:
+        raise ValueError(
+            f"execution header events={header_events}, observed={execution_rows}"
+        )
+    header_total = header.get("total_execute_ns")
+    if isinstance(header_total, int) and header_total != total_execute_ns:
+        raise ValueError(
+            f"execution header total_execute_ns={header_total}, "
+            f"observed={total_execute_ns}"
+        )
+
+    if execution_counts != logical_counts:
+        missing = logical_counts - execution_counts
+        extra = execution_counts - logical_counts
+        details: list[str] = []
+        if missing:
+            details.append(
+                "missing="
+                + ",".join(
+                    f"L{layer}/E{expert}/G{generation}x{count}"
+                    for (layer, expert, generation), count in missing.most_common(8)
+                )
+            )
+        if extra:
+            details.append(
+                "extra="
+                + ",".join(
+                    f"L{layer}/E{expert}/G{generation}x{count}"
+                    for (layer, expert, generation), count in extra.most_common(8)
+                )
+            )
+        raise ValueError(
+            "expert execution count does not match logical routes by lease identity: "
+            + " ".join(details)
+        )
+
+    return {
+        "execution_events": execution_rows,
+        "execution_total_ns": total_execute_ns,
+        "execution_unique_lease_identities": len(execution_counts),
+        "execution_resident_byte_sizes": sorted(resident_bytes),
+    }
+
+
+def validate_pair(
+    physical_path: Path,
+    logical_path: Path,
+    execution_path: Path | None = None,
+) -> dict[str, Any]:
     physical_rows = read_jsonl(physical_path)
     logical_rows = read_jsonl(logical_path)
     physical_header = physical_rows[0]
@@ -189,7 +296,7 @@ def validate_pair(physical_path: Path, logical_path: Path) -> dict[str, Any]:
             f"observed lookup groups={len(lookup_groups)}"
         )
 
-    return {
+    result: dict[str, Any] = {
         "build": logical_build or physical_build,
         "logical_routes": len(logical_events),
         "physical_events": sum(physical_events.values()),
@@ -205,11 +312,19 @@ def validate_pair(physical_path: Path, logical_path: Path) -> dict[str, Any]:
             }
         ),
         "physical_event_counts": dict(sorted(physical_events.items())),
+        "execution_validated": execution_path is not None,
     }
+    if execution_path is not None:
+        result.update(
+            validate_execution_trace(
+                execution_path, logical_events, logical_build or physical_build
+            )
+        )
+    return result
 
 
 def emit_human(result: dict[str, Any]) -> None:
-    print(
+    line = (
         "trace_pair status=ok "
         f"build={result['build']} requests={result['requests']} "
         f"routes={result['logical_routes']} lookups={result['physical_lookup_groups']} "
@@ -218,6 +333,12 @@ def emit_human(result: dict[str, Any]) -> None:
         f"decode_routes={result['decode_routes']} "
         f"physical_events={result['physical_events']}"
     )
+    if result.get("execution_validated"):
+        line += (
+            f" executions={result['execution_events']}"
+            f" execute_ms={result['execution_total_ns'] / 1e6:.3f}"
+        )
+    print(line)
     counts = result["physical_event_counts"]
     if counts:
         print(
@@ -228,14 +349,22 @@ def emit_human(result: dict[str, Any]) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Validate V4 physical v1 and logical v2 trace correlation."
+        description=(
+            "Validate V4 physical v1 and logical v2 trace correlation, with "
+            "optional expert execution lifecycle validation."
+        )
     )
     parser.add_argument("physical", type=Path)
     parser.add_argument("logical", type=Path)
+    parser.add_argument(
+        "--execution",
+        type=Path,
+        help="optional colibri.v4.expert_execute_trace.v1 file",
+    )
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
     try:
-        result = validate_pair(args.physical, args.logical)
+        result = validate_pair(args.physical, args.logical, args.execution)
     except (OSError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
