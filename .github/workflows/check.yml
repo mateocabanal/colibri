@@ -89,6 +89,38 @@ jobs:
         run: |
           python c/tests/test_qwen_prefix_serve.py \
             --binary c/qwen_moe --fixture c/qwen_moe_tiny
+      - name: Publish tiny Qwen source fixture
+        uses: actions/upload-artifact@v4
+        with:
+          name: qwen-moe-tiny-source
+          path: c/qwen_moe_tiny
+          if-no-files-found: error
+
+  qwen-prefix-tiny-macos:
+    # Reuse the Linux-generated source fixture so Apple Silicon validates the
+    # exact same hybrid model without paying for torch/transformers a second
+    # time. This is a runtime restore oracle, not just a macOS compile check.
+    name: macOS (native Qwen prefix oracle)
+    needs: qwen-prefix-tiny
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: install libomp
+        run: brew install libomp
+      - name: Download generated Qwen fixture
+        uses: actions/download-artifact@v4
+        with:
+          name: qwen-moe-tiny-source
+          path: c/qwen_moe_tiny
+      - name: Build native Qwen engine and validate cold target oracle
+        run: |
+          make -C c qwen_moe ARCH=native
+          c/qwen_moe c/qwen_moe_tiny 2
+      - name: Validate warm hybrid prompt reuse against cold prefill
+        run: |
+          python3 c/tests/test_qwen_prefix_serve.py \
+            --binary c/qwen_moe --fixture c/qwen_moe_tiny
 
   v4-tiny:
     name: Linux (generated tiny V4 target oracle)
