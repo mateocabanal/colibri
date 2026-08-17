@@ -139,14 +139,26 @@ static int g_metal_compute = 0;
 #define g_metal_compute 0
 #endif
 /* page-aligned when Metal zero-copy is active, plain malloc otherwise */
-static void *moe_slab_alloc(size_t n){
-    void *p = malloc(n);
-    if (!p) { fprintf(stderr, "OOM expert\n"); exit(1); }
+static size_t moe_slab_bytes(size_t n){
+#ifdef COLI_METAL
     if (g_metal_compute) {
-        void *q = NULL;
-        if (!posix_memalign(&q, 16384, n)) p = q;
-        else free(p);   /* fall back to malloc'd; register will copy instead of wrap */
+        if (n > SIZE_MAX - 16383u) { fprintf(stderr, "expert slab size overflow\n"); exit(1); }
+        return (n + 16383u) & ~(size_t)16383u;
     }
+#endif
+    return n;
+}
+static void *moe_slab_alloc(size_t n){
+    void *p = NULL;
+#ifdef COLI_METAL
+    if (g_metal_compute) {
+        if (posix_memalign(&p, 16384, n) != 0) p = NULL;
+    } else
+#endif
+    {
+        p = malloc(n);
+    }
+    if (!p && n) { fprintf(stderr, "OOM expert (%zu bytes)\n", n); exit(1); }
     return p;
 }
 
@@ -1302,19 +1314,22 @@ static void slot_alloc_mxfp4(Slot *s, const ColiMxfp4ExpertLayout *layout){
         !size_add_ok(scale_bytes, layout->down_scale_bytes, &scale_bytes)) {
         fprintf(stderr, "expert MXFP4 allocation overflows\n"); exit(1);
     }
-    s->mxg = malloc(weight_bytes);
-    s->mxgs = malloc(scale_bytes);
-    if ((!s->mxg && weight_bytes) || (!s->mxgs && scale_bytes)) {
-        fprintf(stderr, "OOM MXFP4 expert (%zu weight + %zu scale bytes)\n",
-                weight_bytes, scale_bytes);
-        exit(1);
-    }
+    size_t weight_alloc = moe_slab_bytes(weight_bytes);
+    size_t scale_alloc = moe_slab_bytes(scale_bytes);
+    s->mxg = moe_slab_alloc(weight_alloc);
+    s->mxgs = moe_slab_alloc(scale_alloc);
     s->mxu = s->mxg + layout->gate_weight_bytes;
     s->mxd = s->mxu + layout->up_weight_bytes;
     s->mxus = s->mxgs + layout->gate_scale_bytes;
     s->mxds = s->mxus + layout->up_scale_bytes;
     s->pinned = 0;
     s->fmt = 7;
+#ifdef COLI_METAL
+    if (g_metal_compute) {
+        coli_metal_register(s->mxg, weight_alloc);
+        coli_metal_register(s->mxgs, scale_alloc);
+    }
+#endif
 }
 
 static void slot_alloc_q8(Model *m, Slot *s){
@@ -2156,7 +2171,24 @@ static void moe_token(Model *m, Layer *l, int layer, const float *x, float *out)
     if (g_metal_compute) {
         int fmt0 = slots[0]->fmt, unif = 1;
         for (int i = 1; i < K; i++) if (slots[i]->fmt != fmt0) { unif = 0; break; }
-        if (unif && (fmt0 == 4 || fmt0 == 8)) {
+        if (unif && fmt0 == 7 && K <= 64) {
+            for (int i = 0; i < K; i++) expert_wait_ready(m, slots[i]);
+            const void *gp[64], *up[64], *dp[64];
+            const uint8_t *gsp[64], *usp[64], *dsp[64];
+            int xoff[64], nr[64], rows[64]; float rw[64];
+            float *xg = falloc((int64_t)K * D);
+            for (int i = 0; i < K; i++) {
+                Slot *s = slots[i];
+                gp[i] = s->mxg; up[i] = s->mxu; dp[i] = s->mxd;
+                gsp[i] = s->mxgs; usp[i] = s->mxus; dsp[i] = s->mxds;
+                memcpy(xg + (int64_t)i * D, x, (size_t)D * sizeof(float));
+                xoff[i] = i; nr[i] = 1; rows[i] = 0; rw[i] = w[i];
+            }
+            gpu_ok = coli_metal_moe_block_mxfp4(K, D, c->moe_inter,
+                                                 gp, up, dp, gsp, usp, dsp,
+                                                 xg, xoff, nr, rows, rw, acc, 1);
+            free(xg);
+        } else if (unif && (fmt0 == 4 || fmt0 == 8)) {
             for (int i = 0; i < K; i++) expert_wait_ready(m, slots[i]);   /* MIO async loads must land before GPU reads them */
             const void *gp[64], *up[64], *dp[64];
             const float *gsp[64], *usp[64], *dsp[64];
@@ -2450,7 +2482,7 @@ static void arena_free(ArenaSlot *a, int n){
     for (int i = 0; i < n; i++) {
         Slot *s = &a[i].s;
 #ifdef COLI_METAL
-        if (g_metal_compute) { coli_metal_unregister(s->g); coli_metal_unregister(s->g4); coli_metal_unregister(s->gs); coli_metal_unregister(s->g4s); }
+        if (g_metal_compute) { coli_metal_unregister(s->g); coli_metal_unregister(s->g4); coli_metal_unregister(s->gs); coli_metal_unregister(s->g4s); coli_metal_unregister(s->mxg); coli_metal_unregister(s->mxgs); }
 #endif
         free(s->gu); free(s->bgu); free(s->g); free(s->g4); free(s->g4s);
         free(s->mxg); free(s->mxgs);
@@ -2658,7 +2690,7 @@ static void moe_batch(Model *m, Layer *l, int layer, const float *xs, int C, flo
             Slot *s = &wave[a];
             if (s->mio_resident) continue;
 #ifdef COLI_METAL
-            if (g_metal_compute) { coli_metal_unregister(s->g4); coli_metal_unregister(s->g4s); }
+            if (g_metal_compute) { coli_metal_unregister(s->g4); coli_metal_unregister(s->g4s); coli_metal_unregister(s->mxg); coli_metal_unregister(s->mxgs); }
 #endif
             free(s->gu); free(s->bgu); free(s->g); free(s->gs); free(s->g4); free(s->g4s);
             free(s->mxg); free(s->mxgs);

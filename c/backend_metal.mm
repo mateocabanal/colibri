@@ -253,7 +253,7 @@ kernel void moe_gemv(device const ulong* waddr [[buffer(0)]], device const ulong
     for(int i=K8*8+slane;i<K;i+=32) acc+=float(w[i])*xr[i];
   }
   acc=simd_sum(acc);
-  if(slane==0) yout[row] = (fmt==4 || fmt==5 || fmt==6) ? acc : acc*sc[o];   // fmt4 grouped / fmt6 in-block scales folded; fmt5 none
+  if(slane==0) yout[row] = (fmt==4 || fmt==5 || fmt==6 || fmt==7) ? acc : acc*sc[o]; // grouped/in-block/MXFP4 scales folded; fmt5 none
 }
 
 // fmt=6 activation rotation for the GPU-resident down-projection input: one FWHT
@@ -1305,10 +1305,10 @@ extern "C" size_t coli_metal_tensor_bytes(const ColiMetalTensor *t) { return t ?
 // unresolved slab / bad fmt (caller falls back to CPU).
 static id<MTLCommandBuffer> moe_submit(int nb, int D, int Iinter, int fmt, int qgs,
                          const void *const *g, const void *const *u, const void *const *d,
-                         const float *const *gs, const float *const *us, const float *const *ds,
+                         const void *const *gs, const void *const *us, const void *const *ds,
                          const float *xg, const int *xoff, const int *nr, int R,
                          id<MTLBuffer> xg_buf, id<MTLBuffer> gg_buf, id<MTLBuffer> uu_buf, id<MTLBuffer> hh_buf) {
-  if (!g_dev || (fmt != 1 && fmt != 2 && fmt != 4 && fmt != 5 && fmt != 6)) return nil;
+  if (!g_dev || (fmt != 1 && fmt != 2 && fmt != 4 && fmt != 5 && fmt != 6 && fmt != 7)) return nil;
   if (fmt == 6) {   /* e8 kernel assumes clean block tiling, and every FWHT tile of the
                      * down input (CPU tiling rule, e8_rot_rows) must fit threadgroup mem */
     if ((D & 255) || (Iinter & 31)) return nil;
@@ -1438,7 +1438,32 @@ extern "C" int coli_metal_moe_block(int nb, int D, int Iinter, int fmt, int qgs,
     g_gg = ensure(g_gg,&g_gg_cap,(size_t)R*Iinter*4);
     g_uu = ensure(g_uu,&g_uu_cap,(size_t)R*Iinter*4);
     g_hh = ensure(g_hh,&g_hh_cap,(size_t)R*D*4);
-    id<MTLCommandBuffer> cb = moe_submit(nb,D,Iinter,fmt,qgs,g,u,d,gs,us,ds,xg,xoff,nr,R,g_xg,g_gg,g_uu,g_hh);
+    id<MTLCommandBuffer> cb = moe_submit(nb,D,Iinter,fmt,qgs,g,u,d,
+        reinterpret_cast<const void *const *>(gs), reinterpret_cast<const void *const *>(us),
+        reinterpret_cast<const void *const *>(ds), xg,xoff,nr,R,g_xg,g_gg,g_uu,g_hh);
+    if (!cb) return 0;
+    return moe_finish(cb,g_hh,nb,R,D,rows,rw,out);
+  }
+}
+
+
+extern "C" int coli_metal_moe_block_mxfp4(int nb, int D, int Iinter,
+                         const void *const *g, const void *const *u, const void *const *d,
+                         const uint8_t *const *gs, const uint8_t *const *us,
+                         const uint8_t *const *ds,
+                         const float *xg, const int *xoff, const int *nr,
+                         const int *rows, const float *rw, float *out, int S) {
+  (void)S;
+  @autoreleasepool {
+    int R = 0; for (int e=0;e<nb;e++) R += nr[e];
+    if (R == 0) return 1;
+    g_xg = ensure(g_xg,&g_xg_cap,(size_t)R*D*4);
+    g_gg = ensure(g_gg,&g_gg_cap,(size_t)R*Iinter*4);
+    g_uu = ensure(g_uu,&g_uu_cap,(size_t)R*Iinter*4);
+    g_hh = ensure(g_hh,&g_hh_cap,(size_t)R*D*4);
+    id<MTLCommandBuffer> cb = moe_submit(nb,D,Iinter,7,0,g,u,d,
+        reinterpret_cast<const void *const *>(gs), reinterpret_cast<const void *const *>(us),
+        reinterpret_cast<const void *const *>(ds), xg,xoff,nr,R,g_xg,g_gg,g_uu,g_hh);
     if (!cb) return 0;
     return moe_finish(cb,g_hh,nb,R,D,rows,rw,out);
   }
@@ -1463,7 +1488,9 @@ extern "C" ColiMetalMoeHandle* coli_metal_moe_block_begin(int nb, int D, int Iin
     id<MTLBuffer> bgg=[g_dev newBufferWithLength:(size_t)R*Iinter*4 options:g_res_opts];
     id<MTLBuffer> buu=[g_dev newBufferWithLength:(size_t)R*Iinter*4 options:g_res_opts];
     id<MTLBuffer> bhh=[g_dev newBufferWithLength:(size_t)R*D*4 options:g_res_opts];
-    id<MTLCommandBuffer> cb = moe_submit(nb,D,Iinter,fmt,qgs,g,u,d,gs,us,ds,xg,xoff,nr,R,bxg,bgg,buu,bhh);
+    id<MTLCommandBuffer> cb = moe_submit(nb,D,Iinter,fmt,qgs,g,u,d,
+        reinterpret_cast<const void *const *>(gs), reinterpret_cast<const void *const *>(us),
+        reinterpret_cast<const void *const *>(ds), xg,xoff,nr,R,bxg,bgg,buu,bhh);
     if (!cb) return nullptr;
     ColiMetalMoeHandle *h = new ColiMetalMoeHandle();
     h->cb=cb; h->hh=bhh; h->rows.assign(rows,rows+R); h->rwv.assign(rw,rw+R);

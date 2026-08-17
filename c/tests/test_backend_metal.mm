@@ -387,6 +387,61 @@ static int run_moe(const std::vector<int>& nrv, int qgs, const char* name) {
   return pass?0:1;
 }
 
+// ---- fmt=7 (MXFP4) fused moe_block vs an independent scalar reference ----
+static float mx4_ref(uint8_t nib){
+  static const float lut[16]={0.f,.5f,1.f,1.5f,2.f,3.f,4.f,6.f,-0.f,-.5f,-1.f,-1.5f,-2.f,-3.f,-4.f,-6.f};
+  return lut[nib&15];
+}
+static float mxscale_ref(uint8_t s){ uint32_t u=(uint32_t)s<<23; float f; memcpy(&f,&u,4); return f; }
+static double mxrow_ref(const uint8_t* w,const uint8_t* s,const float* x,int K){
+  double a=0; for(int k=0;k<K;k++){ uint8_t b=w[k>>1]; uint8_t n=(k&1)?(b>>4):(b&15); a+=(double)mx4_ref(n)*x[k]*mxscale_ref(s[k/32]); } return a;
+}
+static int run_moe_mxfp4(const std::vector<int>& nrv, const char* name) {
+  const int D=128, I=64; int nb=(int)nrv.size();
+  int rbG=(D+1)/2, rbD=(I+1)/2, ngG=(D+31)/32, ngD=(I+31)/32;
+  int R=0; std::vector<int>xoff(nb),nr(nrv); for(int e=0;e<nb;e++){xoff[e]=R;R+=nr[e];}
+  size_t wlogical=(size_t)I*rbG*2+(size_t)D*rbD;
+  size_t slogical=(size_t)I*ngG*2+(size_t)D*ngD;
+  size_t wlen=roundpg(wlogical), slen=roundpg(slogical);
+  std::vector<void*> ws(nb), ss(nb); std::vector<const void*> g(nb),u(nb),d(nb);
+  std::vector<const uint8_t*> gs(nb),us(nb),ds(nb);
+  srand(7707+nb+R);
+  for(int e=0;e<nb;e++){
+    posix_memalign(&ws[e],16384,wlen); posix_memalign(&ss[e],16384,slen);
+    uint8_t* wp=(uint8_t*)ws[e]; uint8_t* sp=(uint8_t*)ss[e];
+    for(size_t j=0;j<wlogical;j++) wp[j]=(uint8_t)(rand()&0xff);
+    for(size_t j=0;j<slogical;j++) sp[j]=(uint8_t)(124+(rand()%7)); // 2^-3 .. 2^3
+    g[e]=wp; u[e]=wp+(size_t)I*rbG; d[e]=wp+(size_t)I*rbG*2;
+    gs[e]=sp; us[e]=sp+(size_t)I*ngG; ds[e]=sp+(size_t)I*ngG*2;
+    coli_metal_register(ws[e],wlen); coli_metal_register(ss[e],slen);
+  }
+  std::vector<float>xg((size_t)R*D); for(auto&v:xg)v=((rand()%2001)-1000)/5000.f;
+  std::vector<int>rows(R); std::vector<float>rw(R); for(int r=0;r<R;r++){rows[r]=r%2;rw[r]=0.1f+(rand()%50)/100.f;}
+  const int S=2; std::vector<double>ref((size_t)S*D,0.0), mag((size_t)S*D,0.0);
+  std::vector<double> gate(I), upv(I), hid(I);
+  for(int e=0;e<nb;e++) for(int rr=0;rr<nr[e];rr++){
+    int gr=xoff[e]+rr; const float*x=&xg[(size_t)gr*D];
+    for(int o=0;o<I;o++){
+      gate[o]=mxrow_ref((const uint8_t*)g[e]+(size_t)o*rbG,gs[e]+(size_t)o*ngG,x,D);
+      upv[o]=mxrow_ref((const uint8_t*)u[e]+(size_t)o*rbG,us[e]+(size_t)o*ngG,x,D);
+      hid[o]=(gate[o]/(1.0+exp(-gate[o])))*upv[o];
+    }
+    int row=rows[gr];
+    for(int o=0;o<D;o++){
+      double y=0, ym=0; const uint8_t*wr=(const uint8_t*)d[e]+(size_t)o*rbD; const uint8_t*sr=ds[e]+(size_t)o*ngD;
+      for(int k=0;k<I;k++){uint8_t b=wr[k>>1],n=(k&1)?(b>>4):(b&15);double term=mx4_ref(n)*hid[k]*mxscale_ref(sr[k/32]);y+=term;ym+=fabs(term);}
+      ref[(size_t)row*D+o]+=rw[gr]*y; mag[(size_t)row*D+o]+=fabs((double)rw[gr])*ym;
+    }
+  }
+  std::vector<float>got((size_t)S*D,0.f);
+  int ok=coli_metal_moe_block_mxfp4(nb,D,I,g.data(),u.data(),d.data(),gs.data(),us.data(),ds.data(),
+                                     xg.data(),xoff.data(),nr.data(),rows.data(),rw.data(),got.data(),S);
+  double worst=0; int bad=0; for(size_t i=0;i<got.size();i++){double er=fabs((double)got[i]-ref[i]);double rel=mag[i]>1e-30?er/mag[i]:er;if(rel>worst)worst=rel;if(rel>2e-4)bad++;}
+  int pass=ok&&bad==0; printf("  %-30s R=%d worst_rel=%.2e  %s\n",name,R,worst,pass?"ok":"*** MISMATCH");
+  for(int e=0;e<nb;e++){coli_metal_unregister(ws[e]);coli_metal_unregister(ss[e]);free(ws[e]);free(ss[e]);}
+  return pass?0:1;
+}
+
 // ---- fmt=6 (E8/IQ3) moe_block vs the engine's own scalar decoder ----
 // Mirrors the engine split exactly: the caller pre-rotates the staged gate/up input
 // (colibri.c metal_stage_rot_e8), the GPU rotates the down input (moe_fwht), and
@@ -767,6 +822,9 @@ int main(void) {
   fail |= run_moe({1,1,1,1,1,1,1,1}, 128, "moe decode nb=8  fmt4-g128");
   fail |= run_moe({3,1,4,2,1,5},     128, "moe ragged nb=6  fmt4-g128");
   fail |= run_moe({3,1,4,2,1,5},     64,  "moe ragged nb=6  fmt4-g64");
+  printf("Metal MXFP4 moe_block tests:\n");
+  fail |= run_moe_mxfp4({1,1,1,1}, "mxfp4 decode nb=4");
+  fail |= run_moe_mxfp4({3,1,2},     "mxfp4 ragged nb=3");
   printf("Metal fmt=6 (E8/IQ3) moe_block tests:\n");
   fail |= run_moe_e8({1,1,1,1,1,1,1,1}, "e8 decode nb=8");
   fail |= run_moe_e8({3,1,4,2,1,5},     "e8 ragged nb=6");
