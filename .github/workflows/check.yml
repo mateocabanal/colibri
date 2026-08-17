@@ -75,7 +75,10 @@ jobs:
       - name: Generate fixture and run target oracle
         # Normal builds leave expert-forward untouched. The generated target is
         # the dedicated correctness gate for the optional #56 execution hook.
-        run: make -C c deepseek-v4-tiny-check V4_TRACE_EXEC=1
+        run: |
+          make -C c deepseek-v4-tiny-check V4_TRACE_EXEC=1
+          python c/tests/test_v4_execution_trace_tiny.py \
+            --binary c/deepseek_v4 --fixture c/deepseek_v4_tiny
 
   macos:
     # clang; libomp for the threaded path (Makefile falls back to
