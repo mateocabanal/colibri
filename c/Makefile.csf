@@ -18,12 +18,22 @@ endif
 tests/test_coli_format$(EXE): tests/test_coli_format.c coli_format.c coli_executor.c coli_format.h coli_executor.h compat.h
 	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) tests/test_coli_format.c coli_format.c coli_executor.c -o $@ -pthread $(EXTRA_LDFLAGS)
 
-test: tests/test_coli_format$(EXE)
+tests/test_mxfp4_expert$(EXE): tests/test_mxfp4_expert.c mxfp4_expert.c mxfp4_expert.h coli_format.c coli_format.h compat.h
+	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) tests/test_mxfp4_expert.c mxfp4_expert.c coli_format.c -o $@ -pthread $(EXTRA_LDFLAGS)
+
+tests/test_mxfp4_runtime$(EXE): tests/test_mxfp4_runtime.c mxfp4_runtime.c mxfp4_runtime.h quant.h
+	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) tests/test_mxfp4_runtime.c mxfp4_runtime.c -o $@ -lm $(EXTRA_LDFLAGS)
+
+test: tests/test_coli_format$(EXE) tests/test_mxfp4_expert$(EXE) tests/test_mxfp4_runtime$(EXE)
 	./tests/test_coli_format$(EXE)
+	./tests/test_mxfp4_expert$(EXE)
+	./tests/test_mxfp4_runtime$(EXE)
 
 test-asan:
 	$(MAKE) -f Makefile.csf clean
 	$(MAKE) -f Makefile.csf test EXTRA_CFLAGS="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer" EXTRA_LDFLAGS="-fsanitize=address,undefined"
 
 clean:
-	rm -f tests/test_coli_format tests/test_coli_format.exe
+	rm -f tests/test_coli_format tests/test_coli_format.exe \
+		tests/test_mxfp4_expert tests/test_mxfp4_expert.exe \
+		tests/test_mxfp4_runtime tests/test_mxfp4_runtime.exe
