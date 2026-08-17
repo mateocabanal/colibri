@@ -9,27 +9,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-static int append_bytes(char **buffer, size_t *length, size_t *capacity,
-                        const char *bytes, size_t count) {
-    if (*length > SIZE_MAX - count - 1) return -1;
-    size_t needed = *length + count + 1;
-    if (needed > *capacity) {
-        size_t next = *capacity ? *capacity : 256;
-        while (next < needed) {
-            if (next > SIZE_MAX / 2) { next = needed; break; }
-            next *= 2;
-        }
-        char *grown = realloc(*buffer, next);
-        if (!grown) return -1;
-        *buffer = grown;
-        *capacity = next;
-    }
-    memcpy(*buffer + *length, bytes, count);
-    *length += count;
-    (*buffer)[*length] = '\0';
-    return 0;
-}
-
 static int decode_token_string(const ColiV4Session *session,
                                const int *ids, int count,
                                char **output) {
@@ -39,11 +18,25 @@ static int decode_token_string(const ColiV4Session *session,
         char piece[512];
         int bytes = tok_decode((tok *)&session->tokenizer, &ids[index], 1,
                                piece, (int)sizeof(piece));
-        if (bytes < 0 || append_bytes(&text, &length, &capacity,
-                                     piece, (size_t)bytes)) {
+        if (bytes < 0 || length > SIZE_MAX - (size_t)bytes - 1) {
             free(text);
             return -1;
         }
+        size_t needed = length + (size_t)bytes + 1;
+        if (needed > capacity) {
+            size_t next = capacity ? capacity : 256;
+            while (next < needed) {
+                if (next > SIZE_MAX / 2) { next = needed; break; }
+                next *= 2;
+            }
+            char *grown = realloc(text, next);
+            if (!grown) { free(text); return -1; }
+            text = grown;
+            capacity = next;
+        }
+        memcpy(text + length, piece, (size_t)bytes);
+        length += (size_t)bytes;
+        text[length] = '\0';
     }
     if (!text) {
         text = calloc(1, 1);
@@ -54,12 +47,11 @@ static int decode_token_string(const ColiV4Session *session,
 }
 
 static int generated_text(ColiV4Session *session, char **output) {
-    size_t length = 0;
-    if (coli_v4_session_generated_text(session, NULL, 0, &length) != 0)
-        return -1;
-    char *text = malloc(length + 1);
+    size_t capacity = (size_t)session->text_length + 1;
+    char *text = malloc(capacity);
     if (!text) return -1;
-    if (coli_v4_session_generated_text(session, text, length + 1, &length) != 0) {
+    size_t length = 0;
+    if (coli_v4_session_generated_text(session, text, capacity, &length) != 0) {
         free(text);
         return -1;
     }
@@ -108,7 +100,8 @@ int main(int argc, char **argv) {
     char error[1024] = {0};
     ColiV4Engine *shared_engine = NULL, *cold_engine = NULL;
     ColiV4Session *first = NULL, *restored = NULL, *cold = NULL;
-    char *extension = NULL, *restored_text = NULL, *cold_text = NULL;
+    char *extension_token = NULL, *extension = NULL;
+    char *restored_text = NULL, *cold_text = NULL;
     int status = 1;
 
     if (!getenv("V4_PREFIX_CACHE_MB") || !atoi(getenv("V4_PREFIX_CACHE_MB"))) {
@@ -127,35 +120,26 @@ int main(int argc, char **argv) {
         fprintf(stderr, "first generation failed: %s\n", error);
         goto cleanup;
     }
-    if (!first->fed.fed || first->fed.len <= 0 || first->fed.tainted) {
-        fprintf(stderr, "first session did not leave reusable exact state\n");
+    if (!first->prompt_ids || first->prompt_count <= 0) {
+        fprintf(stderr, "first session did not retain tokenized prompt\n");
         goto cleanup;
     }
-    int cached_tokens = first->fed.len;
+    int cached_tokens = first->prompt_count;
 
-    /* Decode the exact token sequence represented by the captured state, then
-     * append one known token. The synthetic tiny tokenizer is round-trippable;
-     * this creates a strict prefix extension without guessing which final
-     * generated token has or has not already entered target state. */
-    if (decode_token_string(first, first->fed.fed, first->fed.len, &extension)) {
-        fprintf(stderr, "failed to decode cached prefix\n");
-        goto cleanup;
-    }
-    char *extra = NULL;
-    if (decode_token_string(first, first->fed.fed, 1, &extra)) {
+    /* The cache snapshot is taken immediately after prefill, so it represents
+     * exactly the request prompt, not prompt+generated output. Build a strict
+     * extension by appending one known round-trippable tiny-fixture token. */
+    if (decode_token_string(first, first->prompt_ids, 1, &extension_token)) {
         fprintf(stderr, "failed to decode extension token\n");
         goto cleanup;
     }
-    size_t ext_len = strlen(extension), extra_len = strlen(extra);
-    char *grown = realloc(extension, ext_len + extra_len + 1);
-    if (!grown) {
-        free(extra);
-        fprintf(stderr, "out of memory extending prompt\n");
-        goto cleanup;
-    }
-    extension = grown;
-    memcpy(extension + ext_len, extra, extra_len + 1);
-    free(extra);
+    size_t prompt_len = strlen(initial_prompt);
+    size_t token_len = strlen(extension_token);
+    if (prompt_len > SIZE_MAX - token_len - 1) goto cleanup;
+    extension = malloc(prompt_len + token_len + 1);
+    if (!extension) goto cleanup;
+    memcpy(extension, initial_prompt, prompt_len);
+    memcpy(extension + prompt_len, extension_token, token_len + 1);
 
     if (run_generation(restored, extension, error, sizeof(error))) {
         fprintf(stderr, "restored generation failed: %s\n", error);
@@ -213,12 +197,13 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
 
-    printf("PASS cross-session prefix cache: %d tokens restored, %.3f MiB copied in %.3f ms, output identical to cold prefill\n",
+    printf("PASS cross-session prefix cache: %d prompt tokens restored, %.3f MiB copied in %.3f ms, output identical to cold prefill\n",
            cached_tokens, cache.restore_bytes / (1024.0 * 1024.0),
            cache.restore_ns / 1.0e6);
     status = 0;
 
 cleanup:
+    free(extension_token);
     free(extension);
     free(restored_text);
     free(cold_text);
