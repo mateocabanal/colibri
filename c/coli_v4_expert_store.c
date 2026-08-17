@@ -97,6 +97,7 @@ typedef struct {
     uint64_t offered_cache_bytes;
     uint64_t dense_cache_budget_bytes;
     uint64_t hot_hysteresis;
+    int dense_cache_configured;
 
     /* #56 aggregate activation/locality trace. */
     uint64_t *usage;
@@ -749,7 +750,8 @@ static void destroy(ColiExpertStore *store) {
         }
 
         trace_flush(s);
-        coli_v4_dense_cache_reset();
+        if (s->dense_cache_configured)
+            coli_v4_dense_cache_reset();
 
         if (s->slots) {
             for (int i = 0; i < s->total_slots; i++) {
@@ -870,7 +872,15 @@ int coli_v4_coli_expert_store_open(const ColiV4ColiExpertStoreOptions *o,
     const char *policy = getenv("V4_RESIDENCY_POLICY");
     s->legacy_layout = policy && !strcmp(policy, "legacy");
     if (s->legacy_layout) {
-        uint64_t per_layer = offered_slots / (uint64_t)s->layers;
+        /* Reproduce the old store's exact slot-count formula for a trustworthy
+         * A/B. Physical allocations remain 16 KiB rounded for Metal, just as
+         * they were on #63; the logical cache count is based on record bytes. */
+        if (s->record_bytes > UINT64_MAX / (uint64_t)s->layers) {
+            fail(e, n, "COLI legacy expert cache size overflow");
+            goto bad;
+        }
+        uint64_t per_layer_bytes = (uint64_t)s->layers * s->record_bytes;
+        uint64_t per_layer = o->cache_bytes / per_layer_bytes;
         if (!per_layer) {
             fail(e, n, "COLI legacy cache budget cannot hold one expert per layer");
             goto bad;
@@ -971,6 +981,7 @@ int coli_v4_coli_expert_store_open(const ColiV4ColiExpertStoreOptions *o,
     }
 
     coli_v4_dense_cache_configure(s->dense_cache_budget_bytes);
+    s->dense_cache_configured = 1;
     print_execution_mode();
     fprintf(stderr,
             "v4_residency policy=%s offered=%.2fGiB expert_capacity=%.2fGiB "
