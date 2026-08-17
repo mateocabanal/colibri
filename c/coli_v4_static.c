@@ -5,6 +5,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+#define DENSE_CACHE_BUCKETS 2048u
 
 typedef struct DenseCacheEntry {
     char *name;
@@ -13,14 +16,19 @@ typedef struct DenseCacheEntry {
     uint64_t stored_bytes;
     uint64_t last_used;
     struct DenseCacheEntry *next;
+    struct DenseCacheEntry *hash_next;
 } DenseCacheEntry;
 
 static struct {
     pthread_mutex_t mutex;
     DenseCacheEntry *entries;
+    DenseCacheEntry *buckets[DENSE_CACHE_BUCKETS];
     ColiV4DenseCacheStats stats;
     uint64_t clock;
-} g_dense_cache = { PTHREAD_MUTEX_INITIALIZER, NULL, {0}, 0 };
+    uint64_t hit_copy_bytes;
+    uint64_t hit_copy_ns;
+    long double min_score;
+} g_dense_cache = { PTHREAD_MUTEX_INITIALIZER, NULL, {0}, {0}, 0, 0, 0, 0.0L };
 
 static int bad(char *e, size_t n, const char *f, const char *s) {
     if (e && n) snprintf(e, n, f, s);
@@ -39,6 +47,21 @@ static uint16_t fmt(ColiSafetensorsDType d) {
     }
 }
 
+static uint64_t now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec;
+}
+
+static unsigned cache_hash(const char *name) {
+    uint32_t h = UINT32_C(2166136261);
+    for (const unsigned char *p = (const unsigned char *)name; *p; ++p) {
+        h ^= *p;
+        h *= UINT32_C(16777619);
+    }
+    return h & (DENSE_CACHE_BUCKETS - 1u);
+}
+
 static long double cache_score(uint64_t stored, uint64_t resident) {
     return resident ? (long double)stored / (long double)resident : 0.0L;
 }
@@ -51,24 +74,41 @@ static void cache_entry_free(DenseCacheEntry *entry) {
 }
 
 static DenseCacheEntry *cache_find_locked(const char *name) {
-    for (DenseCacheEntry *entry = g_dense_cache.entries; entry; entry = entry->next)
+    for (DenseCacheEntry *entry = g_dense_cache.buckets[cache_hash(name)];
+         entry; entry = entry->hash_next)
         if (strcmp(entry->name, name) == 0) return entry;
     return NULL;
+}
+
+static void cache_recompute_min_score_locked(void) {
+    if (!g_dense_cache.entries) {
+        g_dense_cache.min_score = 0.0L;
+        return;
+    }
+    long double value = cache_score(g_dense_cache.entries->stored_bytes,
+                                    g_dense_cache.entries->resident_bytes);
+    for (DenseCacheEntry *entry = g_dense_cache.entries->next;
+         entry; entry = entry->next) {
+        long double score = cache_score(entry->stored_bytes, entry->resident_bytes);
+        if (score < value) value = score;
+    }
+    g_dense_cache.min_score = value;
 }
 
 /*
  * Dense/static access is a deterministic scan over the same layer records on
  * every token. Ordinary LRU is pathological when the working set is larger
  * than the cache: the next scan evicts exactly the objects that would have
- * been reused later in that scan.  Residency is therefore an admission
+ * been reused later in that scan. Residency is therefore an admission
  * problem, not a recency problem.
  *
  * Once the budget is full, a candidate may displace only an object with a
  * STRICTLY lower recurring-I/O-saved/resident-byte score. Equal-value objects
- * remain pinned. This makes the cache scan-resistant after its warmup pass and
- * is the online equivalent of keeping a stable greedy prefix of the ranking.
+ * remain pinned. This makes the cache scan-resistant after its warmup pass.
  */
 static DenseCacheEntry *cache_lower_value_victim_locked(long double candidate_score) {
+    if (g_dense_cache.entries && candidate_score <= g_dense_cache.min_score)
+        return NULL;
     DenseCacheEntry *victim = NULL;
     long double victim_score = 0.0L;
     for (DenseCacheEntry *entry = g_dense_cache.entries; entry; entry = entry->next) {
@@ -88,12 +128,19 @@ static void cache_remove_locked(DenseCacheEntry *victim) {
     while (*link && *link != victim) link = &(*link)->next;
     if (!*link) return;
     *link = victim->next;
+
+    unsigned bucket = cache_hash(victim->name);
+    DenseCacheEntry **hash_link = &g_dense_cache.buckets[bucket];
+    while (*hash_link && *hash_link != victim) hash_link = &(*hash_link)->hash_next;
+    if (*hash_link) *hash_link = victim->hash_next;
+
     if (g_dense_cache.stats.resident_bytes >= victim->resident_bytes)
         g_dense_cache.stats.resident_bytes -= victim->resident_bytes;
     else
         g_dense_cache.stats.resident_bytes = 0;
     g_dense_cache.stats.evictions++;
     cache_entry_free(victim);
+    cache_recompute_min_score_locked();
 }
 
 void coli_v4_dense_cache_configure(uint64_t budget_bytes) {
@@ -117,6 +164,15 @@ void coli_v4_dense_cache_stats(ColiV4DenseCacheStats *stats) {
 
 void coli_v4_dense_cache_shutdown(void) {
     pthread_mutex_lock(&g_dense_cache.mutex);
+    if (g_dense_cache.hit_copy_bytes) {
+        double ms = g_dense_cache.hit_copy_ns / 1000000.0;
+        double gib = g_dense_cache.hit_copy_bytes / 1073741824.0;
+        double gib_s = g_dense_cache.hit_copy_ns
+            ? gib / ((double)g_dense_cache.hit_copy_ns / 1000000000.0) : 0.0;
+        fprintf(stderr,
+                "v4_dense_cache_copy bytes=%.2fGiB time_ms=%.3f bandwidth=%.2fGiB/s\n",
+                gib, ms, gib_s);
+    }
     DenseCacheEntry *entry = g_dense_cache.entries;
     while (entry) {
         DenseCacheEntry *next = entry->next;
@@ -124,14 +180,17 @@ void coli_v4_dense_cache_shutdown(void) {
         entry = next;
     }
     g_dense_cache.entries = NULL;
+    memset(g_dense_cache.buckets, 0, sizeof(g_dense_cache.buckets));
     g_dense_cache.stats.resident_bytes = 0;
+    g_dense_cache.min_score = 0.0L;
+    g_dense_cache.hit_copy_bytes = 0;
+    g_dense_cache.hit_copy_ns = 0;
     pthread_mutex_unlock(&g_dense_cache.mutex);
 }
 
 /* Returns 1 on hit, 0 on miss. output is always caller-owned for now.
- * A follow-up converts selected resident tensors to borrowed zero-copy views;
- * keeping this ownership boundary unchanged in this tranche makes the A/B
- * isolate scan-resistance from that lifetime refactor. */
+ * Copy cost is measured under V4_PROFILE so the next A/B quantifies exactly
+ * how much zero-copy borrowed views can recover. */
 static int cache_get(const char *name, uint64_t expected_bytes,
                      uint64_t stored_bytes, unsigned char **output) {
     *output = NULL;
@@ -142,6 +201,7 @@ static int cache_get(const char *name, uint64_t expected_bytes,
         pthread_mutex_unlock(&g_dense_cache.mutex);
         return 0;
     }
+    const uint64_t began = g_coli_v4_profile_on ? now_ns() : 0;
     unsigned char *copy = malloc((size_t)entry->resident_bytes);
     if (!copy) {
         g_dense_cache.stats.misses++;
@@ -149,6 +209,10 @@ static int cache_get(const char *name, uint64_t expected_bytes,
         return 0;
     }
     memcpy(copy, entry->data, (size_t)entry->resident_bytes);
+    if (began) {
+        g_dense_cache.hit_copy_ns += now_ns() - began;
+        g_dense_cache.hit_copy_bytes += entry->resident_bytes;
+    }
     entry->last_used = ++g_dense_cache.clock;
     g_dense_cache.stats.hits++;
     g_dense_cache.stats.stored_bytes_avoided += stored_bytes;
@@ -195,8 +259,13 @@ static void cache_put(const char *name, const unsigned char *data,
     entry->last_used = ++g_dense_cache.clock;
     entry->next = g_dense_cache.entries;
     g_dense_cache.entries = entry;
+    unsigned bucket = cache_hash(name);
+    entry->hash_next = g_dense_cache.buckets[bucket];
+    g_dense_cache.buckets[bucket] = entry;
     g_dense_cache.stats.resident_bytes += resident_bytes;
     g_dense_cache.stats.inserts++;
+    if (g_dense_cache.stats.inserts == 1 || candidate_score < g_dense_cache.min_score)
+        g_dense_cache.min_score = candidate_score;
     pthread_mutex_unlock(&g_dense_cache.mutex);
 }
 
