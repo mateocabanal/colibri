@@ -64,6 +64,13 @@ int coli_mxfp4_expert_validate_info(const ColiExpertInfo *info,
  * caller-owned cache storage. The COLIEXPT framing and padding never become
  * resident, and this function performs no heap allocation.
  */
+int coli_mxfp4_expert_load_ex(const ColiPackage *package,
+                              const ColiRecordInfo *record,
+                              int hidden, int intermediate,
+                              const ColiMxfp4ExpertBuffers *buffers,
+                              ColiMxfp4ExpertLayout *layout,
+                              uint32_t read_flags,
+                              char *error, size_t error_size);
 int coli_mxfp4_expert_load(const ColiPackage *package,
                            const ColiRecordInfo *record,
                            int hidden, int intermediate,

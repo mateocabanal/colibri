@@ -1018,8 +1018,9 @@ static void load_expert_coli(Model *m, int layer, int eid, Slot *s){
             .down_scales = s->mxds, .down_scale_capacity = layout.down_scale_bytes,
         };
         const ColiPackage *pkg = coli_executor_package(m->coli);
-        if (coli_mxfp4_expert_load(pkg, erec, cc->hidden, cc->moe_inter,
-                                   &buffers, &layout, err, sizeof(err))) {
+        uint32_t read_flags = g_expert_drop ? COLI_CSF_READ_UNCACHED : COLI_CSF_READ_DEFAULT;
+        if (coli_mxfp4_expert_load_ex(pkg, erec, cc->hidden, cc->moe_inter,
+                                      &buffers, &layout, read_flags, err, sizeof(err))) {
             fprintf(stderr, "qwen coli: read MXFP4 expert (%d,%d) failed: %s\n",
                     layer, eid, err[0] ? err : "read failed");
             exit(1);
@@ -1036,12 +1037,13 @@ static void load_expert_coli(Model *m, int layer, int eid, Slot *s){
     }
     slot_alloc_bf16(s, ng, nd); s->fmt = 16; s->pinned = 0;
     const ColiPackage *pkg = coli_executor_package(m->coli);
-    if (coli_package_read_range(pkg, erec, ei.matrices[gi].weight_offset,
-                                s->bgu, (size_t)ng * 2, NULL, 0) ||
-        coli_package_read_range(pkg, erec, ei.matrices[ui].weight_offset,
-                                s->bgu + ng, (size_t)ng * 2, NULL, 0) ||
-        coli_package_read_range(pkg, erec, ei.matrices[di].weight_offset,
-                                s->bd, (size_t)nd * 2, NULL, 0)) {
+    uint32_t read_flags = g_expert_drop ? COLI_CSF_READ_UNCACHED : COLI_CSF_READ_DEFAULT;
+    if (coli_package_read_range_ex(pkg, erec, ei.matrices[gi].weight_offset,
+                                   s->bgu, (size_t)ng * 2, read_flags, NULL, 0) ||
+        coli_package_read_range_ex(pkg, erec, ei.matrices[ui].weight_offset,
+                                   s->bgu + ng, (size_t)ng * 2, read_flags, NULL, 0) ||
+        coli_package_read_range_ex(pkg, erec, ei.matrices[di].weight_offset,
+                                   s->bd, (size_t)nd * 2, read_flags, NULL, 0)) {
         fprintf(stderr, "qwen coli: read expert (%d,%d) failed\n", layer, eid); exit(1);
     }
 }

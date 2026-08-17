@@ -5,6 +5,7 @@
 #include "backend_metal.h"
 #include <cstring>
 #include <vector>
+#include <map>
 #include <mutex>
 
 // ---- shader: general quantized GEMV, one threadgroup per output element (o,si) ----
@@ -564,8 +565,21 @@ extern "C" void coli_metal_attn_lat(double *ksched, double *gsched){
 
 // Registry of page-aligned host slabs wrapped zero-copy for the batched MoE path.
 struct Slab { void *base; size_t len; id<MTLBuffer> buf; };
-static std::vector<Slab> g_slabs;
+/* Ordered by base address: exact register/unregister and predecessor interval
+ * lookup are O(log N), rather than scanning every resident expert slab. */
+static std::map<uintptr_t, Slab> g_slabs;
 static std::mutex g_slab_mtx;   // expert_load registers slabs from parallel OpenMP threads
+
+static id<MTLBuffer> slab_resolve_locked(uintptr_t u, uint64_t *addr) {
+  auto it = g_slabs.upper_bound(u);
+  if (it == g_slabs.begin()) return nil;
+  --it;
+  uintptr_t base = it->first;
+  const Slab &s = it->second;
+  if ((u - base) >= s.len) return nil;
+  if (addr) *addr = (uint64_t)[s.buf gpuAddress] + (u - base);
+  return s.buf;
+}
 
 // ---- E5 experiment: COLI_METAL_RESSET=1 -- one persistent MTLResidencySet attached to
 // g_queue (macOS 15+) replaces moe_submit's per-command-buffer useResource: loop over
@@ -773,9 +787,10 @@ extern "C" void coli_metal_register(void *base, size_t len) {
   id<MTLBuffer> old = nil;   // E5: replaced wrapper on re-register of a live base (defensive)
   {
     std::lock_guard<std::mutex> lk(g_slab_mtx);   // called from parallel expert_load threads
-    bool found = false;
-    for (auto &s : g_slabs) if (s.base == base) { old = s.buf; s.len = len; s.buf = b; found = true; break; }
-    if (!found) g_slabs.push_back({base, len, b});
+    uintptr_t key = (uintptr_t)base;
+    auto it = g_slabs.find(key);
+    if (it != g_slabs.end()) { old = it->second.buf; it->second = {base, len, b}; }
+    else g_slabs.emplace(key, Slab{base, len, b});
   }
   // E5, outside g_slab_mtx (no Metal call under the slab lock), before returning. Invariant
   // defended: set membership mirrors g_slabs exactly -- a re-register of a live base must
@@ -789,18 +804,15 @@ extern "C" void coli_metal_unregister(void *base) {
   id<MTLBuffer> b = nil;
   {
     std::lock_guard<std::mutex> lk(g_slab_mtx);
-    for (size_t i=0;i<g_slabs.size();i++) if (g_slabs[i].base==base) {
-      b = g_slabs[i].buf; g_slabs[i].buf=nil; g_slabs.erase(g_slabs.begin()+i); break; }
+    auto it = g_slabs.find((uintptr_t)base);
+    if (it != g_slabs.end()) { b = it->second.buf; it->second.buf=nil; g_slabs.erase(it); }
   }
   if (b) resset_remove(b);   // E5: outside g_slab_mtx; commits before the caller frees base
 }
 // Resolve a host pointer inside a registered slab to (buffer, gpuAddress). Returns nil if unknown.
 static id<MTLBuffer> resolve(const void *p, uint64_t *addr) {
   std::lock_guard<std::mutex> lk(g_slab_mtx);
-  uintptr_t u=(uintptr_t)p;
-  for (auto &s : g_slabs) { uintptr_t b=(uintptr_t)s.base;
-    if (u>=b && u<b+s.len) { *addr = (uint64_t)[s.buf gpuAddress] + (u-b); return s.buf; } }
-  return nil;
+  return slab_resolve_locked((uintptr_t)p, addr);
 }
 
 // True if p lies inside a currently-registered slab. The shim uses this to
@@ -808,10 +820,7 @@ static id<MTLBuffer> resolve(const void *p, uint64_t *addr) {
 // a key whose slab vanished must not serve a stale MTLBuffer wrapper.
 extern "C" int coli_metal_ptr_registered(const void *p) {
   std::lock_guard<std::mutex> lk(g_slab_mtx);
-  uintptr_t u=(uintptr_t)p;
-  for (auto &s : g_slabs)
-    if (u>=(uintptr_t)s.base && u<(uintptr_t)s.base+s.len) return 1;
-  return 0;
+  return slab_resolve_locked((uintptr_t)p, NULL) != nil;
 }
 
 // Keep-alive spinner (COLI_METAL_SPIN=1): keeps trivial GPU work in flight so the GPU

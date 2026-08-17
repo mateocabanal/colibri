@@ -182,21 +182,22 @@ static int check_buffer(const char *name, uint8_t *pointer, size_t capacity,
 
 static int read_span(const ColiPackage *package, const ColiRecordInfo *record,
                      const ColiExpertMatrixInfo *matrix, int scale,
-                     uint8_t *destination, size_t bytes,
+                     uint8_t *destination, size_t bytes, uint32_t read_flags,
                      char *error, size_t error_size) {
     const uint64_t offset = scale ? matrix->scale_offset : matrix->weight_offset;
-    if (coli_package_read_range(package, record, offset, destination, bytes,
-                                error, error_size) != 0)
+    if (coli_package_read_range_ex(package, record, offset, destination, bytes,
+                                   read_flags, error, error_size) != 0)
         return -1;
     return 0;
 }
 
-int coli_mxfp4_expert_load(const ColiPackage *package,
-                           const ColiRecordInfo *record,
-                           int hidden, int intermediate,
-                           const ColiMxfp4ExpertBuffers *buffers,
-                           ColiMxfp4ExpertLayout *layout,
-                           char *error, size_t error_size) {
+int coli_mxfp4_expert_load_ex(const ColiPackage *package,
+                              const ColiRecordInfo *record,
+                              int hidden, int intermediate,
+                              const ColiMxfp4ExpertBuffers *buffers,
+                              ColiMxfp4ExpertLayout *layout,
+                              uint32_t read_flags,
+                              char *error, size_t error_size) {
     if (!package || !record || !buffers || !layout)
         return fail(error, error_size, "MXFP4 expert load received null input");
     if (record->kind != COLI_CSF_REC_EXPERT)
@@ -240,17 +241,28 @@ int coli_mxfp4_expert_load(const ColiPackage *package,
     const ColiExpertMatrixInfo *down = find_role(&info, COLI_MXFP4_EXPERT_ROLE_DOWN);
 
     if (read_span(package, record, gate, 0, buffers->gate_weights,
-                  layout->gate_weight_bytes, error, error_size) != 0 ||
+                  layout->gate_weight_bytes, read_flags, error, error_size) != 0 ||
         read_span(package, record, gate, 1, buffers->gate_scales,
-                  layout->gate_scale_bytes, error, error_size) != 0 ||
+                  layout->gate_scale_bytes, read_flags, error, error_size) != 0 ||
         read_span(package, record, up, 0, buffers->up_weights,
-                  layout->up_weight_bytes, error, error_size) != 0 ||
+                  layout->up_weight_bytes, read_flags, error, error_size) != 0 ||
         read_span(package, record, up, 1, buffers->up_scales,
-                  layout->up_scale_bytes, error, error_size) != 0 ||
+                  layout->up_scale_bytes, read_flags, error, error_size) != 0 ||
         read_span(package, record, down, 0, buffers->down_weights,
-                  layout->down_weight_bytes, error, error_size) != 0 ||
+                  layout->down_weight_bytes, read_flags, error, error_size) != 0 ||
         read_span(package, record, down, 1, buffers->down_scales,
-                  layout->down_scale_bytes, error, error_size) != 0)
+                  layout->down_scale_bytes, read_flags, error, error_size) != 0)
         return -1;
     return 0;
+}
+
+int coli_mxfp4_expert_load(const ColiPackage *package,
+                           const ColiRecordInfo *record,
+                           int hidden, int intermediate,
+                           const ColiMxfp4ExpertBuffers *buffers,
+                           ColiMxfp4ExpertLayout *layout,
+                           char *error, size_t error_size) {
+    return coli_mxfp4_expert_load_ex(package, record, hidden, intermediate,
+                                     buffers, layout, COLI_CSF_READ_DEFAULT,
+                                     error, error_size);
 }
