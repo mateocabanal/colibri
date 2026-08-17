@@ -64,7 +64,8 @@ typedef struct {
     size_t capacity;
     uint64_t dropped;
     uint64_t seq;
-    uint64_t request_id;
+    uint64_t next_request_id;
+    uint64_t requests_started;
     uint64_t lookup_seq;
     uint64_t correlation_misses;
     size_t pending_start;
@@ -76,6 +77,13 @@ typedef struct {
 } ColiV4RouteTraceState;
 
 typedef struct {
+    uint64_t request_id;
+    int prompt_tokens;
+    int reused_tokens;
+    int active;
+} ColiV4TraceRequestContext;
+
+typedef struct {
     int valid;
     int layer;
     int64_t start_position;
@@ -83,6 +91,8 @@ typedef struct {
     int batch;
     ColiExpertPhase phase;
     size_t event_start;
+    uint64_t request_id;
+    int prompt_tokens;
 } ColiV4RouteCallContext;
 
 typedef struct {
@@ -96,6 +106,7 @@ static ColiV4RouteTraceState g_v4_route_trace = {
     .mutex = PTHREAD_MUTEX_INITIALIZER,
 };
 static pthread_once_t g_v4_route_trace_once = PTHREAD_ONCE_INIT;
+static _Thread_local ColiV4TraceRequestContext g_v4_trace_request;
 static _Thread_local ColiV4RouteCallContext g_v4_route_call;
 
 static uint64_t v4_route_now_ns(void) {
@@ -132,6 +143,15 @@ static const char *v4_route_phase_name(ColiExpertPhase phase) {
     }
 }
 
+static uint64_t v4_route_allocate_request_locked(ColiV4RouteTraceState *state) {
+    uint64_t id = state->next_request_id;
+    if (!id) id = 1;
+    if (state->next_request_id < UINT64_MAX)
+        state->next_request_id = id + 1;
+    state->requests_started++;
+    return id;
+}
+
 static void v4_route_trace_flush(void) {
     ColiV4RouteTraceState *state = &g_v4_route_trace;
     if (!state->enabled || !state->path) return;
@@ -153,12 +173,14 @@ static void v4_route_trace_flush(void) {
             "\"build\":\"%s\",\"record_bytes\":0,"
             "\"events\":%llu,\"dropped\":%llu,"
             "\"source\":\"route_selected\","
+            "\"requests_started\":%llu,"
             "\"physical_lookups\":%llu,"
             "\"correlation_misses\":%llu,"
             "\"uncorrelated_routes\":%llu}\n",
             COLI_V4_GIT_SHA,
             (unsigned long long)state->count,
             (unsigned long long)state->dropped,
+            (unsigned long long)state->requests_started,
             (unsigned long long)state->lookup_seq,
             (unsigned long long)state->correlation_misses,
             (unsigned long long)uncorrelated);
@@ -192,6 +214,7 @@ static void v4_route_trace_flush(void) {
     }
     size_t count = state->count;
     uint64_t dropped = state->dropped;
+    uint64_t requests = state->requests_started;
     uint64_t lookups = state->lookup_seq;
     uint64_t misses = state->correlation_misses;
     pthread_mutex_unlock(&state->mutex);
@@ -199,10 +222,11 @@ static void v4_route_trace_flush(void) {
 
     fprintf(stderr,
             "v4_route_trace status=written path=%s events=%llu dropped=%llu "
-            "lookups=%llu correlation_misses=%llu\n",
+            "requests=%llu lookups=%llu correlation_misses=%llu\n",
             state->path,
             (unsigned long long)count,
             (unsigned long long)dropped,
+            (unsigned long long)requests,
             (unsigned long long)lookups,
             (unsigned long long)misses);
 }
@@ -239,11 +263,11 @@ static void v4_route_trace_init(void) {
             capacity = (size_t)parsed;
     }
 
-    state->request_id = 1;
+    state->next_request_id = 1;
     const char *request_id = getenv("V4_ROUTE_REQUEST_ID");
     if (request_id && *request_id) {
         unsigned long long parsed = strtoull(request_id, NULL, 10);
-        if (parsed) state->request_id = (uint64_t)parsed;
+        if (parsed) state->next_request_id = (uint64_t)parsed;
     }
 
     state->events = calloc(capacity, sizeof(*state->events));
@@ -256,15 +280,36 @@ static void v4_route_trace_init(void) {
     state->enabled = 1;
     atexit(v4_route_trace_flush);
     fprintf(stderr,
-            "v4_route_trace status=buffering path=%s capacity=%llu request_id=%llu\n",
+            "v4_route_trace status=buffering path=%s capacity=%llu request_id_start=%llu\n",
             state->path,
             (unsigned long long)capacity,
-            (unsigned long long)state->request_id);
+            (unsigned long long)state->next_request_id);
 }
 
 static int v4_route_trace_enabled(void) {
     pthread_once(&g_v4_route_trace_once, v4_route_trace_init);
     return g_v4_route_trace.enabled;
+}
+
+/* Called once per successful prompt tokenization by the runtime overlay, before
+ * any fresh prompt token is executed. Thread-local request context prevents a
+ * future multi-session scheduler from confusing owner-thread route identity;
+ * the current V4 physical lookup scheduler remains single-request-at-a-time. */
+void coli_v4_route_trace_begin_request(int prompt_tokens, int reused_tokens) {
+    if (!v4_route_trace_enabled()) return;
+    ColiV4RouteTraceState *state = &g_v4_route_trace;
+    pthread_mutex_lock(&state->mutex);
+    if (state->pending_active) {
+        state->correlation_misses++;
+        state->pending_active = 0;
+    }
+    uint64_t id = v4_route_allocate_request_locked(state);
+    pthread_mutex_unlock(&state->mutex);
+
+    g_v4_trace_request.request_id = id;
+    g_v4_trace_request.prompt_tokens = prompt_tokens;
+    g_v4_trace_request.reused_tokens = reused_tokens;
+    g_v4_trace_request.active = 1;
 }
 
 static void v4_route_trace_context(
@@ -280,6 +325,12 @@ static void v4_route_trace_context(
         state->correlation_misses++;
         state->pending_active = 0;
     }
+    if (!g_v4_trace_request.active) {
+        g_v4_trace_request.request_id = v4_route_allocate_request_locked(state);
+        g_v4_trace_request.prompt_tokens = -1;
+        g_v4_trace_request.reused_tokens = 0;
+        g_v4_trace_request.active = 1;
+    }
     g_v4_route_call.event_start = state->count;
     pthread_mutex_unlock(&state->mutex);
 
@@ -289,6 +340,8 @@ static void v4_route_trace_context(
     g_v4_route_call.next_item = 0;
     g_v4_route_call.batch = batch;
     g_v4_route_call.phase = phase;
+    g_v4_route_call.request_id = g_v4_trace_request.request_id;
+    g_v4_route_call.prompt_tokens = g_v4_trace_request.prompt_tokens;
 }
 
 static void v4_route_trace_selected(const int *indices, const float *weights,
@@ -300,6 +353,12 @@ static void v4_route_trace_selected(const int *indices, const float *weights,
     int item = g_v4_route_call.next_item++;
     int complete = g_v4_route_call.next_item >= g_v4_route_call.batch;
     int64_t position = g_v4_route_call.start_position + item;
+    ColiExpertPhase phase = g_v4_route_call.phase;
+    if (phase == COLI_EXPERT_PHASE_UNKNOWN &&
+        g_v4_route_call.prompt_tokens >= 0) {
+        phase = position < g_v4_route_call.prompt_tokens
+            ? COLI_EXPERT_PHASE_PREFILL : COLI_EXPERT_PHASE_DECODE;
+    }
 
     ColiV4RouteTraceState *state = &g_v4_route_trace;
     pthread_mutex_lock(&state->mutex);
@@ -310,13 +369,13 @@ static void v4_route_trace_selected(const int *indices, const float *weights,
         }
         ColiV4RouteTraceEvent *event = &state->events[state->count++];
         event->seq = ++state->seq;
-        event->request_id = state->request_id;
+        event->request_id = g_v4_route_call.request_id;
         event->token_position = position;
         event->layer = g_v4_route_call.layer;
         event->expert = indices[rank];
         event->route_rank = rank;
         event->route_weight = weights[rank];
-        event->phase = g_v4_route_call.phase;
+        event->phase = phase;
         event->lookup_result = -1;
     }
     if (complete) {
