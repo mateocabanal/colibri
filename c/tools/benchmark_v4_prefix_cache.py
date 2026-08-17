@@ -278,6 +278,11 @@ def main() -> int:
     treatment_ttfts = [float(pair["cache_on"]["second_ttft_sec"]) for pair in pairs]  # type: ignore[index]
     paired_saved = [float(pair["ttft_saved_sec"]) for pair in pairs]
     paired_speedup = [float(pair["ttft_speedup"]) for pair in pairs]
+    cache_restore_ms = [float(pair["cache_on"]["restore_ms"]) for pair in pairs]  # type: ignore[index]
+    cache_first_store_ms = [float(pair["cache_on"]["first_store_ms"]) for pair in pairs]  # type: ignore[index]
+    cache_second_store_ms = [float(pair["cache_on"]["second_store_ms"]) for pair in pairs]  # type: ignore[index]
+    cache_first_store_bytes = [int(pair["cache_on"]["first_store_bytes"]) for pair in pairs]  # type: ignore[index]
+    cache_second_store_bytes = [int(pair["cache_on"]["second_store_bytes"]) for pair in pairs]  # type: ignore[index]
     first_baseline = pairs[0]["cache_off"]  # type: ignore[assignment]
 
     result = {
@@ -303,6 +308,11 @@ def main() -> int:
         "cache_second_ttft_median_sec": statistics.median(treatment_ttfts),
         "paired_ttft_saved_median_sec": statistics.median(paired_saved),
         "paired_ttft_speedup_median": statistics.median(paired_speedup),
+        "cache_restore_ms_median": statistics.median(cache_restore_ms),
+        "cache_first_store_ms_median": statistics.median(cache_first_store_ms),
+        "cache_second_store_ms_median": statistics.median(cache_second_store_ms),
+        "cache_first_store_bytes_median": statistics.median(cache_first_store_bytes),
+        "cache_second_store_bytes_median": statistics.median(cache_second_store_bytes),
         "pairs": pairs,
         "environment": relevant_environment(),
         "mode_environment": {
