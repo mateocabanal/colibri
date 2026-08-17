@@ -109,15 +109,19 @@ void coli_profile_emit_scope(FILE *stream, const ColiProfile *profile,
     uint64_t wall = delta_u64(end->wall_ns, start->wall_ns);
     uint64_t accounted = 0;
     uint64_t io_wait = 0;
+    uint64_t cpu_wait = 0;
     for (size_t i = 0; i < profile->config.phase_count; i++) {
         uint64_t ns = delta_u64(end->phase_ns[i], start->phase_ns[i]);
-        if (profile->config.phases[i].flags & COLI_PROFILE_ACCOUNTED)
+        unsigned flags = profile->config.phases[i].flags;
+        if (flags & COLI_PROFILE_ACCOUNTED)
             accounted += ns;
-        if (profile->config.phases[i].flags & COLI_PROFILE_IO_WAIT)
+        if (flags & COLI_PROFILE_IO_WAIT)
             io_wait += ns;
+        if (flags & (COLI_PROFILE_IO_WAIT | COLI_PROFILE_CPU_WAIT))
+            cpu_wait += ns;
     }
     int64_t unaccounted = (int64_t)wall - (int64_t)accounted;
-    uint64_t cpu_compute = accounted > io_wait ? accounted - io_wait : 0;
+    uint64_t cpu_compute = accounted > cpu_wait ? accounted - cpu_wait : 0;
     const char *prefix = profile->config.line_prefix && profile->config.line_prefix[0]
         ? profile->config.line_prefix : "coli_profile";
     fprintf(stream, "%s", prefix);
@@ -125,11 +129,11 @@ void coli_profile_emit_scope(FILE *stream, const ColiProfile *profile,
         fprintf(stream, " engine=%s", profile->config.engine);
     fprintf(stream,
             " scope=%s tokens=%llu wall_ms=%.3f accounted_ms=%.3f "
-            "unaccounted_ms=%+.3f cpu_compute_ms=%.3f io_wait_ms=%.3f",
+            "unaccounted_ms=%+.3f cpu_compute_ms=%.3f cpu_wait_ms=%.3f io_wait_ms=%.3f",
             scope,
             (unsigned long long)delta_u64(end->tokens, start->tokens),
             wall / 1e6, accounted / 1e6, unaccounted / 1e6,
-            cpu_compute / 1e6, io_wait / 1e6);
+            cpu_compute / 1e6, cpu_wait / 1e6, io_wait / 1e6);
     for (size_t i = 0; i < profile->config.phase_count; i++) {
         uint64_t ns = delta_u64(end->phase_ns[i], start->phase_ns[i]);
         fprintf(stream, " %s_ms=%.3f", profile->config.phases[i].name, ns / 1e6);
