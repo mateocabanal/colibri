@@ -247,6 +247,16 @@ kernel void moe_gemv(device const ulong* waddr [[buffer(0)]], device const ulong
       acc+=dot(w0*float4(sr[g0],sr[g1],sr[g2],sr[g3]),x4[2*c])
           +dot(w1*float4(sr[g4],sr[g5],sr[g6],sr[g7]),x4[2*c+1]); }
     for(int i=K8*8+slane;i<K;i+=32){ uchar b=w[i>>1]; int v=(i&1)?(b>>4):(b&0xF); acc+=float(v-8)*xr[i]*sr[i/qgs]; }
+  } else if (fmt == 7) {                            // MXFP4 E2M1 + raw E8M0/32 columns
+    int rb=(K+1)/2, ng=(K+31)/32;
+    device const uchar* w=(device const uchar*)(waddr[e])+(long)o*rb;
+    device const uchar* sr=(device const uchar*)(saddr[e])+(long)o*ng;
+    const float mx4[16]={0.f,.5f,1.f,1.5f,2.f,3.f,4.f,6.f,-0.f,-.5f,-1.f,-1.5f,-2.f,-3.f,-4.f,-6.f};
+    for(int i=slane*2;i<K;i+=64){
+      uchar b=w[i>>1]; float sv=as_type<float>((uint)sr[i/32]<<23);
+      acc += mx4[b&0xFu]*xr[i]*sv;
+      if(i+1<K) acc += mx4[b>>4]*xr[i+1]*sv;
+    }
   } else { device const char* w=(device const char*)(waddr[e])+(long)o*K;
     device const char4* w4=(device const char4*)w;
     for(int c=slane;c<K8;c+=32) acc+=dot(float4(w4[2*c]),x4[2*c])+dot(float4(w4[2*c+1]),x4[2*c+1]);
