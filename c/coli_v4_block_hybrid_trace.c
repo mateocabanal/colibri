@@ -7,9 +7,9 @@
  *
  * Keep the large hybrid block implementation in deepseek_v4.c, but intercept
  * the three attention entry points that already carry authoritative layer /
- * token-position identity and the BF16 router call that returns authoritative
- * top-k rank/weight. This lets detailed tracing capture every logical routed
- * expert selection without changing the physical expert-load schedule.
+ * token-position identity and the router calls that return authoritative top-k
+ * rank/weight. This lets detailed tracing capture every logical routed expert
+ * selection without changing the physical expert-load schedule.
  *
  * In particular, batched prefill routes all items before walking the union of
  * selected experts. Tracing at lookup() would lose the many-to-one mapping;
@@ -294,6 +294,18 @@ int coli_v4_trace_attention_window_batch_ref(
         start_position, batch, error, error_size);
 }
 
+int coli_v4_trace_route(
+    float *weights, int *indices, const float *hidden,
+    const float *gate, const float *bias,
+    const int *forced_indices, int experts, int dimension,
+    int topk, float route_scale) {
+    int result = coli_v4_route(
+        weights, indices, hidden, gate, bias, forced_indices,
+        experts, dimension, topk, route_scale);
+    if (!result) v4_route_trace_selected(indices, weights, topk);
+    return result;
+}
+
 #ifndef COLI_V4_DISABLE_BF16_ROUTE
 int coli_v4_trace_route_bf16(
     float *weights, int *indices, const float *hidden,
@@ -315,6 +327,7 @@ int coli_v4_trace_route_bf16(
 #define coli_v4_attention_token_ref coli_v4_trace_attention_token_ref
 #define coli_v4_attention_window_token_ref coli_v4_trace_attention_window_token_ref
 #define coli_v4_attention_window_batch_ref coli_v4_trace_attention_window_batch_ref
+#define coli_v4_route coli_v4_trace_route
 #ifndef COLI_V4_DISABLE_BF16_ROUTE
 #define coli_v4_route_bf16 coli_v4_trace_route_bf16
 #endif
