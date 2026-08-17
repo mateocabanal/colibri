@@ -1,4 +1,4 @@
-name: Repair Qwen MXFP4 runtime stager
+name: Qwen MXFP4 runtime integrator
 
 on:
   push:
@@ -8,7 +8,7 @@ permissions:
   contents: write
 
 jobs:
-  repair:
+  integrate:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -16,13 +16,21 @@ jobs:
           ref: feat/qwen36-mxfp4
           fetch-depth: 0
           persist-credentials: true
-      - name: Remove invalid YAML guard
+      - name: Apply integration patch
+        run: python3 tools/apply_qwen_mxfp4_runtime.py
+      - name: Build and run focused tests
         shell: bash
         run: |
-          sed -i "/^[[:space:]]*if: github.actor != 'github-actions\[bot\]'/d" .github/workflows/qwen-mxfp4-runtime-integration.yml
+          make -C c tests/test_mxfp4_runtime tests/test_mxfp4_expert tests/test_qwen_moe
+          ./c/tests/test_mxfp4_runtime
+          ./c/tests/test_mxfp4_expert
+          ./c/tests/test_qwen_moe
+      - name: Commit runtime integration
+        shell: bash
+        run: |
           if git diff --quiet; then exit 0; fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add .github/workflows/qwen-mxfp4-runtime-integration.yml
-          git commit -m "ci: fix Qwen MXFP4 runtime stager"
+          git add c/qwen_moe.c c/Makefile c/tests/test_qwen_moe.c
+          git commit -m "feat(qwen): wire MXFP4 COLI experts into runtime"
           git push origin HEAD:feat/qwen36-mxfp4
