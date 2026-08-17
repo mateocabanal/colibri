@@ -3014,7 +3014,7 @@ static float *step_batched(Model *m, const int *ids, int n, int pos_base){
             for (int j = 0; j < cj; j++)
                 rmsnorm_row(normed + (int64_t)j * D, hbuf + (int64_t)j * D, L->in_ln, D, c->eps);
             if (c->layer_is_gdn[l]) gdn_batch(m, L, l, normed, cj, hbuf);
-            else                    attention_batch(m, L, l, normed, cj, j0, hbuf);
+            else                    attention_batch(m, L, l, normed, cj, pos_base + j0, hbuf);
             for (int j = 0; j < cj; j++)
                 rmsnorm_row(normed + (int64_t)j * D, hbuf + (int64_t)j * D, L->post_ln, D, c->eps);
             moe_batch(m, L, l, normed, cj, hbuf);
