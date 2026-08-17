@@ -72,6 +72,7 @@
 #endif
 #include "omp_tune.h"
 #include "route_trace.h"
+#include "qwen_prefix_cache.h"
 #include "profile.h"
 #ifdef COLI_METALIO
 #include "metalio.h"
@@ -3550,9 +3551,26 @@ static void serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
      * long prefill no longer looks like a dead client and draws a spurious
      * CANCEL that would arrive mid-turn and truncate the reply. */
     printf("ACCEPT %s %d\n", q->id, np); fflush(stdout);
-    request_state_reset(m);
-    float *logit = step(m, ids, np, 0);
+    QwenPrefixStateView prefix_view = qwen_prefix_state_view(m);
+    QwenPrefixCacheStats prefix_before;
+    qwen_prefix_cache_stats(&m->prefix_cache, &prefix_before);
+    double prefix_restore_t0 = now_s();
+    int prefix_reused = qwen_prefix_cache_restore(&m->prefix_cache,
+                                                   &prefix_view, ids, np);
+    double prefix_restore_ms = (now_s() - prefix_restore_t0) * 1000.0;
+    if (!prefix_reused) request_state_reset(m);
+    double prefix_prefill_t0 = now_s();
+    float *logit = step(m, ids + prefix_reused, np - prefix_reused,
+                        prefix_reused);
+    double prefix_prefill_ms = (now_s() - prefix_prefill_t0) * 1000.0;
     qprof_prefill_end(m, np);
+    size_t prefix_snapshot_bytes = 0, prefix_kv_bytes = 0, prefix_gdn_elems = 0;
+    (void)qwen_prefix_cache_entry_bytes(&prefix_view, np,
+                                        &prefix_snapshot_bytes,
+                                        &prefix_kv_bytes,
+                                        &prefix_gdn_elems);
+    int prefix_captured = 0;
+    double prefix_capture_ms = 0.0;
     int hist_len = np, gen = 0, limited = 1, cancelled = 0;
     char buf[512];
     for (int s = 0; s < q->max_tok && !cancelled; s++) {
@@ -3586,6 +3604,24 @@ static void serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
         logit = step(m, &nt, 1, hist_len - 1);
     }
     logits_free(&logit);
+    /* Defensive fallback: all normal first-token/stop paths already captured
+     * the exact end-of-prefill state before any generated-token step. */
+    qwen_prefix_capture_once(m, &prefix_view, ids, np,
+                             &prefix_captured, &prefix_capture_ms);
+    QwenPrefixCacheStats prefix_after;
+    qwen_prefix_cache_stats(&m->prefix_cache, &prefix_after);
+    if (m->prefix_cache.log) {
+        unsigned long long restore_bytes =
+            (unsigned long long)(prefix_after.restore_bytes - prefix_before.restore_bytes);
+        unsigned long long stores =
+            (unsigned long long)(prefix_after.stores - prefix_before.stores);
+        fprintf(stderr,
+                "[QWEN-PREFIX] request=%s prompt=%d matched=%d restore_bytes=%llu restore_ms=%.3f prefill_ms=%.3f snapshot_bytes=%zu capture_stored=%llu capture_ms=%.3f entries=%zu resident_bytes=%zu budget_bytes=%zu\n",
+                q->id, np, prefix_reused, restore_bytes, prefix_restore_ms,
+                prefix_prefill_ms, prefix_snapshot_bytes, stores,
+                prefix_capture_ms, prefix_after.entries,
+                prefix_after.resident_bytes, prefix_after.budget_bytes);
+    }
     qprof_request_end(m, np, gen);
     double dt = now_s() - t0;
     double tot = (double)(m->hits - h0 + m->miss - m0);
@@ -4001,6 +4037,7 @@ int main(int argc, char **argv){
 #ifdef COLI_CUDA
     if (g_cuda_compute) coli_cuda_shutdown();
 #endif
+    qwen_prefix_cache_clear(&m.prefix_cache);
     tok_free(&T);
     return rc;
 }
