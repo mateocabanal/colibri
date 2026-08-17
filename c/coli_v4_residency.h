@@ -65,6 +65,17 @@ typedef struct {
     size_t selected_count;
 } ColiV4ResidencySelection;
 
+/* Package expert slots are directly Metal-registerable on Apple UMA and are
+ * 16 KiB aligned/rounded. The planner must budget allocated bytes, not merely
+ * stored record bytes, so expose the same calculation to startup planning. */
+static inline int coli_v4_expert_slot_bytes(uint64_t record_bytes,
+                                            uint64_t *slot_bytes) {
+    if (!slot_bytes || !record_bytes || record_bytes > UINT64_MAX - 16383u)
+        return -1;
+    *slot_bytes = (record_bytes + 16383u) & ~UINT64_C(16383);
+    return *slot_bytes ? 0 : -1;
+}
+
 /* Exact comparison of a_num/a_den and b_num/b_den without cross-multiplication
  * overflow. Continued-fraction comparison alternates direction after taking a
  * reciprocal. Returns -1/0/+1. Denominators must be non-zero. */
