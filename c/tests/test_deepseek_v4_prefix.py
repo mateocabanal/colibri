@@ -1,15 +1,10 @@
 #!/usr/bin/env python3
-"""KV/prompt prefix reuse on the DeepSeek V4 serve path.
+"""KV/prompt prefix reuse on the DeepSeek V4 runtime.
 
-The property under test is not "it is faster" -- it is that reusing or
-restoring attention state produces the bytes a cold prefill would have
-produced. Same-session cases exercise the existing `kv_prefix` path. The #12
-case uses two distinct session slots inside one engine process so only the
-process-local multi-prefix cache can provide the second request's state.
-
-Speaking the SUBMIT/DATA/DONE protocol directly rather than through
-openai_server.Engine keeps the test on the engine's own contract, including the
-trailing reuse field of the DONE frame.
+Same-session cases speak the existing single-session SERVE protocol directly.
+The #12 cross-session case deliberately does not extend that protocol: it builds
+and runs a tiny C integration binary that creates two real ColiV4Session
+instances sharing one ColiV4Engine, plus a second engine as the cold oracle.
 """
 from __future__ import annotations
 
@@ -31,33 +26,25 @@ def parse_tokens(text: str) -> list[int]:
 
 
 class Serve:
-    """One persistent `SERVE=1` engine process with multiple session slots."""
+    """One persistent `SERVE=1` engine process (the protocol owns one session)."""
 
-    def __init__(self, binary: Path, model: Path, ctx: str = "128",
-                 prefix_cache_mb: int | None = None) -> None:
-        env = dict(os.environ, SERVE="1", SNAP=str(model), CTX=ctx,
-                   V4_PREFIX_LOG="1")
-        if prefix_cache_mb is not None:
-            env["V4_PREFIX_CACHE_MB"] = str(prefix_cache_mb)
-            # Tiny fixture prompts are intentionally short; production keeps
-            # the much more conservative default admission threshold.
-            env["V4_PREFIX_CACHE_MIN_TOKENS"] = "1"
-        else:
-            env.pop("V4_PREFIX_CACHE_MB", None)
-            env.pop("V4_PREFIX_CACHE_MIN_TOKENS", None)
+    def __init__(self, binary: Path, model: Path, ctx: str = "128") -> None:
+        env = dict(os.environ, SERVE="1", SNAP=str(model), CTX=ctx)
+        env.pop("V4_PREFIX_CACHE_MB", None)
+        env.pop("V4_PREFIX_CACHE_MIN_TOKENS", None)
         self.process = subprocess.Popen(
             [str(binary)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, env=env,
         )
         self.counter = 0
 
-    def submit(self, prompt: str, max_tokens: int,
-               slot: int = 0) -> tuple[str, int]:
+    def submit(self, prompt: str, max_tokens: int) -> tuple[str, int]:
         """Returns generated text and the DONE frame's reused-prefix count."""
         self.counter += 1
         request_id = f"r{self.counter}"
         payload = prompt.encode("utf-8")
-        header = (f"SUBMIT {request_id} {slot} {len(payload)} {max_tokens} "
+        # The second field is currently a reserved protocol value and must be 0.
+        header = (f"SUBMIT {request_id} 0 {len(payload)} {max_tokens} "
                   f"0.0 1.0 0\n").encode("ascii")
         assert self.process.stdin is not None
         self.process.stdin.write(header + payload + b"\n")
@@ -166,46 +153,54 @@ def check_growing_conversation(binary: Path, model: Path,
 
 def check_cross_session_cache(binary: Path, model: Path,
                               case: dict[str, object]) -> None:
-    """A distinct session restores the longest exact prefix from #12 cache."""
-    first_ids = list(case["prompt_ids"])            # type: ignore[arg-type]
-    max_new = 4
-
-    shared = Serve(binary, model, prefix_cache_mb=64)
-    try:
-        first_text, first_reuse = shared.submit(
-            token_prompt(first_ids), max_new, slot=0)
-        if first_reuse != 0:
-            raise AssertionError(
-                f"first cached turn unexpectedly reported reuse={first_reuse}"
-            )
-        second_ids = extended_prompt(first_ids, first_text)
-        # Slot 1 has never run. A positive reuse count here cannot come from its
-        # own kv_prefix; it must be a process-local cross-session cache hit.
-        restored_text, restored_reuse = shared.submit(
-            token_prompt(second_ids), max_new, slot=1)
-    finally:
-        shared.close()
-
-    cold = Serve(binary, model)
-    try:
-        cold_text, cold_reuse = cold.submit(token_prompt(second_ids), max_new)
-    finally:
-        cold.close()
-
-    if cold_reuse != 0:
-        raise AssertionError(f"cold comparison engine reported reuse={cold_reuse}")
-    if restored_reuse < len(first_ids):
+    """Two actual sessions share one engine/cache; a second engine is cold."""
+    c_dir = binary.resolve().parent
+    make = os.environ.get("MAKE", "make")
+    build = subprocess.run(
+        [make, "-f", "Makefile.deepseek-v4", "deepseek-v4-prefix-cache-test"],
+        cwd=c_dir,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=180,
+    )
+    if build.returncode:
         raise AssertionError(
-            "cross-session cache did not restore the first request state: "
-            f"reuse={restored_reuse}, first_prompt={len(first_ids)}"
+            "cross-session helper build failed:\n"
+            f"stdout:\n{build.stdout}\nstderr:\n{build.stderr}"
         )
-    if restored_text != cold_text:
+    helper = c_dir / (
+        "test_v4_prefix_cache_sessions.exe"
+        if os.name == "nt" else "test_v4_prefix_cache_sessions"
+    )
+    env = dict(os.environ,
+               V4_PREFIX_CACHE_MB="64",
+               V4_PREFIX_CACHE_MIN_TOKENS="1",
+               V4_PREFIX_LOG="1")
+    result = subprocess.run(
+        [helper.as_posix(), model.resolve().as_posix(),
+         token_prompt(list(case["prompt_ids"]))],  # type: ignore[arg-type]
+        cwd=c_dir,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=180,
+        env=env,
+    )
+    if result.returncode:
         raise AssertionError(
-            "cross-session restored state diverged from cold prefill:\n"
-            f"  restored: {restored_text!r}\n  cold: {cold_text!r}"
+            "cross-session prefix-cache oracle failed:\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
         )
-    print(f"PASS cross-session prefix cache: {restored_reuse} tokens restored, "
-          "output identical to a cold prefill")
+    if "PASS cross-session prefix cache:" not in result.stdout:
+        raise AssertionError(
+            f"cross-session helper did not report success: {result.stdout!r}"
+        )
+    print(result.stdout.strip())
 
 
 def check_divergent_prompt_resets(binary: Path, model: Path,
