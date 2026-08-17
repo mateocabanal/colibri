@@ -72,6 +72,7 @@
 #endif
 #include "omp_tune.h"
 #include "route_trace.h"
+#include "profile.h"
 #ifdef COLI_METALIO
 #include "metalio.h"
 #endif
@@ -321,11 +322,155 @@ typedef struct {
     int last_route[64];            /* most recent top-k (for lookahead prefetch) */
     int last_route_k;
     uint64_t prefetch_misses;      /* loads triggered by lookahead prefetch */
-    double t_attn, t_gdn, t_moe, t_expio;   /* per-request phase timings (PROF) */
+    double t_attn, t_gdn, t_moe, t_expio, t_head; /* legacy PROF + generic profile sources */
     double dense_load_s;
     ColiExecutor *coli; /* COLLACOLI: non-NULL = COLI package backend */
     int coli_load;
 } Model;
+
+/* Generic inference profiler adapter. DeepSeek V4 and Qwen share profile.c;
+ * each engine only defines its phase taxonomy and scope/counter snapshots. */
+enum {
+    QPROF_MODEL_LOAD = 0,
+    QPROF_STARTUP_OTHER,
+    QPROF_ATTN,
+    QPROF_GDN,
+    QPROF_MOE,
+    QPROF_EXPERT_IO,
+    QPROF_HEAD,
+    QPROF_METAL_ENCODE,
+    QPROF_METAL_SUBMIT,
+    QPROF_METAL_WAIT,
+    QPROF_METAL_KERNEL,
+    QPROF_COUNT
+};
+enum {
+    QPC_EXPERT_REQUESTS = 0,
+    QPC_EXPERT_HITS,
+    QPC_EXPERT_MISSES,
+    QPC_PREFETCH_MISSES,
+    QPC_COUNT
+};
+static const ColiProfilePhaseDef qprof_phases[QPROF_COUNT] = {
+    [QPROF_MODEL_LOAD]    = {"model_load", COLI_PROFILE_ACCOUNTED},
+    [QPROF_STARTUP_OTHER] = {"startup_other", COLI_PROFILE_ACCOUNTED},
+    [QPROF_ATTN]          = {"attention", COLI_PROFILE_ACCOUNTED},
+    [QPROF_GDN]           = {"gdn", COLI_PROFILE_ACCOUNTED},
+    [QPROF_MOE]           = {"moe", COLI_PROFILE_ACCOUNTED},
+    /* Nested inside MoE: subtract from accounted wall to expose compute time,
+     * but never add it to accounted twice. */
+    [QPROF_EXPERT_IO]     = {"expert_io", COLI_PROFILE_IO_WAIT},
+    [QPROF_HEAD]          = {"head_compute", COLI_PROFILE_ACCOUNTED},
+    [QPROF_METAL_ENCODE]  = {"metal_encode", 0},
+    [QPROF_METAL_SUBMIT]  = {"metal_submit", 0},
+    [QPROF_METAL_WAIT]    = {"metal_wait", 0},
+    [QPROF_METAL_KERNEL]  = {"metal_kernel", 0},
+};
+static const ColiProfileCounterDef qprof_counters[QPC_COUNT] = {
+    [QPC_EXPERT_REQUESTS] = {"expert_requests"},
+    [QPC_EXPERT_HITS] = {"expert_hits"},
+    [QPC_EXPERT_MISSES] = {"expert_misses"},
+    [QPC_PREFETCH_MISSES] = {"prefetch_misses"},
+};
+static ColiProfile g_qprof;
+
+static uint64_t qprof_s_to_ns(double seconds) {
+    if (!(seconds > 0.0)) return 0;
+    double ns = seconds * 1.0e9;
+    return ns >= (double)UINT64_MAX ? UINT64_MAX : (uint64_t)ns;
+}
+
+static void qprof_reset(void) {
+    static const ColiProfileConfig config = {
+        .engine = "qwen_moe",
+        .env_name = "QWEN_PROFILE",
+        .line_prefix = "coli_profile",
+        .include_engine = 1,
+        .phases = qprof_phases,
+        .phase_count = QPROF_COUNT,
+        .counters = qprof_counters,
+        .counter_count = QPC_COUNT,
+    };
+    coli_profile_reset(&g_qprof, &config);
+#ifdef COLI_METAL
+    coli_metal_profile_set_on(coli_profile_enabled(&g_qprof));
+    if (coli_profile_enabled(&g_qprof)) coli_metal_profile_reset();
+#endif
+    if (coli_profile_enabled(&g_qprof)) coli_profile_mark(&g_qprof, 0);
+}
+
+static void qprof_sync(Model *m) {
+    if (!coli_profile_enabled(&g_qprof)) return;
+    coli_profile_phase_set(&g_qprof, QPROF_ATTN, qprof_s_to_ns(m->t_attn));
+    coli_profile_phase_set(&g_qprof, QPROF_GDN, qprof_s_to_ns(m->t_gdn));
+    coli_profile_phase_set(&g_qprof, QPROF_MOE, qprof_s_to_ns(m->t_moe));
+    coli_profile_phase_set(&g_qprof, QPROF_EXPERT_IO, qprof_s_to_ns(m->t_expio));
+    coli_profile_phase_set(&g_qprof, QPROF_HEAD, qprof_s_to_ns(m->t_head));
+    coli_profile_counter_set(&g_qprof, QPC_EXPERT_REQUESTS, m->hits + m->miss);
+    coli_profile_counter_set(&g_qprof, QPC_EXPERT_HITS, m->hits);
+    coli_profile_counter_set(&g_qprof, QPC_EXPERT_MISSES, m->miss);
+    coli_profile_counter_set(&g_qprof, QPC_PREFETCH_MISSES, m->prefetch_misses);
+#ifdef COLI_METAL
+    uint64_t encode = 0, submit = 0, wait = 0, kernel = 0;
+    coli_metal_profile_get(&encode, &submit, &wait, &kernel);
+    coli_profile_phase_set(&g_qprof, QPROF_METAL_ENCODE, encode);
+    coli_profile_phase_set(&g_qprof, QPROF_METAL_SUBMIT, submit);
+    coli_profile_phase_set(&g_qprof, QPROF_METAL_WAIT, wait);
+    coli_profile_phase_set(&g_qprof, QPROF_METAL_KERNEL, kernel);
+#endif
+}
+
+static void qprof_startup_end(Model *m) {
+    if (!coli_profile_enabled(&g_qprof)) return;
+    uint64_t model_ns = qprof_s_to_ns(m->dense_load_s);
+    coli_profile_phase_set(&g_qprof, QPROF_MODEL_LOAD, model_ns);
+    ColiProfileSnapshot snap = coli_profile_get(&g_qprof);
+    coli_profile_phase_set(&g_qprof, QPROF_STARTUP_OTHER,
+                           snap.wall_ns > model_ns ? snap.wall_ns - model_ns : 0);
+    qprof_sync(m);
+    coli_profile_mark(&g_qprof, 1);
+    coli_profile_mark_tokens(&g_qprof, 1, 0);
+    coli_profile_emit_scope(stderr, &g_qprof, "startup", 0, 1);
+}
+
+static void qprof_request_begin(Model *m) {
+    /* Preserve the legacy SERVE PROF contract while making these same timers
+     * the engine adapter's source of truth. */
+    m->t_attn = m->t_gdn = m->t_moe = m->t_expio = m->t_head = 0.0;
+    if (!coli_profile_enabled(&g_qprof)) return;
+    qprof_sync(m);
+    coli_profile_mark(&g_qprof, 2);
+    coli_profile_mark_tokens(&g_qprof, 2, 0);
+    coli_profile_mark(&g_qprof, 3);
+    coli_profile_mark_tokens(&g_qprof, 3, 0);
+}
+
+static void qprof_prefill_end(Model *m, int prompt_tokens) {
+    if (!coli_profile_enabled(&g_qprof)) return;
+    qprof_sync(m);
+    coli_profile_mark(&g_qprof, 4);
+    coli_profile_mark_tokens(&g_qprof, 4,
+                             prompt_tokens > 0 ? (uint64_t)prompt_tokens : 0);
+}
+
+static void qprof_request_end(Model *m, int prompt_tokens, int generated_tokens) {
+    if (!coli_profile_enabled(&g_qprof)) return;
+    qprof_sync(m);
+    coli_profile_mark(&g_qprof, 5);
+    uint64_t total = (prompt_tokens > 0 ? (uint64_t)prompt_tokens : 0) +
+                     (generated_tokens > 0 ? (uint64_t)generated_tokens : 0);
+    coli_profile_mark_tokens(&g_qprof, 5, total);
+    coli_profile_emit_scope(stderr, &g_qprof, "run", 2, 5);
+    coli_profile_emit_scope(stderr, &g_qprof, "prompt", 3, 4);
+    coli_profile_emit_scope(stderr, &g_qprof, "decode", 4, 5);
+}
+
+static double qprof_head_begin(void) {
+    return coli_profile_enabled(&g_qprof) ? now_s() : 0.0;
+}
+static void qprof_head_end(Model *m, double began) {
+    if (began > 0.0) m->t_head += now_s() - began;
+}
 
 static pthread_mutex_t g_mx = PTHREAD_MUTEX_INITIALIZER;
 static int g_prefetch = 0;         /* QWEN_PREFETCH: layer-lookahead expert prefetch */
@@ -2788,7 +2933,9 @@ static float *step_batched(Model *m, const int *ids, int n, int pos_base){
     }
     rmsnorm_row(normed, hbuf + (int64_t)(last_cj - 1) * D, m->final_norm, D, c->eps);
     float *logits = falloc(c->vocab);
+    double qhead_began = qprof_head_begin();
     wt_mul(logits, normed, &m->lm_head, 1, c->vocab, D);
+    qprof_head_end(m, qhead_began);
     free(hbuf); free(normed);
     return logits;
 }
@@ -2879,7 +3026,9 @@ static float *step(Model *m, const int *ids, int n, int pos_base){
     float *normed = falloc(D);
     rmsnorm_row(normed, h, m->final_norm, D, c->eps);
     float *logits = falloc(c->vocab);
+    double qhead_began = qprof_head_begin();
     wt_mul(logits, normed, &m->lm_head, 1, c->vocab, D);
+    qprof_head_end(m, qhead_began);
     free(h); free(normed);
     return logits;
 }
@@ -3080,14 +3229,19 @@ static int mode_greedy(Model *m){
     if (np < 1 || !ids_in_vocab(&m->c, ids, np, "QWENMOE_PROMPT_IDS")) {
         fprintf(stderr, "invalid QWENMOE_PROMPT_IDS\n"); free(ids); return 1;
     }
+    qprof_request_begin(m);
     float *logits = step(m, ids, np, 0);
+    qprof_prefill_end(m, np);
+    int qprof_gen = 0;
     for (int s = 0; s < max_new; s++) {
         int best = qwen_pick_token(m, logits, -1);
         logits_free(&logits);
         if (best == m->c.eos) break;
         printf("ID %d\n", best);
+        qprof_gen++;
         logits = step(m, &best, 1, np + s);
     }
+    qprof_request_end(m, np, qprof_gen);
     logits_free(&logits);
     free(ids);
     return 0;
@@ -3193,7 +3347,10 @@ static int mode_chat(Model *m, Tok *T){
             printf("[context full: session restarted]\n");
             if (sys_n > 0) { step(m, sys_ids, sys_n, 0); hpos = sys_n; }
         }
+        qprof_request_begin(m);
         float *logits = step(m, ids, np, hpos);
+        qprof_prefill_end(m, np);
+        int qprof_gen = 0;
         memcpy(hist + hpos, ids, (size_t)np * sizeof(int));
         hpos += np;
         char buf[1024];
@@ -3211,12 +3368,14 @@ static int mode_chat(Model *m, Tok *T){
             }
             int pos = hpos;
             hist[hpos++] = nt;
+            qprof_gen++;
             int nb = tok_decode(T, &nt, 1, buf, sizeof(buf) - 1);
             buf[nb] = 0;
             fwrite(buf, 1, (size_t)nb, stdout);
             fflush(stdout);
             logits = step(m, &nt, 1, pos);
         }
+        qprof_request_end(m, np, qprof_gen);
         logits_free(&logits);
         printf("\n");
     }
@@ -3284,7 +3443,7 @@ static void serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
         fflush(stdout); free(ids); return;
     }
     g_temp = q->temp; g_nuc = q->top_p;
-    m->t_attn = m->t_gdn = m->t_moe = m->t_expio = 0;
+    qprof_request_begin(m);
     double t0 = now_s();
     uint64_t h0 = m->hits, m0 = m->miss;
     /* ACCEPT before prefill: the server commits the streaming 200 here and,
@@ -3294,6 +3453,7 @@ static void serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
     printf("ACCEPT %s %d\n", q->id, np); fflush(stdout);
     request_state_reset(m);
     float *logit = step(m, ids, np, 0);
+    qprof_prefill_end(m, np);
     int hist_len = np, gen = 0, limited = 1, cancelled = 0;
     char buf[512];
     for (int s = 0; s < q->max_tok && !cancelled; s++) {
@@ -3314,6 +3474,7 @@ static void serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
         logit = step(m, &nt, 1, hist_len - 1);
     }
     logits_free(&logit);
+    qprof_request_end(m, np, gen);
     double dt = now_s() - t0;
     double tot = (double)(m->hits - h0 + m->miss - m0);
     printf("DONE %s STAT %d %.3f %.1f %.2f %d %d\n", q->id, gen,
@@ -3597,6 +3758,7 @@ int main(int argc, char **argv){
     if (g_arena_wave < 8 || g_arena_wave > QWEN_ARENA_CAP_MAX) g_arena_wave = QWEN_ARENA_CAP;
     g_dense_drop  = getenv("DENSE_KEEP_PAGES") ? 0 : 1;
 
+    qprof_reset();
     Model m; model_init(&m, snap, cap);
     Tok T;
     char tokpath[2048];
@@ -3686,6 +3848,7 @@ int main(int argc, char **argv){
         }
     }
 #endif
+    qprof_startup_end(&m);
     const char *mode = getenv("QWENMOE_MODE");
     if (mode && !strcmp(mode, "teacher"))      rc = mode_teacher(&m);
     else if (mode && !strcmp(mode, "greedy"))  rc = mode_greedy(&m);

@@ -26,6 +26,13 @@ int  coli_metal_available(void);
 void coli_metal_stats(size_t *tensor_count, size_t *tensor_bytes);
 int  coli_metal_mem_info(size_t *used_bytes, size_t *total_bytes);
 
+/* Generic cumulative backend timing hooks. Engines opt in at runtime through
+ * their profile adapter; counters stay disabled on the normal hot path. */
+void coli_metal_profile_set_on(int on);
+void coli_metal_profile_reset(void);
+void coli_metal_profile_get(uint64_t *encode_ns, uint64_t *submit_ns,
+                            uint64_t *wait_ns, uint64_t *kernel_ns);
+
 /*
  * y[S,O] = (x[S,I] @ W[O,I]^T) * scale[o]. fmt=4 (grouped int4) instead folds a
  * PER-GROUP scale into the accumulation -- see the shader comment in backend_metal.mm.

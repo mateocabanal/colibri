@@ -42,11 +42,6 @@ int main(void) {
     coli_profile_add(&p, 2, 9000000);
     coli_profile_counter_add(&p, 0, 4096);
     coli_profile_counter_add(&p, 1, 3);
-    /* Give the wall clock a real positive interval; phase values are synthetic
-     * so diagnostic overlap intentionally exceeds wall without affecting the
-     * accounted sum. */
-    struct timespec ts = {0, 12000000};
-    nanosleep(&ts, NULL);
     coli_profile_mark(&p, 1);
     coli_profile_mark_tokens(&p, 1, 12);
 
