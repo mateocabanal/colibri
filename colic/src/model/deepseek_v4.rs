@@ -40,6 +40,8 @@ impl DeepSeekV4Frontend {
             experts_per_token: required_u32(&source.root, &config, "num_experts_per_tok")?,
             attention_heads: required_u32(&source.root, &config, "num_attention_heads")?,
             head_dim: required_u32(&source.root, &config, "head_dim")?,
+            num_key_value_heads: 0,
+            linear_key_head_dim: 0,
             q_lora_rank: required_u32(&source.root, &config, "q_lora_rank")?,
             o_groups: required_u32(&source.root, &config, "o_groups")?,
             o_lora_rank: required_u32(&source.root, &config, "o_lora_rank")?,
