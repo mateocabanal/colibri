@@ -41,6 +41,11 @@ not runtime dependencies of the C engine.
   logical experts, Jaccard overlap, previous-working-set retention, next-request
   reuse, and per-layer adjacent-request overlap. Duplicate route selections do
   not inflate the working set.
+- `validate_v4_trace_pair.py`: exact-COLI identity/lifecycle closure gate. It
+  verifies every logical v2 lease joins the physical v1 lifecycle by
+  `(layer, expert, generation)`, checks many-to-one lookup fanout, rejects
+  dropped/corrupt traces, and can additionally validate a compile-gated expert
+  execution trace with `--execution`.
 - `analyze_v4_residency_value.py`: offline policy-reference tool for #3. It
   compares deterministic residency and global hot-expert capacity using
   estimated **exposed I/O milliseconds avoided per resident GiB**. Repeated
@@ -92,6 +97,23 @@ python3 tools/analyze_v4_expert_trace.py \
 python3 tools/analyze_v4_request_overlap.py \
   /tmp/v4-experts.jsonl.routes.jsonl --top-layers 10
 
+# Validate physical-v1 <-> logical-v2 lease identity on an exact COLI run.
+python3 tools/validate_v4_trace_pair.py \
+  /tmp/v4-experts.jsonl /tmp/v4-experts.jsonl.routes.jsonl
+
+# Optional execution lifecycle capture. This is COMPILE-GATED so normal builds
+# do not put a tracing wrapper on expert-forward at all. The execution stream is
+# still buffered/bounded and written only at process teardown.
+make deepseek-v4-clean
+make deepseek-v4 V4_TRACE_EXEC=1
+V4_EXPERT_TRACE=/tmp/v4-experts.jsonl \
+V4_EXEC_TRACE=/tmp/v4-exec.jsonl \
+V4_EXEC_TRACE_CAP=131072 \
+./deepseek_v4 /path/to/model.coli hi
+python3 tools/validate_v4_trace_pair.py \
+  /tmp/v4-experts.jsonl /tmp/v4-experts.jsonl.routes.jsonl \
+  --execution /tmp/v4-exec.jsonl
+
 # Optional explicit route-sidecar controls. Request ids are assigned
 # monotonically at the session-generate boundary. V4_ROUTE_REQUEST_ID changes
 # the first id in that sequence (useful for deterministic fixtures), rather than
@@ -122,9 +144,17 @@ three loss/error counters at zero. One physical lookup can legitimately have
 `lookup_routes > 1` during batch-union prefill. All logical routes in that group
 share the same `lookup_id`, lookup duration, result and `lease_generation`.
 The `(layer, expert, lease_generation)` triple is the stable join key back to the
-physical v1 lifecycle. `lookup_ns` is physical lookup latency and may overlap
-other pipeline work; do not relabel it as exposed token-wall wait without an
-owner-thread wait measurement.
+physical v1 lifecycle and, for a `V4_TRACE_EXEC=1` build, to the expert execution
+stream. The execution stream reports one `execute` record per routed expert
+forward with resident bytes, tensor execution formats, duration, result and
+lease generation. Its buffer obeys `V4_EXEC_TRACE_CAP` (falling back to the route
+or expert trace cap) and reports drops rather than blocking inference.
+
+`lookup_ns` is physical lookup latency and may overlap other pipeline work; do
+not relabel it as exposed token-wall wait without an owner-thread wait
+measurement. Likewise, the sum of per-expert execution durations is diagnostic:
+backend work can overlap or include accelerator waits already represented by the
+canonical #1 phase profiler.
 
 Phase telemetry: by default the runner sets `V4_PROFILE=1`, and the engine
 emits one `v4_phases scope=startup|run|prompt|decode` line per scope with
