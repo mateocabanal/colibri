@@ -10,9 +10,10 @@ during batch-union prefill.
 
 When a V4_TRACE_EXEC=1 build also supplies an execution trace, the validator
 requires one successful expert-forward execution for every logical route
-selection, grouped by that same stable lease identity. It deliberately does not
-invent per-route exposed wait from worker lookup duration: owner-thread wait and
-worker storage/compute overlap are different measurements.
+selection, grouped by that same stable lease identity. With V4_PROFILE=1 the
+execution stream also carries the canonical owner-thread loader-wait delta
+sampled immediately before each expert executes. This remains separate from
+worker `lookup_ns`; the two measurements answer different questions.
 """
 
 from __future__ import annotations
@@ -65,6 +66,7 @@ def validate_execution_trace(
     execution_path: Path,
     logical_events: list[dict[str, Any]],
     expected_build: Any,
+    loaded_identities: set[Identity],
 ) -> dict[str, Any]:
     rows = read_jsonl(execution_path)
     header = rows[0]
@@ -88,7 +90,12 @@ def validate_execution_trace(
         for row in logical_events
     )
     execution_counts: Counter[Identity] = Counter()
+    first_execution_seen: set[Identity] = set()
     total_execute_ns = 0
+    total_owner_wait_ns = 0
+    measured_owner_wait_events = 0
+    cold_first_owner_wait_ns = 0
+    cold_first_owner_wait_measured = 0
     execution_rows = 0
     resident_bytes: set[int] = set()
     for line_number, row in enumerate(rows[1:], 2):
@@ -113,6 +120,27 @@ def validate_execution_trace(
             raise ValueError(f"{where}: resident_bytes must be non-zero")
         for field in ("gate_format", "down_format", "up_format"):
             as_nonnegative_int(row.get(field), field, where)
+
+        owner_wait_measured = row.get("owner_wait_measured", False)
+        if not isinstance(owner_wait_measured, bool):
+            raise ValueError(f"{where}: owner_wait_measured must be boolean")
+        owner_wait_ns = as_nonnegative_int(
+            row.get("owner_wait_ns", 0), "owner_wait_ns", where
+        )
+        if not owner_wait_measured and owner_wait_ns:
+            raise ValueError(
+                f"{where}: owner_wait_ns={owner_wait_ns} while measurement is disabled"
+            )
+        if owner_wait_measured:
+            measured_owner_wait_events += 1
+            total_owner_wait_ns += owner_wait_ns
+
+        is_first = key not in first_execution_seen
+        first_execution_seen.add(key)
+        if is_first and key in loaded_identities and owner_wait_measured:
+            cold_first_owner_wait_measured += 1
+            cold_first_owner_wait_ns += owner_wait_ns
+
         execution_counts[key] += 1
         total_execute_ns += elapsed
         resident_bytes.add(bytes_here)
@@ -128,6 +156,18 @@ def validate_execution_trace(
         raise ValueError(
             f"execution header total_execute_ns={header_total}, "
             f"observed={total_execute_ns}"
+        )
+    header_measured = header.get("owner_wait_measured_events")
+    if isinstance(header_measured, int) and header_measured != measured_owner_wait_events:
+        raise ValueError(
+            f"execution header owner_wait_measured_events={header_measured}, "
+            f"observed={measured_owner_wait_events}"
+        )
+    header_wait = header.get("total_owner_wait_ns")
+    if isinstance(header_wait, int) and header_wait != total_owner_wait_ns:
+        raise ValueError(
+            f"execution header total_owner_wait_ns={header_wait}, "
+            f"observed={total_owner_wait_ns}"
         )
 
     if execution_counts != logical_counts:
@@ -160,6 +200,11 @@ def validate_execution_trace(
         "execution_total_ns": total_execute_ns,
         "execution_unique_lease_identities": len(execution_counts),
         "execution_resident_byte_sizes": sorted(resident_bytes),
+        "owner_wait_measured_events": measured_owner_wait_events,
+        "owner_wait_total_ns": total_owner_wait_ns,
+        "cold_loaded_generations": len(loaded_identities & set(execution_counts)),
+        "cold_first_execute_owner_wait_measured": cold_first_owner_wait_measured,
+        "cold_first_execute_owner_wait_ns": cold_first_owner_wait_ns,
     }
 
 
@@ -205,6 +250,7 @@ def validate_pair(
         "slot_wait",
     }
     physical_identities: set[Identity] = set()
+    loaded_identities: set[Identity] = set()
     physical_events: Counter[str] = Counter()
     for index, row in enumerate(physical_rows[1:], 2):
         event = row.get("event")
@@ -217,7 +263,10 @@ def validate_pair(
             row.get("generation", 0), "generation", f"physical line {index}"
         )
         if generation and event in lifecycle_names:
-            physical_identities.add(identity(row, f"physical line {index}"))
+            key = identity(row, f"physical line {index}")
+            physical_identities.add(key)
+            if event == "load_complete":
+                loaded_identities.add(key)
 
     logical_events = [
         row for row in logical_rows[1:]
@@ -312,12 +361,16 @@ def validate_pair(
             }
         ),
         "physical_event_counts": dict(sorted(physical_events.items())),
+        "loaded_lease_identities": len(loaded_identities),
         "execution_validated": execution_path is not None,
     }
     if execution_path is not None:
         result.update(
             validate_execution_trace(
-                execution_path, logical_events, logical_build or physical_build
+                execution_path,
+                logical_events,
+                logical_build or physical_build,
+                loaded_identities,
             )
         )
     return result
@@ -337,6 +390,9 @@ def emit_human(result: dict[str, Any]) -> None:
         line += (
             f" executions={result['execution_events']}"
             f" execute_ms={result['execution_total_ns'] / 1e6:.3f}"
+            f" owner_wait_measured={result['owner_wait_measured_events']}"
+            f" owner_wait_ms={result['owner_wait_total_ns'] / 1e6:.3f}"
+            f" cold_first_wait_ms={result['cold_first_execute_owner_wait_ns'] / 1e6:.3f}"
         )
     print(line)
     counts = result["physical_event_counts"]
@@ -351,7 +407,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Validate V4 physical v1 and logical v2 trace correlation, with "
-            "optional expert execution lifecycle validation."
+            "optional expert execution/owner-wait lifecycle validation."
         )
     )
     parser.add_argument("physical", type=Path)
