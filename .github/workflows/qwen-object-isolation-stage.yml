@@ -61,3 +61,4 @@ jobs:
           git add c/Makefile c/tools/clean.py .github/workflows/qwen-object-isolation-stage.yml
           git commit -m 'fix(qwen): isolate COLI build objects from V4'
           git push origin HEAD:feat/qwen36-mxfp4
+# trigger
