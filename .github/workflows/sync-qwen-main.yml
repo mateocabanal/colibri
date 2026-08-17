@@ -1,0 +1,53 @@
+name: sync qwen prompt cache with main
+
+on:
+  push:
+    branches: [sync/qwen-prompt-cache-main-20260817]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-qwen-prompt-cache-main
+  cancel-in-progress: false
+
+jobs:
+  merge-and-validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: sync/qwen-prompt-cache-main-20260817
+          fetch-depth: 0
+      - name: Merge latest main, preferring main only on conflicting hunks
+        run: |
+          set -euxo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git fetch origin main
+          git merge --no-edit -X theirs origin/main
+      - name: Assert both optimization stacks survived
+        run: |
+          set -euxo pipefail
+          grep -Fq '#include "qwen_prefix_cache.h"' c/qwen_moe.c
+          grep -Fq 'qwen_prefix_cache_restore' c/qwen_moe.c
+          grep -Fq 'qwen_prefix_capture_once' c/qwen_moe.c
+          grep -Fq '[QWEN-PREFIX]' c/qwen_moe.c
+          grep -Fq '#include "mxfp4_expert.h"' c/qwen_moe.c
+          grep -Fq '#include "mxfp4_runtime.h"' c/qwen_moe.c
+          test -f c/tools/benchmark_qwen_prefix_cache.py
+          test -f c/qwen_prefix_cache.h
+          git diff --check HEAD^1..HEAD
+      - name: Build Qwen and run prompt-cache unit gate
+        run: |
+          set -euxo pipefail
+          make -C c qwen_moe ARCH=x86-64-v3
+          python3 -m py_compile c/tools/benchmark_qwen_prefix_cache.py c/tests/test_qwen_prefix_cache.py c/tests/test_qwen_prefix_serve.py
+          python3 c/tests/test_qwen_prefix_cache.py
+      - name: Remove temporary workflow and publish validated merge
+        run: |
+          set -euxo pipefail
+          git rm .github/workflows/sync-qwen-main.yml
+          git commit -m 'chore(qwen): remove temporary main sync gate'
+          git push origin HEAD:sync/qwen-prompt-cache-main-20260817
