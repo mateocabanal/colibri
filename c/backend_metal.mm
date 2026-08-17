@@ -1343,9 +1343,14 @@ static id<MTLCommandBuffer> moe_submit(int nb, int D, int Iinter, int fmt, int q
     if(!(b=resolve(g[e],&ag[e]))) {g_moe_fb++; return nil;} add_use(b);
     if(!(b=resolve(u[e],&au[e]))) {g_moe_fb++; return nil;} add_use(b);
     if(!(b=resolve(d[e],&ad[e]))) {g_moe_fb++; return nil;} add_use(b);
-    if(!(b=resolve(gs[e],&sgv[e]))) {g_moe_fb++; return nil;} add_use(b);
-    if(!(b=resolve(us[e],&suv[e]))) {g_moe_fb++; return nil;} add_use(b);
-    if(!(b=resolve(ds[e],&sdv[e]))) {g_moe_fb++; return nil;} add_use(b);
+    if (fmt == 5) {
+      /* Raw BF16 has no scale payload; moe_gemv never dereferences saddr. */
+      sgv[e]=ag[e]; suv[e]=au[e]; sdv[e]=ad[e];
+    } else {
+      if(!(b=resolve(gs[e],&sgv[e]))) {g_moe_fb++; return nil;} add_use(b);
+      if(!(b=resolve(us[e],&suv[e]))) {g_moe_fb++; return nil;} add_use(b);
+      if(!(b=resolve(ds[e],&sdv[e]))) {g_moe_fb++; return nil;} add_use(b);
+    }
   }
   std::vector<int> erow(R); for(int e=0;e<nb;e++) for(int r=0;r<nr[e];r++) erow[xoff[e]+r]=e;
   auto shb=[&](const void*p,size_t n){ return [g_dev newBufferWithBytes:p length:n options:MTLResourceStorageModeShared]; };

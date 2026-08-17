@@ -138,13 +138,16 @@ static int g_metal_compute = 0;
 #endif
 /* page-aligned when Metal zero-copy is active, plain malloc otherwise */
 static void *moe_slab_alloc(size_t n){
+#ifdef COLI_METAL
+    if (g_metal_compute) {
+        void *p = NULL;
+        if (!posix_memalign(&p, 16384, n)) return p;
+        /* Alignment failure is not fatal: CPU fallback and the Metal backend's
+         * non-zero-copy registration path still work with an ordinary slab. */
+    }
+#endif
     void *p = malloc(n);
     if (!p) { fprintf(stderr, "OOM expert\n"); exit(1); }
-    if (g_metal_compute) {
-        void *q = NULL;
-        if (!posix_memalign(&q, 16384, n)) p = q;
-        else free(p);   /* fall back to malloc'd; register will copy instead of wrap */
-    }
     return p;
 }
 
@@ -887,7 +890,13 @@ static void matmul(float *y, const float *x, const float *w, int S, int O, int I
     }
 }
 
-/* int8 weights + per-row f32 scales (dequant on use) */
+/* exact BF16 weights, decoded in-register on use */
+#ifdef __AVX2__
+#include <immintrin.h>
+#endif
+#if defined(__ARM_NEON) && defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 static void matmul_bf16(float *y, const float *x, const uint16_t *w, int S, int O, int I){
     #pragma omp parallel for schedule(static)
     for (int so = 0; so < S * O; so++) {
@@ -895,8 +904,29 @@ static void matmul_bf16(float *y, const float *x, const uint16_t *w, int S, int 
         const float *xs = x + (int64_t)s * I;
         const uint16_t *wr = w + (int64_t)o * I;
         float acc = 0.f;
-        #pragma omp simd reduction(+:acc)
-        for (int i = 0; i < I; i++) acc += xs[i] * coli_bf16_decode(wr[i]);
+        int i = 0;
+#ifdef __AVX2__
+        __m256 av = _mm256_setzero_ps();
+        for (; i + 8 <= I; i += 8) {
+            __m128i b16 = _mm_loadu_si128((const __m128i *)(wr + i));
+            __m256i b32 = _mm256_slli_epi32(_mm256_cvtepu16_epi32(b16), 16);
+            __m256 wf = _mm256_castsi256_ps(b32);
+            av = _mm256_fmadd_ps(_mm256_loadu_ps(xs + i), wf, av);
+        }
+        float lanes[8]; _mm256_storeu_ps(lanes, av);
+        acc = lanes[0] + lanes[1] + lanes[2] + lanes[3] +
+              lanes[4] + lanes[5] + lanes[6] + lanes[7];
+#elif defined(__ARM_NEON) && defined(__aarch64__)
+        float32x4_t a0 = vdupq_n_f32(0.f), a1 = vdupq_n_f32(0.f);
+        for (; i + 8 <= I; i += 8) {
+            uint32x4_t b0 = vshll_n_u16(vld1_u16(wr + i), 16);
+            uint32x4_t b1 = vshll_n_u16(vld1_u16(wr + i + 4), 16);
+            a0 = vfmaq_f32(a0, vld1q_f32(xs + i), vreinterpretq_f32_u32(b0));
+            a1 = vfmaq_f32(a1, vld1q_f32(xs + i + 4), vreinterpretq_f32_u32(b1));
+        }
+        acc = vaddvq_f32(vaddq_f32(a0, a1));
+#endif
+        for (; i < I; i++) acc += xs[i] * coli_bf16_decode(wr[i]);
         y[(int64_t)so] = acc;
     }
 }
@@ -1245,10 +1275,14 @@ static void slot_alloc_bf16(Slot *s, int64_t ng, int64_t nd){
     if ((uint64_t)total > SIZE_MAX / sizeof(uint16_t)) {
         fprintf(stderr, "expert BF16 allocation overflows\n"); exit(1);
     }
-    s->bgu = malloc((size_t)total * sizeof(uint16_t));
+    size_t bytes = (size_t)total * sizeof(uint16_t);
+    s->bgu = moe_slab_alloc(bytes);
     if (!s->bgu) { fprintf(stderr, "OOM BF16 expert\n"); exit(1); }
     s->bd = s->bgu + 2 * ng;
     s->fmt = 16;
+#ifdef COLI_METAL
+    if (g_metal_compute) coli_metal_register(s->bgu, bytes);
+#endif
 }
 
 static void slot_alloc_q8(Model *m, Slot *s){
@@ -1948,56 +1982,37 @@ static void expert_wait_ready(Model *m, Slot *s){
 #endif
 }
 
-/* one expert applied to one token, result written into acc (caller zeroes) */
-static void expert_apply(Model *m, Slot *s, const float *x, float *acc){
+/* one expert applied to one token. Caller supplies reusable scratch:
+ * gu[2*I] (gate|up) and h[I]; out[D] is overwritten. */
+static void expert_apply(Model *m, Slot *s, const float *x,
+                         float *out, float *gu, float *h){
     Cfg *c = &m->c; int I = c->moe_inter, D = c->hidden;
     if (s->fmt == 4 || s->fmt == 5) {
-        /* packed experts: i4-grouped (2 vals/byte, 64-group scales) or
-         * int3-g64 (24B/64-group). Both stream from disk exactly like int8. */
-        float *gate = falloc(I), *up = falloc(I);
+        float *gate = gu, *up = gu + I;
         if (s->fmt == 4) {
-            /* fused pair: one activation pass feeds both matrices (decode) */
             matmul_i4_grouped_pair(gate, up, x, s->g4, s->g4s, s->u4, s->u4s,
                                    D, I, 64);
         } else {
             matmul_i3(gate, x, s->g4, s->g4s, 1, D, I);
             matmul_i3(up,   x, s->u4, s->u4s, 1, D, I);
         }
-        float *h = falloc(I);
         for (int i = 0; i < I; i++) h[i] = silu(gate[i]) * up[i];
-        float *y = falloc(D);
-        if (s->fmt == 4) matmul_i4_grouped(y, h, s->d4, s->d4s, 1, I, D, 64);
-        else             matmul_i3(y, h, s->d4, s->d4s, 1, I, D);
-        for (int d = 0; d < D; d++) acc[d] += y[d];
-        free(gate); free(up); free(h); free(y);
+        if (s->fmt == 4) matmul_i4_grouped(out, h, s->d4, s->d4s, 1, I, D, 64);
+        else             matmul_i3(out, h, s->d4, s->d4s, 1, I, D);
     } else if (s->fmt == 16) {
-    float *gu = falloc(2 * I);
-    matmul_bf16(gu, x, s->bgu, 1, 2 * I, D);
-    float *h = falloc(I);
-    for (int i = 0; i < I; i++) h[i] = silu(gu[i]) * gu[I + i];
-    float *y = falloc(D);
-    matmul_bf16(y, h, s->bd, 1, D, I);
-    for (int d = 0; d < D; d++) acc[d] += y[d];
-    free(gu); free(h); free(y);
+        matmul_bf16(gu, x, s->bgu, 1, 2 * I, D);
+        for (int i = 0; i < I; i++) h[i] = silu(gu[i]) * gu[I + i];
+        matmul_bf16(out, h, s->bd, 1, D, I);
     } else if (s->fmt == 8) {
-        float *gate = falloc(I), *up = falloc(I);
+        float *gate = gu, *up = gu + I;
         matmul_q8(gate, x, s->g, s->gs, 1, I, D);
         matmul_q8(up,   x, s->u, s->us, 1, I, D);
-        float *h = falloc(I);
         for (int i = 0; i < I; i++) h[i] = silu(gate[i]) * up[i];
-        float *y = falloc(D);
-        matmul_q8(y, h, s->dd, s->ds, 1, D, I);
-        for (int d = 0; d < D; d++) acc[d] += y[d];
-        free(gate); free(up); free(h); free(y);
+        matmul_q8(out, h, s->dd, s->ds, 1, D, I);
     } else {
-        float *gu = falloc(2 * I);
         matmul(gu, x, s->gu, 1, 2 * I, D);
-        float *h = falloc(I);
         for (int i = 0; i < I; i++) h[i] = silu(gu[i]) * gu[I + i];
-        float *y = falloc(D);
-        matmul(y, h, s->d, 1, D, I);
-        for (int d = 0; d < D; d++) acc[d] += y[d];
-        free(gu); free(h); free(y);
+        matmul(out, h, s->d, 1, D, I);
     }
 }
 
@@ -2083,7 +2098,7 @@ static void moe_token(Model *m, Layer *l, int layer, const float *x, float *out)
     if (g_metal_compute) {
         int fmt0 = slots[0]->fmt, unif = 1;
         for (int i = 1; i < K; i++) if (slots[i]->fmt != fmt0) { unif = 0; break; }
-        if (unif && (fmt0 == 4 || fmt0 == 8)) {
+        if (unif && (fmt0 == 4 || fmt0 == 8 || fmt0 == 16)) {
             for (int i = 0; i < K; i++) expert_wait_ready(m, slots[i]);   /* MIO async loads must land before GPU reads them */
             const void *gp[64], *up[64], *dp[64];
             const float *gsp[64], *usp[64], *dsp[64];
@@ -2096,6 +2111,11 @@ static void moe_token(Model *m, Layer *l, int layer, const float *x, float *out)
                     if (fmt0 == 4) {
                         gp[i] = s->g4; up[i] = s->u4; dp[i] = s->d4;
                         gsp[i] = s->g4s; usp[i] = s->u4s; dsp[i] = s->d4s;
+                    } else if (fmt0 == 16) {
+                        gp[i] = s->bgu;
+                        up[i] = s->bgu + (int64_t)c->moe_inter * D;
+                        dp[i] = s->bd;
+                        gsp[i] = usp[i] = dsp[i] = NULL;
                     } else {
                         gp[i] = s->g; up[i] = s->u; dp[i] = s->dd;
                         gsp[i] = s->gs; usp[i] = s->us; dsp[i] = s->ds;
@@ -2104,7 +2124,8 @@ static void moe_token(Model *m, Layer *l, int layer, const float *x, float *out)
                     xoff[i] = i; nr[i] = 1; rows[i] = 0;
                     rw[i] = w[i];
                 }
-                gpu_ok = coli_metal_moe_block(K, D, c->moe_inter, fmt0 == 4 ? 4 : 1, 64,
+                int metal_fmt = fmt0 == 4 ? 4 : (fmt0 == 16 ? 5 : 1);
+                gpu_ok = coli_metal_moe_block(K, D, c->moe_inter, metal_fmt, 64,
                                               gp, up, dp, gsp, usp, dsp,
                                               xg, xoff, nr, rows, rw, acc, 1);
                 free(xg);
@@ -2112,13 +2133,18 @@ static void moe_token(Model *m, Layer *l, int layer, const float *x, float *out)
         }
     }
 #endif
-    if (!gpu_ok) for (int i = 0; i < K; i++) {
-        expert_wait_ready(m, slots[i]);
-        float *y = calloc((size_t)D, sizeof(float));    /* expert_apply ACCUMULATES */
-        if (!y) { fprintf(stderr, "OOM\n"); exit(1); }
-        expert_apply(m, slots[i], x, y);
-        for (int d = 0; d < D; d++) acc[d] += y[d] * w[i];
-        free(y);
+    if (!gpu_ok) {
+        /* Reuse one scratch set across all K selected experts. The old decode
+         * path allocated gate/up/h/result buffers independently per expert. */
+        float *gu = falloc(2 * c->moe_inter);
+        float *h = falloc(c->moe_inter);
+        float *y = falloc(D);
+        for (int i = 0; i < K; i++) {
+            expert_wait_ready(m, slots[i]);
+            expert_apply(m, slots[i], x, y, gu, h);
+            for (int d = 0; d < D; d++) acc[d] += y[d] * w[i];
+        }
+        free(gu); free(h); free(y);
     }
     free(slots);
     /* routing telemetry: counts (HOT/COLI_USAGE) + ROUTE_TRACE stream */
