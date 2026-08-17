@@ -12,7 +12,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  merge-and-validate:
+  reconcile-and-validate:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -20,36 +20,38 @@ jobs:
         with:
           ref: sync/qwen-prompt-cache-main-20260817
           fetch-depth: 0
-      - name: Merge latest main and publish candidate
+      - name: Reconcile prompt cache onto optimized runtime
         run: |
           set -euxo pipefail
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git fetch origin main
-          if ! git merge-base --is-ancestor origin/main HEAD; then
-            git merge --no-edit -X theirs origin/main
-            git push origin HEAD:sync/qwen-prompt-cache-main-20260817
-          fi
-      - name: Assert both optimization stacks survived
-        run: |
-          set -euxo pipefail
+          git merge-base --is-ancestor origin/main HEAD
+          python3 c/tools/reconcile_qwen_prefix_main.py
+          git diff --check
           grep -Fq '#include "qwen_prefix_cache.h"' c/qwen_moe.c
-          grep -Fq 'qwen_prefix_cache_restore' c/qwen_moe.c
-          grep -Fq 'qwen_prefix_capture_once' c/qwen_moe.c
-          grep -Fq '[QWEN-PREFIX]' c/qwen_moe.c
           grep -Fq '#include "mxfp4_expert.h"' c/qwen_moe.c
           grep -Fq '#include "mxfp4_runtime.h"' c/qwen_moe.c
-          test -f c/tools/benchmark_qwen_prefix_cache.py
-          test -f c/qwen_prefix_cache.h
-      - name: Build Qwen and run prompt-cache unit gate
+          grep -Fq 'qwen_prefix_cache_restore' c/qwen_moe.c
+          grep -Fq 'qwen_prefix_capture_once' c/qwen_moe.c
+          grep -Fq 'qwen_prefix_cache_ram_cap' c/qwen_moe.c
+          grep -Fq 'qprof_prefill_end' c/qwen_moe.c
+          grep -Fq 'qprof_request_end' c/qwen_moe.c
+      - name: Build optimized Qwen
         run: |
           set -euxo pipefail
           make -C c qwen_moe ARCH=x86-64-v3
-          python3 -m py_compile c/tools/benchmark_qwen_prefix_cache.py c/tests/test_qwen_prefix_cache.py c/tests/test_qwen_prefix_serve.py
-          python3 c/tests/test_qwen_prefix_cache.py
-      - name: Remove temporary workflow after validation
+      - name: Run prompt-cache and MXFP4 unit gates
         run: |
           set -euxo pipefail
-          git rm .github/workflows/sync-qwen-main.yml
-          git commit -m 'chore(qwen): remove temporary main sync gate'
+          python3 -m py_compile c/tools/benchmark_qwen_prefix_cache.py c/tests/test_qwen_prefix_cache.py c/tests/test_qwen_prefix_serve.py
+          python3 c/tests/test_qwen_prefix_cache.py
+          make -C c -f Makefile.csf test
+      - name: Publish validated reconciliation
+        run: |
+          set -euxo pipefail
+          git add c/qwen_moe.c c/Makefile
+          git commit -m 'chore(qwen): reconcile prompt cache with optimized main'
+          git rm c/tools/reconcile_qwen_prefix_main.py .github/workflows/sync-qwen-main.yml
+          git commit -m 'chore(qwen): remove temporary main sync helpers'
           git push origin HEAD:sync/qwen-prompt-cache-main-20260817
