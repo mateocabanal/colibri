@@ -3150,6 +3150,17 @@ static int serve_read_cmd(const char *cur_id) {
     return 0;
 }
 
+static void qwen_prefix_capture_once(Model *m,
+                                     const QwenPrefixStateView *view,
+                                     const int *ids, int np,
+                                     int *captured, double *capture_ms) {
+    if (*captured) return;
+    double began = now_s();
+    qwen_prefix_cache_store(&m->prefix_cache, view, ids, np);
+    *capture_ms += (now_s() - began) * 1000.0;
+    *captured = 1;
+}
+
 static void serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
     int cap = q->plen + 16;
     int *ids = malloc(size_mul_or_die((size_t)cap, sizeof(int), "serve prompt ids"));
@@ -3170,23 +3181,47 @@ static void serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
      * CANCEL that would arrive mid-turn and truncate the reply. */
     printf("ACCEPT %s %d\n", q->id, np); fflush(stdout);
     QwenPrefixStateView prefix_view = qwen_prefix_state_view(m);
+    QwenPrefixCacheStats prefix_before;
+    qwen_prefix_cache_stats(&m->prefix_cache, &prefix_before);
+    double prefix_restore_t0 = now_s();
     int prefix_reused = qwen_prefix_cache_restore(&m->prefix_cache,
                                                    &prefix_view, ids, np);
+    double prefix_restore_ms = (now_s() - prefix_restore_t0) * 1000.0;
     if (!prefix_reused) request_state_reset(m);
+    double prefix_prefill_t0 = now_s();
     float *logit = step(m, ids + prefix_reused, np - prefix_reused,
                         prefix_reused);
-    /* Capture before decode advances the live state past the prompt. */
-    qwen_prefix_cache_store(&m->prefix_cache, &prefix_view, ids, np);
+    double prefix_prefill_ms = (now_s() - prefix_prefill_t0) * 1000.0;
+    size_t prefix_snapshot_bytes = 0, prefix_kv_bytes = 0, prefix_gdn_elems = 0;
+    (void)qwen_prefix_cache_entry_bytes(&prefix_view, np,
+                                        &prefix_snapshot_bytes,
+                                        &prefix_kv_bytes,
+                                        &prefix_gdn_elems);
+    int prefix_captured = 0;
+    double prefix_capture_ms = 0.0;
     int hist_len = np, gen = 0, limited = 1, cancelled = 0;
     char buf[512];
     for (int s = 0; s < q->max_tok && !cancelled; s++) {
         int nt = qwen_pick_token(m, logit, -1);
         logits_free(&logit);
-        if (is_stop(nt)) { limited = 0; break; }
+        if (is_stop(nt)) {
+            /* No DATA will be emitted. Capture while the live state is
+             * still exactly end-of-prefill, then finish the request. */
+            qwen_prefix_capture_once(m, &prefix_view, ids, np,
+                                     &prefix_captured, &prefix_capture_ms);
+            limited = 0; break;
+        }
         int nb = tok_decode(T, &nt, 1, buf, sizeof(buf)-1);
         printf("DATA %s %d\n", q->id, nb);
         fwrite(buf, 1, (size_t)nb, stdout);
         fputc('\n', stdout); fflush(stdout);
+        /* Sampling/decoding does not mutate sequence state. Emit the first
+         * token before copying the potentially 100+ MiB hybrid snapshot,
+         * then capture before the first generated-token step can advance
+         * attention KV or GDN recurrence. This removes capture memcpy from
+         * TTFT without changing the state being cached. */
+        qwen_prefix_capture_once(m, &prefix_view, ids, np,
+                                 &prefix_captured, &prefix_capture_ms);
         gen++; hist_len++;
         while (coli_stdin_readable()) {
             int r = serve_read_cmd(q->id);
@@ -3197,6 +3232,24 @@ static void serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
         logit = step(m, &nt, 1, hist_len - 1);
     }
     logits_free(&logit);
+    /* Defensive fallback for any future serve path that leaves the loop
+     * without emitting DATA or taking the stop-token branch. */
+    qwen_prefix_capture_once(m, &prefix_view, ids, np,
+                             &prefix_captured, &prefix_capture_ms);
+    QwenPrefixCacheStats prefix_after;
+    qwen_prefix_cache_stats(&m->prefix_cache, &prefix_after);
+    if (m->prefix_cache.log) {
+        unsigned long long restore_bytes =
+            (unsigned long long)(prefix_after.restore_bytes - prefix_before.restore_bytes);
+        unsigned long long stores =
+            (unsigned long long)(prefix_after.stores - prefix_before.stores);
+        fprintf(stderr,
+                "[QWEN-PREFIX] request=%s prompt=%d matched=%d restore_bytes=%llu restore_ms=%.3f prefill_ms=%.3f snapshot_bytes=%zu capture_stored=%llu capture_ms=%.3f entries=%zu resident_bytes=%zu budget_bytes=%zu\n",
+                q->id, np, prefix_reused, restore_bytes, prefix_restore_ms,
+                prefix_prefill_ms, prefix_snapshot_bytes, stores,
+                prefix_capture_ms, prefix_after.entries,
+                prefix_after.resident_bytes, prefix_after.budget_bytes);
+    }
     double dt = now_s() - t0;
     double tot = (double)(m->hits - h0 + m->miss - m0);
     printf("DONE %s STAT %d %.3f %.1f %.2f %d %d\n", q->id, gen,
