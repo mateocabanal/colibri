@@ -1,0 +1,63 @@
+name: Stage Qwen COLI object isolation fix
+
+on:
+  push:
+    branches: [feat/qwen36-mxfp4]
+    paths: [.github/workflows/qwen-object-isolation-stage.yml]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Isolate Qwen COLI objects
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          makefile = Path('c/Makefile')
+          s = makefile.read_text()
+          old = 'QMOE_COLI_OBJS = coli_executor.o coli_format.o mxfp4_expert.o mxfp4_runtime.o\n'
+          new = 'QMOE_COLI_OBJS = qwen_coli_executor.o qwen_coli_format.o mxfp4_expert.o mxfp4_runtime.o\n'
+          if old in s:
+              s = s.replace(old, new, 1)
+          elif new not in s:
+              raise SystemExit('QMOE_COLI_OBJS anchor missing')
+
+          anchor = 'qwen_moe$(EXE): qwen_moe.c st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h mxfp4_expert.h mxfp4_runtime.h quant.h backend_cuda.h $(QMOE_COLI_OBJS) $(QMOE_GPU_OBJ) $(MIO_OBJ) $(METAL_OBJ)\n'
+          rules = '''qwen_coli_executor.o: coli_executor.c coli_executor.h coli_format.h\n\t$(CC) $(QMOE_CFLAGS) -c coli_executor.c -o $@\n\nqwen_coli_format.o: coli_format.c coli_format.h compat.h\n\t$(CC) $(QMOE_CFLAGS) -c coli_format.c -o $@\n\n'''
+          if 'qwen_coli_executor.o:' not in s:
+              if anchor not in s:
+                  raise SystemExit('qwen target anchor missing')
+              s = s.replace(anchor, rules + anchor, 1)
+          makefile.write_text(s)
+
+          clean = Path('c/tools/clean.py')
+          s = clean.read_text()
+          anchor = '    "backend_metal.o", "backend_metal_test",\n'
+          replacement = anchor + '    "qwen_coli_executor.o", "qwen_coli_format.o",\n    "mxfp4_expert.o", "mxfp4_runtime.o",\n'
+          if '"qwen_coli_executor.o"' not in s:
+              if anchor not in s:
+                  raise SystemExit('clean.py anchor missing')
+              s = s.replace(anchor, replacement, 1)
+          clean.write_text(s)
+
+          Path('.github/workflows/qwen-object-isolation-stage.yml').unlink()
+          PY
+          git diff --check
+          make -C c clean
+          make -C c qwen_moe -j2
+      - name: Commit fix
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add c/Makefile c/tools/clean.py .github/workflows/qwen-object-isolation-stage.yml
+          git commit -m 'fix(qwen): isolate COLI build objects from V4'
+          git push origin HEAD:feat/qwen36-mxfp4
