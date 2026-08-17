@@ -39,6 +39,24 @@ static void init_minimal_model(Model *m, Tok *T){
 	m->final_norm = final_norm;
 }
 
+
+static uint16_t test_bf16_bits(float x){
+    uint32_t u; memcpy(&u, &x, sizeof(u)); return (uint16_t)(u >> 16);
+}
+static void test_bf16_matmul(void){
+    enum { S=2, O=7, I=19 };
+    float x[S*I], got[S*O], ref[S*O]; uint16_t w[O*I];
+    for (int i=0;i<S*I;i++) x[i]=(float)((i%13)-6)/16.f;
+    for (int i=0;i<O*I;i++) w[i]=test_bf16_bits((float)((i%17)-8)/32.f);
+    matmul_bf16(got, x, w, S, O, I);
+    for (int s=0;s<S;s++) for (int o=0;o<O;o++) {
+        float a=0.f; for (int i=0;i<I;i++) a += x[s*I+i] * coli_bf16_decode(w[o*I+i]);
+        ref[s*O+o]=a;
+    }
+    for (int i=0;i<S*O;i++) CHECK(fabsf(got[i]-ref[i]) < 2e-5f,
+        "BF16 SIMD mismatch at %d: got %.9g ref %.9g", i, got[i], ref[i]);
+}
+
 static void test_padded_vocab_selection(void){
 	Model m;
 	Tok T;
@@ -302,6 +320,7 @@ static void test_arena_plan(void){
 }
 
 int main(void){
+	test_bf16_matmul();
 	test_padded_vocab_selection();
 	test_lifetime_exits();
 	test_hostile_shapes();

@@ -335,6 +335,41 @@ static int run_fp8_moe_gate(const char *name) {
   return ok?0:1;
 }
 
+
+static uint16_t metal_bf16_bits(float x){ uint32_t u; memcpy(&u,&x,4); return (uint16_t)(u>>16); }
+static float metal_bf16_decode(uint16_t x){ uint32_t u=(uint32_t)x<<16; float f; memcpy(&f,&u,4); return f; }
+static int run_moe_bf16(const char *name){
+  const int D=256, I=128, nb=2, R=2, fmt=5, S=1;
+  std::vector<void*> slab(nb); std::vector<const void*> g(nb),u(nb),d(nb);
+  std::vector<const float*> gs(nb,nullptr),us(nb,nullptr),ds(nb,nullptr);
+  size_t elems=(size_t)I*D*2+(size_t)D*I, used=elems*sizeof(uint16_t);
+  size_t bytes=((used+16383u)/16384u)*16384u;
+  srand(7351);
+  for(int e=0;e<nb;e++){
+    if(posix_memalign(&slab[e],16384,bytes)){ printf("  %-30s alloc FAIL\\n",name); return 1; }
+    uint16_t *p=(uint16_t*)slab[e];
+    for(size_t j=0;j<elems;j++) p[j]=metal_bf16_bits((float)((int)(j%23)-11)/128.f);
+    g[e]=p; u[e]=p+(size_t)I*D; d[e]=p+(size_t)I*D*2; coli_metal_register(slab[e],bytes);
+  }
+  int xoff[nb]={0,1}, nr[nb]={1,1}, rows[R]={0,0}; float rw[R]={0.4f,0.6f};
+  std::vector<float> xg((size_t)R*D), ref(D,0.f), got(D,0.f), gg(I),uu(I),hh(D);
+  for(auto &v:xg) v=(float)((rand()%129)-64)/128.f;
+  for(int e=0;e<nb;e++){
+    const uint16_t *wg=(const uint16_t*)g[e], *wu=(const uint16_t*)u[e], *wd=(const uint16_t*)d[e]; const float *xr=xg.data()+(size_t)e*D;
+    for(int o=0;o<I;o++){ float a=0; for(int k=0;k<D;k++) a+=xr[k]*metal_bf16_decode(wg[(size_t)o*D+k]); gg[o]=a; }
+    for(int o=0;o<I;o++){ float a=0; for(int k=0;k<D;k++) a+=xr[k]*metal_bf16_decode(wu[(size_t)o*D+k]); uu[o]=a; }
+    for(int o=0;o<I;o++){ float v=gg[o]; gg[o]=(v/(1.f+expf(-v)))*uu[o]; }
+    for(int o=0;o<D;o++){ float a=0; for(int k=0;k<I;k++) a+=gg[k]*metal_bf16_decode(wd[(size_t)o*I+k]); hh[o]=a; }
+    for(int o=0;o<D;o++) ref[o]+=rw[e]*hh[o];
+  }
+  int ok=coli_metal_moe_block(nb,D,I,fmt,0,g.data(),u.data(),d.data(),gs.data(),us.data(),ds.data(),xg.data(),xoff,nr,rows,rw,got.data(),S);
+  double ma=0,ym=0; for(int i=0;i<D;i++){ ma=fmax(ma,fabs(got[i]-ref[i])); ym=fmax(ym,fabs(ref[i])); }
+  double nerr=ma/(ym+1e-9); int pass=ok && nerr<2e-4;
+  printf("  %-30s nerr=%.2e  %s\\n",name,nerr,pass?"ok":"*** MISMATCH");
+  for(int e=0;e<nb;e++){ coli_metal_unregister(slab[e]); free(slab[e]); }
+  return pass?0:1;
+}
+
 static float deq4(const uint8_t* w,int i){ uint8_t b=w[i>>1]; int v=(i&1)?(b>>4):(b&0xF); return (float)(v-8); }
 static size_t roundpg(size_t n){ size_t p=16384; return ((n+p-1)/p)*p; }
 
@@ -762,6 +797,7 @@ int main(void) {
   fail |= run_fp8_gemm_gate("fp8 GEMM entry explicitly gated off (coli_metal_gemm refuses)");
   fail |= run_fp8_moe_gate("fp8 MB_BUILD/moe_submit entry gated off (shared-expert fmt=8 hazard)");
   printf("Metal batched moe_block tests:\n");
+  fail |= run_moe_bf16("moe decode raw-BF16 no-scales");
   fail |= run_moe({1,1,1,1,1,1,1,1}, 0,   "moe decode nb=8");
   fail |= run_moe({3,1,4,2,1,5},     0,   "moe ragged nb=6");
   fail |= run_moe({1,1,1,1,1,1,1,1}, 128, "moe decode nb=8  fmt4-g128");

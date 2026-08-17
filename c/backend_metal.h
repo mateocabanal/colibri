@@ -137,10 +137,10 @@ int coli_metal_resset_stats(double *flush_s);
  * ~150us Metal launch latency is paid once per block, not per matmul.
  *
  *  D           = hidden size, Iinter = moe intermediate size
- *  g/u/d[e]    = pointers to expert e's gate/up/down quantized weights (in RAM slabs)
- *  gs/us/ds[e] = pointers to expert e's per-row (fmt=1/2) or per-group (fmt=4) scales
- *  fmt         = quant format (shared across experts): 1=int8, 2=int4 per-row, 4=int4
- *                grouped. qgs is the fmt=4 group size (ignored, pass 0, for fmt!=4).
+ *  g/u/d[e]    = pointers to expert e's gate/up/down weights in registered RAM slabs
+ *  gs/us/ds[e] = scale pointers for quantized formats; may be NULL for fmt=5 raw BF16
+ *  fmt         = expert format shared across the block: 1=int8, 2=int4 per-row,
+ *                4=int4 grouped, 5=raw BF16, 6=E8/IQ3. qgs is used only by fmt=4.
  *  qgs         = fmt=4 group size shared across experts in this block (0 for fmt!=4)
  *  xg          = packed activations [total_rows, D]; xoff[e] = row offset of expert e
  *  nr[e]       = rows for expert e; rows[]/rw[] map packed rows back to out positions
@@ -155,10 +155,9 @@ int coli_metal_moe_block(int nb, int D, int Iinter, int fmt, int qgs,
                          float *out, int S);
 
 /*
- * Async two-phase variant: begin encodes+commits the block (own scratch, no wait) and
- * returns a handle, so the CPU can load missed experts from disk WHILE the GPU computes
- * the resident ones; end waits, checks for GPU faults, scatter-adds into out, and frees
- * the handle. begin returns NULL (nothing submitted) on unresolved slab / bad fmt / R==0;
+ * Async two-phase variant: begin submits the block (own scratch, no wait) so the CPU can
+ * overlap disk loads with GPU compute; end waits + scatters. Handle owns everything.
+ * begin returns NULL (nothing submitted) on unresolved slab / bad fmt / R==0;
  * end returns 0 on GPU fault (caller redoes those experts on CPU).
  */
 typedef struct ColiMetalMoeHandle ColiMetalMoeHandle;
