@@ -46,6 +46,17 @@ static int decode_token_string(const ColiV4Session *session,
     return 0;
 }
 
+static char *append_text(const char *prefix, const char *suffix) {
+    size_t prefix_len = strlen(prefix);
+    size_t suffix_len = strlen(suffix);
+    if (prefix_len > SIZE_MAX - suffix_len - 1) return NULL;
+    char *output = malloc(prefix_len + suffix_len + 1);
+    if (!output) return NULL;
+    memcpy(output, prefix, prefix_len);
+    memcpy(output + prefix_len, suffix, suffix_len + 1);
+    return output;
+}
+
 static int generated_text(ColiV4Session *session, char **output) {
     size_t capacity = (size_t)session->text_length + 1;
     char *text = malloc(capacity);
@@ -99,9 +110,10 @@ int main(int argc, char **argv) {
     const char *initial_prompt = argv[2];
     char error[1024] = {0};
     ColiV4Engine *shared_engine = NULL, *cold_engine = NULL;
-    ColiV4Session *first = NULL, *restored = NULL, *cold = NULL;
-    char *extension_token = NULL, *extension = NULL;
-    char *restored_text = NULL, *cold_text = NULL;
+    ColiV4Session *first = NULL, *equal = NULL, *extended = NULL;
+    ColiV4Session *longest = NULL, *cold = NULL;
+    char *extension_token = NULL, *prompt_plus_one = NULL, *prompt_plus_two = NULL;
+    char *longest_text = NULL, *cold_text = NULL;
     int status = 1;
 
     if (!getenv("V4_PREFIX_CACHE_MB") || !atoi(getenv("V4_PREFIX_CACHE_MB"))) {
@@ -111,7 +123,9 @@ int main(int argc, char **argv) {
 
     if (open_engine(&shared_engine, model, error, sizeof(error)) ||
         open_session(&first, shared_engine, error, sizeof(error)) ||
-        open_session(&restored, shared_engine, error, sizeof(error))) {
+        open_session(&equal, shared_engine, error, sizeof(error)) ||
+        open_session(&extended, shared_engine, error, sizeof(error)) ||
+        open_session(&longest, shared_engine, error, sizeof(error))) {
         fprintf(stderr, "shared engine/session open failed: %s\n", error);
         goto cleanup;
     }
@@ -124,35 +138,86 @@ int main(int argc, char **argv) {
         fprintf(stderr, "first session did not retain tokenized prompt\n");
         goto cleanup;
     }
-    int cached_tokens = first->prompt_count;
+    int base_tokens = first->prompt_count;
+
+    ColiV4PrefixCacheStats after_first = {0};
+    coli_v4_prefix_cache_stats(&after_first);
+    if (!after_first.stores || !after_first.entries) {
+        fprintf(stderr,
+                "first prefill was not admitted: stores=%llu entries=%zu\n",
+                (unsigned long long)after_first.stores, after_first.entries);
+        goto cleanup;
+    }
+
+    /* Exact equality is deliberately not a hit: the generation contract always
+     * executes at least one fresh prompt token, so only strict prefixes qualify. */
+    if (run_generation(equal, initial_prompt, error, sizeof(error))) {
+        fprintf(stderr, "equal-prompt generation failed: %s\n", error);
+        goto cleanup;
+    }
+    if (equal->prefix_reused != 0) {
+        fprintf(stderr, "equal prompt unexpectedly reused %d tokens\n",
+                equal->prefix_reused);
+        goto cleanup;
+    }
 
     /* The cache snapshot is taken immediately after prefill, so it represents
-     * exactly the request prompt, not prompt+generated output. Build a strict
-     * extension by appending one known round-trippable tiny-fixture token. */
+     * exactly the request prompt. Append a known round-trippable tiny token to
+     * create P+X and require a fresh session to restore P. */
     if (decode_token_string(first, first->prompt_ids, 1, &extension_token)) {
         fprintf(stderr, "failed to decode extension token\n");
         goto cleanup;
     }
-    size_t prompt_len = strlen(initial_prompt);
-    size_t token_len = strlen(extension_token);
-    if (prompt_len > SIZE_MAX - token_len - 1) goto cleanup;
-    extension = malloc(prompt_len + token_len + 1);
-    if (!extension) goto cleanup;
-    memcpy(extension, initial_prompt, prompt_len);
-    memcpy(extension + prompt_len, extension_token, token_len + 1);
-
-    if (run_generation(restored, extension, error, sizeof(error))) {
-        fprintf(stderr, "restored generation failed: %s\n", error);
+    prompt_plus_one = append_text(initial_prompt, extension_token);
+    if (!prompt_plus_one) {
+        fprintf(stderr, "out of memory building first extension\n");
         goto cleanup;
     }
-    if (restored->prefix_reused != cached_tokens) {
+    if (run_generation(extended, prompt_plus_one, error, sizeof(error))) {
+        fprintf(stderr, "first extension generation failed: %s\n", error);
+        goto cleanup;
+    }
+    if (extended->prefix_reused != base_tokens) {
         fprintf(stderr,
-                "cross-session cache did not restore exact prefix: got=%d expected=%d\n",
-                restored->prefix_reused, cached_tokens);
+                "cross-session cache did not restore base prefix: got=%d expected=%d\n",
+                extended->prefix_reused, base_tokens);
         goto cleanup;
     }
-    if (generated_text(restored, &restored_text)) {
-        fprintf(stderr, "cannot decode restored output\n");
+    if (!extended->prompt_ids || extended->prompt_count <= base_tokens) {
+        fprintf(stderr, "extended request did not grow the prompt token prefix\n");
+        goto cleanup;
+    }
+    int extended_tokens = extended->prompt_count;
+
+    ColiV4PrefixCacheStats after_extended = {0};
+    coli_v4_prefix_cache_stats(&after_extended);
+    if (after_extended.entries < 2 || after_extended.stores < 2) {
+        fprintf(stderr,
+                "second prefix was not retained: stores=%llu entries=%zu\n",
+                (unsigned long long)after_extended.stores,
+                after_extended.entries);
+        goto cleanup;
+    }
+
+    /* Now P and P+X are both resident. P+X+Y must restore the longer P+X
+     * snapshot, proving selection is longest-prefix rather than first-match. */
+    prompt_plus_two = append_text(prompt_plus_one, extension_token);
+    if (!prompt_plus_two) {
+        fprintf(stderr, "out of memory building second extension\n");
+        goto cleanup;
+    }
+    if (run_generation(longest, prompt_plus_two, error, sizeof(error))) {
+        fprintf(stderr, "longest-prefix generation failed: %s\n", error);
+        goto cleanup;
+    }
+    if (longest->prefix_reused != extended_tokens) {
+        fprintf(stderr,
+                "longest-prefix selection failed: got=%d expected=%d base=%d\n",
+                longest->prefix_reused, extended_tokens, base_tokens);
+        goto cleanup;
+    }
+    if (generated_text(longest, &longest_text)) {
+        fprintf(stderr, "cannot decode longest-prefix output\n");
         goto cleanup;
     }
 
@@ -164,7 +229,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "cold engine/session open failed: %s\n", error);
         goto cleanup;
     }
-    if (run_generation(cold, extension, error, sizeof(error))) {
+    if (run_generation(cold, prompt_plus_two, error, sizeof(error))) {
         fprintf(stderr, "cold generation failed: %s\n", error);
         goto cleanup;
     }
@@ -177,38 +242,44 @@ int main(int argc, char **argv) {
         fprintf(stderr, "cannot decode cold output\n");
         goto cleanup;
     }
-    if (strcmp(restored_text, cold_text)) {
+    if (strcmp(longest_text, cold_text)) {
         fprintf(stderr,
-                "restored output diverged from cold prefill:\nrestored=%s\ncold=%s\n",
-                restored_text, cold_text);
+                "longest-prefix restored output diverged from cold prefill:\nrestored=%s\ncold=%s\n",
+                longest_text, cold_text);
         goto cleanup;
     }
 
     ColiV4PrefixCacheStats cache = {0};
     coli_v4_prefix_cache_stats(&cache);
-    if (!cache.hits || cache.matched_tokens < (uint64_t)cached_tokens ||
+    uint64_t expected_matched = (uint64_t)base_tokens + (uint64_t)extended_tokens;
+    if (cache.hits < 2 || cache.matched_tokens < expected_matched ||
         !cache.restore_bytes || !cache.restore_ns) {
         fprintf(stderr,
-                "prefix-cache telemetry incomplete: hits=%llu matched=%llu bytes=%llu ns=%llu\n",
+                "prefix-cache telemetry incomplete: hits=%llu matched=%llu expected_matched=%llu bytes=%llu ns=%llu\n",
                 (unsigned long long)cache.hits,
                 (unsigned long long)cache.matched_tokens,
+                (unsigned long long)expected_matched,
                 (unsigned long long)cache.restore_bytes,
                 (unsigned long long)cache.restore_ns);
         goto cleanup;
     }
 
-    printf("PASS cross-session prefix cache: %d prompt tokens restored, %.3f MiB copied in %.3f ms, output identical to cold prefill\n",
-           cached_tokens, cache.restore_bytes / (1024.0 * 1024.0),
+    printf("PASS cross-session prefix cache: base=%d extended=%d longest=%d prompt tokens, %.3f MiB restored in %.3f ms, output identical to cold prefill\n",
+           base_tokens, extended_tokens, longest->prefix_reused,
+           cache.restore_bytes / (1024.0 * 1024.0),
            cache.restore_ns / 1.0e6);
     status = 0;
 
 cleanup:
     free(extension_token);
-    free(extension);
-    free(restored_text);
+    free(prompt_plus_one);
+    free(prompt_plus_two);
+    free(longest_text);
     free(cold_text);
     if (first) coli_v4_session_destroy(first);
-    if (restored) coli_v4_session_destroy(restored);
+    if (equal) coli_v4_session_destroy(equal);
+    if (extended) coli_v4_session_destroy(extended);
+    if (longest) coli_v4_session_destroy(longest);
     if (cold) coli_v4_session_destroy(cold);
     if (shared_engine) coli_v4_engine_destroy(shared_engine);
     if (cold_engine) coli_v4_engine_destroy(cold_engine);
