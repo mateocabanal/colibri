@@ -20,6 +20,9 @@ FILES = [
     "backend_cuda_test", "backend_cuda_test.exe",
     "backend_cuda_bench", "backend_cuda_bench.exe",
     "backend_metal.o", "backend_metal_test",
+    "qwen_coli_executor.o", "qwen_coli_format.o",
+    "qwen_profile.o",
+    "mxfp4_expert.o", "mxfp4_runtime.o",
     "coli_cuda.dll", "coli_cuda.lib", "coli_cuda.exp",
     # hipcc emits an import library, export file and PDB alongside the DLL.
     "coli_hip.dll", "coli_hip.lib", "coli_hip.exp", "coli_hip.pdb",

@@ -57,6 +57,11 @@
 #include <stdint.h>
 #include <pthread.h>
 #include "coli_executor.h"   /* COLLACOLI: COLI package backend */
+#include "mxfp4_expert.h"
+#include "mxfp4_runtime.h"
+#ifdef COLI_CUDA
+#include "backend_cuda.h"
+#endif
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 #include <sys/resource.h>
 #include <unistd.h>
@@ -67,6 +72,7 @@
 #endif
 #include "omp_tune.h"
 #include "route_trace.h"
+#include "profile.h"
 #ifdef COLI_METALIO
 #include "metalio.h"
 #endif
@@ -126,6 +132,12 @@ static float *falloc(int64_t n){
     return p;
 }
 
+#ifdef COLI_CUDA
+static int g_cuda_compute = 0;
+#else
+#define g_cuda_compute 0
+#endif
+
 #ifdef COLI_METAL
 #include "backend_metal.h"
 /* QWEN_METAL_COMPUTE=1: route routed-expert gate/up/down matmuls to the
@@ -137,14 +149,26 @@ static int g_metal_compute = 0;
 #define g_metal_compute 0
 #endif
 /* page-aligned when Metal zero-copy is active, plain malloc otherwise */
-static void *moe_slab_alloc(size_t n){
-    void *p = malloc(n);
-    if (!p) { fprintf(stderr, "OOM expert\n"); exit(1); }
+static size_t moe_slab_bytes(size_t n){
+#ifdef COLI_METAL
     if (g_metal_compute) {
-        void *q = NULL;
-        if (!posix_memalign(&q, 16384, n)) p = q;
-        else free(p);   /* fall back to malloc'd; register will copy instead of wrap */
+        if (n > SIZE_MAX - 16383u) { fprintf(stderr, "expert slab size overflow\n"); exit(1); }
+        return (n + 16383u) & ~(size_t)16383u;
     }
+#endif
+    return n;
+}
+static void *moe_slab_alloc(size_t n){
+    void *p = NULL;
+#ifdef COLI_METAL
+    if (g_metal_compute) {
+        if (posix_memalign(&p, 16384, n) != 0) p = NULL;
+    } else
+#endif
+    {
+        p = malloc(n);
+    }
+    if (!p && n) { fprintf(stderr, "OOM expert (%zu bytes)\n", n); exit(1); }
     return p;
 }
 
@@ -261,7 +285,7 @@ typedef struct {
     int eid;                       /* -1 = slot in flight */
     int loading_eid;               /* expert id being loaded into this slot (-1 when idle) */
     int pinned;
-    int fmt;                       /* 0=f32, 16=BF16, 8=int8, 4=i4-grouped, 5=int3-g64 */
+    int fmt;                       /* 0=f32, 16=BF16, 8=int8, 7=MXFP4, 4=i4-grouped, 5=int3-g64 */
     int mio;                       /* 1 = weight bytes live in a MetalIO shared buffer */
     int mio_slot;                  /* metalio slot id, -1 = not backed yet */
     int mio_resident;              /* 1 = current pointers point INTO the mio buffer */
@@ -273,6 +297,9 @@ typedef struct {
     float *gs, *us, *ds;           /* q8: row scales */
     uint8_t *g4, *u4, *d4;         /* packed (fmt 4/5): g|u|d blocks, packed layout */
     float *g4s, *u4s, *d4s;        /* packed: per-64-input-group f32 scales */
+    uint8_t *mxg, *mxu, *mxd;       /* MXFP4 E2M1 packed gate/up/down weights */
+    uint8_t *mxgs, *mxus, *mxds;    /* MXFP4 raw E8M0 scales, one per 32 columns */
+    uint8_t *mxbase;                 /* owner for coalesced on-disk MXFP4 slab, else NULL */
     uint64_t used;
 } Slot;
 typedef struct { Slot *slots; int n, cap; } LCache;
@@ -296,11 +323,187 @@ typedef struct {
     int last_route[64];            /* most recent top-k (for lookahead prefetch) */
     int last_route_k;
     uint64_t prefetch_misses;      /* loads triggered by lookahead prefetch */
-    double t_attn, t_gdn, t_moe, t_expio;   /* per-request phase timings (PROF) */
+    uint64_t prof_expert_requests; /* logical routed expert applications */
+    uint64_t prof_expert_loads;    /* physical expert loads from storage */
+    double t_attn, t_gdn, t_moe, t_expio, t_head; /* legacy PROF + generic profile sources */
     double dense_load_s;
     ColiExecutor *coli; /* COLLACOLI: non-NULL = COLI package backend */
     int coli_load;
 } Model;
+
+/* Generic inference profiler adapter. DeepSeek V4 and Qwen share profile.c;
+ * each engine only defines its phase taxonomy and scope/counter snapshots. */
+enum {
+    QPROF_MODEL_LOAD = 0,
+    QPROF_STARTUP_OTHER,
+    QPROF_ATTN,
+    QPROF_GDN,
+    QPROF_MOE,
+    QPROF_EXPERT_IO,
+    QPROF_HEAD,
+    QPROF_METAL_ENCODE,
+    QPROF_METAL_SUBMIT,
+    QPROF_METAL_WAIT,
+    QPROF_METAL_KERNEL,
+    QPROF_METAL_MOE_SETUP,
+    QPROF_METAL_MOE_WAIT,
+    QPROF_METAL_MOE_KERNEL,
+    QPROF_METAL_MOE_SCATTER,
+    QPROF_COUNT
+};
+enum {
+    QPC_ROUTED_EXPERT_REQUESTS = 0,
+    QPC_EXPERT_LOADS,
+    QPC_CACHE_HITS,
+    QPC_CACHE_MISSES,
+    QPC_PREFETCH_MISSES,
+    QPC_METAL_MOE_BLOCKS,
+    QPC_METAL_MOE_FALLBACKS,
+    QPC_METAL_MOE_EXPERTS,
+    QPC_COUNT
+};
+static const ColiProfilePhaseDef qprof_phases[QPROF_COUNT] = {
+    [QPROF_MODEL_LOAD]    = {"model_load", COLI_PROFILE_ACCOUNTED},
+    [QPROF_STARTUP_OTHER] = {"startup_other", COLI_PROFILE_ACCOUNTED},
+    [QPROF_ATTN]          = {"attention", COLI_PROFILE_ACCOUNTED},
+    [QPROF_GDN]           = {"gdn", COLI_PROFILE_ACCOUNTED},
+    [QPROF_MOE]           = {"moe", COLI_PROFILE_ACCOUNTED},
+    /* Nested inside MoE: subtract from accounted wall to expose compute time,
+     * but never add it to accounted twice. */
+    [QPROF_EXPERT_IO]     = {"expert_io", COLI_PROFILE_IO_WAIT},
+    [QPROF_HEAD]          = {"head_compute", COLI_PROFILE_ACCOUNTED},
+    [QPROF_METAL_ENCODE]  = {"metal_encode", 0},
+    [QPROF_METAL_SUBMIT]  = {"metal_submit", 0},
+    [QPROF_METAL_WAIT]    = {"metal_wait", 0},
+    [QPROF_METAL_KERNEL]  = {"metal_kernel", 0},
+    [QPROF_METAL_MOE_SETUP]   = {"metal_moe_setup", 0},
+    [QPROF_METAL_MOE_WAIT]    = {"metal_moe_wait", COLI_PROFILE_CPU_WAIT},
+    [QPROF_METAL_MOE_KERNEL]  = {"metal_moe_kernel", 0},
+    [QPROF_METAL_MOE_SCATTER] = {"metal_moe_scatter", 0},
+};
+static const ColiProfileCounterDef qprof_counters[QPC_COUNT] = {
+    [QPC_ROUTED_EXPERT_REQUESTS] = {"routed_expert_requests"},
+    [QPC_EXPERT_LOADS] = {"expert_loads"},
+    [QPC_CACHE_HITS] = {"cache_hits"},
+    [QPC_CACHE_MISSES] = {"cache_misses"},
+    [QPC_PREFETCH_MISSES] = {"prefetch_misses"},
+    [QPC_METAL_MOE_BLOCKS] = {"metal_moe_blocks"},
+    [QPC_METAL_MOE_FALLBACKS] = {"metal_moe_fallbacks"},
+    [QPC_METAL_MOE_EXPERTS] = {"metal_moe_experts"},
+};
+static ColiProfile g_qprof;
+
+static uint64_t qprof_s_to_ns(double seconds) {
+    if (!(seconds > 0.0)) return 0;
+    double ns = seconds * 1.0e9;
+    return ns >= (double)UINT64_MAX ? UINT64_MAX : (uint64_t)ns;
+}
+
+static void qprof_reset(void) {
+    static const ColiProfileConfig config = {
+        .engine = "qwen_moe",
+        .env_name = "QWEN_PROFILE",
+        .line_prefix = "coli_profile",
+        .include_engine = 1,
+        .phases = qprof_phases,
+        .phase_count = QPROF_COUNT,
+        .counters = qprof_counters,
+        .counter_count = QPC_COUNT,
+    };
+    coli_profile_reset(&g_qprof, &config);
+#ifdef COLI_METAL
+    coli_metal_profile_set_on(coli_profile_enabled(&g_qprof));
+    if (coli_profile_enabled(&g_qprof)) coli_metal_profile_reset();
+#endif
+    if (coli_profile_enabled(&g_qprof)) coli_profile_mark(&g_qprof, 0);
+}
+
+static void qprof_sync(Model *m) {
+    if (!coli_profile_enabled(&g_qprof)) return;
+    coli_profile_phase_set(&g_qprof, QPROF_ATTN, qprof_s_to_ns(m->t_attn));
+    coli_profile_phase_set(&g_qprof, QPROF_GDN, qprof_s_to_ns(m->t_gdn));
+    coli_profile_phase_set(&g_qprof, QPROF_MOE, qprof_s_to_ns(m->t_moe));
+    coli_profile_phase_set(&g_qprof, QPROF_EXPERT_IO, qprof_s_to_ns(m->t_expio));
+    coli_profile_phase_set(&g_qprof, QPROF_HEAD, qprof_s_to_ns(m->t_head));
+    coli_profile_counter_set(&g_qprof, QPC_ROUTED_EXPERT_REQUESTS, m->prof_expert_requests);
+    coli_profile_counter_set(&g_qprof, QPC_EXPERT_LOADS, m->prof_expert_loads);
+    coli_profile_counter_set(&g_qprof, QPC_CACHE_HITS, m->hits);
+    coli_profile_counter_set(&g_qprof, QPC_CACHE_MISSES, m->miss);
+    coli_profile_counter_set(&g_qprof, QPC_PREFETCH_MISSES, m->prefetch_misses);
+#ifdef COLI_METAL
+    uint64_t encode = 0, submit = 0, wait = 0, kernel = 0;
+    coli_metal_profile_get(&encode, &submit, &wait, &kernel);
+    coli_profile_phase_set(&g_qprof, QPROF_METAL_ENCODE, encode);
+    coli_profile_phase_set(&g_qprof, QPROF_METAL_SUBMIT, submit);
+    coli_profile_phase_set(&g_qprof, QPROF_METAL_WAIT, wait);
+    coli_profile_phase_set(&g_qprof, QPROF_METAL_KERNEL, kernel);
+
+    double moe_setup = 0.0, moe_wait = 0.0, moe_scatter = 0.0;
+    uint64_t moe_ok = 0, moe_fb = 0, moe_experts = 0;
+    coli_metal_moe_times(&moe_setup, &moe_wait, &moe_scatter);
+    coli_metal_moe_counts(&moe_ok, &moe_fb, &moe_experts);
+    coli_profile_phase_set(&g_qprof, QPROF_METAL_MOE_SETUP, qprof_s_to_ns(moe_setup));
+    coli_profile_phase_set(&g_qprof, QPROF_METAL_MOE_WAIT, qprof_s_to_ns(moe_wait));
+    coli_profile_phase_set(&g_qprof, QPROF_METAL_MOE_KERNEL,
+                           qprof_s_to_ns(coli_metal_moe_kernel_time()));
+    coli_profile_phase_set(&g_qprof, QPROF_METAL_MOE_SCATTER, qprof_s_to_ns(moe_scatter));
+    coli_profile_counter_set(&g_qprof, QPC_METAL_MOE_BLOCKS, moe_ok);
+    coli_profile_counter_set(&g_qprof, QPC_METAL_MOE_FALLBACKS, moe_fb);
+    coli_profile_counter_set(&g_qprof, QPC_METAL_MOE_EXPERTS, moe_experts);
+#endif
+}
+
+static void qprof_startup_end(Model *m) {
+    if (!coli_profile_enabled(&g_qprof)) return;
+    uint64_t model_ns = qprof_s_to_ns(m->dense_load_s);
+    coli_profile_phase_set(&g_qprof, QPROF_MODEL_LOAD, model_ns);
+    ColiProfileSnapshot snap = coli_profile_get(&g_qprof);
+    coli_profile_phase_set(&g_qprof, QPROF_STARTUP_OTHER,
+                           snap.wall_ns > model_ns ? snap.wall_ns - model_ns : 0);
+    qprof_sync(m);
+    coli_profile_mark(&g_qprof, 1);
+    coli_profile_mark_tokens(&g_qprof, 1, 0);
+    coli_profile_emit_scope(stderr, &g_qprof, "startup", 0, 1);
+}
+
+static void qprof_request_begin(Model *m) {
+    /* Preserve the legacy SERVE PROF contract while making these same timers
+     * the engine adapter's source of truth. */
+    m->t_attn = m->t_gdn = m->t_moe = m->t_expio = m->t_head = 0.0;
+    if (!coli_profile_enabled(&g_qprof)) return;
+    qprof_sync(m);
+    coli_profile_mark(&g_qprof, 2);
+    coli_profile_mark_tokens(&g_qprof, 2, 0);
+    coli_profile_mark(&g_qprof, 3);
+    coli_profile_mark_tokens(&g_qprof, 3, 0);
+}
+
+static void qprof_prefill_end(Model *m, int prompt_tokens) {
+    if (!coli_profile_enabled(&g_qprof)) return;
+    qprof_sync(m);
+    coli_profile_mark(&g_qprof, 4);
+    coli_profile_mark_tokens(&g_qprof, 4,
+                             prompt_tokens > 0 ? (uint64_t)prompt_tokens : 0);
+}
+
+static void qprof_request_end(Model *m, int prompt_tokens, int generated_tokens) {
+    if (!coli_profile_enabled(&g_qprof)) return;
+    qprof_sync(m);
+    coli_profile_mark(&g_qprof, 5);
+    uint64_t total = (prompt_tokens > 0 ? (uint64_t)prompt_tokens : 0) +
+                     (generated_tokens > 0 ? (uint64_t)generated_tokens : 0);
+    coli_profile_mark_tokens(&g_qprof, 5, total);
+    coli_profile_emit_scope(stderr, &g_qprof, "run", 2, 5);
+    coli_profile_emit_scope(stderr, &g_qprof, "prompt", 3, 4);
+    coli_profile_emit_scope(stderr, &g_qprof, "decode", 4, 5);
+}
+
+static double qprof_head_begin(void) {
+    return coli_profile_enabled(&g_qprof) ? now_s() : 0.0;
+}
+static void qprof_head_end(Model *m, double began) {
+    if (began > 0.0) m->t_head += now_s() - began;
+}
 
 static pthread_mutex_t g_mx = PTHREAD_MUTEX_INITIALIZER;
 static int g_prefetch = 0;         /* QWEN_PREFETCH: layer-lookahead expert prefetch */
@@ -590,6 +793,7 @@ static char g_prefix[64] = "";      /* "model.language_model." or "" (probed) */
 static int coli_mode = 0;
 static void slot_alloc_f32(Slot *s, int64_t ng, int64_t nd);  /* defined below */
 static void slot_alloc_bf16(Slot *s, int64_t ng, int64_t nd); /* exact COLI residency */
+static void slot_alloc_mxfp4(Slot *s, const ColiMxfp4ExpertLayout *layout);
 
 /* BF16 -> f32 (deepseek_v4.c also defines this globally; qwen_moe builds
  * standalone so we need our own; static here to avoid a clash if both are
@@ -788,20 +992,69 @@ static void load_expert_coli(Model *m, int layer, int eid, Slot *s){
         fprintf(stderr, "qwen coli: missing/invalid expert (%d,%d)\n", layer, eid); exit(1);
     }
     int gi = coli_emx(&ei, 1), ui = coli_emx(&ei, 2), di = coli_emx(&ei, 3);
-    if (gi < 0 || ui < 0 || di < 0 ||
-        !coli_exact_bf16_matrix(&ei.matrices[gi], cc->moe_inter, cc->hidden) ||
+    if (gi < 0 || ui < 0 || di < 0) {
+        fprintf(stderr, "qwen coli: expert (%d,%d) is missing gate/up/down roles\n", layer, eid); exit(1);
+    }
+
+    /* Keep MXFP4 compressed in the streamed cache. The generic loader validates
+     * the compiler/runtime ABI and reads only the six executable E2M1/E8M0 spans. */
+    if (ei.matrices[gi].math_format == COLI_CSF_MATH_MXFP4_E2M1 ||
+        ei.matrices[ui].math_format == COLI_CSF_MATH_MXFP4_E2M1 ||
+        ei.matrices[di].math_format == COLI_CSF_MATH_MXFP4_E2M1) {
+        ColiMxfp4ExpertLayout layout;
+        char err[512] = {0};
+        if (coli_mxfp4_expert_validate_info(&ei, cc->hidden, cc->moe_inter,
+                                            &layout, err, sizeof(err))) {
+            fprintf(stderr, "qwen coli: expert (%d,%d) MXFP4 layout broken: %s\n",
+                    layer, eid, err[0] ? err : "validation failed");
+            exit(1);
+        }
+        slot_alloc_mxfp4(s, &layout);
+        const ColiPackage *pkg = coli_executor_package(m->coli);
+        uint32_t read_flags = g_expert_drop ? COLI_CSF_READ_UNCACHED : COLI_CSF_READ_DEFAULT;
+        int load_rc = 0;
+        if (s->mxbase) {
+            /* Fast path: compiler-style layout, one direct record-range read. */
+            load_rc = coli_package_read_range_ex(pkg, erec, layout.record_span_offset,
+                                                  s->mxbase, layout.record_span_bytes,
+                                                  read_flags, err, sizeof(err));
+        } else {
+            ColiMxfp4ExpertBuffers buffers = {
+                .gate_weights = s->mxg, .gate_weight_capacity = layout.gate_weight_bytes,
+                .gate_scales = s->mxgs, .gate_scale_capacity = layout.gate_scale_bytes,
+                .up_weights = s->mxu, .up_weight_capacity = layout.up_weight_bytes,
+                .up_scales = s->mxus, .up_scale_capacity = layout.up_scale_bytes,
+                .down_weights = s->mxd, .down_weight_capacity = layout.down_weight_bytes,
+                .down_scales = s->mxds, .down_scale_capacity = layout.down_scale_bytes,
+            };
+            load_rc = coli_mxfp4_expert_load_ex(pkg, erec, cc->hidden, cc->moe_inter,
+                                                 &buffers, &layout, read_flags,
+                                                 err, sizeof(err));
+        }
+        if (load_rc) {
+            fprintf(stderr, "qwen coli: read MXFP4 expert (%d,%d) failed: %s\n",
+                    layer, eid, err[0] ? err : "read failed");
+            exit(1);
+        }
+        s->fmt = 7;
+        s->pinned = 0;
+        return;
+    }
+
+    if (!coli_exact_bf16_matrix(&ei.matrices[gi], cc->moe_inter, cc->hidden) ||
         !coli_exact_bf16_matrix(&ei.matrices[ui], cc->moe_inter, cc->hidden) ||
         !coli_exact_bf16_matrix(&ei.matrices[di], cc->hidden, cc->moe_inter)) {
         fprintf(stderr, "qwen coli: expert (%d,%d) exact BF16 layout broken\n", layer, eid); exit(1);
     }
     slot_alloc_bf16(s, ng, nd); s->fmt = 16; s->pinned = 0;
     const ColiPackage *pkg = coli_executor_package(m->coli);
-    if (coli_package_read_range(pkg, erec, ei.matrices[gi].weight_offset,
-                                s->bgu, (size_t)ng * 2, NULL, 0) ||
-        coli_package_read_range(pkg, erec, ei.matrices[ui].weight_offset,
-                                s->bgu + ng, (size_t)ng * 2, NULL, 0) ||
-        coli_package_read_range(pkg, erec, ei.matrices[di].weight_offset,
-                                s->bd, (size_t)nd * 2, NULL, 0)) {
+    uint32_t read_flags = g_expert_drop ? COLI_CSF_READ_UNCACHED : COLI_CSF_READ_DEFAULT;
+    if (coli_package_read_range_ex(pkg, erec, ei.matrices[gi].weight_offset,
+                                   s->bgu, (size_t)ng * 2, read_flags, NULL, 0) ||
+        coli_package_read_range_ex(pkg, erec, ei.matrices[ui].weight_offset,
+                                   s->bgu + ng, (size_t)ng * 2, read_flags, NULL, 0) ||
+        coli_package_read_range_ex(pkg, erec, ei.matrices[di].weight_offset,
+                                   s->bd, (size_t)nd * 2, read_flags, NULL, 0)) {
         fprintf(stderr, "qwen coli: read expert (%d,%d) failed\n", layer, eid); exit(1);
     }
 }
@@ -1251,6 +1504,57 @@ static void slot_alloc_bf16(Slot *s, int64_t ng, int64_t nd){
     s->fmt = 16;
 }
 
+static void slot_alloc_mxfp4(Slot *s, const ColiMxfp4ExpertLayout *layout){
+    if (s->mxg) return;
+
+    /* colic currently emits the six executable regions almost contiguously
+     * (16-byte alignment only). Preserve that physical layout in RAM so one
+     * pread can populate the whole expert and one Metal registration covers
+     * every interior pointer. Keep a conservative padding guard so arbitrary
+     * valid COLIEXPT records still use the generic two-slab/six-read path. */
+    if (layout->record_span_bytes >= layout->resident_bytes &&
+        layout->record_span_bytes - layout->resident_bytes <= 4096) {
+        size_t span_alloc = moe_slab_bytes(layout->record_span_bytes);
+        s->mxbase = moe_slab_alloc(span_alloc);
+        s->mxg  = s->mxbase + layout->gate_weight_span_offset;
+        s->mxgs = s->mxbase + layout->gate_scale_span_offset;
+        s->mxu  = s->mxbase + layout->up_weight_span_offset;
+        s->mxus = s->mxbase + layout->up_scale_span_offset;
+        s->mxd  = s->mxbase + layout->down_weight_span_offset;
+        s->mxds = s->mxbase + layout->down_scale_span_offset;
+        s->pinned = 0;
+        s->fmt = 7;
+#ifdef COLI_METAL
+        if (g_metal_compute) coli_metal_register(s->mxbase, span_alloc);
+#endif
+        return;
+    }
+
+    size_t weight_bytes = 0, scale_bytes = 0;
+    if (!size_add_ok(layout->gate_weight_bytes, layout->up_weight_bytes, &weight_bytes) ||
+        !size_add_ok(weight_bytes, layout->down_weight_bytes, &weight_bytes) ||
+        !size_add_ok(layout->gate_scale_bytes, layout->up_scale_bytes, &scale_bytes) ||
+        !size_add_ok(scale_bytes, layout->down_scale_bytes, &scale_bytes)) {
+        fprintf(stderr, "expert MXFP4 allocation overflows\n"); exit(1);
+    }
+    size_t weight_alloc = moe_slab_bytes(weight_bytes);
+    size_t scale_alloc = moe_slab_bytes(scale_bytes);
+    s->mxg = moe_slab_alloc(weight_alloc);
+    s->mxgs = moe_slab_alloc(scale_alloc);
+    s->mxu = s->mxg + layout->gate_weight_bytes;
+    s->mxd = s->mxu + layout->up_weight_bytes;
+    s->mxus = s->mxgs + layout->gate_scale_bytes;
+    s->mxds = s->mxus + layout->up_scale_bytes;
+    s->pinned = 0;
+    s->fmt = 7;
+#ifdef COLI_METAL
+    if (g_metal_compute) {
+        coli_metal_register(s->mxg, weight_alloc);
+        coli_metal_register(s->mxgs, scale_alloc);
+    }
+#endif
+}
+
 static void slot_alloc_q8(Model *m, Slot *s){
     if (s->g) return;
     Cfg *c = &m->c;
@@ -1302,6 +1606,7 @@ static void slot_alloc_packed(Model *m, Slot *s, int fmt){
 }
 
 static void load_expert(Model *m, int layer, int eid, Slot *s){
+    m->prof_expert_loads++;
     if (coli_mode) { load_expert_coli(m, layer, eid, s); return; }
     char nm[512], qsnm[512];
     Cfg *cc = &m->c;
@@ -1951,7 +2256,19 @@ static void expert_wait_ready(Model *m, Slot *s){
 /* one expert applied to one token, result written into acc (caller zeroes) */
 static void expert_apply(Model *m, Slot *s, const float *x, float *acc){
     Cfg *c = &m->c; int I = c->moe_inter, D = c->hidden;
-    if (s->fmt == 4 || s->fmt == 5) {
+    if (s->fmt == 7) {
+#ifdef COLI_CUDA
+        if (g_cuda_compute && coli_cuda_expert_mlp_mxfp4(acc, x,
+                s->mxg, s->mxgs, s->mxu, s->mxus, s->mxd, s->mxds,
+                1, D, I)) return;
+#endif
+        float *gate = falloc(I), *up = falloc(I), *h = falloc(I), *y = falloc(D);
+        coli_mxfp4_swiglu_expert(acc, x,
+                                 s->mxg, s->mxgs, s->mxu, s->mxus,
+                                 s->mxd, s->mxds, 1, D, I, 1.0f,
+                                 gate, up, h, y);
+        free(gate); free(up); free(h); free(y);
+    } else if (s->fmt == 4 || s->fmt == 5) {
         /* packed experts: i4-grouped (2 vals/byte, 64-group scales) or
          * int3-g64 (24B/64-group). Both stream from disk exactly like int8. */
         float *gate = falloc(I), *up = falloc(I);
@@ -2031,6 +2348,7 @@ static void expert_prefetch_next_early(Model *m, int layer, int nr){
 
 static void moe_token(Model *m, Layer *l, int layer, const float *x, float *out){
     Cfg *c = &m->c; int E = c->n_experts, K = c->topk, D = c->hidden;
+    m->prof_expert_requests += (uint64_t)K;
     float *logits = falloc(E);
     wt_mul(logits, x, &l->router, 1, E, D);
     softmax_row(logits, E);
@@ -2083,7 +2401,24 @@ static void moe_token(Model *m, Layer *l, int layer, const float *x, float *out)
     if (g_metal_compute) {
         int fmt0 = slots[0]->fmt, unif = 1;
         for (int i = 1; i < K; i++) if (slots[i]->fmt != fmt0) { unif = 0; break; }
-        if (unif && (fmt0 == 4 || fmt0 == 8)) {
+        if (unif && fmt0 == 7 && K <= 64) {
+            for (int i = 0; i < K; i++) expert_wait_ready(m, slots[i]);
+            const void *gp[64], *up[64], *dp[64];
+            const uint8_t *gsp[64], *usp[64], *dsp[64];
+            int xoff[64], nr[64], rows[64]; float rw[64];
+            float *xg = falloc((int64_t)K * D);
+            for (int i = 0; i < K; i++) {
+                Slot *s = slots[i];
+                gp[i] = s->mxg; up[i] = s->mxu; dp[i] = s->mxd;
+                gsp[i] = s->mxgs; usp[i] = s->mxus; dsp[i] = s->mxds;
+                memcpy(xg + (int64_t)i * D, x, (size_t)D * sizeof(float));
+                xoff[i] = i; nr[i] = 1; rows[i] = 0; rw[i] = w[i];
+            }
+            gpu_ok = coli_metal_moe_block_mxfp4(K, D, c->moe_inter,
+                                                 gp, up, dp, gsp, usp, dsp,
+                                                 xg, xoff, nr, rows, rw, acc, 1);
+            free(xg);
+        } else if (unif && (fmt0 == 4 || fmt0 == 8)) {
             for (int i = 0; i < K; i++) expert_wait_ready(m, slots[i]);   /* MIO async loads must land before GPU reads them */
             const void *gp[64], *up[64], *dp[64];
             const float *gsp[64], *usp[64], *dsp[64];
@@ -2377,15 +2712,18 @@ static void arena_free(ArenaSlot *a, int n){
     for (int i = 0; i < n; i++) {
         Slot *s = &a[i].s;
 #ifdef COLI_METAL
-        if (g_metal_compute) { coli_metal_unregister(s->g); coli_metal_unregister(s->g4); coli_metal_unregister(s->gs); coli_metal_unregister(s->g4s); }
+        if (g_metal_compute) { coli_metal_unregister(s->g); coli_metal_unregister(s->g4); coli_metal_unregister(s->gs); coli_metal_unregister(s->g4s); if (s->mxbase) coli_metal_unregister(s->mxbase); else { coli_metal_unregister(s->mxg); coli_metal_unregister(s->mxgs); } }
 #endif
         free(s->gu); free(s->bgu); free(s->g); free(s->g4); free(s->g4s);
+        if (s->mxbase) free(s->mxbase); else { free(s->mxg); free(s->mxgs); }
         s->gu = NULL; s->bgu = NULL; s->bd = NULL; s->g = NULL; s->g4 = NULL; s->g4s = NULL;
+        s->mxg = s->mxu = s->mxd = NULL; s->mxgs = s->mxus = s->mxds = NULL; s->mxbase = NULL;
     }
 }
 
 static void moe_batch(Model *m, Layer *l, int layer, const float *xs, int C, float *out){
     Cfg *c = &m->c; int E = c->n_experts, K = c->topk, D = c->hidden;
+    m->prof_expert_requests += (uint64_t)C * (uint64_t)K;
     double t0 = now_s();
     /* router over the whole chunk */
     float *rlogits = falloc((int64_t)C * E);
@@ -2497,7 +2835,22 @@ static void moe_batch(Model *m, Layer *l, int layer, const float *xs, int C, flo
                     memcpy(xscratch + (int64_t)st * D, xs + (int64_t)j * D, (size_t)D * sizeof(float));
                     st++;
                 }
-            if (s->fmt == 4 || s->fmt == 5) {
+            if (s->fmt == 7) {
+#ifdef COLI_CUDA
+                if (g_cuda_compute && coli_cuda_expert_mlp_mxfp4(yscratch, xscratch,
+                        s->mxg, s->mxgs, s->mxu, s->mxus, s->mxd, s->mxds,
+                        st, D, I)) goto qwen_mxfp4_batch_done;
+#endif
+                float *gate = falloc((int64_t)st * I), *up = falloc((int64_t)st * I);
+                float *h = falloc((int64_t)st * I);
+                coli_mxfp4_matmul(gate, xscratch, s->mxg, s->mxgs, st, D, I);
+                coli_mxfp4_matmul(up, xscratch, s->mxu, s->mxus, st, D, I);
+                for (int r = 0; r < st; r++)
+                    for (int i = 0; i < I; i++)
+                        h[(int64_t)r * I + i] = silu(gate[(int64_t)r * I + i]) * up[(int64_t)r * I + i];
+                coli_mxfp4_matmul(yscratch, h, s->mxd, s->mxds, st, I, D);
+                free(gate); free(up); free(h);
+            } else if (s->fmt == 4 || s->fmt == 5) {
                 float *gate = falloc((int64_t)st * I), *up = falloc((int64_t)st * I);
                 if (s->fmt == 4) {
                     matmul_i4_grouped(gate, xscratch, s->g4, s->g4s, st, D, I, 64);
@@ -2539,6 +2892,9 @@ static void moe_batch(Model *m, Layer *l, int layer, const float *xs, int C, flo
                 matmul(yscratch, h, s->d, st, D, I);
                 free(gu); free(h);
             }
+#ifdef COLI_CUDA
+qwen_mxfp4_batch_done:
+#endif
             /* store this expert's routed rows at their (token, topk) slots */
             int si = 0;
             for (int j = 0; j < C; j++) for (int k = 0; k < K; k++)
@@ -2573,9 +2929,10 @@ static void moe_batch(Model *m, Layer *l, int layer, const float *xs, int C, flo
             Slot *s = &wave[a];
             if (s->mio_resident) continue;
 #ifdef COLI_METAL
-            if (g_metal_compute) { coli_metal_unregister(s->g4); coli_metal_unregister(s->g4s); }
+            if (g_metal_compute) { coli_metal_unregister(s->g4); coli_metal_unregister(s->g4s); if (s->mxbase) coli_metal_unregister(s->mxbase); else { coli_metal_unregister(s->mxg); coli_metal_unregister(s->mxgs); } }
 #endif
             free(s->gu); free(s->bgu); free(s->g); free(s->gs); free(s->g4); free(s->g4s);
+            if (s->mxbase) free(s->mxbase); else { free(s->mxg); free(s->mxgs); }
         }
     }
     free(uniq); free(eid_slot); free(wave); free(xscratch); free(yscratch);
@@ -2648,7 +3005,9 @@ static float *step_batched(Model *m, const int *ids, int n, int pos_base){
     }
     rmsnorm_row(normed, hbuf + (int64_t)(last_cj - 1) * D, m->final_norm, D, c->eps);
     float *logits = falloc(c->vocab);
+    double qhead_began = qprof_head_begin();
     wt_mul(logits, normed, &m->lm_head, 1, c->vocab, D);
+    qprof_head_end(m, qhead_began);
     free(hbuf); free(normed);
     return logits;
 }
@@ -2739,7 +3098,9 @@ static float *step(Model *m, const int *ids, int n, int pos_base){
     float *normed = falloc(D);
     rmsnorm_row(normed, h, m->final_norm, D, c->eps);
     float *logits = falloc(c->vocab);
+    double qhead_began = qprof_head_begin();
     wt_mul(logits, normed, &m->lm_head, 1, c->vocab, D);
+    qprof_head_end(m, qhead_began);
     free(h); free(normed);
     return logits;
 }
@@ -2940,14 +3301,19 @@ static int mode_greedy(Model *m){
     if (np < 1 || !ids_in_vocab(&m->c, ids, np, "QWENMOE_PROMPT_IDS")) {
         fprintf(stderr, "invalid QWENMOE_PROMPT_IDS\n"); free(ids); return 1;
     }
+    qprof_request_begin(m);
     float *logits = step(m, ids, np, 0);
+    qprof_prefill_end(m, np);
+    int qprof_gen = 0;
     for (int s = 0; s < max_new; s++) {
         int best = qwen_pick_token(m, logits, -1);
         logits_free(&logits);
         if (best == m->c.eos) break;
         printf("ID %d\n", best);
+        qprof_gen++;
         logits = step(m, &best, 1, np + s);
     }
+    qprof_request_end(m, np, qprof_gen);
     logits_free(&logits);
     free(ids);
     return 0;
@@ -3053,7 +3419,10 @@ static int mode_chat(Model *m, Tok *T){
             printf("[context full: session restarted]\n");
             if (sys_n > 0) { step(m, sys_ids, sys_n, 0); hpos = sys_n; }
         }
+        qprof_request_begin(m);
         float *logits = step(m, ids, np, hpos);
+        qprof_prefill_end(m, np);
+        int qprof_gen = 0;
         memcpy(hist + hpos, ids, (size_t)np * sizeof(int));
         hpos += np;
         char buf[1024];
@@ -3071,12 +3440,14 @@ static int mode_chat(Model *m, Tok *T){
             }
             int pos = hpos;
             hist[hpos++] = nt;
+            qprof_gen++;
             int nb = tok_decode(T, &nt, 1, buf, sizeof(buf) - 1);
             buf[nb] = 0;
             fwrite(buf, 1, (size_t)nb, stdout);
             fflush(stdout);
             logits = step(m, &nt, 1, pos);
         }
+        qprof_request_end(m, np, qprof_gen);
         logits_free(&logits);
         printf("\n");
     }
@@ -3144,7 +3515,7 @@ static void serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
         fflush(stdout); free(ids); return;
     }
     g_temp = q->temp; g_nuc = q->top_p;
-    m->t_attn = m->t_gdn = m->t_moe = m->t_expio = 0;
+    qprof_request_begin(m);
     double t0 = now_s();
     uint64_t h0 = m->hits, m0 = m->miss;
     /* ACCEPT before prefill: the server commits the streaming 200 here and,
@@ -3154,6 +3525,7 @@ static void serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
     printf("ACCEPT %s %d\n", q->id, np); fflush(stdout);
     request_state_reset(m);
     float *logit = step(m, ids, np, 0);
+    qprof_prefill_end(m, np);
     int hist_len = np, gen = 0, limited = 1, cancelled = 0;
     char buf[512];
     for (int s = 0; s < q->max_tok && !cancelled; s++) {
@@ -3174,6 +3546,7 @@ static void serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
         logit = step(m, &nt, 1, hist_len - 1);
     }
     logits_free(&logit);
+    qprof_request_end(m, np, gen);
     double dt = now_s() - t0;
     double tot = (double)(m->hits - h0 + m->miss - m0);
     printf("DONE %s STAT %d %.3f %.1f %.2f %d %d\n", q->id, gen,
@@ -3213,16 +3586,53 @@ static void serve_hwinfo(Model *m) {
     fflush(stdout);
 }
 
+static uint64_t qwen_slot_resident_bytes(const Cfg *c, const Slot *s) {
+    const uint64_t D = (uint64_t)c->hidden;
+    const uint64_t I = (uint64_t)c->moe_inter;
+    const uint64_t params = 3u * D * I;
+    switch (s->fmt) {
+        case 0:  return params * sizeof(float);
+        case 16: return params * sizeof(uint16_t);
+        case 8:  return params + (2u * I + D) * sizeof(float);
+        case 4: {
+            const uint64_t weights = 2u * I * ((D + 1u) / 2u) + D * ((I + 1u) / 2u);
+            const uint64_t scales = (2u * I * ((D + 63u) / 64u) +
+                                     D * ((I + 63u) / 64u)) * sizeof(float);
+            return weights + scales;
+        }
+        case 5: {
+            const uint64_t weights = 2u * I * (uint64_t)qm_i3_rowbytes((int)D) +
+                                     D * (uint64_t)qm_i3_rowbytes((int)I);
+            const uint64_t scales = (2u * I * ((D + 63u) / 64u) +
+                                     D * ((I + 63u) / 64u)) * sizeof(float);
+            return weights + scales;
+        }
+        case 7: {
+            const uint64_t weights = 2u * I * ((D + 1u) / 2u) + D * ((I + 1u) / 2u);
+            const uint64_t scales = 2u * I * ((D + 31u) / 32u) +
+                                    D * ((I + 31u) / 32u);
+            return weights + scales;
+        }
+        default: return 0;
+    }
+}
+
 static void serve_tiers_emap(Model *m) {
     Cfg *c = &m->c; int E = c->n_experts;
     int filled = 0;
-    for (int i = 0; i < c->n_layers; i++) filled += m->cache[i].n;
-    int64_t I = c->moe_inter, D = c->hidden;
-    /* per-expert resident bytes: int8 gate/up/down + one f32 scale per row */
-    int64_t slotb = coli_mode ? 3*I*D*2 : 3*I*D + (2*I+D)*4;
+    uint64_t ram_bytes = 0;
+    for (int i = 0; i < c->n_layers; i++) {
+        LCache *lc = &m->cache[i];
+        for (int z = 0; z < lc->n; z++) {
+            Slot *slot = &lc->slots[z];
+            if (slot->eid < 0) continue; /* in-flight loads are not published residency */
+            filled++;
+            ram_bytes += qwen_slot_resident_bytes(c, slot);
+        }
+    }
     int64_t total_experts = (int64_t)c->n_layers * E;
     printf("TIERS 0 %d %lld 0.00 %.2f\n", filled,
-           (long long)(total_experts - filled), filled*(double)slotb/1e9);
+           (long long)(total_experts - filled), (double)ram_bytes/1e9);
     /* EMAP: 1 byte/expert hex — tier(2b: 0=disk 1=RAM)<<6 | heat(6b: log2 usage) */
     size_t hex_n = size_mul_or_die((size_t)c->n_layers, E, "expert map");
     hex_n = size_mul_or_die(hex_n, 2, "expert map hex");
@@ -3420,6 +3830,7 @@ int main(int argc, char **argv){
     if (g_arena_wave < 8 || g_arena_wave > QWEN_ARENA_CAP_MAX) g_arena_wave = QWEN_ARENA_CAP;
     g_dense_drop  = getenv("DENSE_KEEP_PAGES") ? 0 : 1;
 
+    qprof_reset();
     Model m; model_init(&m, snap, cap);
     Tok T;
     char tokpath[2048];
@@ -3454,6 +3865,23 @@ int main(int argc, char **argv){
     }
 
     int rc = 0;
+#ifdef COLI_CUDA
+    /* A direct CUDA/HIP build is expected to use its GPU. Unlike Metal, which
+     * is an optional compute experiment in the default macOS binary, `make
+     * qwen_moe CUDA=1` opts into this backend explicitly. Set
+     * QWEN_CUDA_COMPUTE=0 for the CPU fallback or QWEN_CUDA_DEVICE=N to pick
+     * a device. Only routed MXFP4 experts are offloaded in this first slice. */
+    g_cuda_compute = getenv("QWEN_CUDA_COMPUTE") ? atoi(getenv("QWEN_CUDA_COMPUTE")) : 1;
+    if (g_cuda_compute) {
+        int dev = getenv("QWEN_CUDA_DEVICE") ? atoi(getenv("QWEN_CUDA_DEVICE")) : 0;
+        if (!coli_cuda_init(&dev, 1)) {
+            fprintf(stderr, "qwen_moe: CUDA/HIP unavailable — using CPU MoE\n");
+            g_cuda_compute = 0;
+        } else {
+            fprintf(stderr, "[qwen] MXFP4 routed experts on GPU device %d\n", dev);
+        }
+    }
+#endif
 #ifdef COLI_METAL
     /* QWEN_METAL_COMPUTE=1: Apple-GPU batched MoE matmuls (opt-in; CPU
      * kernels stay the default and the fallback). Init must happen AFTER
@@ -3492,6 +3920,7 @@ int main(int argc, char **argv){
         }
     }
 #endif
+    qprof_startup_end(&m);
     const char *mode = getenv("QWENMOE_MODE");
     if (mode && !strcmp(mode, "teacher"))      rc = mode_teacher(&m);
     else if (mode && !strcmp(mode, "greedy"))  rc = mode_greedy(&m);
@@ -3512,6 +3941,9 @@ int main(int argc, char **argv){
                 st.latency_samples ? st.total_latency_s * 1000.0 / (double)st.latency_samples : 0.0);
         metalio_shutdown();
     }
+#endif
+#ifdef COLI_CUDA
+    if (g_cuda_compute) coli_cuda_shutdown();
 #endif
     tok_free(&T);
     return rc;

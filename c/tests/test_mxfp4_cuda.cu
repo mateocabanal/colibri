@@ -131,6 +131,39 @@ static void all_codes(void) {
     else printf("  ok   all 16 e2m1 codes decode exactly (cpu == gpu == spec)\n");
 }
 
+
+static void fused_expert_case(void) {
+    const int S=3,D=64,I=32;
+    const int grb=(D+1)/2, drb=(I+1)/2, gng=(D+31)/32, dng=(I+31)/32;
+    uint8_t *g=(uint8_t*)malloc((size_t)I*grb), *u=(uint8_t*)malloc((size_t)I*grb);
+    uint8_t *d=(uint8_t*)malloc((size_t)D*drb);
+    uint8_t *gs=(uint8_t*)malloc((size_t)I*gng), *us=(uint8_t*)malloc((size_t)I*gng);
+    uint8_t *ds=(uint8_t*)malloc((size_t)D*dng);
+    float *x=(float*)malloc((size_t)S*D*sizeof(float));
+    float *gate=(float*)malloc((size_t)S*I*sizeof(float));
+    float *upv=(float*)malloc((size_t)S*I*sizeof(float));
+    float *h=(float*)malloc((size_t)S*I*sizeof(float));
+    float *cpu=(float*)malloc((size_t)S*D*sizeof(float));
+    float *gpu=(float*)malloc((size_t)S*D*sizeof(float));
+    if(!g||!u||!d||!gs||!us||!ds||!x||!gate||!upv||!h||!cpu||!gpu){printf("  FAIL fused expert oom\n");fails++;goto done;}
+    for(int n=0;n<I*grb;n++){g[n]=(uint8_t)rnd();u[n]=(uint8_t)rnd();}
+    for(int n=0;n<D*drb;n++)d[n]=(uint8_t)rnd();
+    for(int n=0;n<I*gng;n++){gs[n]=(uint8_t)(122+rnd()%11);us[n]=(uint8_t)(122+rnd()%11);}
+    for(int n=0;n<D*dng;n++)ds[n]=(uint8_t)(122+rnd()%11);
+    for(int n=0;n<S*D;n++)x[n]=((float)(rnd()%2001)-1000.f)/2000.f;
+    mxfp4_ref(gate,x,g,gs,S,D,I); mxfp4_ref(upv,x,u,us,S,D,I);
+    for(int n=0;n<S*I;n++)h[n]=(gate[n]/(1.f+expf(-gate[n])))*upv[n];
+    mxfp4_ref(cpu,h,d,ds,S,I,D);
+    if(!coli_cuda_expert_mlp_mxfp4(gpu,x,g,gs,u,us,d,ds,S,D,I)){
+        printf("  FAIL fused MXFP4 expert CUDA path refused\n");fails++;goto done;
+    }
+    { double worst=0; int bad=0; for(int n=0;n<S*D;n++){double den=fabs(cpu[n])>1e-6?fabs(cpu[n]):1e-6;double r=fabs((double)cpu[n]-gpu[n])/den;if(r>worst)worst=r;if(r>3e-4)bad++;}
+      if(bad){printf("  FAIL fused MXFP4 expert %d/%d differ worst rel %.3e\n",bad,S*D,worst);fails++;}
+      else printf("  ok   fused MXFP4 SwiGLU expert      S=%d D=%d I=%d worst rel %.2e\n",S,D,I,worst); }
+done:
+    free(g);free(u);free(d);free(gs);free(us);free(ds);free(x);free(gate);free(upv);free(h);free(cpu);free(gpu);
+}
+
 int main(void) {
     int ndev = 0;
     if (cudaGetDeviceCount(&ndev) != cudaSuccess || ndev < 1) {
@@ -144,6 +177,7 @@ int main(void) {
     }
 
     all_codes();
+    fused_expert_case();
     one_case("decode + matmul",            1,   64,   32, -1);
     one_case("multi-row batch",            4,  128,   64, -1);
     one_case("wide rows (many groups)",    1, 2048,   16, -1);

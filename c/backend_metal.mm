@@ -5,6 +5,7 @@
 #include "backend_metal.h"
 #include <cstring>
 #include <vector>
+#include <map>
 #include <mutex>
 
 // ---- shader: general quantized GEMV, one threadgroup per output element (o,si) ----
@@ -247,13 +248,23 @@ kernel void moe_gemv(device const ulong* waddr [[buffer(0)]], device const ulong
       acc+=dot(w0*float4(sr[g0],sr[g1],sr[g2],sr[g3]),x4[2*c])
           +dot(w1*float4(sr[g4],sr[g5],sr[g6],sr[g7]),x4[2*c+1]); }
     for(int i=K8*8+slane;i<K;i+=32){ uchar b=w[i>>1]; int v=(i&1)?(b>>4):(b&0xF); acc+=float(v-8)*xr[i]*sr[i/qgs]; }
+  } else if (fmt == 7) {                            // MXFP4 E2M1 + raw E8M0/32 columns
+    int rb=(K+1)/2, ng=(K+31)/32;
+    device const uchar* w=(device const uchar*)(waddr[e])+(long)o*rb;
+    device const uchar* sr=(device const uchar*)(saddr[e])+(long)o*ng;
+    const float mx4[16]={0.f,.5f,1.f,1.5f,2.f,3.f,4.f,6.f,-0.f,-.5f,-1.f,-1.5f,-2.f,-3.f,-4.f,-6.f};
+    for(int i=slane*2;i<K;i+=64){
+      uchar b=w[i>>1]; float sv=as_type<float>((uint)sr[i/32]<<23);
+      acc += mx4[b&0xFu]*xr[i]*sv;
+      if(i+1<K) acc += mx4[b>>4]*xr[i+1]*sv;
+    }
   } else { device const char* w=(device const char*)(waddr[e])+(long)o*K;
     device const char4* w4=(device const char4*)w;
     for(int c=slane;c<K8;c+=32) acc+=dot(float4(w4[2*c]),x4[2*c])+dot(float4(w4[2*c+1]),x4[2*c+1]);
     for(int i=K8*8+slane;i<K;i+=32) acc+=float(w[i])*xr[i];
   }
   acc=simd_sum(acc);
-  if(slane==0) yout[row] = (fmt==4 || fmt==5 || fmt==6) ? acc : acc*sc[o];   // fmt4 grouped / fmt6 in-block scales folded; fmt5 none
+  if(slane==0) yout[row] = (fmt==4 || fmt==5 || fmt==6 || fmt==7) ? acc : acc*sc[o]; // grouped/in-block/MXFP4 scales folded; fmt5 none
 }
 
 // fmt=6 activation rotation for the GPU-resident down-projection input: one FWHT
@@ -554,8 +565,21 @@ extern "C" void coli_metal_attn_lat(double *ksched, double *gsched){
 
 // Registry of page-aligned host slabs wrapped zero-copy for the batched MoE path.
 struct Slab { void *base; size_t len; id<MTLBuffer> buf; };
-static std::vector<Slab> g_slabs;
+/* Ordered by base address: exact register/unregister and predecessor interval
+ * lookup are O(log N), rather than scanning every resident expert slab. */
+static std::map<uintptr_t, Slab> g_slabs;
 static std::mutex g_slab_mtx;   // expert_load registers slabs from parallel OpenMP threads
+
+static id<MTLBuffer> slab_resolve_locked(uintptr_t u, uint64_t *addr) {
+  auto it = g_slabs.upper_bound(u);
+  if (it == g_slabs.begin()) return nil;
+  --it;
+  uintptr_t base = it->first;
+  const Slab &s = it->second;
+  if ((u - base) >= s.len) return nil;
+  if (addr) *addr = (uint64_t)[s.buf gpuAddress] + (u - base);
+  return s.buf;
+}
 
 // ---- E5 experiment: COLI_METAL_RESSET=1 -- one persistent MTLResidencySet attached to
 // g_queue (macOS 15+) replaces moe_submit's per-command-buffer useResource: loop over
@@ -763,9 +787,10 @@ extern "C" void coli_metal_register(void *base, size_t len) {
   id<MTLBuffer> old = nil;   // E5: replaced wrapper on re-register of a live base (defensive)
   {
     std::lock_guard<std::mutex> lk(g_slab_mtx);   // called from parallel expert_load threads
-    bool found = false;
-    for (auto &s : g_slabs) if (s.base == base) { old = s.buf; s.len = len; s.buf = b; found = true; break; }
-    if (!found) g_slabs.push_back({base, len, b});
+    uintptr_t key = (uintptr_t)base;
+    auto it = g_slabs.find(key);
+    if (it != g_slabs.end()) { old = it->second.buf; it->second = {base, len, b}; }
+    else g_slabs.emplace(key, Slab{base, len, b});
   }
   // E5, outside g_slab_mtx (no Metal call under the slab lock), before returning. Invariant
   // defended: set membership mirrors g_slabs exactly -- a re-register of a live base must
@@ -779,18 +804,15 @@ extern "C" void coli_metal_unregister(void *base) {
   id<MTLBuffer> b = nil;
   {
     std::lock_guard<std::mutex> lk(g_slab_mtx);
-    for (size_t i=0;i<g_slabs.size();i++) if (g_slabs[i].base==base) {
-      b = g_slabs[i].buf; g_slabs[i].buf=nil; g_slabs.erase(g_slabs.begin()+i); break; }
+    auto it = g_slabs.find((uintptr_t)base);
+    if (it != g_slabs.end()) { b = it->second.buf; it->second.buf=nil; g_slabs.erase(it); }
   }
   if (b) resset_remove(b);   // E5: outside g_slab_mtx; commits before the caller frees base
 }
 // Resolve a host pointer inside a registered slab to (buffer, gpuAddress). Returns nil if unknown.
 static id<MTLBuffer> resolve(const void *p, uint64_t *addr) {
   std::lock_guard<std::mutex> lk(g_slab_mtx);
-  uintptr_t u=(uintptr_t)p;
-  for (auto &s : g_slabs) { uintptr_t b=(uintptr_t)s.base;
-    if (u>=b && u<b+s.len) { *addr = (uint64_t)[s.buf gpuAddress] + (u-b); return s.buf; } }
-  return nil;
+  return slab_resolve_locked((uintptr_t)p, addr);
 }
 
 // True if p lies inside a currently-registered slab. The shim uses this to
@@ -798,10 +820,7 @@ static id<MTLBuffer> resolve(const void *p, uint64_t *addr) {
 // a key whose slab vanished must not serve a stale MTLBuffer wrapper.
 extern "C" int coli_metal_ptr_registered(const void *p) {
   std::lock_guard<std::mutex> lk(g_slab_mtx);
-  uintptr_t u=(uintptr_t)p;
-  for (auto &s : g_slabs)
-    if (u>=(uintptr_t)s.base && u<(uintptr_t)s.base+s.len) return 1;
-  return 0;
+  return slab_resolve_locked((uintptr_t)p, NULL) != nil;
 }
 
 // Keep-alive spinner (COLI_METAL_SPIN=1): keeps trivial GPU work in flight so the GPU
@@ -1305,10 +1324,10 @@ extern "C" size_t coli_metal_tensor_bytes(const ColiMetalTensor *t) { return t ?
 // unresolved slab / bad fmt (caller falls back to CPU).
 static id<MTLCommandBuffer> moe_submit(int nb, int D, int Iinter, int fmt, int qgs,
                          const void *const *g, const void *const *u, const void *const *d,
-                         const float *const *gs, const float *const *us, const float *const *ds,
+                         const void *const *gs, const void *const *us, const void *const *ds,
                          const float *xg, const int *xoff, const int *nr, int R,
                          id<MTLBuffer> xg_buf, id<MTLBuffer> gg_buf, id<MTLBuffer> uu_buf, id<MTLBuffer> hh_buf) {
-  if (!g_dev || (fmt != 1 && fmt != 2 && fmt != 4 && fmt != 5 && fmt != 6)) return nil;
+  if (!g_dev || (fmt != 1 && fmt != 2 && fmt != 4 && fmt != 5 && fmt != 6 && fmt != 7)) return nil;
   if (fmt == 6) {   /* e8 kernel assumes clean block tiling, and every FWHT tile of the
                      * down input (CPU tiling rule, e8_rot_rows) must fit threadgroup mem */
     if ((D & 255) || (Iinter & 31)) return nil;
@@ -1438,7 +1457,32 @@ extern "C" int coli_metal_moe_block(int nb, int D, int Iinter, int fmt, int qgs,
     g_gg = ensure(g_gg,&g_gg_cap,(size_t)R*Iinter*4);
     g_uu = ensure(g_uu,&g_uu_cap,(size_t)R*Iinter*4);
     g_hh = ensure(g_hh,&g_hh_cap,(size_t)R*D*4);
-    id<MTLCommandBuffer> cb = moe_submit(nb,D,Iinter,fmt,qgs,g,u,d,gs,us,ds,xg,xoff,nr,R,g_xg,g_gg,g_uu,g_hh);
+    id<MTLCommandBuffer> cb = moe_submit(nb,D,Iinter,fmt,qgs,g,u,d,
+        reinterpret_cast<const void *const *>(gs), reinterpret_cast<const void *const *>(us),
+        reinterpret_cast<const void *const *>(ds), xg,xoff,nr,R,g_xg,g_gg,g_uu,g_hh);
+    if (!cb) return 0;
+    return moe_finish(cb,g_hh,nb,R,D,rows,rw,out);
+  }
+}
+
+
+extern "C" int coli_metal_moe_block_mxfp4(int nb, int D, int Iinter,
+                         const void *const *g, const void *const *u, const void *const *d,
+                         const uint8_t *const *gs, const uint8_t *const *us,
+                         const uint8_t *const *ds,
+                         const float *xg, const int *xoff, const int *nr,
+                         const int *rows, const float *rw, float *out, int S) {
+  (void)S;
+  @autoreleasepool {
+    int R = 0; for (int e=0;e<nb;e++) R += nr[e];
+    if (R == 0) return 1;
+    g_xg = ensure(g_xg,&g_xg_cap,(size_t)R*D*4);
+    g_gg = ensure(g_gg,&g_gg_cap,(size_t)R*Iinter*4);
+    g_uu = ensure(g_uu,&g_uu_cap,(size_t)R*Iinter*4);
+    g_hh = ensure(g_hh,&g_hh_cap,(size_t)R*D*4);
+    id<MTLCommandBuffer> cb = moe_submit(nb,D,Iinter,7,0,g,u,d,
+        reinterpret_cast<const void *const *>(gs), reinterpret_cast<const void *const *>(us),
+        reinterpret_cast<const void *const *>(ds), xg,xoff,nr,R,g_xg,g_gg,g_uu,g_hh);
     if (!cb) return 0;
     return moe_finish(cb,g_hh,nb,R,D,rows,rw,out);
   }
@@ -1463,7 +1507,9 @@ extern "C" ColiMetalMoeHandle* coli_metal_moe_block_begin(int nb, int D, int Iin
     id<MTLBuffer> bgg=[g_dev newBufferWithLength:(size_t)R*Iinter*4 options:g_res_opts];
     id<MTLBuffer> buu=[g_dev newBufferWithLength:(size_t)R*Iinter*4 options:g_res_opts];
     id<MTLBuffer> bhh=[g_dev newBufferWithLength:(size_t)R*D*4 options:g_res_opts];
-    id<MTLCommandBuffer> cb = moe_submit(nb,D,Iinter,fmt,qgs,g,u,d,gs,us,ds,xg,xoff,nr,R,bxg,bgg,buu,bhh);
+    id<MTLCommandBuffer> cb = moe_submit(nb,D,Iinter,fmt,qgs,g,u,d,
+        reinterpret_cast<const void *const *>(gs), reinterpret_cast<const void *const *>(us),
+        reinterpret_cast<const void *const *>(ds), xg,xoff,nr,R,bxg,bgg,buu,bhh);
     if (!cb) return nullptr;
     ColiMetalMoeHandle *h = new ColiMetalMoeHandle();
     h->cb=cb; h->hh=bhh; h->rows.assign(rows,rows+R); h->rwv.assign(rw,rw+R);

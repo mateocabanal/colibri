@@ -133,7 +133,7 @@ V4_SPLIT_OBJS = COLI_V4_UNIT_RESOURCE_PLAN.o \
 	COLI_V4_UNIT_EXPERT_STORE_AUTO.o \
 	$(V4_TRACE_SPLIT_OBJS)
 V4_AMALGAMATED_OBJS = $(filter-out $(V4_SPLIT_OBJS),$(sort $(TARGET_OBJS) $(TEST_UNIT_OBJS)))
-V4_COLI_OBJS = coli_v4_expert_store.o coli_v4_static.o coli_executor.o coli_format.o $(V4_TRACE_EXEC_OBJS)
+V4_COLI_OBJS = coli_v4_expert_store.o coli_v4_static.o coli_executor.o coli_format.o coli_profile_v4.o $(V4_TRACE_EXEC_OBJS)
 V4_OBJS = $(TARGET_OBJS) $(V4_COLI_OBJS) $(V4_METAL_OBJS)
 V4_BUILD_CONFIG = .deepseek-v4-build-config
 
@@ -156,6 +156,10 @@ coli_executor.o: coli_executor.c coli_executor.h coli_format.h
 	$(CC) $(CFLAGS) -c coli_executor.c -o $@
 coli_format.o: coli_format.c coli_format.h compat.h coli_v4_macos_uncached_io.h
 	$(CC) $(CFLAGS) -include coli_v4_macos_uncached_io.h -c coli_format.c -o $@
+coli_profile_v4.o: profile.c profile.h
+	$(CC) $(CFLAGS) -c profile.c -o $@
+COLI_V4_UNIT_PROFILE.o: coli_v4_profile.c profile.h deepseek_v4_internal.h expert_store.h
+	$(CC) $(CFLAGS) -c coli_v4_profile.c -o $@
 coli_v4_expert_execute_trace.o: coli_v4_expert_execute_trace.c deepseek_v4_internal.h expert_store.h tensor.h
 	$(CC) $(CFLAGS) -c coli_v4_expert_execute_trace.c -o $@
 

@@ -198,7 +198,7 @@ static void *read_worker(void *arg) {
 static int test_hand_fixture(void) {
     char dir[128],err[256];ColiPackage*p=NULL;const ColiRecordInfo*r;ColiTensorInfo ti;unsigned char b=0;pthread_t th[4];ReadThread ctx[4];int i;
     CHECK(make_temp(dir)==0);CHECK(install_hand_fixture(dir)==0);CHECK(coli_package_open(&p,dir,err,sizeof(err))==0);CHECK(p!=NULL);CHECK(coli_package_record_count(p)==1);CHECK(strcmp(coli_package_profile(p),"portable-v1")==0);CHECK(strcmp(coli_package_compiler(p),"hand-fixture")==0);
-    r=coli_package_record_by_name(p,"tiny.weight");CHECK(r&&r==coli_package_record_by_id(p,1));CHECK(coli_package_tensor_info(p,r,&ti,err,sizeof(err))==0);CHECK(ti.rank==2&&ti.dims[0]==1&&ti.dims[1]==1&&ti.data_offset==128);CHECK(coli_package_read_range(p,r,128,&b,1,err,sizeof(err))==0&&b==0x2a);CHECK(coli_package_verify_all(p,err,sizeof(err))==0);
+    r=coli_package_record_by_name(p,"tiny.weight");CHECK(r&&r==coli_package_record_by_id(p,1));CHECK(coli_package_tensor_info(p,r,&ti,err,sizeof(err))==0);CHECK(ti.rank==2&&ti.dims[0]==1&&ti.dims[1]==1&&ti.data_offset==128);CHECK(coli_package_read_range(p,r,128,&b,1,err,sizeof(err))==0&&b==0x2a);b=0;CHECK(coli_package_read_range_ex(p,r,128,&b,1,COLI_CSF_READ_UNCACHED,err,sizeof(err))==0&&b==0x2a);CHECK(coli_package_read_range_ex(p,r,128,&b,1,0x80000000u,err,sizeof(err))!=0);CHECK(coli_package_verify_all(p,err,sizeof(err))==0);
     for(i=0;i<4;i++){ctx[i].p=p;ctx[i].r=r;ctx[i].fail=0;CHECK(pthread_create(&th[i],NULL,read_worker,&ctx[i])==0);}for(i=0;i<4;i++){CHECK(pthread_join(th[i],NULL)==0);CHECK(!ctx[i].fail);}coli_package_close(p);cleanup_dir(dir,1);return 0;
 }
 

@@ -26,6 +26,13 @@ int  coli_metal_available(void);
 void coli_metal_stats(size_t *tensor_count, size_t *tensor_bytes);
 int  coli_metal_mem_info(size_t *used_bytes, size_t *total_bytes);
 
+/* Generic cumulative backend timing hooks. Engines opt in at runtime through
+ * their profile adapter; counters stay disabled on the normal hot path. */
+void coli_metal_profile_set_on(int on);
+void coli_metal_profile_reset(void);
+void coli_metal_profile_get(uint64_t *encode_ns, uint64_t *submit_ns,
+                            uint64_t *wait_ns, uint64_t *kernel_ns);
+
 /*
  * y[S,O] = (x[S,I] @ W[O,I]^T) * scale[o]. fmt=4 (grouped int4) instead folds a
  * PER-GROUP scale into the accumulation -- see the shader comment in backend_metal.mm.
@@ -150,6 +157,18 @@ int coli_metal_resset_stats(double *flush_s);
 int coli_metal_moe_block(int nb, int D, int Iinter, int fmt, int qgs,
                          const void *const *g, const void *const *u, const void *const *d,
                          const float *const *gs, const float *const *us, const float *const *ds,
+                         const float *xg, const int *xoff, const int *nr,
+                         const int *rows, const float *rw,
+                         float *out, int S);
+
+/* MXFP4 specialization of the fused routed-expert block. The generic legacy
+ * entry point above keeps float scale pointers for fmt 1/2/4/5/6 callers;
+ * MXFP4's E8M0 scales are raw bytes, so exposing them as float* would encode a
+ * false ABI contract. Internally both paths use format-neutral GPU addresses. */
+int coli_metal_moe_block_mxfp4(int nb, int D, int Iinter,
+                         const void *const *g, const void *const *u, const void *const *d,
+                         const uint8_t *const *gs, const uint8_t *const *us,
+                         const uint8_t *const *ds,
                          const float *xg, const int *xoff, const int *nr,
                          const int *rows, const float *rw,
                          float *out, int S);

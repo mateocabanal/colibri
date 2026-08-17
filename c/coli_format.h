@@ -186,8 +186,22 @@ const char *coli_package_compiler(const ColiPackage *package);
 const uint8_t *coli_package_source_fingerprint(const ColiPackage *package);
 uint32_t coli_package_record_alignment(const ColiPackage *package);
 
+enum {
+    COLI_CSF_READ_DEFAULT = 0,
+    /* Best effort: consume the requested source bytes without retaining them in
+     * the host file cache. On macOS this uses the shard's F_NOCACHE descriptor;
+     * on POSIX systems without a safe unaligned direct-I/O path it reads
+     * normally then advises DONTNEED. Callers must not depend on the hint. */
+    COLI_CSF_READ_UNCACHED = 1u << 0,
+};
+
 /* Reads an exact byte range relative to the top-level record. Range reads are
  * thread-safe: they use pread/compat_pread and no shared seek position. */
+int coli_package_read_range_ex(const ColiPackage *package,
+                               const ColiRecordInfo *record,
+                               uint64_t record_offset, void *destination,
+                               size_t bytes, uint32_t read_flags,
+                               char *error, size_t error_size);
 int coli_package_read_range(const ColiPackage *package,
                             const ColiRecordInfo *record,
                             uint64_t record_offset, void *destination,

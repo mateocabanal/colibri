@@ -741,9 +741,25 @@ olmoe$(EXE): olmoe.c st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unico
 # no-CUDA build class as olmoe (#783). On darwin, links the MTLIO subsystem
 # (QWEN_METAL_IO=1) for async expert streaming — CPU compute reads the
 # shared-storage buffers in place; MetalIO is never mandatory.
-QMOE_COLI_OBJS = coli_executor.o coli_format.o
-qwen_moe$(EXE): qwen_moe.c st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h $(QMOE_COLI_OBJS) $(MIO_OBJ) $(METAL_OBJ)
-	$(CC) $(NOCUDA_CFLAGS) $(MIO_CFLAGS) qwen_moe.c $(QMOE_COLI_OBJS) $(MIO_OBJ) $(METAL_OBJ) -o qwen_moe$(EXE) $(NOCUDA_LDFLAGS) $(MIO_LDFLAGS) $(filter -framework Metal -framework Foundation -lc++,$(LDFLAGS))
+QMOE_COLI_OBJS = qwen_coli_executor.o qwen_coli_format.o mxfp4_expert.o mxfp4_runtime.o qwen_profile.o
+# Qwen's first CUDA/HIP slice is the streamed MXFP4 routed-expert path. Direct
+# Linux GPU builds link backend_cuda.o; CPU builds and Windows runtime-DLL builds
+# keep the old no-CUDA surface until the loader ABI grows this new entry point.
+QMOE_GPU_ENABLED = $(if $(filter 1,$(CUDA) $(HIP)),1,)
+QMOE_GPU_OBJ = $(if $(QMOE_GPU_ENABLED),$(CUDA_OBJ),)
+QMOE_CFLAGS = $(if $(QMOE_GPU_ENABLED),$(CFLAGS),$(NOCUDA_CFLAGS))
+QMOE_LDFLAGS = $(if $(QMOE_GPU_ENABLED),$(LDFLAGS),$(NOCUDA_LDFLAGS))
+qwen_coli_executor.o: coli_executor.c coli_executor.h coli_format.h
+	$(CC) $(QMOE_CFLAGS) -c coli_executor.c -o $@
+
+qwen_coli_format.o: coli_format.c coli_format.h compat.h
+	$(CC) $(QMOE_CFLAGS) -c coli_format.c -o $@
+
+qwen_profile.o: profile.c profile.h
+	$(CC) $(QMOE_CFLAGS) -c profile.c -o $@
+
+qwen_moe$(EXE): qwen_moe.c st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h profile.h mxfp4_expert.h mxfp4_runtime.h quant.h backend_cuda.h $(QMOE_COLI_OBJS) $(QMOE_GPU_OBJ) $(MIO_OBJ) $(METAL_OBJ)
+	$(CC) $(QMOE_CFLAGS) $(MIO_CFLAGS) qwen_moe.c $(QMOE_COLI_OBJS) $(QMOE_GPU_OBJ) $(MIO_OBJ) $(METAL_OBJ) -o qwen_moe$(EXE) $(QMOE_LDFLAGS) $(MIO_LDFLAGS) $(filter -framework Metal -framework Foundation -lc++,$(LDFLAGS))
 
 inkling$(EXE): inkling.c st.h json.h compat.h $(INK_CUDA_OBJ) $(METAL_OBJ)
 	$(CC) $(CFLAGS) inkling.c $(INK_CUDA_OBJ) $(METAL_OBJ) -o inkling$(EXE) $(LDFLAGS)
@@ -965,6 +981,9 @@ tests/test_v4_ownership$(EXE): tests/test_v4_ownership.c $(V4_OWNERSHIP_OBJS)
 
 endif
 
+tests/test_profile$(EXE): tests/test_profile.c profile.c profile.h
+	$(CC) $(CFLAGS) tests/test_profile.c profile.c -o $@ $(LDFLAGS)
+
 tests/test_route_trace$(EXE): tests/test_route_trace.c route_trace.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
@@ -1152,5 +1171,5 @@ tests/test_kv_prefix$(EXE): tests/test_kv_prefix.c kv_prefix.h
 tests/test_kimi_request_state$(EXE): tests/test_kimi_request_state.c kimi_k3.c kv_prefix.h st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h omp_tune.h route_trace.h
 	$(CC) $(NOCUDA_CFLAGS) tests/test_kimi_request_state.c $(VK_OBJ) -o tests/test_kimi_request_state$(EXE) $(NOCUDA_LDFLAGS)
 
-tests/test_qwen_moe$(EXE): tests/test_qwen_moe.c qwen_moe.c st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h sample.h omp_tune.h route_trace.h $(QMOE_COLI_OBJS)
+tests/test_qwen_moe$(EXE): tests/test_qwen_moe.c qwen_moe.c st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h sample.h omp_tune.h route_trace.h profile.h mxfp4_expert.h mxfp4_runtime.h quant.h $(QMOE_COLI_OBJS)
 	$(CC) $(NOCUDA_CFLAGS) tests/test_qwen_moe.c $(QMOE_COLI_OBJS) -o tests/test_qwen_moe$(EXE) $(NOCUDA_LDFLAGS)
