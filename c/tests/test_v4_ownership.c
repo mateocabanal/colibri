@@ -24,6 +24,30 @@ int coli_v4_expert_store_open_planned(
     return -1;
 }
 
+/* Package-only support is linked into the real runtime unit now. The ownership
+ * fixture intentionally exercises the safetensors path and does not need a
+ * real COLI package reader, so keep this narrow harness self-contained instead
+ * of dragging the full package stack into a lifecycle test. */
+int coli_executor_open(ColiExecutor **out, const char *package_path,
+                       const ColiExecutorOpenOptions *options,
+                       char *error, size_t error_size) {
+    (void)package_path;
+    (void)options;
+    if (out) *out = NULL;
+    if (error && error_size)
+        snprintf(error, error_size, "executor stub");
+    return -1;
+}
+
+void coli_executor_close(ColiExecutor *executor) {
+    (void)executor;
+}
+
+/* The ownership tests do not collect phase telemetry. Runtime initialization
+ * still calls the reset hook, so provide the same no-op boundary here. */
+void coli_v4_profile_reset(void) {
+}
+
 void coli_v4_layer_resident_reference_free(
     ColiV4Engine *engine, ColiDeepSeekV4LayerWeights *weights) {
     (void)engine;
