@@ -2,12 +2,12 @@
 #define _GNU_SOURCE
 #endif
 
-#include "deepseek_v4_internal.h"
-#include "coli_v4_prefix_cache.h"
-
-/* Compile the existing compressor snapshot unit unchanged, then expose exact
- * payload accounting while its private snapshot layout is visible here. */
+/* Compile the existing compressor snapshot unit first. It deliberately remaps
+ * compressor symbols before including deepseek_v4_internal.h; pre-including
+ * that header here would trip its include guard and hide the remapped function
+ * declarations from Clang/MSVC-like strict C compilers. */
 #include "deepseek_v4.c"
+#include "coli_v4_prefix_cache.h"
 
 size_t coli_v4_compressor_snapshot_bytes(
     const ColiV4CompressorSnapshot *snapshot) {
