@@ -91,6 +91,13 @@ LDFLAGS = -lm -fopenmp -pthread
 V4_BINARY := deepseek_v4
 endif
 
+# Stamp the binary with the source revision used for the build. This is
+# intentionally part of CFLAGS so .deepseek-v4-build-config invalidates stale
+# objects after a branch switch / pull. Source archives without .git remain
+# buildable and report "unknown".
+V4_GIT_SHA := $(shell git rev-parse --short=12 HEAD 2>/dev/null || printf unknown)
+CFLAGS += -DCOLI_V4_GIT_SHA='"$(V4_GIT_SHA)"'
+
 LTO ?= 1
 ifeq ($(LTO),1)
 CFLAGS += -flto
