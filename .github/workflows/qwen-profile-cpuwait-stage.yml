@@ -27,12 +27,16 @@ jobs:
           p.write_text(s.replace(old,new,1))
           PY
           git diff --check
-      - name: Build and test
+      - name: Run CPU regression tests
         run: |
           make -C c clean
-          make -C c tests/test_profile tests/test_qwen_moe qwen_moe METAL=1 -j2
+          make -C c tests/test_profile tests/test_qwen_moe -j2
           ./c/tests/test_profile
           ./c/tests/test_qwen_moe
+      - name: Build real Qwen Metal target
+        run: |
+          make -C c clean
+          make -C c qwen_moe METAL=1 -j2
       - name: Commit and remove staging workflow
         run: |
           rm .github/workflows/qwen-profile-cpuwait-stage.yml
