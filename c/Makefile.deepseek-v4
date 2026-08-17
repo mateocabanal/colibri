@@ -115,6 +115,14 @@ endif
 
 include Makefile.deepseek-v4.units
 
+# Package-only dense residency borrows immutable cache pointers. The public V4
+# layer API still uses the legacy `free(each payload)` cleanup contract, so only
+# the layer-resident amalgamation unit routes free() through a cache-aware
+# release shim. All other units keep normal libc free semantics. Keep this in
+# the build-config stamp so branch switches cannot reuse a stale layer object.
+V4_LAYER_RESIDENT_CFLAGS := -Dfree=coli_v4_layer_payload_free
+COLI_V4_UNIT_LAYER_RESIDENT.o: CFLAGS += $(V4_LAYER_RESIDENT_CFLAGS)
+
 TARGET_OBJS = $(addsuffix .o,$(V4_TARGET_UNITS))
 TEST_UNIT_OBJS = $(addsuffix .o,$(V4_TEST_UNITS))
 V4_COLI_OBJS = coli_v4_expert_store.o coli_v4_static.o coli_executor.o coli_format.o
@@ -129,7 +137,7 @@ FORCE:
 # accidentally reused by a later default Metal build.  Track the effective
 # configuration and make every V4 object depend on it.
 $(V4_BUILD_CONFIG): FORCE
-	@printf '%s\n' 'CC=$(CC)' 'CFLAGS=$(CFLAGS)' 'LDFLAGS=$(LDFLAGS)' 'METAL=$(METAL)' 'LTO=$(LTO)' > $@.tmp
+	@printf '%s\n' 'CC=$(CC)' 'CFLAGS=$(CFLAGS)' 'LDFLAGS=$(LDFLAGS)' 'METAL=$(METAL)' 'LTO=$(LTO)' 'V4_LAYER_RESIDENT_CFLAGS=$(V4_LAYER_RESIDENT_CFLAGS)' > $@.tmp
 	@if test -f $@ && cmp -s $@.tmp $@; then rm -f $@.tmp; else mv -f $@.tmp $@; fi
 
 $(V4_OBJS) $(TEST_UNIT_OBJS): $(V4_BUILD_CONFIG)
