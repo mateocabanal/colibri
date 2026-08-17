@@ -59,6 +59,9 @@
 #include "coli_executor.h"   /* COLLACOLI: COLI package backend */
 #include "mxfp4_expert.h"
 #include "mxfp4_runtime.h"
+#ifdef COLI_CUDA
+#include "backend_cuda.h"
+#endif
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 #include <sys/resource.h>
 #include <unistd.h>
@@ -127,6 +130,12 @@ static float *falloc(int64_t n){
     if (!p) { fprintf(stderr, "OOM %lld\n", (long long)n); exit(1); }
     return p;
 }
+
+#ifdef COLI_CUDA
+static int g_cuda_compute = 0;
+#else
+#define g_cuda_compute 0
+#endif
 
 #ifdef COLI_METAL
 #include "backend_metal.h"
@@ -2033,6 +2042,11 @@ static void expert_wait_ready(Model *m, Slot *s){
 static void expert_apply(Model *m, Slot *s, const float *x, float *acc){
     Cfg *c = &m->c; int I = c->moe_inter, D = c->hidden;
     if (s->fmt == 7) {
+#ifdef COLI_CUDA
+        if (g_cuda_compute && coli_cuda_expert_mlp_mxfp4(acc, x,
+                s->mxg, s->mxgs, s->mxu, s->mxus, s->mxd, s->mxds,
+                1, D, I)) return;
+#endif
         float *gate = falloc(I), *up = falloc(I), *h = falloc(I), *y = falloc(D);
         coli_mxfp4_swiglu_expert(acc, x,
                                  s->mxg, s->mxgs, s->mxu, s->mxus,
@@ -2605,6 +2619,11 @@ static void moe_batch(Model *m, Layer *l, int layer, const float *xs, int C, flo
                     st++;
                 }
             if (s->fmt == 7) {
+#ifdef COLI_CUDA
+                if (g_cuda_compute && coli_cuda_expert_mlp_mxfp4(yscratch, xscratch,
+                        s->mxg, s->mxgs, s->mxu, s->mxus, s->mxd, s->mxds,
+                        st, D, I)) goto qwen_mxfp4_batch_done;
+#endif
                 float *gate = falloc((int64_t)st * I), *up = falloc((int64_t)st * I);
                 float *h = falloc((int64_t)st * I);
                 coli_mxfp4_matmul(gate, xscratch, s->mxg, s->mxgs, st, D, I);
@@ -2656,6 +2675,9 @@ static void moe_batch(Model *m, Layer *l, int layer, const float *xs, int C, flo
                 matmul(yscratch, h, s->d, st, D, I);
                 free(gu); free(h);
             }
+#ifdef COLI_CUDA
+qwen_mxfp4_batch_done:
+#endif
             /* store this expert's routed rows at their (token, topk) slots */
             int si = 0;
             for (int j = 0; j < C; j++) for (int k = 0; k < K; k++)
@@ -3572,6 +3594,23 @@ int main(int argc, char **argv){
     }
 
     int rc = 0;
+#ifdef COLI_CUDA
+    /* A direct CUDA/HIP build is expected to use its GPU. Unlike Metal, which
+     * is an optional compute experiment in the default macOS binary, `make
+     * qwen_moe CUDA=1` opts into this backend explicitly. Set
+     * QWEN_CUDA_COMPUTE=0 for the CPU fallback or QWEN_CUDA_DEVICE=N to pick
+     * a device. Only routed MXFP4 experts are offloaded in this first slice. */
+    g_cuda_compute = getenv("QWEN_CUDA_COMPUTE") ? atoi(getenv("QWEN_CUDA_COMPUTE")) : 1;
+    if (g_cuda_compute) {
+        int dev = getenv("QWEN_CUDA_DEVICE") ? atoi(getenv("QWEN_CUDA_DEVICE")) : 0;
+        if (!coli_cuda_init(&dev, 1)) {
+            fprintf(stderr, "qwen_moe: CUDA/HIP unavailable — using CPU MoE\n");
+            g_cuda_compute = 0;
+        } else {
+            fprintf(stderr, "[qwen] MXFP4 routed experts on GPU device %d\n", dev);
+        }
+    }
+#endif
 #ifdef COLI_METAL
     /* QWEN_METAL_COMPUTE=1: Apple-GPU batched MoE matmuls (opt-in; CPU
      * kernels stay the default and the fallback). Init must happen AFTER
@@ -3630,6 +3669,9 @@ int main(int argc, char **argv){
                 st.latency_samples ? st.total_latency_s * 1000.0 / (double)st.latency_samples : 0.0);
         metalio_shutdown();
     }
+#endif
+#ifdef COLI_CUDA
+    if (g_cuda_compute) coli_cuda_shutdown();
 #endif
     tok_free(&T);
     return rc;

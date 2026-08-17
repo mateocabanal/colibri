@@ -83,6 +83,17 @@ COLI_CUDA_DLLEXPORT int coli_cuda_matmul_mxfp4(float *y, const float *x,
                                                const unsigned char *e8s,
                                                int S, int I, int O);
 
+/* Stateless streamed MXFP4 SwiGLU expert. Unlike three calls to the matmul
+ * helper, activations cross PCIe once: gate/up/down weights+E8M0 scales upload
+ * into reusable device staging, gate/up + SiLU + down stay on-device, and only
+ * the final [S,D] result returns to the host. */
+COLI_CUDA_DLLEXPORT int coli_cuda_expert_mlp_mxfp4(
+        float *y, const float *x,
+        const unsigned char *gate, const unsigned char *gate_e8,
+        const unsigned char *up, const unsigned char *up_e8,
+        const unsigned char *down, const unsigned char *down_e8,
+        int S, int D, int I);
+
 COLI_CUDA_DLLEXPORT int coli_cuda_matmul(ColiCudaTensor **tensor,
                      float *y, const float *x,
                      const void *weights, const float *scales,

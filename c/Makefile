@@ -742,8 +742,15 @@ olmoe$(EXE): olmoe.c st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unico
 # (QWEN_METAL_IO=1) for async expert streaming — CPU compute reads the
 # shared-storage buffers in place; MetalIO is never mandatory.
 QMOE_COLI_OBJS = coli_executor.o coli_format.o mxfp4_expert.o mxfp4_runtime.o
-qwen_moe$(EXE): qwen_moe.c st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h mxfp4_expert.h mxfp4_runtime.h quant.h $(QMOE_COLI_OBJS) $(MIO_OBJ) $(METAL_OBJ)
-	$(CC) $(NOCUDA_CFLAGS) $(MIO_CFLAGS) qwen_moe.c $(QMOE_COLI_OBJS) $(MIO_OBJ) $(METAL_OBJ) -o qwen_moe$(EXE) $(NOCUDA_LDFLAGS) $(MIO_LDFLAGS) $(filter -framework Metal -framework Foundation -lc++,$(LDFLAGS))
+# Qwen's first CUDA/HIP slice is the streamed MXFP4 routed-expert path. Direct
+# Linux GPU builds link backend_cuda.o; CPU builds and Windows runtime-DLL builds
+# keep the old no-CUDA surface until the loader ABI grows this new entry point.
+QMOE_GPU_ENABLED = $(if $(filter 1,$(CUDA) $(HIP)),1,)
+QMOE_GPU_OBJ = $(if $(QMOE_GPU_ENABLED),$(CUDA_OBJ),)
+QMOE_CFLAGS = $(if $(QMOE_GPU_ENABLED),$(CFLAGS),$(NOCUDA_CFLAGS))
+QMOE_LDFLAGS = $(if $(QMOE_GPU_ENABLED),$(LDFLAGS),$(NOCUDA_LDFLAGS))
+qwen_moe$(EXE): qwen_moe.c st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h mxfp4_expert.h mxfp4_runtime.h quant.h backend_cuda.h $(QMOE_COLI_OBJS) $(QMOE_GPU_OBJ) $(MIO_OBJ) $(METAL_OBJ)
+	$(CC) $(QMOE_CFLAGS) $(MIO_CFLAGS) qwen_moe.c $(QMOE_COLI_OBJS) $(QMOE_GPU_OBJ) $(MIO_OBJ) $(METAL_OBJ) -o qwen_moe$(EXE) $(QMOE_LDFLAGS) $(MIO_LDFLAGS) $(filter -framework Metal -framework Foundation -lc++,$(LDFLAGS))
 
 inkling$(EXE): inkling.c st.h json.h compat.h $(INK_CUDA_OBJ) $(METAL_OBJ)
 	$(CC) $(CFLAGS) inkling.c $(INK_CUDA_OBJ) $(METAL_OBJ) -o inkling$(EXE) $(LDFLAGS)
