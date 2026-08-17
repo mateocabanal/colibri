@@ -376,7 +376,7 @@ static const ColiProfilePhaseDef qprof_phases[QPROF_COUNT] = {
     [QPROF_METAL_WAIT]    = {"metal_wait", 0},
     [QPROF_METAL_KERNEL]  = {"metal_kernel", 0},
     [QPROF_METAL_MOE_SETUP]   = {"metal_moe_setup", 0},
-    [QPROF_METAL_MOE_WAIT]    = {"metal_moe_wait", 0},
+    [QPROF_METAL_MOE_WAIT]    = {"metal_moe_wait", COLI_PROFILE_CPU_WAIT},
     [QPROF_METAL_MOE_KERNEL]  = {"metal_moe_kernel", 0},
     [QPROF_METAL_MOE_SCATTER] = {"metal_moe_scatter", 0},
 };
