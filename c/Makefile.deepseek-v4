@@ -172,8 +172,8 @@ coli_v4_expert_execute_trace.o: coli_v4_expert_execute_trace.c deepseek_v4_inter
 
 COLI_V4_UNIT_RESOURCE_PLAN.o: coli_v4_resource_plan.c deepseek_v4_internal.h coli_v4_residency.h
 	$(CC) $(CFLAGS) -c coli_v4_resource_plan.c -o $@
-COLI_V4_UNIT_EXPERT_STORE_AUTO.o: coli_v4_expert_store_auto.c deepseek_v4_internal.h coli_v4_expert_store.h coli_v4_residency.h coli_executor.h st.h
-	$(CC) $(CFLAGS) -c coli_v4_expert_store_auto.c -o $@
+COLI_V4_UNIT_EXPERT_STORE_AUTO.o: coli_v4_expert_store_auto_prefix.c coli_v4_expert_store_auto.c coli_v4_prefix_cache.h deepseek_v4_internal.h coli_v4_expert_store.h coli_v4_residency.h coli_executor.h st.h
+	$(CC) $(CFLAGS) -c coli_v4_expert_store_auto_prefix.c -o $@
 COLI_V4_UNIT_COMPRESSOR_SNAPSHOT.o: coli_v4_compressor_snapshot_size.c deepseek_v4.c deepseek_v4_internal.h coli_v4_prefix_cache.h
 	$(CC) $(CFLAGS) -DCOLI_V4_UNIT_COMPRESSOR_SNAPSHOT -c coli_v4_compressor_snapshot_size.c -o $@
 COLI_V4_UNIT_INDEXER_SNAPSHOT.o: coli_v4_indexer_snapshot_size.c deepseek_v4.c deepseek_v4_internal.h coli_v4_prefix_cache.h
