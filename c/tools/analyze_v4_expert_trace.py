@@ -260,6 +260,44 @@ def per_layer_frequency_oracle_curve(
     return rows
 
 
+def global_frequency_oracle_curve(
+    analysis: TraceAnalysis, capacities: list[int]
+) -> list[dict]:
+    """Upper bound for a globally allocated persistent hot-expert tier.
+
+    Unlike the per-layer oracle, this may spend all persistent slots on the
+    hottest logical `(layer, expert)` pairs and spend nothing on diffuse layers.
+    This models the best possible value of a future global persistent tier for a
+    fixed slot budget. A selected expert still pays its first load, so only
+    `count - 1` requests are credited as avoided reads.
+    """
+
+    total = len(analysis.requests)
+    frequency = Counter(analysis.requests)
+    rows = []
+    for capacity in capacities:
+        selected = frequency.most_common(capacity)
+        resident_slots = len(selected)
+        hits = sum(max(0, count - 1) for _, count in selected)
+        resident_bytes = resident_slots * analysis.record_bytes
+        bytes_avoided = hits * analysis.record_bytes
+        rows.append(
+            {
+                "capacity": capacity,
+                "resident_slots": resident_slots,
+                "resident_bytes": resident_bytes,
+                "hits": hits,
+                "misses": total - hits,
+                "hit_rate": (hits / total) if total else 0.0,
+                "bytes_avoided": bytes_avoided,
+                "trace_value_per_resident_byte": (
+                    bytes_avoided / resident_bytes if resident_bytes else 0.0
+                ),
+            }
+        )
+    return rows
+
+
 def summary_dict(
     analysis: TraceAnalysis,
     capacities: list[int],
@@ -284,6 +322,11 @@ def summary_dict(
                 for expert, count in top
             ],
         }
+
+    layer_count = len(analysis.layer_frequency)
+    equal_budget_global_capacities = sorted(
+        {layer_count * capacity for capacity in persistent_capacities if layer_count}
+    )
 
     return {
         "requests": len(analysis.requests),
@@ -312,6 +355,9 @@ def summary_dict(
         "persistent_per_layer_frequency_oracle_curve": (
             per_layer_frequency_oracle_curve(analysis, persistent_capacities)
         ),
+        "persistent_global_frequency_oracle_curve": global_frequency_oracle_curve(
+            analysis, equal_budget_global_capacities
+        ),
         "layers": top_layers,
     }
 
@@ -339,6 +385,19 @@ def _print_persistent_curve(title: str, rows: list[dict]) -> None:
         avoided_gib = row["bytes_avoided"] / (1024**3)
         print(
             f"  {row['slots_per_layer']:11d}   {100.0 * row['hit_rate']:6.2f}%  "
+            f"{row['hits']:7d}   {resident_gib:7.2f}G   {avoided_gib:7.2f}G   "
+            f"{row['trace_value_per_resident_byte']:8.3f}x"
+        )
+
+
+def _print_global_hot_curve(rows: list[dict]) -> None:
+    print("\nGlobal perfect-hot oracle (equal RAM budgets):")
+    print("  slots          hit-rate     hits   resident   avoided   value/byte")
+    for row in rows:
+        resident_gib = row["resident_bytes"] / (1024**3)
+        avoided_gib = row["bytes_avoided"] / (1024**3)
+        print(
+            f"  {row['capacity']:5d}          {100.0 * row['hit_rate']:6.2f}%  "
             f"{row['hits']:7d}   {resident_gib:7.2f}G   {avoided_gib:7.2f}G   "
             f"{row['trace_value_per_resident_byte']:8.3f}x"
         )
@@ -379,6 +438,7 @@ def print_human(summary: dict, top_n: int) -> None:
         "Per-layer perfect-hot oracle (upper bound)",
         summary["persistent_per_layer_frequency_oracle_curve"],
     )
+    _print_global_hot_curve(summary["persistent_global_frequency_oracle_curve"])
 
     print(f"\nTop {top_n} experts per layer:")
     for layer, info in summary["layers"].items():
