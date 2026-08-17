@@ -22,14 +22,17 @@ jobs:
           cache: pip
           cache-dependency-path: c/tools/requirements-deepseek-v4-tiny.txt
       - run: python -m pip install -r c/tools/requirements-deepseek-v4-tiny.txt
-      - name: Apply benchmark accounting patch
-        run: python3 c/tools/apply_qwen_prefix_gap_bench_patch.py
-      - name: Check and build
+      - name: Sync corrected fixture/oracle and apply benchmark accounting
+        run: |
+          python3 c/tools/apply_qwen_tiny_stop_patch.py
+          python3 c/tools/apply_qwen_prefix_gap_bench_patch.py
+      - name: Check, build, and require real generated serve tokens
         run: |
           git diff --check
-          python3 -m py_compile c/tools/benchmark_qwen_prefix_cache.py
+          python3 -m py_compile c/tools/benchmark_qwen_prefix_cache.py c/tests/test_qwen_prefix_serve.py
           python c/tools/make_qwen_moe_tiny.py --output c/qwen_moe_tiny --force
           make -C c qwen_moe ARCH=x86-64-v3
+          python c/tests/test_qwen_prefix_serve.py --binary c/qwen_moe --fixture c/qwen_moe_tiny
       - name: Require two-token fixed-memory accounting
         run: |
           printf '<t005><t007><t009><t011><t013><t017><t019><t023>' > /tmp/qwen-prefix.txt
@@ -46,6 +49,7 @@ jobs:
           s = p['summary']
           assert p['matched_tokens'] == 8
           assert p['pairs'][0]['cache_on']['measure']['data_frames'] >= 2
+          assert p['pairs'][0]['cache_off']['measure']['data_frames'] >= 2
           assert s['first_to_second_on_median_sec'] >= 0
           assert s['first_to_second_off_median_sec'] >= 0
           assert 'first_to_second_penalty_median_sec' in s
@@ -54,9 +58,11 @@ jobs:
           PY
       - name: Commit clean benchmark change
         run: |
-          git rm .github/workflows/qwen-prefix-gap-bench-integration.yml c/tools/apply_qwen_prefix_gap_bench_patch.py
+          git rm .github/workflows/qwen-prefix-gap-bench-integration.yml \
+            c/tools/apply_qwen_prefix_gap_bench_patch.py \
+            c/tools/apply_qwen_tiny_stop_patch.py
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add c/tools/benchmark_qwen_prefix_cache.py
+          git add c/tools/benchmark_qwen_prefix_cache.py c/tools/make_qwen_moe_tiny.py c/tests/test_qwen_prefix_serve.py
           git commit -m "bench(qwen): account for post-first-token capture stall"
           git push origin HEAD:feat/qwen-prompt-cache-metrics
