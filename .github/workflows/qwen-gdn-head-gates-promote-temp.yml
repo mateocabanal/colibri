@@ -3,6 +3,8 @@ name: Promote Qwen batched GDN head gates
 on:
   push:
     branches: [fix/qwen-batched-gdn-head-gates]
+  pull_request:
+    branches: [main]
 
 permissions:
   contents: write
