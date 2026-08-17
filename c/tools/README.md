@@ -27,12 +27,14 @@ not runtime dependencies of the C engine.
   also emits an explicit logical-route schema-v2 sidecar at
   `<V4_EXPERT_TRACE>.routes.jsonl` (or `V4_ROUTE_TRACE=<path>`). That sidecar
   records every top-k route selection before batch-union lookups collapse many
-  logical selections into one physical lease, including request id, token
-  position, layer, expert, route rank and route weight. Both schemas are accepted
-  by the analyzer. It reports activation skew, exact LRU stack/reuse distance,
-  hypothetical cache curves, co-routing, unique logical experts/token and
-  adjacent-token overlap. Old v1 traces still fall back to layer-wrap token
-  inference; explicit v2 route traces use authoritative token identity.
+  logical selections into one physical lease. It includes request id, token
+  position, prefill/decode phase, layer, expert, route rank/weight, and the
+  physical lookup correlation (`lookup_id`, lookup duration, fanout, result,
+  lease generation). Both schemas are accepted by the analyzer. It reports
+  activation skew, exact LRU stack/reuse distance, hypothetical cache curves,
+  co-routing, unique logical experts/token and adjacent-token overlap. Old v1
+  traces still fall back to layer-wrap token inference; explicit v2 route traces
+  use authoritative request/token/phase identity.
 - `analyze_v4_residency_value.py`: offline policy-reference tool for #3. It
   compares deterministic residency and global hot-expert capacity using
   estimated **exposed I/O milliseconds avoided per resident GiB**. Repeated
@@ -79,9 +81,10 @@ python3 tools/analyze_v4_expert_trace.py /tmp/v4-experts.jsonl \
 python3 tools/analyze_v4_expert_trace.py \
   /tmp/v4-experts.jsonl.routes.jsonl --top 10
 
-# Optional explicit route-sidecar controls. V4_ROUTE_REQUEST_ID is the current
-# single-request CLI/session id override; server integration should supply real
-# request/session ids rather than relying on this compatibility knob.
+# Optional explicit route-sidecar controls. Request ids are assigned
+# monotonically at the session-generate boundary. V4_ROUTE_REQUEST_ID changes
+# the first id in that sequence (useful for deterministic fixtures), rather than
+# pinning every generation request to one id.
 V4_ROUTE_TRACE=/tmp/v4-routes.jsonl \
 V4_ROUTE_TRACE_CAP=131072 \
 V4_ROUTE_REQUEST_ID=42 \
@@ -100,6 +103,17 @@ python3 tools/analyze_v4_residency_value.py /tmp/v4-experts.jsonl \
 The V4 runner forces `--no-dspark` so results measure the exact target path.
 It does **not** claim to flush the OS page cache; use `--warm-cache` for an
 explicit cold/warm pair (trial 2 = page-cache warm).
+
+Detailed route tracing is bounded in memory and writes the JSONL only at normal
+process teardown. The v2 header reports `dropped`, `physical_lookups`,
+`correlation_misses`, and `uncorrelated_routes`; a clean trace should have all
+three loss/error counters at zero. One physical lookup can legitimately have
+`lookup_routes > 1` during batch-union prefill. All logical routes in that group
+share the same `lookup_id`, lookup duration, result and `lease_generation`.
+The `(layer, expert, lease_generation)` triple is the stable join key back to the
+physical v1 lifecycle. `lookup_ns` is physical lookup latency and may overlap
+other pipeline work; do not relabel it as exposed token-wall wait without an
+owner-thread wait measurement.
 
 Phase telemetry: by default the runner sets `V4_PROFILE=1`, and the engine
 emits one `v4_phases scope=startup|run|prompt|decode` line per scope with
