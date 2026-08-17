@@ -162,21 +162,165 @@ def check_session(
             f"prompt={prompt_count} generated={generated_count}"
         )
     if compatibility_flag:
-        # --no-dspark used to be a no-op that only printed a notice, because the
-        # engine was target-only and had nothing to disable. It now disables
-        # verified speculative drafting for real, so asserting the old notice
-        # would require the engine to keep claiming it does nothing.
-        #
-        # What matters either way is that the run stays token-exact, which the
-        # checks above already prove, and that the flag actually suppresses
-        # speculation: with drafting off no attempt is ever made, so the
-        # counters the engine prints at exit must be zero.
         attempts = re.search(r"v4_dspark attempts=(\d+)", result.stderr)
         if attempts and int(attempts.group(1)) != 0:
             raise AssertionError(
                 f"--no-dspark still attempted {attempts.group(1)} speculations")
     print(f"PASS target session {name}: exact IDs and exact length")
     return actual["full_ids"]
+
+
+def read_jsonl(path: Path) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise AssertionError(f"{path.name}:{number}: malformed JSON: {exc}") from exc
+        if not isinstance(row, dict):
+            raise AssertionError(f"{path.name}:{number}: expected JSON object")
+        rows.append(row)
+    if not rows:
+        raise AssertionError(f"{path.name}: empty trace")
+    return rows
+
+
+def check_route_trace(
+    binary: Path, model: Path, case: dict[str, object], temporary: Path
+) -> None:
+    """Gate #56 when this binary was compiled with detailed route tracing."""
+    routes = temporary / "routes.jsonl"
+    max_new = min(2, int(case["max_new_tokens"]))
+    env = dict(
+        os.environ,
+        V4_ROUTE_TRACE=routes.as_posix(),
+        V4_ROUTE_TRACE_CAP="65536",
+        V4_ROUTE_REQUEST_ID="77",
+    )
+    result = run(
+        "target explicit route trace",
+        [
+            binary.as_posix(),
+            model.as_posix(),
+            token_prompt(case["prompt_ids"]),
+            "--raw-prompt",
+            "--max-tokens",
+            str(max_new),
+            "--no-dspark",
+        ],
+        env=env,
+    )
+    if "v4_route_trace status=written" not in result.stderr:
+        # Detailed route instrumentation is deliberately compile-gated. The
+        # ordinary all-engines/default-hot-path CI build must remain valid with
+        # V4_TRACE_ROUTE=0; the dedicated V4_TRACE_EXEC=1 jobs below/alongside
+        # this oracle exercise the strict route lifecycle assertions.
+        print("SKIP target trace: detailed route tracing not compiled into this binary")
+        return
+
+    route_rows = read_jsonl(routes)
+    header = route_rows[0]
+    if header.get("schema") != "colibri.v4.expert_trace.v2":
+        raise AssertionError(f"unexpected logical trace header: {header}")
+    if header.get("source") != "route_selected" or header.get("dropped") != 0:
+        raise AssertionError(f"bad logical trace metadata: {header}")
+    if header.get("requests_started") != 1:
+        raise AssertionError(f"expected one traced request: {header}")
+    if not isinstance(header.get("physical_lookups"), int) or header["physical_lookups"] <= 0:
+        raise AssertionError(f"trace did not observe physical expert lookups: {header}")
+    if header.get("correlation_misses") != 0 or header.get("uncorrelated_routes") != 0:
+        raise AssertionError(f"route/lookup correlation was incomplete: {header}")
+
+    selections = [row for row in route_rows[1:] if row.get("event") == "request"]
+    if not selections:
+        raise AssertionError("logical route trace contains no selections")
+    prompt_count = len(case["prompt_ids"])
+    positions: set[int] = set()
+    route_groups: dict[tuple[int, int], list[int]] = {}
+    lookup_groups: dict[int, list[dict[str, object]]] = {}
+    for row in selections:
+        if row.get("request_id") != 77:
+            raise AssertionError(f"route request id was not preserved: {row}")
+        position = row.get("token_position")
+        layer = row.get("layer")
+        expert = row.get("expert")
+        rank = row.get("route_rank")
+        weight = row.get("route_weight")
+        lookup_id = row.get("lookup_id")
+        lookup_ns = row.get("lookup_ns")
+        lookup_routes = row.get("lookup_routes")
+        lookup_result = row.get("lookup_result")
+        generation = row.get("lease_generation")
+        if not isinstance(position, int) or position < 0:
+            raise AssertionError(f"route is missing token position: {row}")
+        if not isinstance(layer, int) or layer < 0:
+            raise AssertionError(f"route is missing layer identity: {row}")
+        if not isinstance(expert, int) or expert < 0:
+            raise AssertionError(f"route is missing expert identity: {row}")
+        if not isinstance(rank, int) or rank < 0:
+            raise AssertionError(f"route is missing rank identity: {row}")
+        if not isinstance(weight, (int, float)):
+            raise AssertionError(f"route is missing numeric weight: {row}")
+        expected_phase = "prefill" if position < prompt_count else "decode"
+        if row.get("phase") != expected_phase:
+            raise AssertionError(
+                f"route phase mismatch at position {position}: "
+                f"expected {expected_phase}, got {row.get('phase')}: {row}"
+            )
+        if not isinstance(lookup_id, int) or lookup_id <= 0:
+            raise AssertionError(f"route is missing physical lookup id: {row}")
+        if not isinstance(lookup_ns, int) or lookup_ns < 0:
+            raise AssertionError(f"route is missing lookup duration: {row}")
+        if not isinstance(lookup_routes, int) or lookup_routes < 1:
+            raise AssertionError(f"route is missing lookup fanout: {row}")
+        if lookup_result != 0:
+            raise AssertionError(f"route physical lookup failed: {row}")
+        if not isinstance(generation, int) or generation < 0:
+            raise AssertionError(f"route is missing lease generation: {row}")
+        positions.add(position)
+        route_groups.setdefault((position, layer), []).append(rank)
+        lookup_groups.setdefault(lookup_id, []).append(row)
+
+    if not set(range(prompt_count)).issubset(positions):
+        raise AssertionError(
+            f"route trace missed prompt positions: expected 0..{prompt_count - 1}, "
+            f"got {sorted(positions)}"
+        )
+    if max_new > 1 and prompt_count not in positions:
+        raise AssertionError("route trace missed the first decode input position")
+
+    for key, ranks in route_groups.items():
+        ordered = sorted(ranks)
+        if ordered != list(range(len(ordered))):
+            raise AssertionError(f"non-dense route ranks for {key}: {ranks}")
+
+    for lookup_id, rows in lookup_groups.items():
+        expected_fanout = len(rows)
+        identities = {
+            (row["layer"], row["expert"], row["lease_generation"])
+            for row in rows
+        }
+        if len(identities) != 1:
+            raise AssertionError(
+                f"lookup {lookup_id} mixed physical identities: {identities}"
+            )
+        for row in rows:
+            if row["lookup_routes"] != expected_fanout:
+                raise AssertionError(
+                    f"lookup {lookup_id} fanout mismatch: "
+                    f"expected {expected_fanout}, got {row['lookup_routes']}"
+                )
+    if len(lookup_groups) != header["physical_lookups"]:
+        raise AssertionError(
+            f"physical lookup count mismatch: header={header['physical_lookups']} "
+            f"groups={len(lookup_groups)}"
+        )
+
+    print(
+        "PASS target trace: explicit logical v2 + physical lookup correlation "
+        f"({len(selections)} selections, {len(positions)} token positions, "
+        f"{len(lookup_groups)} lookups)"
+    )
 
 
 def check_serve(binary: Path, model: Path, case: dict[str, object]) -> None:
@@ -227,11 +371,6 @@ def check_cli_uses_engine_context(binary: Path, model: Path, temporary: Path) ->
         ],
         env=dict(os.environ, CTX="768"),
     )
-    # `coli tune` compares candidates from tokens-and-elapsed, and before #898
-    # only the GLM engine emitted a parseable line -- so the tuner ran GLM at
-    # every checkpoint. Assert the line here rather than trusting a one-off
-    # manual check: the first placement of it compiled fine and sat in a branch
-    # text mode never reaches, so it never printed and nothing noticed.
     tune = re.search(r"TUNE decode: (\d+) tokens in ([0-9.]+)s", result.stdout)
     if not tune:
         raise AssertionError(
@@ -279,8 +418,8 @@ def main() -> int:
                 ordinal=ordinal,
                 compatibility_flag=ordinal == 0,
             )
-        # The 72-token case crosses the 64-token target prefill chunk boundary.
         check_session(binary, fixture, "long", cases["long"], temporary)
+        check_route_trace(binary, fixture, cases["short"], temporary)
         check_cli_uses_engine_context(binary, fixture, temporary)
         check_serve(binary, fixture, cases["short"])
 

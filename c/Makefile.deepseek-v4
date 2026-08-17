@@ -32,10 +32,9 @@ $(error Makefile.deepseek-v4 supports x86-64/aarch64 Linux, Windows/MSYS2, and a
 endif
 
 # The parent Makefile's V4 unit-test link deliberately does not link the Metal
-# Objective-C++ backend.  Keep those object files CPU-only even though normal
-# macOS V4 engine builds default METAL=1.  Without this, native_quant.h emits
+# Objective-C++ backend. Keep those object files CPU-only even though normal
+# macOS V4 engine builds default METAL=1. Without this, native_quant.h emits
 # references to coli_metal_* and `make check` fails at link time on arm64 macOS.
-# A real `deepseek-v4` target still gets the default Metal path below.
 ifneq (,$(filter deepseek-v4-test-objs,$(MAKECMDGOALS)))
 METAL := 0
 endif
@@ -52,10 +51,6 @@ CFLAGS = -D_GNU_SOURCE -D_FILE_OFFSET_BITS=64 -O3 -march=$(ARCH) -fopenmp \
 LDFLAGS = -lm -fopenmp -static -pthread
 V4_BINARY := deepseek_v4.exe
 else ifeq ($(UNAME_S),Darwin)
-# Apple clang has no bundled OpenMP runtime: use Homebrew libomp when its
-# artifacts are actually present, else build single-threaded (pragmas are
-# ignored). No -march: NEON is baseline on arm64 and the per-feature gates in
-# the sources do the rest. Mirrors the parent Makefile's Darwin block.
 CC = clang
 OMPDIR := $(shell brew --prefix libomp 2>/dev/null)
 ifneq ($(and $(OMPDIR),$(wildcard $(OMPDIR)/include/omp.h),$(wildcard $(OMPDIR)/lib/libomp.*)),)
@@ -74,9 +69,6 @@ CFLAGS = -D_GNU_SOURCE -O3 $(OMPC) -pthread -include pthread.h \
 	-DCOLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
 LDFLAGS = -lm $(OMPL) -pthread
 V4_BINARY := deepseek_v4
-# METAL=1 enables the Apple-GPU MXFP4 expert path on Darwin (default ON —
-# shader compiles at runtime, no Xcode/offline metal compiler needed; CPU is
-# always the fallback). V4_METAL_EXPERTS=0 opts out at runtime.
 METAL ?= 1
 V4_METAL_OBJS =
 ifeq ($(METAL),1)
@@ -100,10 +92,6 @@ LDFLAGS = -lm -fopenmp -pthread
 V4_BINARY := deepseek_v4
 endif
 
-# Stamp the binary with the source revision used for the build. This is
-# intentionally part of CFLAGS so .deepseek-v4-build-config invalidates stale
-# objects after a branch switch / pull. Source archives without .git remain
-# buildable and report "unknown".
 V4_GIT_SHA := $(shell git rev-parse --short=12 HEAD 2>/dev/null || printf unknown)
 CFLAGS += -DCOLI_V4_GIT_SHA='"$(V4_GIT_SHA)"'
 
@@ -113,31 +101,47 @@ CFLAGS += -flto
 LDFLAGS += -flto
 endif
 
+# #56 detailed instrumentation is compile-gated so the normal inference binary
+# compiles the original block and generation units directly. There is therefore
+# no route-wrapper, pthread_once, trace-state check, or expert-forward wrapper on
+# the default hot path. Aggregate store/profile counters remain available.
+#
+# V4_TRACE_ROUTE=1 enables logical route + lookup correlation. V4_TRACE_EXEC=1
+# defaults route tracing on as well because execution validation needs the
+# logical stream. A caller may build route-only tracing explicitly.
+V4_TRACE_EXEC ?= 0
+V4_TRACE_ROUTE ?= $(V4_TRACE_EXEC)
+V4_TRACE_EXEC_OBJS =
+ifeq ($(V4_TRACE_EXEC),1)
+V4_TRACE_EXEC_OBJS = coli_v4_expert_execute_trace.o
+endif
+
 include Makefile.deepseek-v4.units
 
-# Package-only dense residency borrows immutable cache pointers. The public V4
-# layer API still uses the legacy `free(each payload)` cleanup contract, so only
-# the layer-resident amalgamation unit routes free() through a cache-aware
-# release shim. All other units keep normal libc free semantics. Keep this in
-# the build-config stamp so branch switches cannot reuse a stale layer object.
 V4_LAYER_RESIDENT_CFLAGS := -Dfree=coli_v4_layer_payload_free
 COLI_V4_UNIT_LAYER_RESIDENT.o: CFLAGS += $(V4_LAYER_RESIDENT_CFLAGS)
 
 TARGET_OBJS = $(addsuffix .o,$(V4_TARGET_UNITS))
 TEST_UNIT_OBJS = $(addsuffix .o,$(V4_TEST_UNITS))
-V4_COLI_OBJS = coli_v4_expert_store.o coli_v4_static.o coli_executor.o coli_format.o
+V4_TRACE_SPLIT_OBJS =
+ifeq ($(V4_TRACE_ROUTE),1)
+V4_TRACE_SPLIT_OBJS = COLI_V4_UNIT_BLOCK_HYBRID.o COLI_V4_UNIT_GENERATE_STATS.o
+endif
+# Planner units are permanent standalone sources. The large block/generation
+# units only leave the amalgamation in a detailed-trace build.
+V4_SPLIT_OBJS = COLI_V4_UNIT_RESOURCE_PLAN.o \
+	COLI_V4_UNIT_EXPERT_STORE_AUTO.o \
+	$(V4_TRACE_SPLIT_OBJS)
+V4_AMALGAMATED_OBJS = $(filter-out $(V4_SPLIT_OBJS),$(sort $(TARGET_OBJS) $(TEST_UNIT_OBJS)))
+V4_COLI_OBJS = coli_v4_expert_store.o coli_v4_static.o coli_executor.o coli_format.o $(V4_TRACE_EXEC_OBJS)
 V4_OBJS = $(TARGET_OBJS) $(V4_COLI_OBJS) $(V4_METAL_OBJS)
 V4_BUILD_CONFIG = .deepseek-v4-build-config
 
 .PHONY: deepseek-v4 deepseek-v4-clean deepseek-v4-test-objs FORCE
 FORCE:
 
-# C/Objective-C++ objects share names across METAL=0 and METAL=1 builds.  Make
-# does not otherwise see a changed command line, so a CPU-only build could be
-# accidentally reused by a later default Metal build.  Track the effective
-# configuration and make every V4 object depend on it.
 $(V4_BUILD_CONFIG): FORCE
-	@printf '%s\n' 'CC=$(CC)' 'CFLAGS=$(CFLAGS)' 'LDFLAGS=$(LDFLAGS)' 'METAL=$(METAL)' 'LTO=$(LTO)' 'V4_LAYER_RESIDENT_CFLAGS=$(V4_LAYER_RESIDENT_CFLAGS)' > $@.tmp
+	@printf '%s\n' 'CC=$(CC)' 'CFLAGS=$(CFLAGS)' 'LDFLAGS=$(LDFLAGS)' 'METAL=$(METAL)' 'LTO=$(LTO)' 'V4_TRACE_ROUTE=$(V4_TRACE_ROUTE)' 'V4_TRACE_EXEC=$(V4_TRACE_EXEC)' 'V4_LAYER_RESIDENT_CFLAGS=$(V4_LAYER_RESIDENT_CFLAGS)' > $@.tmp
 	@if test -f $@ && cmp -s $@.tmp $@; then rm -f $@.tmp; else mv -f $@.tmp $@; fi
 
 $(V4_OBJS) $(TEST_UNIT_OBJS): $(V4_BUILD_CONFIG)
@@ -152,11 +156,36 @@ coli_executor.o: coli_executor.c coli_executor.h coli_format.h
 	$(CC) $(CFLAGS) -c coli_executor.c -o $@
 coli_format.o: coli_format.c coli_format.h compat.h coli_v4_macos_uncached_io.h
 	$(CC) $(CFLAGS) -include coli_v4_macos_uncached_io.h -c coli_format.c -o $@
+coli_v4_expert_execute_trace.o: coli_v4_expert_execute_trace.c deepseek_v4_internal.h expert_store.h tensor.h
+	$(CC) $(CFLAGS) -c coli_v4_expert_execute_trace.c -o $@
+
+COLI_V4_UNIT_RESOURCE_PLAN.o: coli_v4_resource_plan.c deepseek_v4_internal.h coli_v4_residency.h
+	$(CC) $(CFLAGS) -c coli_v4_resource_plan.c -o $@
+COLI_V4_UNIT_EXPERT_STORE_AUTO.o: coli_v4_expert_store_auto.c deepseek_v4_internal.h coli_v4_expert_store.h coli_v4_residency.h coli_executor.h st.h
+	$(CC) $(CFLAGS) -c coli_v4_expert_store_auto.c -o $@
+
+ifeq ($(V4_TRACE_ROUTE),1)
+# Detailed route tracing needs authoritative position before batch-union lookups
+# collapse logical selections into a physical lease. Compile the existing large
+# block through the overlay only in the explicit tracing build.
+ifeq ($(V4_TRACE_EXEC),1)
+COLI_V4_UNIT_BLOCK_HYBRID.o: CFLAGS += -Dcoli_v4_expert_forward_ref=coli_v4_trace_expert_forward_ref
+endif
+COLI_V4_UNIT_BLOCK_HYBRID.o: coli_v4_block_hybrid_trace.c deepseek_v4.c deepseek_v4.h \
+	deepseek_v4_internal.h expert_store.h tensor.h
+	$(CC) $(CFLAGS) -DCOLI_V4_UNIT_BLOCK_HYBRID -c coli_v4_block_hybrid_trace.c -o $@
+
+# coli_v4_session_generate() lives in GENERATE_STATS. The route build intercepts
+# its one kv-prefix decision to establish the request boundary and prompt length.
+COLI_V4_UNIT_GENERATE_STATS.o: coli_v4_generate_stats_trace.c deepseek_v4.c deepseek_v4.h \
+	deepseek_v4_internal.h kv_prefix.h
+	$(CC) $(CFLAGS) -DCOLI_V4_UNIT_GENERATE_STATS -c coli_v4_generate_stats_trace.c -o $@
+endif
 
 $(V4_BINARY): $(V4_OBJS)
 	$(CC) $(V4_OBJS) -o $@ $(LDFLAGS)
 
-$(TARGET_OBJS) $(TEST_UNIT_OBJS): %.o: deepseek_v4.c deepseek_v4.h \
+$(V4_AMALGAMATED_OBJS): %.o: deepseek_v4.c deepseek_v4.h \
 	deepseek_v4_internal.h deepseek_v4_dspark.inc st.h json.h compat.h tensor.h quant.h \
 	native_quant.h native_quant_batch.h native_quant_dual.h \
 	native_quant_fp4_rows16.h
@@ -165,4 +194,4 @@ $(TARGET_OBJS) $(TEST_UNIT_OBJS): %.o: deepseek_v4.c deepseek_v4.h \
 deepseek-v4-test-objs: $(TEST_UNIT_OBJS)
 
 deepseek-v4-clean:
-	rm -f $(V4_BINARY) $(V4_OBJS) $(TEST_UNIT_OBJS) $(V4_BUILD_CONFIG)
+	rm -f $(V4_BINARY) $(V4_OBJS) $(TEST_UNIT_OBJS) coli_v4_expert_execute_trace.o $(V4_BUILD_CONFIG)
