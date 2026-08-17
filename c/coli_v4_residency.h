@@ -15,6 +15,10 @@ extern "C" {
  * slots, then offers the remainder to the deterministic dense/static cache.
  * This keeps total optional residency within the planner's existing budget
  * while #3 evolves toward a first-class tensor-granular planner.
+ *
+ * Runtime A/B: the expert store defaults to the new balanced split;
+ * V4_RESIDENCY_POLICY=legacy restores the old per-layer expert-cache geometry
+ * and leaves no reclaimed budget for this dense/static cache.
  */
 typedef struct {
     uint64_t budget_bytes;
