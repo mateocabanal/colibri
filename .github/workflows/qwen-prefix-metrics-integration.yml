@@ -1,0 +1,70 @@
+name: Qwen prefix metrics integration
+
+on:
+  push:
+    branches: [feat/qwen-prompt-cache-metrics]
+
+permissions:
+  contents: write
+
+jobs:
+  integrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: feat/qwen-prompt-cache-metrics
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: c/tools/requirements-deepseek-v4-tiny.txt
+      - name: Install tiny-fixture dependencies
+        run: python -m pip install -r c/tools/requirements-deepseek-v4-tiny.txt
+      - name: Apply exact engine edits
+        run: python3 c/tools/apply_qwen_prefix_metrics_patch.py
+      - name: Check patch and Python syntax
+        run: |
+          git diff --check
+          python3 -m py_compile c/tools/benchmark_qwen_prefix_cache.py
+      - name: Run cache geometry unit
+        run: cd c && python3 -m unittest tests.test_qwen_prefix_cache -v
+      - name: Generate hybrid tiny fixture and build engine
+        run: |
+          python c/tools/make_qwen_moe_tiny.py --output c/qwen_moe_tiny --force
+          make -C c qwen_moe ARCH=x86-64-v3
+      - name: Re-run warm/cold correctness oracle after capture move
+        run: |
+          python c/tests/test_qwen_prefix_serve.py \
+            --binary c/qwen_moe --fixture c/qwen_moe_tiny
+      - name: Exercise fixed-memory benchmark path
+        run: |
+          printf '<t005><t007><t009><t011><t013><t017><t019><t023>' > /tmp/qwen-prefix.txt
+          printf '<t029><t031><t037><t041><t043><t047>' > /tmp/qwen-tail.txt
+          unset CACHE
+          python c/tools/benchmark_qwen_prefix_cache.py \
+            --binary c/qwen_moe --model c/qwen_moe_tiny \
+            --prefix-file /tmp/qwen-prefix.txt --tail-file /tmp/qwen-tail.txt \
+            --memory-gb 4.5 --cache-mb 8 --min-prefix-tokens 1 \
+            --context 128 --max-tokens 1 --trials 1 \
+            --output /tmp/qwen-prefix-bench.json
+          python - <<'PY'
+          import json
+          p = json.load(open('/tmp/qwen-prefix-bench.json'))
+          assert p['schema'] == 'colibri.qwen.prefix_cache_benchmark.v1'
+          assert p['matched_tokens'] == 8
+          assert p['snapshot_bytes'] > 0
+          assert p['summary']['restore_ms_median'] >= 0
+          assert p['summary']['capture_ms_median'] >= 0
+          print('qwen prefix benchmark smoke: ok')
+          PY
+      - name: Commit clean stacked change
+        run: |
+          git rm .github/workflows/qwen-prefix-metrics-integration.yml c/tools/apply_qwen_prefix_metrics_patch.py
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add c/qwen_moe.c c/tools/benchmark_qwen_prefix_cache.py
+          git commit -m "perf(qwen): move prompt snapshot copy off TTFT path"
+          git push origin HEAD:feat/qwen-prompt-cache-metrics
