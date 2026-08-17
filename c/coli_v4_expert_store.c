@@ -75,6 +75,7 @@ typedef struct {
     int expert;
     unsigned char kind;
     unsigned char tier;
+    unsigned char has_tier;
 } TraceEvent;
 
 typedef struct {
@@ -213,6 +214,7 @@ static void trace_add_locked(State *s, TraceKind kind, ColiExpertKey key,
     event->expert = key.expert;
     event->kind = (unsigned char)kind;
     event->tier = (unsigned char)(slot ? slot->tier : SLOT_TIER_TRANSIENT);
+    event->has_tier = slot != NULL;
 }
 
 static void trace_flush(State *s) {
@@ -234,15 +236,25 @@ static void trace_flush(State *s) {
             (unsigned long long)s->trace_dropped);
     for (size_t i = 0; i < s->trace_count; i++) {
         const TraceEvent *event = &s->trace[i];
-        fprintf(file,
-                "{\"seq\":%llu,\"event\":\"%s\","
-                "\"layer\":%d,\"expert\":%d,\"tier\":\"%s\","
-                "\"generation\":%llu,\"bytes\":%llu}\n",
-                (unsigned long long)event->seq,
-                trace_name(event->kind), event->layer, event->expert,
-                tier_name((SlotTier)event->tier),
-                (unsigned long long)event->generation,
-                (unsigned long long)event->bytes);
+        if (event->has_tier) {
+            fprintf(file,
+                    "{\"seq\":%llu,\"event\":\"%s\","
+                    "\"layer\":%d,\"expert\":%d,\"tier\":\"%s\","
+                    "\"generation\":%llu,\"bytes\":%llu}\n",
+                    (unsigned long long)event->seq,
+                    trace_name(event->kind), event->layer, event->expert,
+                    tier_name((SlotTier)event->tier),
+                    (unsigned long long)event->generation,
+                    (unsigned long long)event->bytes);
+        } else {
+            fprintf(file,
+                    "{\"seq\":%llu,\"event\":\"%s\","
+                    "\"layer\":%d,\"expert\":%d,\"tier\":null,"
+                    "\"generation\":0,\"bytes\":%llu}\n",
+                    (unsigned long long)event->seq,
+                    trace_name(event->kind), event->layer, event->expert,
+                    (unsigned long long)event->bytes);
+        }
     }
 
     /* Layer summaries make activation skew useful immediately without requiring
@@ -716,33 +728,37 @@ static void destroy(ColiExpertStore *store) {
                     s->io_peak_inflight);
         }
 
-        fprintf(stderr,
-                "v4_residency_stats requests=%llu hits=%llu misses=%llu "
-                "persistent_hits=%llu transient_hits=%llu inflight_joins=%llu "
-                "loads=%llu load_failures=%llu evictions=%llu slot_waits=%llu "
-                "expert_capacity=%.2fGiB dense_cache_budget=%.2fGiB\n",
-                (unsigned long long)s->stats.requests,
-                (unsigned long long)s->stats.hits,
-                (unsigned long long)s->stats.misses,
-                (unsigned long long)s->stats.persistent_hits,
-                (unsigned long long)s->stats.transient_hits,
-                (unsigned long long)s->stats.inflight_joins,
-                (unsigned long long)s->stats.loads_started,
-                (unsigned long long)s->stats.loads_failed,
-                (unsigned long long)s->stats.evictions,
-                (unsigned long long)s->stats.slot_waits,
-                s->stats.capacity_bytes / (1024.0 * 1024.0 * 1024.0),
-                s->dense_cache_budget_bytes / (1024.0 * 1024.0 * 1024.0));
+        if (s->executor) {
+            fprintf(stderr,
+                    "v4_residency_stats requests=%llu hits=%llu misses=%llu "
+                    "persistent_hits=%llu transient_hits=%llu inflight_joins=%llu "
+                    "loads=%llu load_failures=%llu evictions=%llu slot_waits=%llu "
+                    "expert_capacity=%.2fGiB dense_cache_budget=%.2fGiB\n",
+                    (unsigned long long)s->stats.requests,
+                    (unsigned long long)s->stats.hits,
+                    (unsigned long long)s->stats.misses,
+                    (unsigned long long)s->stats.persistent_hits,
+                    (unsigned long long)s->stats.transient_hits,
+                    (unsigned long long)s->stats.inflight_joins,
+                    (unsigned long long)s->stats.loads_started,
+                    (unsigned long long)s->stats.loads_failed,
+                    (unsigned long long)s->stats.evictions,
+                    (unsigned long long)s->stats.slot_waits,
+                    s->stats.capacity_bytes / (1024.0 * 1024.0 * 1024.0),
+                    s->dense_cache_budget_bytes / (1024.0 * 1024.0 * 1024.0));
+        }
 
         trace_flush(s);
         coli_v4_dense_cache_reset();
 
-        for (int i = 0; i < s->total_slots; i++) {
+        if (s->slots) {
+            for (int i = 0; i < s->total_slots; i++) {
 #ifdef COLI_METAL
-            if (s->slots[i].data)
-                coli_metal_unregister(s->slots[i].data);
+                if (s->slots[i].data)
+                    coli_metal_unregister(s->slots[i].data);
 #endif
-            compat_aligned_free(s->slots[i].data);
+                compat_aligned_free(s->slots[i].data);
+            }
         }
         pthread_cond_destroy(&s->changed);
         pthread_mutex_destroy(&s->mutex);
@@ -781,6 +797,9 @@ int coli_v4_coli_expert_store_open(const ColiV4ColiExpertStoreOptions *o,
     }
     pthread_mutex_init(&s->mutex, NULL);
     pthread_cond_init(&s->changed, NULL);
+    /* Publish ownership immediately so every later `goto bad` tears down the
+     * partially initialized state rather than leaking the executor/index. */
+    store->state = s;
 
     s->progress_enabled = !getenv("V4_PROGRESS") ||
                           atoi(getenv("V4_PROGRESS")) != 0;
@@ -974,7 +993,6 @@ int coli_v4_coli_expert_store_open(const ColiV4ColiExpertStoreOptions *o,
     }
 
     store->ops = &ops;
-    store->state = s;
     *out = store;
     return 0;
 
