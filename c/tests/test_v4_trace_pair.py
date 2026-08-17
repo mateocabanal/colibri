@@ -91,6 +91,32 @@ class TracePairTests(unittest.TestCase):
             ]
         )
 
+    def execution(self) -> Path:
+        return self.write_trace(
+            [
+                {
+                    "schema": "colibri.v4.expert_execute_trace.v1",
+                    "build": "abc123",
+                    "source": "expert_execute",
+                    "events": 3,
+                    "dropped": 0,
+                    "total_execute_ns": 60,
+                },
+                {"seq": 1, "event": "execute", "layer": 0, "expert": 2,
+                 "generation": 7, "resident_bytes": 300, "route_weight": 0.7,
+                 "execute_ns": 10, "result": 0, "gate_format": 5,
+                 "down_format": 5, "up_format": 5},
+                {"seq": 2, "event": "execute", "layer": 0, "expert": 2,
+                 "generation": 7, "resident_bytes": 300, "route_weight": 0.2,
+                 "execute_ns": 20, "result": 0, "gate_format": 5,
+                 "down_format": 5, "up_format": 5},
+                {"seq": 3, "event": "execute", "layer": 0, "expert": 4,
+                 "generation": 8, "resident_bytes": 300, "route_weight": 0.8,
+                 "execute_ns": 30, "result": 0, "gate_format": 5,
+                 "down_format": 5, "up_format": 5},
+            ]
+        )
+
     def test_valid_pair(self) -> None:
         result = MODULE.validate_pair(self.physical(), self.logical())
         self.assertEqual(result["build"], "abc123")
@@ -102,6 +128,17 @@ class TracePairTests(unittest.TestCase):
         self.assertEqual(result["decode_routes"], 1)
         self.assertEqual(result["unique_lease_identities"], 2)
         self.assertEqual(result["physical_event_counts"]["load_complete"], 2)
+        self.assertFalse(result["execution_validated"])
+
+    def test_valid_pair_with_execution(self) -> None:
+        result = MODULE.validate_pair(
+            self.physical(), self.logical(), self.execution()
+        )
+        self.assertTrue(result["execution_validated"])
+        self.assertEqual(result["execution_events"], 3)
+        self.assertEqual(result["execution_total_ns"], 60)
+        self.assertEqual(result["execution_unique_lease_identities"], 2)
+        self.assertEqual(result["execution_resident_byte_sizes"], [300])
 
     def test_missing_physical_identity_is_rejected(self) -> None:
         logical_rows = [json.loads(line) for line in self.logical().read_text().splitlines()]
@@ -137,6 +174,29 @@ class TracePairTests(unittest.TestCase):
         logical = self.write_trace(logical_rows)
         with self.assertRaisesRegex(ValueError, "fanout says"):
             MODULE.validate_pair(self.physical(), logical)
+
+    def test_execution_count_mismatch_is_rejected(self) -> None:
+        rows = [json.loads(line) for line in self.execution().read_text().splitlines()]
+        rows.pop()
+        rows[0]["events"] = 2
+        rows[0]["total_execute_ns"] = 30
+        execution = self.write_trace(rows)
+        with self.assertRaisesRegex(ValueError, "execution count does not match"):
+            MODULE.validate_pair(self.physical(), self.logical(), execution)
+
+    def test_dropped_execution_trace_is_rejected(self) -> None:
+        rows = [json.loads(line) for line in self.execution().read_text().splitlines()]
+        rows[0]["dropped"] = 1
+        execution = self.write_trace(rows)
+        with self.assertRaisesRegex(ValueError, "execution trace is incomplete"):
+            MODULE.validate_pair(self.physical(), self.logical(), execution)
+
+    def test_execution_build_mismatch_is_rejected(self) -> None:
+        rows = [json.loads(line) for line in self.execution().read_text().splitlines()]
+        rows[0]["build"] = "other"
+        execution = self.write_trace(rows)
+        with self.assertRaisesRegex(ValueError, "execution build mismatch"):
+            MODULE.validate_pair(self.physical(), self.logical(), execution)
 
 
 if __name__ == "__main__":
