@@ -7,8 +7,10 @@ from tools.analyze_v4_expert_trace import (
     analyze,
     capacity_curve,
     global_frequency_oracle_curve,
+    infer_route_groups,
     per_layer_frequency_oracle_curve,
     per_layer_lru_curve,
+    routing_locality_summary,
     summary_dict,
 )
 
@@ -73,9 +75,6 @@ class V4ExpertTraceAnalysisTest(unittest.TestCase):
         self.assertEqual(summary["layers"]["0"]["top_experts"][0]["requests"], 3)
 
     def test_per_layer_persistent_curves(self):
-        # Layer 0: A B A A B => one-slot LRU hits only the adjacent A, while a
-        # perfect one-hot choice of A avoids two loads after A's first request.
-        # Layer 1: C C => both policies avoid C's second load.
         rows = [
             {"event": "request", "layer": 0, "expert": 1},
             {"event": "request", "layer": 0, "expert": 2},
@@ -129,9 +128,6 @@ class V4ExpertTraceAnalysisTest(unittest.TestCase):
         )
 
     def test_global_hot_oracle_avoids_diffuse_layer_waste(self):
-        # Equal per-layer allocation wastes one of two slots on layer 0, whose
-        # requests are all cold. A global two-slot budget can spend both slots
-        # on layer 1's two repeatedly used experts instead.
         rows = [
             {"event": "request", "layer": 0, "expert": 1},
             {"event": "request", "layer": 0, "expert": 2},
@@ -155,6 +151,49 @@ class V4ExpertTraceAnalysisTest(unittest.TestCase):
         self.assertGreater(
             global_hot["trace_value_per_resident_byte"],
             per_layer["trace_value_per_resident_byte"],
+        )
+
+    def test_inferred_token_groups_corouting_and_adjacent_overlap(self):
+        # Two tokens, two routed layers/token, two experts/layer. Layer wrapping
+        # from 1 -> 0 starts token 1. Each layer retains one expert across the
+        # token boundary, giving Jaccard overlap 1/3.
+        rows = [
+            {"event": "request", "layer": 0, "expert": 1},
+            {"event": "request", "layer": 0, "expert": 2},
+            {"event": "request", "layer": 1, "expert": 3},
+            {"event": "request", "layer": 1, "expert": 4},
+            {"event": "request", "layer": 0, "expert": 1},
+            {"event": "request", "layer": 0, "expert": 5},
+            {"event": "request", "layer": 1, "expert": 3},
+            {"event": "request", "layer": 1, "expert": 6},
+        ]
+        temp, path = self.write_trace(rows)
+        self.addCleanup(temp.cleanup)
+        result = analyze(path)
+
+        groups = infer_route_groups(result.requests)
+        self.assertEqual(len(groups), 4)
+        self.assertEqual([group.token for group in groups], [0, 0, 1, 1])
+        self.assertEqual(groups[0].experts, (1, 2))
+        self.assertEqual(groups[2].experts, (1, 5))
+
+        routing = routing_locality_summary(result, 10, prompt_tokens=1)
+        self.assertEqual(routing["token_ids"], "inferred-from-layer-wraps")
+        self.assertEqual(routing["token_count"], 2)
+        self.assertEqual(routing["route_groups"], 4)
+        self.assertEqual(
+            routing["unique_logical_experts_per_token"]["mean"], 4.0
+        )
+        self.assertEqual(routing["adjacent_token_overlap"]["samples"], 2)
+        self.assertEqual(routing["adjacent_token_overlap"]["mean_shared"], 1.0)
+        self.assertAlmostEqual(
+            routing["adjacent_token_overlap"]["mean_jaccard"], 1.0 / 3.0
+        )
+        self.assertEqual(routing["phase"]["prompt_requests"], 4)
+        self.assertEqual(routing["phase"]["decode_requests"], 4)
+        self.assertIn(
+            {"layer": 0, "experts": [1, 2], "co_routes": 1},
+            routing["top_co_routing_pairs"],
         )
 
     def test_invalid_request_event_is_rejected(self):
