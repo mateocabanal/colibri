@@ -16,7 +16,7 @@ static int decode_token_string(const ColiV4Session *session,
     size_t length = 0, capacity = 0;
     for (int index = 0; index < count; index++) {
         char piece[512];
-        int bytes = tok_decode((tok *)&session->tokenizer, &ids[index], 1,
+        int bytes = tok_decode((Tok *)&session->tokenizer, &ids[index], 1,
                                piece, (int)sizeof(piece));
         if (bytes < 0 || length > SIZE_MAX - (size_t)bytes - 1) {
             free(text);
