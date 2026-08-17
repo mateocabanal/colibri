@@ -147,6 +147,7 @@ def percentile(values: list[int], q: float) -> float:
 
 
 def capacity_curve(analysis: TraceAnalysis, capacities: list[int]) -> list[dict]:
+    """Hypothetical global LRU over logical `(layer, expert)` identities."""
     total = len(analysis.requests)
     rows = []
     for capacity in capacities:
@@ -163,7 +164,111 @@ def capacity_curve(analysis: TraceAnalysis, capacities: list[int]) -> list[dict]
     return rows
 
 
-def summary_dict(analysis: TraceAnalysis, capacities: list[int], top_n: int) -> dict:
+def _layer_request_streams(analysis: TraceAnalysis) -> dict[int, list[tuple[int, int]]]:
+    streams: dict[int, list[tuple[int, int]]] = defaultdict(list)
+    for layer, expert in analysis.requests:
+        streams[layer].append((layer, expert))
+    return dict(streams)
+
+
+def per_layer_lru_curve(analysis: TraceAnalysis, capacities: list[int]) -> list[dict]:
+    """Model N independent persistent LRU slots in every observed layer.
+
+    This matches the RAM geometry of `V4_PERSISTENT_EXPERT_SLOTS_PER_LAYER`
+    much better than the global LRU curve. The value ratio is measured over the
+    complete trace: recurring expert bytes avoided divided by persistent bytes
+    reserved. It can be compared directly with the same trace-level ratio for
+    deterministic dense residency.
+    """
+
+    streams = _layer_request_streams(analysis)
+    layer_distances: dict[int, list[int]] = {}
+    for layer, requests in streams.items():
+        layer_distances[layer], _ = exact_reuse_distances(requests)
+
+    total = len(analysis.requests)
+    layers = len(streams)
+    rows = []
+    for capacity in capacities:
+        hits = sum(
+            sum(distance < capacity for distance in distances)
+            for distances in layer_distances.values()
+        )
+        resident_slots = layers * capacity
+        resident_bytes = resident_slots * analysis.record_bytes
+        bytes_avoided = hits * analysis.record_bytes
+        rows.append(
+            {
+                "slots_per_layer": capacity,
+                "layers": layers,
+                "resident_slots": resident_slots,
+                "resident_bytes": resident_bytes,
+                "hits": hits,
+                "misses": total - hits,
+                "hit_rate": (hits / total) if total else 0.0,
+                "bytes_avoided": bytes_avoided,
+                "trace_value_per_resident_byte": (
+                    bytes_avoided / resident_bytes if resident_bytes else 0.0
+                ),
+            }
+        )
+    return rows
+
+
+def per_layer_frequency_oracle_curve(
+    analysis: TraceAnalysis, capacities: list[int]
+) -> list[dict]:
+    """Upper bound for perfectly chosen hot experts in each layer.
+
+    For each layer, choose the N most frequent experts using knowledge of the
+    entire trace. A selected expert still misses on its first request and only
+    subsequent requests count as avoided loads. The real online hysteresis
+    policy cannot beat this curve on the same request sequence, so this is a
+    useful rejection test: if even the oracle's bytes-saved/resident-byte is
+    below dense residency, persistent expert RAM is not competitive.
+    """
+
+    total = len(analysis.requests)
+    layers = len(analysis.layer_frequency)
+    rows = []
+    for capacity in capacities:
+        hits = 0
+        selected_experts = 0
+        for frequency in analysis.layer_frequency.values():
+            selected = frequency.most_common(capacity)
+            selected_experts += len(selected)
+            hits += sum(max(0, count - 1) for _, count in selected)
+        resident_slots = layers * capacity
+        resident_bytes = resident_slots * analysis.record_bytes
+        bytes_avoided = hits * analysis.record_bytes
+        rows.append(
+            {
+                "slots_per_layer": capacity,
+                "layers": layers,
+                "resident_slots": resident_slots,
+                "selected_experts": selected_experts,
+                "resident_bytes": resident_bytes,
+                "hits": hits,
+                "misses": total - hits,
+                "hit_rate": (hits / total) if total else 0.0,
+                "bytes_avoided": bytes_avoided,
+                "trace_value_per_resident_byte": (
+                    bytes_avoided / resident_bytes if resident_bytes else 0.0
+                ),
+            }
+        )
+    return rows
+
+
+def summary_dict(
+    analysis: TraceAnalysis,
+    capacities: list[int],
+    top_n: int,
+    persistent_capacities: list[int] | None = None,
+) -> dict:
+    if persistent_capacities is None:
+        persistent_capacities = [1, 2, 4, 8]
+
     top_layers = {}
     for layer in sorted(analysis.layer_frequency):
         total = sum(analysis.layer_frequency[layer].values())
@@ -201,6 +306,12 @@ def summary_dict(analysis: TraceAnalysis, capacities: list[int], top_n: int) -> 
             "p99": percentile(analysis.reuse_distances, 0.99),
         },
         "lru_capacity_curve": capacity_curve(analysis, capacities),
+        "persistent_per_layer_lru_curve": per_layer_lru_curve(
+            analysis, persistent_capacities
+        ),
+        "persistent_per_layer_frequency_oracle_curve": (
+            per_layer_frequency_oracle_curve(analysis, persistent_capacities)
+        ),
         "layers": top_layers,
     }
 
@@ -218,6 +329,19 @@ def parse_capacities(raw: str) -> list[int]:
     if not capacities:
         raise ValueError("at least one cache capacity is required")
     return sorted(set(capacities))
+
+
+def _print_persistent_curve(title: str, rows: list[dict]) -> None:
+    print(f"\n{title}:")
+    print("  slots/layer   hit-rate     hits   resident   avoided   value/byte")
+    for row in rows:
+        resident_gib = row["resident_bytes"] / (1024**3)
+        avoided_gib = row["bytes_avoided"] / (1024**3)
+        print(
+            f"  {row['slots_per_layer']:11d}   {100.0 * row['hit_rate']:6.2f}%  "
+            f"{row['hits']:7d}   {resident_gib:7.2f}G   {avoided_gib:7.2f}G   "
+            f"{row['trace_value_per_resident_byte']:8.3f}x"
+        )
 
 
 def print_human(summary: dict, top_n: int) -> None:
@@ -238,7 +362,7 @@ def print_human(summary: dict, top_n: int) -> None:
     else:
         print("reuse distance: no repeated expert requests")
 
-    print("\nLRU working-set curve:")
+    print("\nGlobal LRU working-set curve:")
     print("  slots      hit-rate        hits     avoided")
     for row in summary["lru_capacity_curve"]:
         gib = row["bytes_avoided"] / (1024**3)
@@ -246,6 +370,15 @@ def print_human(summary: dict, top_n: int) -> None:
             f"  {row['capacity']:5d}      {100.0 * row['hit_rate']:6.2f}%  "
             f"{row['hits']:10d}   {gib:8.2f} GiB"
         )
+
+    _print_persistent_curve(
+        "Per-layer persistent LRU value",
+        summary["persistent_per_layer_lru_curve"],
+    )
+    _print_persistent_curve(
+        "Per-layer perfect-hot oracle (upper bound)",
+        summary["persistent_per_layer_frequency_oracle_curve"],
+    )
 
     print(f"\nTop {top_n} experts per layer:")
     for layer, info in summary["layers"].items():
@@ -264,6 +397,11 @@ def main(argv: list[str] | None = None) -> int:
         default="1,2,4,8,16,32,64,128,256,512",
         help="comma-separated hypothetical global LRU capacities",
     )
+    parser.add_argument(
+        "--persistent-capacities",
+        default="1,2,4,8",
+        help="comma-separated persistent expert slots to model per layer",
+    )
     parser.add_argument("--top", type=int, default=5, help="experts shown per layer")
     parser.add_argument("--json", action="store_true", help="emit machine-readable summary")
     args = parser.parse_args(argv)
@@ -272,10 +410,13 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--top must be positive")
     try:
         capacities = parse_capacities(args.capacities)
+        persistent_capacities = parse_capacities(args.persistent_capacities)
         analysis = analyze(args.trace)
     except (OSError, ValueError) as exc:
         parser.error(str(exc))
-    summary = summary_dict(analysis, capacities, args.top)
+    summary = summary_dict(
+        analysis, capacities, args.top, persistent_capacities
+    )
     if args.json:
         json.dump(summary, sys.stdout, sort_keys=True, indent=2)
         sys.stdout.write("\n")
