@@ -1,0 +1,410 @@
+#!/usr/bin/env python3
+from pathlib import Path
+
+
+def replace_once(text, old, new, label):
+    if new in text:
+        return text
+    if old not in text:
+        raise SystemExit(f"missing anchor: {label}")
+    return text.replace(old, new, 1)
+
+
+# DeepSeek V4: public profiling ABI stays unchanged; implementation moves to
+# the generic profile core through coli_v4_profile.c.
+p = Path("c/Makefile.deepseek-v4")
+s = p.read_text()
+s = replace_once(
+    s,
+    "V4_COLI_OBJS = coli_v4_expert_store.o coli_v4_static.o coli_executor.o coli_format.o $(V4_TRACE_EXEC_OBJS)\n",
+    "V4_COLI_OBJS = coli_v4_expert_store.o coli_v4_static.o coli_executor.o coli_format.o coli_profile_v4.o $(V4_TRACE_EXEC_OBJS)\n",
+    "V4_COLI_OBJS",
+)
+anchor = (
+    "coli_format.o: coli_format.c coli_format.h compat.h coli_v4_macos_uncached_io.h\n"
+    "\t$(CC) $(CFLAGS) -include coli_v4_macos_uncached_io.h -c coli_format.c -o $@\n"
+)
+if "coli_profile_v4.o: profile.c profile.h" not in s:
+    if anchor not in s:
+        raise SystemExit("missing V4 profile rule anchor")
+    s = s.replace(
+        anchor,
+        anchor
+        + "coli_profile_v4.o: profile.c profile.h\n"
+          "\t$(CC) $(CFLAGS) -c profile.c -o $@\n"
+          "COLI_V4_UNIT_PROFILE.o: coli_v4_profile.c profile.h deepseek_v4_internal.h expert_store.h\n"
+          "\t$(CC) $(CFLAGS) -c coli_v4_profile.c -o $@\n",
+        1,
+    )
+p.write_text(s)
+
+# Main Makefile: use engine-namespaced objects so V4/Qwen build flags can never
+# contaminate one another (same principle as qwen_coli_format.o).
+p = Path("c/Makefile")
+s = p.read_text()
+s = replace_once(
+    s,
+    "QMOE_COLI_OBJS = qwen_coli_executor.o qwen_coli_format.o mxfp4_expert.o mxfp4_runtime.o\n",
+    "QMOE_COLI_OBJS = qwen_coli_executor.o qwen_coli_format.o mxfp4_expert.o mxfp4_runtime.o qwen_profile.o\n",
+    "QMOE_COLI_OBJS",
+)
+qanchor = (
+    "qwen_coli_format.o: coli_format.c coli_format.h compat.h\n"
+    "\t$(CC) $(QMOE_CFLAGS) -c coli_format.c -o $@\n\n"
+)
+if "qwen_profile.o: profile.c profile.h" not in s:
+    if qanchor not in s:
+        raise SystemExit("missing Qwen object rule anchor")
+    s = s.replace(
+        qanchor,
+        qanchor
+        + "qwen_profile.o: profile.c profile.h\n"
+          "\t$(CC) $(QMOE_CFLAGS) -c profile.c -o $@\n\n",
+        1,
+    )
+s = s.replace(
+    "qwen_moe.c st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h mxfp4_expert.h",
+    "qwen_moe.c st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h profile.h mxfp4_expert.h",
+)
+tanchor = (
+    "tests/test_qwen_moe$(EXE): tests/test_qwen_moe.c qwen_moe.c st.h json.h tok.h "
+    "tok_unicode.h tok_unicode_o200k.h compat.h sample.h omp_tune.h route_trace.h "
+    "mxfp4_expert.h mxfp4_runtime.h quant.h $(QMOE_COLI_OBJS)\n"
+)
+if tanchor in s:
+    s = s.replace(
+        tanchor,
+        tanchor.replace("route_trace.h mxfp4_expert.h", "route_trace.h profile.h mxfp4_expert.h"),
+        1,
+    )
+if "tests/test_profile$(EXE):" not in s:
+    insertion = (
+        "tests/test_profile$(EXE): tests/test_profile.c profile.c profile.h\n"
+        "\t$(CC) $(CFLAGS) tests/test_profile.c profile.c -o $@ $(LDFLAGS)\n\n"
+    )
+    if "tests/test_route_trace$(EXE):" not in s:
+        raise SystemExit("missing test insertion anchor")
+    s = s.replace("tests/test_route_trace$(EXE):", insertion + "tests/test_route_trace$(EXE):", 1)
+p.write_text(s)
+
+# Clean namespaced Qwen profile object. V4's dedicated clean already removes
+# every object listed in V4_OBJS.
+p = Path("c/tools/clean.py")
+s = p.read_text()
+anchor = '    "qwen_coli_executor.o", "qwen_coli_format.o",\n'
+if '"qwen_profile.o"' not in s:
+    if anchor not in s:
+        raise SystemExit("missing clean Qwen anchor")
+    s = s.replace(anchor, anchor + '    "qwen_profile.o",\n', 1)
+p.write_text(s)
+
+# Generic test does not need a real sleep; synthetic phase values are enough.
+p = Path("c/tests/test_profile.c")
+s = p.read_text()
+s = s.replace(
+    "    /* Give the wall clock a real positive interval; phase values are synthetic\n"
+    "     * so diagnostic overlap intentionally exceeds wall without affecting the\n"
+    "     * accounted sum. */\n"
+    "    struct timespec ts = {0, 12000000};\n"
+    "    nanosleep(&ts, NULL);\n",
+    "",
+)
+p.write_text(s)
+
+# Qwen engine adapter.
+p = Path("c/qwen_moe.c")
+s = p.read_text()
+s = replace_once(
+    s,
+    '#include "route_trace.h"\n',
+    '#include "route_trace.h"\n#include "profile.h"\n',
+    "qwen profile include",
+)
+s = s.replace(
+    "double t_attn, t_gdn, t_moe, t_expio;   /* per-request phase timings (PROF) */",
+    "double t_attn, t_gdn, t_moe, t_expio, t_head; /* legacy PROF + generic profile sources */",
+)
+
+model_anchor = "} Model;\n\nstatic pthread_mutex_t g_mx = PTHREAD_MUTEX_INITIALIZER;\n"
+adapter = r''' } Model;
+
+/* Generic inference profiler adapter. DeepSeek V4 and Qwen share profile.c;
+ * each engine only defines its phase taxonomy and scope/counter snapshots. */
+enum {
+    QPROF_MODEL_LOAD = 0,
+    QPROF_STARTUP_OTHER,
+    QPROF_ATTN,
+    QPROF_GDN,
+    QPROF_MOE,
+    QPROF_EXPERT_IO,
+    QPROF_HEAD,
+    QPROF_METAL_ENCODE,
+    QPROF_METAL_SUBMIT,
+    QPROF_METAL_WAIT,
+    QPROF_METAL_KERNEL,
+    QPROF_COUNT
+};
+enum {
+    QPC_EXPERT_REQUESTS = 0,
+    QPC_EXPERT_HITS,
+    QPC_EXPERT_MISSES,
+    QPC_PREFETCH_MISSES,
+    QPC_COUNT
+};
+static const ColiProfilePhaseDef qprof_phases[QPROF_COUNT] = {
+    [QPROF_MODEL_LOAD]    = {"model_load", COLI_PROFILE_ACCOUNTED},
+    [QPROF_STARTUP_OTHER] = {"startup_other", COLI_PROFILE_ACCOUNTED},
+    [QPROF_ATTN]          = {"attention", COLI_PROFILE_ACCOUNTED},
+    [QPROF_GDN]           = {"gdn", COLI_PROFILE_ACCOUNTED},
+    [QPROF_MOE]           = {"moe", COLI_PROFILE_ACCOUNTED},
+    /* Nested inside MoE: subtract from accounted wall to expose compute time,
+     * but never add it to accounted twice. */
+    [QPROF_EXPERT_IO]     = {"expert_io", COLI_PROFILE_IO_WAIT},
+    [QPROF_HEAD]          = {"head_compute", COLI_PROFILE_ACCOUNTED},
+    [QPROF_METAL_ENCODE]  = {"metal_encode", 0},
+    [QPROF_METAL_SUBMIT]  = {"metal_submit", 0},
+    [QPROF_METAL_WAIT]    = {"metal_wait", 0},
+    [QPROF_METAL_KERNEL]  = {"metal_kernel", 0},
+};
+static const ColiProfileCounterDef qprof_counters[QPC_COUNT] = {
+    [QPC_EXPERT_REQUESTS] = {"expert_requests"},
+    [QPC_EXPERT_HITS] = {"expert_hits"},
+    [QPC_EXPERT_MISSES] = {"expert_misses"},
+    [QPC_PREFETCH_MISSES] = {"prefetch_misses"},
+};
+static ColiProfile g_qprof;
+
+static uint64_t qprof_s_to_ns(double seconds) {
+    if (!(seconds > 0.0)) return 0;
+    double ns = seconds * 1.0e9;
+    return ns >= (double)UINT64_MAX ? UINT64_MAX : (uint64_t)ns;
+}
+
+static void qprof_reset(void) {
+    static const ColiProfileConfig config = {
+        .engine = "qwen_moe",
+        .env_name = "QWEN_PROFILE",
+        .line_prefix = "coli_profile",
+        .include_engine = 1,
+        .phases = qprof_phases,
+        .phase_count = QPROF_COUNT,
+        .counters = qprof_counters,
+        .counter_count = QPC_COUNT,
+    };
+    coli_profile_reset(&g_qprof, &config);
+#ifdef COLI_METAL
+    coli_metal_profile_set_on(coli_profile_enabled(&g_qprof));
+    if (coli_profile_enabled(&g_qprof)) coli_metal_profile_reset();
+#endif
+    if (coli_profile_enabled(&g_qprof)) coli_profile_mark(&g_qprof, 0);
+}
+
+static void qprof_sync(Model *m) {
+    if (!coli_profile_enabled(&g_qprof)) return;
+    coli_profile_phase_set(&g_qprof, QPROF_ATTN, qprof_s_to_ns(m->t_attn));
+    coli_profile_phase_set(&g_qprof, QPROF_GDN, qprof_s_to_ns(m->t_gdn));
+    coli_profile_phase_set(&g_qprof, QPROF_MOE, qprof_s_to_ns(m->t_moe));
+    coli_profile_phase_set(&g_qprof, QPROF_EXPERT_IO, qprof_s_to_ns(m->t_expio));
+    coli_profile_phase_set(&g_qprof, QPROF_HEAD, qprof_s_to_ns(m->t_head));
+    coli_profile_counter_set(&g_qprof, QPC_EXPERT_REQUESTS, m->hits + m->miss);
+    coli_profile_counter_set(&g_qprof, QPC_EXPERT_HITS, m->hits);
+    coli_profile_counter_set(&g_qprof, QPC_EXPERT_MISSES, m->miss);
+    coli_profile_counter_set(&g_qprof, QPC_PREFETCH_MISSES, m->prefetch_misses);
+#ifdef COLI_METAL
+    uint64_t encode = 0, submit = 0, wait = 0, kernel = 0;
+    coli_metal_profile_get(&encode, &submit, &wait, &kernel);
+    coli_profile_phase_set(&g_qprof, QPROF_METAL_ENCODE, encode);
+    coli_profile_phase_set(&g_qprof, QPROF_METAL_SUBMIT, submit);
+    coli_profile_phase_set(&g_qprof, QPROF_METAL_WAIT, wait);
+    coli_profile_phase_set(&g_qprof, QPROF_METAL_KERNEL, kernel);
+#endif
+}
+
+static void qprof_startup_end(Model *m) {
+    if (!coli_profile_enabled(&g_qprof)) return;
+    uint64_t model_ns = qprof_s_to_ns(m->dense_load_s);
+    coli_profile_phase_set(&g_qprof, QPROF_MODEL_LOAD, model_ns);
+    ColiProfileSnapshot snap = coli_profile_get(&g_qprof);
+    coli_profile_phase_set(&g_qprof, QPROF_STARTUP_OTHER,
+                           snap.wall_ns > model_ns ? snap.wall_ns - model_ns : 0);
+    qprof_sync(m);
+    coli_profile_mark(&g_qprof, 1);
+    coli_profile_mark_tokens(&g_qprof, 1, 0);
+    coli_profile_emit_scope(stderr, &g_qprof, "startup", 0, 1);
+}
+
+static void qprof_request_begin(Model *m) {
+    /* Preserve the legacy SERVE PROF contract while making these same timers
+     * the engine adapter's source of truth. */
+    m->t_attn = m->t_gdn = m->t_moe = m->t_expio = m->t_head = 0.0;
+    if (!coli_profile_enabled(&g_qprof)) return;
+    qprof_sync(m);
+    coli_profile_mark(&g_qprof, 2);
+    coli_profile_mark_tokens(&g_qprof, 2, 0);
+    coli_profile_mark(&g_qprof, 3);
+    coli_profile_mark_tokens(&g_qprof, 3, 0);
+}
+
+static void qprof_prefill_end(Model *m, int prompt_tokens) {
+    if (!coli_profile_enabled(&g_qprof)) return;
+    qprof_sync(m);
+    coli_profile_mark(&g_qprof, 4);
+    coli_profile_mark_tokens(&g_qprof, 4,
+                             prompt_tokens > 0 ? (uint64_t)prompt_tokens : 0);
+}
+
+static void qprof_request_end(Model *m, int prompt_tokens, int generated_tokens) {
+    if (!coli_profile_enabled(&g_qprof)) return;
+    qprof_sync(m);
+    coli_profile_mark(&g_qprof, 5);
+    uint64_t total = (prompt_tokens > 0 ? (uint64_t)prompt_tokens : 0) +
+                     (generated_tokens > 0 ? (uint64_t)generated_tokens : 0);
+    coli_profile_mark_tokens(&g_qprof, 5, total);
+    coli_profile_emit_scope(stderr, &g_qprof, "run", 2, 5);
+    coli_profile_emit_scope(stderr, &g_qprof, "prompt", 3, 4);
+    coli_profile_emit_scope(stderr, &g_qprof, "decode", 4, 5);
+}
+
+static double qprof_head_begin(void) {
+    return coli_profile_enabled(&g_qprof) ? now_s() : 0.0;
+}
+static void qprof_head_end(Model *m, double began) {
+    if (began > 0.0) m->t_head += now_s() - began;
+}
+
+static pthread_mutex_t g_mx = PTHREAD_MUTEX_INITIALIZER;
+'''.lstrip()
+if "static ColiProfile g_qprof;" not in s:
+    if model_anchor not in s:
+        raise SystemExit("missing Model adapter anchor")
+    s = s.replace(model_anchor, adapter, 1)
+
+# Head projection sits outside Qwen's old broad timers.
+head = "    wt_mul(logits, normed, &m->lm_head, 1, c->vocab, D);\n"
+head_new = (
+    "    double qhead_began = qprof_head_begin();\n"
+    + head
+    + "    qprof_head_end(m, qhead_began);\n"
+)
+if "double qhead_began = qprof_head_begin();" not in s:
+    if s.count(head) < 2:
+        raise SystemExit("missing lm_head projection anchors")
+    s = s.replace(head, head_new)
+
+# Greedy scopes.
+old = "    float *logits = step(m, ids, np, 0);\n    for (int s = 0; s < max_new; s++) {\n"
+new = (
+    "    qprof_request_begin(m);\n"
+    "    float *logits = step(m, ids, np, 0);\n"
+    "    qprof_prefill_end(m, np);\n"
+    "    int qprof_gen = 0;\n"
+    "    for (int s = 0; s < max_new; s++) {\n"
+)
+if "int qprof_gen = 0;" not in s:
+    if old not in s:
+        raise SystemExit("missing greedy prefill anchor")
+    s = s.replace(old, new, 1)
+old = '        printf("ID %d\\n", best);\n        logits = step(m, &best, 1, np + s);\n'
+new = '        printf("ID %d\\n", best);\n        qprof_gen++;\n        logits = step(m, &best, 1, np + s);\n'
+if "        qprof_gen++;\n        logits = step(m, &best" not in s:
+    if old not in s:
+        raise SystemExit("missing greedy generation anchor")
+    s = s.replace(old, new, 1)
+old = (
+    "    logits_free(&logits);\n"
+    "    free(ids);\n"
+    "    return 0;\n"
+    "}\n\n"
+    "/* Special-token id by content:"
+)
+new = (
+    "    qprof_request_end(m, np, qprof_gen);\n"
+    "    logits_free(&logits);\n"
+    "    free(ids);\n"
+    "    return 0;\n"
+    "}\n\n"
+    "/* Special-token id by content:"
+)
+if "qprof_request_end(m, np, qprof_gen);" not in s:
+    if old not in s:
+        raise SystemExit("missing greedy end anchor")
+    s = s.replace(old, new, 1)
+
+# Chat scopes: one record per user turn.
+old = (
+    "        float *logits = step(m, ids, np, hpos);\n"
+    "        memcpy(hist + hpos, ids, (size_t)np * sizeof(int));\n"
+)
+new = (
+    "        qprof_request_begin(m);\n"
+    "        float *logits = step(m, ids, np, hpos);\n"
+    "        qprof_prefill_end(m, np);\n"
+    "        int qprof_gen = 0;\n"
+    "        memcpy(hist + hpos, ids, (size_t)np * sizeof(int));\n"
+)
+if "        qprof_request_begin(m);\n        float *logits = step(m, ids, np, hpos);" not in s:
+    if old not in s:
+        raise SystemExit("missing chat prefill anchor")
+    s = s.replace(old, new, 1)
+old = (
+    "            hist[hpos++] = nt;\n"
+    "            int nb = tok_decode(T, &nt, 1, buf, sizeof(buf) - 1);\n"
+)
+new = (
+    "            hist[hpos++] = nt;\n"
+    "            qprof_gen++;\n"
+    "            int nb = tok_decode(T, &nt, 1, buf, sizeof(buf) - 1);\n"
+)
+if "            qprof_gen++;\n            int nb = tok_decode" not in s:
+    if old not in s:
+        raise SystemExit("missing chat generation anchor")
+    s = s.replace(old, new, 1)
+old = "        logits_free(&logits);\n        printf(\"\\n\");\n    }\n    free(hist);\n"
+new = (
+    "        qprof_request_end(m, np, qprof_gen);\n"
+    "        logits_free(&logits);\n"
+    "        printf(\"\\n\");\n"
+    "    }\n"
+    "    free(hist);\n"
+)
+if "        qprof_request_end(m, np, qprof_gen);\n        logits_free(&logits);" not in s:
+    if old not in s:
+        raise SystemExit("missing chat end anchor")
+    s = s.replace(old, new, 1)
+
+# Serve scopes. Generic output is stderr-only, so protocol stdout stays clean.
+old = "    m->t_attn = m->t_gdn = m->t_moe = m->t_expio = 0;\n    double t0 = now_s();\n"
+new = "    qprof_request_begin(m);\n    double t0 = now_s();\n"
+if old in s:
+    s = s.replace(old, new, 1)
+old = "    float *logit = step(m, ids, np, 0);\n    int hist_len = np, gen = 0, limited = 1, cancelled = 0;\n"
+new = "    float *logit = step(m, ids, np, 0);\n    qprof_prefill_end(m, np);\n    int hist_len = np, gen = 0, limited = 1, cancelled = 0;\n"
+if "    qprof_prefill_end(m, np);\n    int hist_len" not in s:
+    if old not in s:
+        raise SystemExit("missing serve prefill anchor")
+    s = s.replace(old, new, 1)
+old = "    logits_free(&logit);\n    double dt = now_s() - t0;\n"
+new = "    logits_free(&logit);\n    qprof_request_end(m, np, gen);\n    double dt = now_s() - t0;\n"
+if "    qprof_request_end(m, np, gen);\n    double dt" not in s:
+    if old not in s:
+        raise SystemExit("missing serve end anchor")
+    s = s.replace(old, new, 1)
+
+# Profiler lifetime covers startup/backend initialization and then mode requests.
+old = "    Model m; model_init(&m, snap, cap);\n"
+new = "    qprof_reset();\n    Model m; model_init(&m, snap, cap);\n"
+if "    qprof_reset();\n    Model m;" not in s:
+    if old not in s:
+        raise SystemExit("missing model_init anchor")
+    s = s.replace(old, new, 1)
+old = '    const char *mode = getenv("QWENMOE_MODE");\n'
+new = '    qprof_startup_end(&m);\n    const char *mode = getenv("QWENMOE_MODE");\n'
+if '    qprof_startup_end(&m);\n    const char *mode' not in s:
+    if old not in s:
+        raise SystemExit("missing mode anchor")
+    s = s.replace(old, new, 1)
+p.write_text(s)
+
+# Temporary staging machinery removes itself after producing the real patch.
+Path(".github/workflows/generic-profile-stage.yml").unlink(missing_ok=True)
+Path("tools/stage_generic_profile.py").unlink(missing_ok=True)
