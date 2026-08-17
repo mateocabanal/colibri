@@ -35,8 +35,10 @@ jobs:
           git diff --check
       - name: Build and run portable tests
         run: |
-          cc -O2 -Wall -Wextra -Werror -I c c/tests/test_coli_format.c c/coli_format.c c/coli_executor.c -lpthread -o /tmp/test_coli_format
-          cc -O2 -Wall -Wextra -Werror -I c c/tests/test_mxfp4_expert.c c/mxfp4_expert.c c/coli_format.c -lpthread -o /tmp/test_mxfp4_expert
+          cc -O2 -Wall -Wextra -Werror -I c -c c/coli_format.c -o /tmp/coli_format.o
+          cc -O2 -Wall -Wextra -Werror -I c -c c/mxfp4_expert.c -o /tmp/mxfp4_expert.o
+          cc -O2 -Wall -Wextra -Wno-misleading-indentation -I c c/tests/test_coli_format.c c/coli_format.c c/coli_executor.c -lpthread -o /tmp/test_coli_format
+          cc -O2 -Wall -Wextra -I c c/tests/test_mxfp4_expert.c c/mxfp4_expert.c c/coli_format.c -lpthread -o /tmp/test_mxfp4_expert
           (cd c && /tmp/test_coli_format)
           /tmp/test_mxfp4_expert
           make -C c clean
