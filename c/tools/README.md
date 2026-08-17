@@ -22,10 +22,19 @@ not runtime dependencies of the C engine.
   relevant environment.
 - `analyze_v4_expert_trace.py`: offline analysis for `V4_EXPERT_TRACE` JSONL.
   Reports activation skew, hottest experts per layer, exact LRU stack/reuse
-  distance, physical residency events, and hypothetical global/per-layer LRU
-  and persistent-hot-tier hit-rate / bytes-avoided curves for configurable
-  expert-cache capacities. It uses a Fenwick tree for O(n log n) reuse-distance
-  analysis and has no third-party dependency.
+  distance, physical residency events, hypothetical global/per-layer LRU and
+  persistent-hot-tier curves, plus inferred per-token co-routing and
+  adjacent-token route overlap. The current v1 trace has no explicit token ID;
+  for the single-request V4 execution stream the analyzer marks token ordinals
+  as **inferred** from layer-number wraps. `--prompt-tokens N` can split those
+  ordinals into prompt/decode summaries. Explicit runtime request/token/rank
+  metadata is still required before #56 is complete.
+- `analyze_v4_residency_value.py`: offline policy-reference tool for #3. It
+  compares deterministic residency and global hot-expert capacity using
+  estimated **exposed I/O milliseconds avoided per resident GiB**. Repeated
+  `--dense-point` inputs can also produce a finite-difference marginal dense
+  frontier, but those points must be from the same workload and differ only in
+  residency budget.
 - `gen_unicode.py`: tokenizer table generation
 
 Run them from `c/`, for example:
@@ -56,7 +65,17 @@ python3 tools/benchmark_v4_perf.py --model /path/to/v4 \
 V4_EXPERT_TRACE=/tmp/v4-experts.jsonl ./deepseek_v4 /path/to/model.coli hi
 python3 tools/analyze_v4_expert_trace.py /tmp/v4-experts.jsonl \
   --capacities 1,2,4,8,16,32,64,128 \
-  --persistent-capacities 1,2,4,8
+  --persistent-capacities 1,2,4,8 \
+  --prompt-tokens 5
+
+# Compare residency classes in the #3 policy metric. This example uses one
+# dense point; repeat --dense-point with SAME-WORKLOAD fixed-memory A/B points
+# to obtain a marginal dense frontier.
+python3 tools/analyze_v4_residency_value.py /tmp/v4-experts.jsonl \
+  --dense-point 3.16,69.58,68.27,39612.6 \
+  --expert-read-gib 70.68 \
+  --expert-wait-ms 7776.5 \
+  --expert-capacities 43,86,172,344
 ```
 
 The V4 runner forces `--no-dspark` so results measure the exact target path.
@@ -77,20 +96,28 @@ wall-clock comparison.
 
 ## Interpreting residency traces
 
-For #3/#56/#57, compare **bytes avoided per resident byte** before moving RAM
-between deterministic tensors and persistent experts. On the constrained M2
-balanced run with 4 global transient expert slots and 0 persistent slots/layer,
-2.63 GiB of deterministic residency avoided 23.65 GiB of recurring dense reads
-over the 15-token run: about **9.0 trace bytes saved per resident byte**. A
-persistent-expert tier should not take RAM from that cache unless the trace
-curve is competitive with that value.
+The policy metric for #3 is now **expected recurring exposed I/O time avoided
+per resident byte**. Raw bytes avoided/resident byte remains a useful stable
+fallback, but it can mis-rank expert and deterministic residency because expert
+storage reads are often hidden behind concurrent compute/read lanes while dense
+reads are much more exposed to token wall time.
 
-Do not confuse the storage reduction with end-to-end speedup. Against the
-previous 5-slots/layer baseline, decode dense+expert traffic fell from about
-81.32 GiB to 61.66 GiB (**-24.2%**), while decode wall time fell from about
-46.20 s to 44.16 s (**-4.4% wall, +4.6% tok/s**). Dense-cache materialization
-explains much of the gap: cache hits copied 23.65 GiB through RAM and consumed
-about 4.42 s over the full run. Direct resident tensor execution views are
-therefore the next deterministic-residency optimization; expert persistence
-should continue to be sized from the trace curves rather than by a fixed slot
-count.
+The short zero-copy M2 run kept 3.70 GiB of deterministic tensors resident and
+avoided 33.28 GiB of rereads. The longer 33-token run kept 3.16 GiB resident and
+avoided 69.58 GiB. The latter also showed that persistent-expert frequency value
+is generation-horizon dependent: a global perfect-hot 43-slot oracle reached
+about 19.5 bytes avoided/resident byte. That does **not** mean the runtime should
+allocate those slots by default: in the same run dense I/O exposed about
+39.61 s for 68.27 GiB read while expert I/O exposed only about 7.78 s for
+70.68 GiB read.
+
+For planner decisions, compare the **marginal** dense tail against an expert
+capacity band, not cache-wide averages. Use fixed-memory, same-workload A/Bs to
+measure the dense marginal frontier; auto-detected free RAM can shift the dense
+budget enough to confound small performance differences.
+
+Do not confuse storage reduction with end-to-end speedup. PR #64 established
+that zero-copy deterministic residency can materially reduce decode I/O while
+four global transient expert slots are enough for the measured three-lane M2
+pipeline (`peak_inflight=3`, `slot_waits=0`). Persistent expert capacity remains
+a trace-driven optional tier rather than a fixed per-layer allocation.
