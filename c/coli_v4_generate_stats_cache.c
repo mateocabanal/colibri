@@ -27,6 +27,19 @@
 #include <stddef.h>
 #include <stdio.h>
 
+/* The cross-session helper builds a test-only clone with -Dmain=... so its own
+ * main can be linked. The embedded generation source has its own temporary
+ * `main` macro for the legacy first-token helper, then undefines it before the
+ * real CLI entry point; command-line renaming therefore cannot suppress that
+ * final main reliably. Normalize the test signal into the source's dedicated
+ * skip guard before including the unit, and remove the command-line macro so
+ * the legacy helper's local rename remains warning-free. */
+#ifdef main
+#undef main
+#define COLI_V4_SKIP_GENERATE_MAIN 1
+#define COLI_V4_PREFIX_TEST_SKIP_GENERATE_MAIN 1
+#endif
+
 /* Defined by the DSpark implementation included by this generation unit. A
  * cross-session target-state restore must not inherit speculative-drafter
  * history from an unrelated request. Target outputs are verified either way,
@@ -85,6 +98,11 @@ static void coli_v4_cached_kv_prefix_record(kv_prefix *prefix,
 #undef coli_v4_session_generate
 #undef kv_prefix_record
 #undef kv_prefix_reuse
+
+#ifdef COLI_V4_PREFIX_TEST_SKIP_GENERATE_MAIN
+#undef COLI_V4_PREFIX_TEST_SKIP_GENERATE_MAIN
+#undef COLI_V4_SKIP_GENERATE_MAIN
+#endif
 
 static uint64_t delta_u64(uint64_t after, uint64_t before) {
     return after >= before ? after - before : 0;
