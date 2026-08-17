@@ -51,6 +51,8 @@ typedef struct {
     uint64_t matched_tokens;
     uint64_t restore_bytes;
     uint64_t restore_ns;
+    uint64_t store_bytes;
+    uint64_t store_ns;
 } ColiV4PrefixCache;
 
 static ColiV4PrefixCache g_prefix_cache = {
@@ -309,6 +311,7 @@ static void release_snapshot_reservation(size_t bytes) {
 
 void coli_v4_prefix_cache_store(ColiV4Session *session) {
     prefix_cache_init();
+    uint64_t began = coli_v4_profile_now();
     if (!g_prefix_cache.budget_bytes || !session || !session->fed.fed ||
         session->fed.tainted || session->fed.len < g_prefix_cache.min_tokens)
         return;
@@ -370,6 +373,8 @@ void coli_v4_prefix_cache_store(ColiV4Session *session) {
             g_prefix_cache.entries[g_prefix_cache.count++] = entry;
             g_prefix_cache.resident_bytes += entry->bytes;
             g_prefix_cache.stores++;
+            g_prefix_cache.store_bytes += (uint64_t)entry->bytes;
+            g_prefix_cache.store_ns += coli_v4_profile_now() - began;
             inserted = 1;
         }
     }
@@ -504,6 +509,8 @@ void coli_v4_prefix_cache_stats(ColiV4PrefixCacheStats *stats) {
     stats->matched_tokens = g_prefix_cache.matched_tokens;
     stats->restore_bytes = g_prefix_cache.restore_bytes;
     stats->restore_ns = g_prefix_cache.restore_ns;
+    stats->store_bytes = g_prefix_cache.store_bytes;
+    stats->store_ns = g_prefix_cache.store_ns;
     stats->resident_bytes = g_prefix_cache.resident_bytes;
     stats->budget_bytes = g_prefix_cache.budget_bytes;
     for (size_t index = 0; index < g_prefix_cache.count; index++)

@@ -21,6 +21,8 @@ typedef struct {
     uint64_t matched_tokens;
     uint64_t restore_bytes;
     uint64_t restore_ns;
+    uint64_t store_bytes;
+    uint64_t store_ns;
     size_t entries;
     size_t resident_bytes;
     size_t budget_bytes;

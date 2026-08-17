@@ -336,6 +336,14 @@ int main(int argc, char **argv) {
         ? cache2.restore_bytes - cache1.restore_bytes : 0;
     uint64_t restore_ns = cache2.restore_ns >= cache1.restore_ns
         ? cache2.restore_ns - cache1.restore_ns : 0;
+    uint64_t first_store_bytes = cache1.store_bytes >= cache0.store_bytes
+        ? cache1.store_bytes - cache0.store_bytes : 0;
+    uint64_t first_store_ns = cache1.store_ns >= cache0.store_ns
+        ? cache1.store_ns - cache0.store_ns : 0;
+    uint64_t second_store_bytes = cache2.store_bytes >= cache1.store_bytes
+        ? cache2.store_bytes - cache1.store_bytes : 0;
+    uint64_t second_store_ns = cache2.store_ns >= cache1.store_ns
+        ? cache2.store_ns - cache1.store_ns : 0;
 
     printf("{\"schema\":\"colibri.v4.prefix_cache_probe.v1\","
            "\"mode\":\"%s\",\"prefix_tokens\":%d,"
@@ -343,6 +351,8 @@ int main(int argc, char **argv) {
            "\"first_ttft_sec\":%.9f,\"second_ttft_sec\":%.9f,"
            "\"cache_hits_delta\":%llu,\"cache_stores_delta\":%llu,"
            "\"restore_bytes\":%llu,\"restore_ms\":%.6f,"
+           "\"first_store_bytes\":%llu,\"first_store_ms\":%.6f,"
+           "\"second_store_bytes\":%llu,\"second_store_ms\":%.6f,"
            "\"cache_resident_bytes\":%zu,\"cache_budget_bytes\":%zu,"
            "\"memory_projected_bytes\":%llu,\"memory_limit_bytes\":%llu}\n",
            cache_enabled ? "cache_on" : "cache_off",
@@ -350,6 +360,8 @@ int main(int argc, char **argv) {
            first_stats.time_to_first_token_sec, second_stats.time_to_first_token_sec,
            (unsigned long long)hit_delta, (unsigned long long)store_delta,
            (unsigned long long)restore_bytes, restore_ns / 1.0e6,
+           (unsigned long long)first_store_bytes, first_store_ns / 1.0e6,
+           (unsigned long long)second_store_bytes, second_store_ns / 1.0e6,
            cache2.resident_bytes, cache2.budget_bytes,
            (unsigned long long)memory.projected_bytes,
            (unsigned long long)memory_limit);
