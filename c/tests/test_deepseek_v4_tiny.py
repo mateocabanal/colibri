@@ -188,7 +188,7 @@ def read_jsonl(path: Path) -> list[dict[str, object]]:
 def check_route_trace(
     binary: Path, model: Path, case: dict[str, object], temporary: Path
 ) -> None:
-    """Gate #56's logical v2 producer independent of the storage backend."""
+    """Gate #56 logical identity, phase ownership, and lookup correlation."""
     routes = temporary / "routes.jsonl"
     max_new = min(2, int(case["max_new_tokens"]))
     env = dict(
@@ -219,13 +219,20 @@ def check_route_trace(
         raise AssertionError(f"unexpected logical trace header: {header}")
     if header.get("source") != "route_selected" or header.get("dropped") != 0:
         raise AssertionError(f"bad logical trace metadata: {header}")
+    if header.get("requests_started") != 1:
+        raise AssertionError(f"expected one traced request: {header}")
+    if not isinstance(header.get("physical_lookups"), int) or header["physical_lookups"] <= 0:
+        raise AssertionError(f"trace did not observe physical expert lookups: {header}")
+    if header.get("correlation_misses") != 0 or header.get("uncorrelated_routes") != 0:
+        raise AssertionError(f"route/lookup correlation was incomplete: {header}")
 
     selections = [row for row in route_rows[1:] if row.get("event") == "request"]
     if not selections:
         raise AssertionError("logical route trace contains no selections")
     prompt_count = len(case["prompt_ids"])
     positions: set[int] = set()
-    groups: dict[tuple[int, int], list[int]] = {}
+    route_groups: dict[tuple[int, int], list[int]] = {}
+    lookup_groups: dict[int, list[dict[str, object]]] = {}
     for row in selections:
         if row.get("request_id") != 77:
             raise AssertionError(f"route request id was not preserved: {row}")
@@ -234,6 +241,11 @@ def check_route_trace(
         expert = row.get("expert")
         rank = row.get("route_rank")
         weight = row.get("route_weight")
+        lookup_id = row.get("lookup_id")
+        lookup_ns = row.get("lookup_ns")
+        lookup_routes = row.get("lookup_routes")
+        lookup_result = row.get("lookup_result")
+        generation = row.get("lease_generation")
         if not isinstance(position, int) or position < 0:
             raise AssertionError(f"route is missing token position: {row}")
         if not isinstance(layer, int) or layer < 0:
@@ -244,8 +256,25 @@ def check_route_trace(
             raise AssertionError(f"route is missing rank identity: {row}")
         if not isinstance(weight, (int, float)):
             raise AssertionError(f"route is missing numeric weight: {row}")
+        expected_phase = "prefill" if position < prompt_count else "decode"
+        if row.get("phase") != expected_phase:
+            raise AssertionError(
+                f"route phase mismatch at position {position}: "
+                f"expected {expected_phase}, got {row.get('phase')}: {row}"
+            )
+        if not isinstance(lookup_id, int) or lookup_id <= 0:
+            raise AssertionError(f"route is missing physical lookup id: {row}")
+        if not isinstance(lookup_ns, int) or lookup_ns < 0:
+            raise AssertionError(f"route is missing lookup duration: {row}")
+        if not isinstance(lookup_routes, int) or lookup_routes < 1:
+            raise AssertionError(f"route is missing lookup fanout: {row}")
+        if lookup_result != 0:
+            raise AssertionError(f"route physical lookup failed: {row}")
+        if not isinstance(generation, int) or generation < 0:
+            raise AssertionError(f"route is missing lease generation: {row}")
         positions.add(position)
-        groups.setdefault((position, layer), []).append(rank)
+        route_groups.setdefault((position, layer), []).append(rank)
+        lookup_groups.setdefault(lookup_id, []).append(row)
 
     if not set(range(prompt_count)).issubset(positions):
         raise AssertionError(
@@ -257,14 +286,40 @@ def check_route_trace(
 
     # Every (token, layer) route group must preserve the original dense rank set
     # even though execution later sorts/merges experts by id.
-    for key, ranks in groups.items():
+    for key, ranks in route_groups.items():
         ordered = sorted(ranks)
         if ordered != list(range(len(ordered))):
             raise AssertionError(f"non-dense route ranks for {key}: {ranks}")
 
+    # A physical lookup may serve several prompt positions. All route events in
+    # that lookup group must agree on the physical expert/generation and report
+    # the exact many-to-one fanout.
+    for lookup_id, rows in lookup_groups.items():
+        expected_fanout = len(rows)
+        identities = {
+            (row["layer"], row["expert"], row["lease_generation"])
+            for row in rows
+        }
+        if len(identities) != 1:
+            raise AssertionError(
+                f"lookup {lookup_id} mixed physical identities: {identities}"
+            )
+        for row in rows:
+            if row["lookup_routes"] != expected_fanout:
+                raise AssertionError(
+                    f"lookup {lookup_id} fanout mismatch: "
+                    f"expected {expected_fanout}, got {row['lookup_routes']}"
+                )
+    if len(lookup_groups) != header["physical_lookups"]:
+        raise AssertionError(
+            f"physical lookup count mismatch: header={header['physical_lookups']} "
+            f"groups={len(lookup_groups)}"
+        )
+
     print(
-        "PASS target trace: explicit logical v2 "
-        f"({len(selections)} selections, {len(positions)} token positions)"
+        "PASS target trace: explicit logical v2 + physical lookup correlation "
+        f"({len(selections)} selections, {len(positions)} token positions, "
+        f"{len(lookup_groups)} lookups)"
     )
 
 
