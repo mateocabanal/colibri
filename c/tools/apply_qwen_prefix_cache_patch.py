@@ -36,14 +36,8 @@ q = replace_once(
 )
 q = replace_once(
     q,
-    '''static size_t kv_state_count(const Cfg *c, int max_t){\n'''
-    '''    size_t n = size_mul_or_die((size_t)c->n_kv_heads, (size_t)max_t, "KV cache");\n'''
-    '''    return size_mul_or_die(n, c->head_dim, "KV cache");\n'''
-    '''}\n''',
-    '''static size_t kv_state_count(const Cfg *c, int max_t){\n'''
-    '''    size_t n = size_mul_or_die((size_t)c->n_kv_heads, (size_t)max_t, "KV cache");\n'''
-    '''    return size_mul_or_die(n, c->head_dim, "KV cache");\n'''
-    '''}\n\n'''
+    'static int g_kv_f16 = 1;             /* QWEN_KV_F16=0 disables (f32 KV) */\n',
+    '''static int g_kv_f16 = 1;             /* QWEN_KV_F16=0 disables (f32 KV) */\n\n'''
     '''static QwenPrefixStateView qwen_prefix_state_view(Model *m){\n'''
     '''    QwenPrefixStateView view = {\n'''
     '''        .layer_count = m->c.n_layers,\n'''
