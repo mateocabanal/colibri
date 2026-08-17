@@ -1,5 +1,7 @@
 #include "../expert_store.h"
+#include "../coli_v4_residency.h"
 
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -74,6 +76,76 @@ static int view_is_cleared(const ColiExpertView *view) {
     return memcmp(view, &zero, sizeof(*view)) == 0;
 }
 
+static int test_residency_value_selector(void) {
+    /* The ratio comparator must not rely on uint64 cross multiplication. */
+    if (coli_v4_residency_ratio_compare(6, 3, 4, 2) != 0) return 1;
+    if (coli_v4_residency_ratio_compare(
+            UINT64_MAX, UINT64_MAX - 1,
+            UINT64_MAX - 1, UINT64_MAX) <= 0)
+        return 1;
+
+    static const ColiV4ResidencyCandidate candidates[] = {
+        /* Dense A: best exposed-time value. */
+        {COLI_V4_RESIDENCY_DENSE_TENSOR, 10, 100, 500, 1000},
+        /* Expert B: best raw byte value. */
+        {COLI_V4_RESIDENCY_PERSISTENT_EXPERT, 20, 100, 700, 200},
+        /* Dense C fits in the 50-byte tail after either 100-byte winner. */
+        {COLI_V4_RESIDENCY_DENSE_TENSOR, 11, 50, 100, 100},
+        /* Optional residency with no predicted benefit is never admitted. */
+        {COLI_V4_RESIDENCY_OTHER, 1, 20, 0, 0},
+    };
+    unsigned char selected[sizeof(candidates) / sizeof(candidates[0])];
+    ColiV4ResidencySelection plan;
+
+    if (coli_v4_residency_select(
+            candidates, 4, 100, COLI_V4_RESIDENCY_VALUE_BYTES,
+            selected, &plan) != 0)
+        return 1;
+    if (!selected[1] || selected[0] || selected[2] || selected[3]) return 1;
+    if (plan.selected_count != 1 || plan.selected_resident_bytes != 100 ||
+        plan.expected_bytes_avoided != 700 ||
+        plan.expected_exposed_ns_avoided != 200)
+        return 1;
+
+    if (coli_v4_residency_select(
+            candidates, 4, 100, COLI_V4_RESIDENCY_VALUE_EXPOSED_NS,
+            selected, &plan) != 0)
+        return 1;
+    if (!selected[0] || selected[1] || selected[2] || selected[3]) return 1;
+    if (plan.selected_count != 1 || plan.selected_resident_bytes != 100 ||
+        plan.expected_bytes_avoided != 500 ||
+        plan.expected_exposed_ns_avoided != 1000)
+        return 1;
+
+    /* Greedy allocation may fill a smaller tail, but can never exceed budget. */
+    if (coli_v4_residency_select(
+            candidates, 4, 150, COLI_V4_RESIDENCY_VALUE_EXPOSED_NS,
+            selected, &plan) != 0)
+        return 1;
+    if (!selected[0] || selected[1] || !selected[2] || selected[3]) return 1;
+    if (plan.selected_count != 2 || plan.selected_resident_bytes != 150 ||
+        plan.selected_resident_bytes > plan.budget_bytes)
+        return 1;
+
+    /* Equal ratios are deterministic: lower kind, then id, then position. */
+    static const ColiV4ResidencyCandidate tied[] = {
+        {COLI_V4_RESIDENCY_PERSISTENT_EXPERT, 1, 50, 100, 100},
+        {COLI_V4_RESIDENCY_DENSE_TENSOR, 9, 50, 100, 100},
+    };
+    unsigned char tied_selected[2];
+    if (coli_v4_residency_select(
+            tied, 2, 50, COLI_V4_RESIDENCY_VALUE_BYTES,
+            tied_selected, &plan) != 0)
+        return 1;
+    if (tied_selected[0] || !tied_selected[1]) return 1;
+
+    if (coli_v4_residency_select(
+            NULL, 1, 50, COLI_V4_RESIDENCY_VALUE_BYTES,
+            tied_selected, &plan) == 0)
+        return 1;
+    return 0;
+}
+
 int main(void) {
     static const ColiExpertStoreOps legacy_ops = {
         mock_lookup, mock_release, mock_prefetch, mock_stats, mock_destroy
@@ -88,6 +160,8 @@ int main(void) {
     ColiExpertView other;
     ColiExpertKey key = {7, 19};
     ColiExpertStoreStats stats;
+
+    if (test_residency_value_selector()) return 1;
 
     if (coli_expert_lookup(&store, key, &view) != 0) return 1;
     if (view.key.layer != 7 || view.key.expert != 19) return 1;
@@ -151,6 +225,6 @@ int main(void) {
 
     store.ops->destroy(&store);
     if (state.active_leases != 0) return 1;
-    puts("expert store ops tests: ok");
+    puts("expert store ops + V4 residency selector tests: ok");
     return 0;
 }
