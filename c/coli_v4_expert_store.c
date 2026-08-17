@@ -1,5 +1,6 @@
 #include "coli_v4_expert_store.h"
 #include "coli_executor.h"
+#include "coli_v4_static.h"
 #include "compat.h"
 #ifdef COLI_METAL
 #include "backend_metal.h"
@@ -27,28 +28,28 @@ typedef struct {
     ColiExpertInfo info;
 } Record;
 
-/* A slot remains unavailable from selection until its positioned read and CRC
- * have completed. refs alone is insufficient: loader lanes acquire before a
- * view exists, so two lanes could otherwise write the same resident buffer. */
 typedef struct {
     int expert;
     unsigned refs, loading;
+    int load_failed;
     unsigned char *data;
+    uint64_t generation;
+    uint64_t last_used;
 } Slot;
 
 typedef struct {
     ColiExecutor *executor;
     int layers, experts, slots_per_layer;
     uint64_t record_bytes, slot_bytes, clock;
+    uint64_t total_cache_budget, dense_cache_budget;
     Record *records;
     Slot *slots;
+    uint64_t *activation_counts;
     unsigned active_leases;
     ColiExpertStoreStats stats;
     pthread_mutex_t mutex;
+    pthread_cond_t changed;
 
-    /* End-user progress + I/O diagnostics. These counters are guarded by mutex.
-     * They intentionally live in the expert store so they measure actual cache
-     * misses / storage work rather than inferred model progress. */
     time_t io_started_at, io_last_report_at;
     uint64_t io_reads, io_bytes;
     unsigned io_inflight, io_peak_inflight;
@@ -76,15 +77,41 @@ static Slot *slots_for(State *s, int layer) {
     return s->slots + (size_t)layer * s->slots_per_layer;
 }
 
+static int env_int(const char *name, int fallback, int lo, int hi) {
+    const char *text = getenv(name);
+    if (!text || !*text) return fallback;
+    char *end = NULL;
+    long value = strtol(text, &end, 10);
+    if (!end || *end || value < lo || value > hi) return fallback;
+    return (int)value;
+}
+
+static long double env_ratio(const char *name, long double fallback) {
+    const char *text = getenv(name);
+    if (!text || !*text) return fallback;
+    char *end = NULL;
+    long double value = strtold(text, &end);
+    if (!end || *end || value < 0.0L || value > 1.0L) return fallback;
+    return value;
+}
+
+static uint64_t env_u64(const char *name, uint64_t fallback, int *present) {
+    const char *text = getenv(name);
+    if (present) *present = 0;
+    if (!text || !*text) return fallback;
+    char *end = NULL;
+    unsigned long long value = strtoull(text, &end, 10);
+    if (!end || *end) return fallback;
+    if (present) *present = 1;
+    return (uint64_t)value;
+}
+
 static void print_execution_mode(void) {
 #ifdef COLI_METAL
     const char *setting = getenv("V4_METAL_EXPERTS");
     const int metal_requested = (!setting || !*setting) ? 1 : (atoi(setting) != 0);
     const int metal_ready = metal_requested && coli_metal_init() && coli_metal_available();
     if (metal_ready) {
-        /* V4's Metal helper accelerates MXFP4 small-batch matvecs. Routing,
-         * control flow, unsupported kernels and any failed Metal dispatch still
-         * execute on the CPU, so calling this mode "hybrid" is deliberate. */
         fprintf(stderr,
                 "v4_execution build=%s mode=hybrid "
                 "cpu=control+unsupported-kernels+fallback "
@@ -109,9 +136,6 @@ static void print_execution_mode(void) {
 #endif
 }
 
-/* Called with s->mutex held. Progress is on by default but deliberately waits
- * for the first real expert miss, so fast/cache-hot runs do not gain startup
- * noise. V4_PROGRESS=0 disables it; V4_PROGRESS_INTERVAL controls cadence. */
 static void io_begin_locked(State *s, ColiExpertKey key) {
     const time_t now = time(NULL);
     if (!s->io_started_at) {
@@ -127,20 +151,22 @@ static void io_begin_locked(State *s, ColiExpertKey key) {
         }
     }
     s->io_inflight++;
+    s->stats.loads_started++;
+    uint64_t inflight_bytes = (uint64_t)s->io_inflight * s->slot_bytes;
+    if (inflight_bytes > s->stats.peak_inflight_bytes)
+        s->stats.peak_inflight_bytes = inflight_bytes;
     if (s->io_inflight > s->io_peak_inflight)
         s->io_peak_inflight = s->io_inflight;
 }
 
-/* Called with s->mutex held after a storage operation.
- * expert_effective is expert payload / total inference wall time, NOT physical
- * SSD throughput. Dense streamed tensors and compute happen during the same
- * wall interval and are intentionally not folded into this counter. */
 static void io_finish_locked(State *s, ColiExpertKey key, int success) {
     const time_t now = time(NULL);
     if (s->io_inflight) s->io_inflight--;
     if (success) {
         s->io_reads++;
         s->io_bytes += s->record_bytes;
+    } else {
+        s->stats.loads_failed++;
     }
     if (!s->progress_enabled || !s->io_started_at ||
         now - s->io_last_report_at < s->progress_interval_s)
@@ -154,15 +180,15 @@ static void io_finish_locked(State *s, ColiExpertKey key, int success) {
     const double hit_pct = s->stats.requests
         ? 100.0 * (double)s->stats.hits / (double)s->stats.requests : 0.0;
 
-    /* Start on a fresh line so stderr diagnostics never concatenate directly
-     * with a partially streamed stdout token (e.g. "Hellov4_progress..."). */
     fprintf(stderr,
             "\nv4_progress phase=expert-stream elapsed=%.0fs reads=%llu "
             "bytes=%.2fGiB expert_effective=%.1fMiB/s "
             "inflight=%u peak_inflight=%u cache_hit=%.1f%% "
-            "layer=%d/%d expert=%d\n",
+            "joins=%llu evictions=%llu layer=%d/%d expert=%d\n",
             elapsed, (unsigned long long)s->io_reads, gib, expert_mib_s,
             s->io_inflight, s->io_peak_inflight, hit_pct,
+            (unsigned long long)s->stats.inflight_joins,
+            (unsigned long long)s->stats.evictions,
             key.layer + 1, s->layers, key.expert);
     fflush(stderr);
     s->io_last_report_at = now;
@@ -211,14 +237,33 @@ static int fill(ColiExpertView *v, ColiExpertKey k, const Record *r,
         return -1;
     v->key = k;
     v->lease = (void *)s;
+    v->generation = s->generation;
     return 0;
+}
+
+static Slot *find_matching_slot_locked(State *s, ColiExpertKey key) {
+    Slot *slots = slots_for(s, key.layer);
+    for (int i = 0; i < s->slots_per_layer; i++)
+        if (slots[i].expert == key.expert && slots[i].data) return &slots[i];
+    return NULL;
+}
+
+static Slot *choose_victim_locked(State *s, int layer) {
+    Slot *slots = slots_for(s, layer);
+    Slot *victim = NULL;
+    for (int i = 0; i < s->slots_per_layer; i++) {
+        Slot *slot = &slots[i];
+        if (slot->refs || slot->loading) continue;
+        if (!slot->data) return slot;
+        if (!victim || slot->last_used < victim->last_used) victim = slot;
+    }
+    return victim;
 }
 
 static int lookup(ColiExpertStore *store, ColiExpertKey key,
                   ColiExpertView *view) {
     State *s = store ? store->state : NULL;
     Record *r = s ? record_for(s, key) : NULL;
-    Slot *slot = NULL;
     if (!s || !r || !view) {
         if (view) memset(view, 0, sizeof(*view));
         return -1;
@@ -226,84 +271,105 @@ static int lookup(ColiExpertStore *store, ColiExpertKey key,
 
     pthread_mutex_lock(&s->mutex);
     s->stats.requests++;
-    Slot *slots = slots_for(s, key.layer);
-    for (int i = 0; i < s->slots_per_layer; i++) {
-        if (!slots[i].loading && slots[i].data && slots[i].expert == key.expert) {
-            slot = &slots[i];
+    s->activation_counts[(size_t)key.layer * s->experts + key.expert]++;
+
+retry:
+    Slot *slot = find_matching_slot_locked(s, key);
+    if (slot) {
+        if (slot->loading) {
+            s->stats.inflight_joins++;
+            while (slot->loading && slot->expert == key.expert)
+                pthread_cond_wait(&s->changed, &s->mutex);
+            if (slot->expert != key.expert || slot->load_failed) goto retry;
+        }
+        if (!slot->load_failed && slot->expert == key.expert) {
             s->stats.hits++;
-            break;
-        }
-    }
-
-    if (!slot) {
-        for (int i = 0; i < s->slots_per_layer; i++)
-            if (!slots[i].refs && !slots[i].loading &&
-                (!slot || !slots[i].data))
-                slot = &slots[i];
-        if (!slot) {
-            pthread_mutex_unlock(&s->mutex);
-            memset(view, 0, sizeof(*view));
-            return -1;
-        }
-
-        if (!slot->data) {
-            if (s->slot_bytes > SIZE_MAX ||
-                posix_memalign((void **)&slot->data, 16384,
-                               (size_t)s->slot_bytes)) {
-                pthread_mutex_unlock(&s->mutex);
-                memset(view, 0, sizeof(*view));
-                return -1;
+            slot->last_used = ++s->clock;
+            slot->refs++;
+            s->active_leases++;
+            int bad_view = fill(view, key, r, slot);
+            if (bad_view) {
+                slot->refs--;
+                s->active_leases--;
             }
-#ifdef COLI_METAL
-            /* bytesNoCopy requires an Apple-page-aligned base and page-rounded span. */
-            if (coli_metal_init())
-                coli_metal_register(slot->data, (size_t)s->slot_bytes);
-#endif
-            s->stats.resident_bytes += s->slot_bytes;
+            pthread_mutex_unlock(&s->mutex);
+            return bad_view ? -1 : 0;
         }
+    }
 
-        slot->expert = -1;
-        slot->loading = 1;
-        io_begin_locked(s, key);
-        pthread_mutex_unlock(&s->mutex);
+    slot = choose_victim_locked(s, key.layer);
+    if (!slot) {
+        /* With a deliberately small transient pool all slots may briefly be
+         * leased/loading. Wait for a release instead of turning cache pressure
+         * into a model execution failure. */
+        pthread_cond_wait(&s->changed, &s->mutex);
+        goto retry;
+    }
 
-        char error[256];
-#ifdef __APPLE__
-        const char *direct = getenv("COLI_V4_DIRECT");
-        coli_v4_expert_io_active = !direct || atoi(direct) != 0;
-#endif
-        int bad = coli_executor_load_expert(
-            s->executor, key.layer, key.expert, slot->data,
-            (size_t)s->record_bytes, error, sizeof(error));
-#ifdef __APPLE__
-        coli_v4_expert_io_active = 0;
-#endif
-
-        pthread_mutex_lock(&s->mutex);
-        slot->loading = 0;
-        io_finish_locked(s, key, !bad);
-        if (bad) {
-            fprintf(stderr,
-                    "v4_coli expert-load failed layer=%d expert=%d: %s\n",
-                    key.layer, key.expert, error);
+    if (!slot->data) {
+        if (s->slot_bytes > SIZE_MAX ||
+            posix_memalign((void **)&slot->data, 16384,
+                           (size_t)s->slot_bytes)) {
             pthread_mutex_unlock(&s->mutex);
             memset(view, 0, sizeof(*view));
             return -1;
         }
-        slot->expert = key.expert;
-        s->stats.misses++;
-        s->stats.bytes_read += s->record_bytes;
+#ifdef COLI_METAL
+        if (coli_metal_init())
+            coli_metal_register(slot->data, (size_t)s->slot_bytes);
+#endif
+        s->stats.resident_bytes += s->slot_bytes;
+    } else if (slot->expert >= 0 && slot->expert != key.expert) {
+        s->stats.evictions++;
     }
 
+    slot->expert = key.expert;
+    slot->loading = 1;
+    slot->load_failed = 0;
+    slot->generation++;
+    slot->last_used = ++s->clock;
+    io_begin_locked(s, key);
+    pthread_mutex_unlock(&s->mutex);
+
+    char error[256];
+#ifdef __APPLE__
+    const char *direct = getenv("COLI_V4_DIRECT");
+    coli_v4_expert_io_active = !direct || atoi(direct) != 0;
+#endif
+    int bad_load = coli_executor_load_expert(
+        s->executor, key.layer, key.expert, slot->data,
+        (size_t)s->record_bytes, error, sizeof(error));
+#ifdef __APPLE__
+    coli_v4_expert_io_active = 0;
+#endif
+
+    pthread_mutex_lock(&s->mutex);
+    slot->loading = 0;
+    slot->load_failed = bad_load != 0;
+    io_finish_locked(s, key, !bad_load);
+    if (bad_load) {
+        slot->expert = -1;
+        pthread_cond_broadcast(&s->changed);
+        fprintf(stderr,
+                "v4_coli expert-load failed layer=%d expert=%d: %s\n",
+                key.layer, key.expert, error);
+        pthread_mutex_unlock(&s->mutex);
+        memset(view, 0, sizeof(*view));
+        return -1;
+    }
+
+    s->stats.misses++;
+    s->stats.bytes_read += s->record_bytes;
+    slot->last_used = ++s->clock;
     slot->refs++;
     s->active_leases++;
+    pthread_cond_broadcast(&s->changed);
+
     int bad_view = fill(view, key, r, slot);
     if (bad_view) {
-        fprintf(stderr,
-                "v4_coli expert-view invalid layer=%d expert=%d\n",
-                key.layer, key.expert);
         slot->refs--;
         s->active_leases--;
+        pthread_cond_broadcast(&s->changed);
     }
     pthread_mutex_unlock(&s->mutex);
     return bad_view ? -1 : 0;
@@ -314,8 +380,12 @@ static void release(ColiExpertStore *store, ColiExpertView *v) {
     Slot *slot = v ? v->lease : NULL;
     if (!s || !slot) return;
     pthread_mutex_lock(&s->mutex);
-    if (slot->refs) slot->refs--;
-    if (s->active_leases) s->active_leases--;
+    if (slot->generation == v->generation && slot->refs) {
+        slot->refs--;
+        if (s->active_leases) s->active_leases--;
+        slot->last_used = ++s->clock;
+        pthread_cond_broadcast(&s->changed);
+    }
     pthread_mutex_unlock(&s->mutex);
 }
 
@@ -334,6 +404,38 @@ static void stats(const ColiExpertStore *store, ColiExpertStoreStats *out) {
     pthread_mutex_unlock(&s->mutex);
 }
 
+static void dump_activation_trace(State *s) {
+    const char *path = getenv("V4_EXPERT_TRACE_PATH");
+    if (!path || !*path) return;
+    FILE *fp = fopen(path, "w");
+    if (!fp) {
+        fprintf(stderr, "v4_trace warning=cannot-open path=%s\n", path);
+        return;
+    }
+    fprintf(fp,
+            "{\"type\":\"summary\",\"requests\":%llu,\"hits\":%llu,"
+            "\"misses\":%llu,\"inflight_joins\":%llu,\"evictions\":%llu,"
+            "\"bytes_read\":%llu}\n",
+            (unsigned long long)s->stats.requests,
+            (unsigned long long)s->stats.hits,
+            (unsigned long long)s->stats.misses,
+            (unsigned long long)s->stats.inflight_joins,
+            (unsigned long long)s->stats.evictions,
+            (unsigned long long)s->stats.bytes_read);
+    for (int layer = 0; layer < s->layers; layer++) {
+        for (int expert = 0; expert < s->experts; expert++) {
+            uint64_t count = s->activation_counts[(size_t)layer * s->experts + expert];
+            if (!count) continue;
+            fprintf(fp,
+                    "{\"type\":\"expert_activation\",\"layer\":%d,"
+                    "\"expert\":%d,\"requests\":%llu}\n",
+                    layer, expert, (unsigned long long)count);
+        }
+    }
+    fclose(fp);
+    fprintf(stderr, "v4_trace kind=expert-aggregate path=%s\n", path);
+}
+
 static void destroy(ColiExpertStore *store) {
     State *s = store ? store->state : NULL;
     if (s) {
@@ -343,12 +445,30 @@ static void destroy(ColiExpertStore *store) {
             fprintf(stderr,
                     "v4_progress phase=expert-stream status=done elapsed=%.0fs "
                     "reads=%llu bytes=%.2fGiB expert_effective=%.1fMiB/s "
-                    "peak_inflight=%u\n",
+                    "peak_inflight=%u joins=%llu evictions=%llu\n",
                     elapsed, (unsigned long long)s->io_reads,
                     (double)s->io_bytes / (1024.0 * 1024.0 * 1024.0),
                     ((double)s->io_bytes / (1024.0 * 1024.0)) / elapsed,
-                    s->io_peak_inflight);
+                    s->io_peak_inflight,
+                    (unsigned long long)s->stats.inflight_joins,
+                    (unsigned long long)s->stats.evictions);
         }
+        ColiV4DenseCacheStats dense;
+        memset(&dense, 0, sizeof(dense));
+        coli_v4_dense_cache_stats(&dense);
+        if (dense.budget_bytes) {
+            fprintf(stderr,
+                    "v4_dense_cache budget=%.2fGiB resident=%.2fGiB hits=%llu "
+                    "misses=%llu inserts=%llu evictions=%llu avoided=%.2fGiB\n",
+                    dense.budget_bytes / 1073741824.0,
+                    dense.resident_bytes / 1073741824.0,
+                    (unsigned long long)dense.hits,
+                    (unsigned long long)dense.misses,
+                    (unsigned long long)dense.inserts,
+                    (unsigned long long)dense.evictions,
+                    dense.stored_bytes_avoided / 1073741824.0);
+        }
+        dump_activation_trace(s);
         for (int i = 0; i < s->layers * s->slots_per_layer; i++) {
 #ifdef COLI_METAL
             if (s->slots[i].data)
@@ -356,10 +476,13 @@ static void destroy(ColiExpertStore *store) {
 #endif
             compat_aligned_free(s->slots[i].data);
         }
+        pthread_cond_destroy(&s->changed);
         pthread_mutex_destroy(&s->mutex);
         coli_executor_close(s->executor);
+        free(s->activation_counts);
         free(s->slots);
         free(s->records);
+        coli_v4_dense_cache_shutdown();
         free(s);
     }
     free(store);
@@ -388,17 +511,11 @@ int coli_v4_coli_expert_store_open(const ColiV4ColiExpertStoreOptions *o,
         return fail(e, n, "out of memory creating COLI expert store");
     }
     pthread_mutex_init(&s->mutex, NULL);
+    pthread_cond_init(&s->changed, NULL);
 
     s->progress_enabled = !getenv("V4_PROGRESS") ||
                           atoi(getenv("V4_PROGRESS")) != 0;
-    s->progress_interval_s = 5;
-    {
-        const char *p = getenv("V4_PROGRESS_INTERVAL");
-        if (p && *p) {
-            int v = atoi(p);
-            if (v >= 1 && v <= 60) s->progress_interval_s = v;
-        }
-    }
+    s->progress_interval_s = env_int("V4_PROGRESS_INTERVAL", 5, 1, 60);
 
     xo.required_profile = o->required_profile;
     xo.checksum_policy = getenv("COLI_VERIFY_RECORDS") &&
@@ -410,8 +527,11 @@ int coli_v4_coli_expert_store_open(const ColiV4ColiExpertStoreOptions *o,
 
     s->layers = o->layers;
     s->experts = o->experts_per_layer;
+    s->total_cache_budget = o->cache_bytes;
     s->records = calloc((size_t)s->layers * s->experts, sizeof(*s->records));
-    if (!s->records) {
+    s->activation_counts = calloc((size_t)s->layers * s->experts,
+                                  sizeof(*s->activation_counts));
+    if (!s->records || !s->activation_counts) {
         fail(e, n, "out of memory indexing COLI experts");
         goto bad;
     }
@@ -443,14 +563,37 @@ int coli_v4_coli_expert_store_open(const ColiV4ColiExpertStoreOptions *o,
         goto bad;
     }
 
-    s->slots_per_layer = (int)(o->cache_bytes /
-        ((uint64_t)s->layers * s->record_bytes));
-    if (s->slots_per_layer < 1) {
+    const uint64_t per_layer_slot_bytes = (uint64_t)s->layers * s->slot_bytes;
+    int max_slots = (int)(o->cache_bytes / per_layer_slot_bytes);
+    if (max_slots < 1) {
         fail(e, n, "COLI cache budget cannot hold one expert per layer");
         goto bad;
     }
-    if (s->slots_per_layer > s->experts)
-        s->slots_per_layer = s->experts;
+    if (max_slots > s->experts) max_slots = s->experts;
+
+    int loader_lanes = env_int("V4_LOADER_LANES", 3, 1, 16);
+    int min_slots = env_int("V4_TRANSIENT_EXPERT_SLOTS", loader_lanes, 1, 16);
+    if (min_slots > max_slots) min_slots = max_slots;
+
+    uint64_t min_expert_bytes = (uint64_t)min_slots * per_layer_slot_bytes;
+    uint64_t optional_bytes = o->cache_bytes > min_expert_bytes
+        ? o->cache_bytes - min_expert_bytes : 0;
+    long double dense_share = env_ratio("V4_DENSE_CACHE_SHARE", 1.0L);
+    uint64_t desired_dense = (uint64_t)((long double)optional_bytes * dense_share);
+    int explicit_dense = 0;
+    desired_dense = env_u64("V4_DENSE_CACHE_BYTES", desired_dense, &explicit_dense);
+    if (desired_dense > optional_bytes) desired_dense = optional_bytes;
+
+    uint64_t expert_budget = o->cache_bytes - desired_dense;
+    int selected_slots = (int)(expert_budget / per_layer_slot_bytes);
+    if (selected_slots < min_slots) selected_slots = min_slots;
+    if (selected_slots > max_slots) selected_slots = max_slots;
+    s->slots_per_layer = selected_slots;
+    uint64_t actual_expert_capacity =
+        (uint64_t)s->slots_per_layer * per_layer_slot_bytes;
+    s->dense_cache_budget = o->cache_bytes > actual_expert_capacity
+        ? o->cache_bytes - actual_expert_capacity : 0;
+    coli_v4_dense_cache_configure(s->dense_cache_budget);
 
     s->slots = calloc((size_t)s->layers * s->slots_per_layer,
                       sizeof(*s->slots));
@@ -460,10 +603,18 @@ int coli_v4_coli_expert_store_open(const ColiV4ColiExpertStoreOptions *o,
     }
     for (int i = 0; i < s->layers * s->slots_per_layer; i++)
         s->slots[i].expert = -1;
-    s->stats.capacity_bytes =
-        (uint64_t)s->layers * s->slots_per_layer * s->slot_bytes;
+    s->stats.capacity_bytes = actual_expert_capacity;
 
     print_execution_mode();
+    fprintf(stderr,
+            "v4_residency policy=benefit-per-byte total=%.2fGiB "
+            "expert=%.2fGiB dense=%.2fGiB expert_slots_per_layer=%d "
+            "transient_floor=%d dense_share=%.2Lf%s\n",
+            o->cache_bytes / 1073741824.0,
+            actual_expert_capacity / 1073741824.0,
+            s->dense_cache_budget / 1073741824.0,
+            s->slots_per_layer, min_slots, dense_share,
+            explicit_dense ? " dense_override=bytes" : "");
     if (s->progress_enabled) {
         fprintf(stderr,
                 "v4_progress enabled=1 interval=%ds "
