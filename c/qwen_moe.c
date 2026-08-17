@@ -56,6 +56,7 @@
 #include <limits.h>
 #include <stdint.h>
 #include <pthread.h>
+#include "coli_executor.h"   /* COLLACOLI: COLI package backend */
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 #include <sys/resource.h>
 #include <unistd.h>
@@ -241,7 +242,7 @@ static int cfg_validate(const Cfg *c, char *why, size_t why_n){
 /* dense matmul weight: f32 resident, or row-int8 (q + per-row f32 scales)
  * when the snapshot carries <name>_q8/<name>_qs — the low-RAM path used for
  * the real checkpoints (4x smaller resident dense, same scheme as experts). */
-typedef struct { float *f; int8_t *q; float *s; } WT;
+typedef struct { float *f; uint16_t *bf16; int8_t *q; float *s; } WT;
 
 typedef struct {
     float *in_ln, *post_ln;
@@ -260,13 +261,14 @@ typedef struct {
     int eid;                       /* -1 = slot in flight */
     int loading_eid;               /* expert id being loaded into this slot (-1 when idle) */
     int pinned;
-    int fmt;                       /* 0=f32, 8=int8 merged, 4=i4-grouped, 5=int3-g64 */
+    int fmt;                       /* 0=f32, 16=BF16, 8=int8, 4=i4-grouped, 5=int3-g64 */
     int mio;                       /* 1 = weight bytes live in a MetalIO shared buffer */
     int mio_slot;                  /* metalio slot id, -1 = not backed yet */
     int mio_resident;              /* 1 = current pointers point INTO the mio buffer */
     int64_t mio_event;             /* event value of the slot's latest load */
     int64_t mio_waited;            /* highest mio event already waited (pending if < mio_event) */
-    float *gu, *d;                 /* f32: [2I,H] gate|up, [H,I] down */
+    float *gu, *d;                 /* f32 snapshot: [2I,H] gate|up, [H,I] down */
+    uint16_t *bgu, *bd;            /* exact COLI BF16: same logical layout */
     int8_t *g, *u, *dd;            /* q8: int8 blocks */
     float *gs, *us, *ds;           /* q8: row scales */
     uint8_t *g4, *u4, *d4;         /* packed (fmt 4/5): g|u|d blocks, packed layout */
@@ -296,6 +298,8 @@ typedef struct {
     uint64_t prefetch_misses;      /* loads triggered by lookahead prefetch */
     double t_attn, t_gdn, t_moe, t_expio;   /* per-request phase timings (PROF) */
     double dense_load_s;
+    ColiExecutor *coli; /* COLLACOLI: non-NULL = COLI package backend */
+    int coli_load;
 } Model;
 
 static pthread_mutex_t g_mx = PTHREAD_MUTEX_INITIALIZER;
@@ -565,6 +569,245 @@ static void load_cfg(Cfg *c, const char *snap){
 
 static char g_prefix[64] = "";      /* "model.language_model." or "" (probed) */
 
+/* ============================================ COLLACOLI ================= */
+/* COLI (.coli package) loading backend for qwen_moe.
+ *
+ * colibri's Rust `colic` compiler emits weights as a COLI package: a
+ * manifest.coli + data-*.coli shards, exact BF16, and (as of 2026-08) NO
+ * config.json / tokenizer.json — those come from the original HF dir named by
+ * env COLI_CONFIG. Exact BF16 matrices stay resident as BF16 and are decoded
+ * only inside GEMV; small vectors are materialized as f32.
+ *
+ * Verified on the real Qwen3.6-35B-A3B.exact.coli package (2026-08-16):
+ *  - expert records: COLIEXPT, 3 matrices, roles 1=gate 2=up 3=down, BF16,
+ *    weight_offset relative to the loaded record payload; up=gate contiguous.
+ *  - name spellings split: full-attn + routed/shared-gate use canonical
+ *    `attn.*` / `ffn.*`; GDN (linear_attn) + shared-expert projection weights
+ *    are kept under their resident HF names `model.language_model.layers.N.
+ *    linear_attn.*` / `...mlp.shared_expert.*`. So this loader uses explicit
+ *    per-role names (below) rather than a fragile string rewrite.
+ */
+static int coli_mode = 0;
+static void slot_alloc_f32(Slot *s, int64_t ng, int64_t nd);  /* defined below */
+static void slot_alloc_bf16(Slot *s, int64_t ng, int64_t nd); /* exact COLI residency */
+
+/* BF16 -> f32 (deepseek_v4.c also defines this globally; qwen_moe builds
+ * standalone so we need our own; static here to avoid a clash if both are
+ * ever linked into one image). */
+static float coli_bf16_decode(uint16_t v){ uint32_t u=(uint32_t)v<<16; float f; memcpy(&f,&u,4); return f; }
+
+static const ColiRecordInfo *coli_rec(Model *m, const char *n){
+    return coli_executor_record_by_name(m->coli, n);
+}
+
+/* Total element count of a tensor, any rank. */
+static uint64_t coli_rank_numel(const ColiTensorInfo *info){
+    uint64_t n = 1;
+    for (uint16_t d = 0; d < info->rank; d++) n *= info->dims[d];
+    return n;
+}
+
+static const char *coli_native_profile(void){
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+    return COLI_CSF_PROFILE_MACOS_ARM64_METAL_APPLE8_V1;
+#elif defined(__linux__) && defined(__x86_64__) && defined(__AVX2__)
+    return COLI_CSF_PROFILE_LINUX_X86_64_AVX2_V1;
+#else
+    return NULL;
+#endif
+}
+
+static int coli_open(Model *m, const char *dir){
+    char manifest[1024];
+    snprintf(manifest, sizeof(manifest), "%s/manifest.coli", dir);
+    FILE *mf = fopen(manifest, "rb");
+    if (!mf) return 0;                 /* not a package -> snapshot backend */
+    fclose(mf);
+    const char *profile = coli_native_profile();
+    if (!profile) {
+        fprintf(stderr, "qwen coli: no native COLI profile for this build; "
+                        "supported: arm64 macOS and AVX2 x86-64 Linux\n");
+        exit(1);
+    }
+    ColiExecutorOpenOptions opts = {0};
+    opts.required_profile = profile;
+    opts.max_resident_record_bytes = 0;
+    char err[512];
+    if (coli_executor_open(&m->coli, dir, &opts, err, sizeof(err))) {
+        fprintf(stderr, "qwen coli: open %s (%s): %s\n", dir, profile, err); exit(1);
+    }
+    coli_mode = 1;
+    return 1;
+}
+
+static float *coli_vec(Model *m, const char *cn, int64_t want){
+    /* GDN + shared-expert params live under the resident HF prefix
+     * (model.language_model.layers.N....) in the package; full-attn + ffn use
+     * canonical bare names (layers.N.attn.* / layers.N.ffn.*). Probe both. */
+    char pref[640]; snprintf(pref, sizeof(pref), "%s%s", g_prefix, cn);
+    const ColiRecordInfo *rec = coli_rec(m, pref);
+    const char *used = pref;
+    if (!rec) { rec = coli_rec(m, cn); used = cn; }
+    ColiTensorInfo info;
+    uint64_t numel = 1;
+    if (!rec || rec->math_format != COLI_CSF_MATH_BF16 ||
+        coli_package_tensor_info(coli_executor_package(m->coli), rec, &info, NULL, 0) ||
+        (numel = coli_rank_numel(&info), numel) != (uint64_t)want) {
+        fprintf(stderr, "qwen coli: missing/invalid %s (want %lld elems)\n", used, (long long)want); exit(1);
+    }
+    float *p = falloc(want);
+    uint16_t *raw = malloc((size_t)want * 2);
+    if (!raw) { fprintf(stderr, "qwen coli: OOM %s\n", used); exit(1); }
+    if (coli_package_read_range(coli_executor_package(m->coli), rec, info.data_offset,
+                                raw, (size_t)want * 2, NULL, 0)) {
+        fprintf(stderr, "qwen coli: read %s failed\n", used); exit(1);
+    }
+    for (int64_t i = 0; i < want; i++) p[i] = coli_bf16_decode(raw[i]);
+    free(raw); return p;
+}
+
+static WT coli_wt(Model *m, const char *cn, int64_t O, int64_t I){
+    WT w = {0};
+    char pref[640]; snprintf(pref, sizeof(pref), "%s%s", g_prefix, cn);
+    const ColiRecordInfo *rec = coli_rec(m, pref);
+    const char *used = pref;
+    if (!rec) { rec = coli_rec(m, cn); used = cn; }
+    ColiTensorInfo info;
+    int shape_ok = 0;
+    if (rec && rec->math_format == COLI_CSF_MATH_BF16 &&
+        rec->codec == COLI_CSF_CODEC_NONE &&
+        !coli_package_tensor_info(coli_executor_package(m->coli), rec, &info, NULL, 0)) {
+        shape_ok = (info.rank == 2 && info.dims[0] == (uint64_t)O &&
+                    info.dims[1] == (uint64_t)I) ||
+                   (O == 1 && info.rank == 1 && info.dims[0] == (uint64_t)I);
+    }
+    uint64_t total = (uint64_t)O * (uint64_t)I;
+    if (!shape_ok || info.data_stored_bytes != total * 2 ||
+        info.data_decoded_bytes != total * 2 || total > SIZE_MAX / sizeof(uint16_t)) {
+        fprintf(stderr, "qwen coli: missing/invalid exact BF16 %s (want %lldx%lld)\n",
+                used, (long long)O, (long long)I); exit(1);
+    }
+    w.bf16 = malloc((size_t)total * sizeof(uint16_t));
+    if (!w.bf16) { fprintf(stderr, "qwen coli: OOM %s\n", used); exit(1); }
+    if (coli_package_read_range(coli_executor_package(m->coli), rec, info.data_offset,
+                                w.bf16, (size_t)total * 2, NULL, 0)) {
+        fprintf(stderr, "qwen coli: read %s failed\n", used); exit(1);
+    }
+    return w;
+}
+
+/* Load all dense/static weights from the COLI package into the Model. Mirrors
+ * model_init's snapshot dense section, but keeps matrix WT payloads exact BF16
+ * instead of expanding them to f32. Allocates the same Layer/Cache/GDN state. */
+static void coli_load_model(Model *m){
+    Cfg *c = &m->c;
+    double t0 = now_s();
+    m->embed    = coli_wt(m, "embed.weight", c->vocab, c->hidden);
+    m->lm_head  = coli_wt(m, "head.weight",  c->vocab, c->hidden);
+    m->final_norm = coli_vec(m, "norm.weight", c->hidden);
+    m->L = calloc(c->n_layers, sizeof(Layer));
+    if (!m->L) { fprintf(stderr, "OOM layers\n"); exit(1); }
+    for (int i = 0; i < c->n_layers; i++) {
+        Layer *l = &m->L[i];
+        int D = c->hidden, H = c->n_heads, hd = c->head_dim, kv = c->n_kv_heads;
+        int C = c->lin_k_dim * c->lin_k_heads * 2 + c->lin_v_dim * c->lin_v_heads;
+        int vdim = c->lin_v_dim * c->lin_v_heads;
+        char lp[256]; snprintf(lp, sizeof(lp), "layers.%d", i);
+        char nm[512];
+        #define CV(field, suffix, N) snprintf(nm, sizeof(nm), "%s.%s", lp, suffix); l->field = coli_vec(m, nm, N)
+        #define CW(field, suffix, O, I) snprintf(nm, sizeof(nm), "%s.%s", lp, suffix); l->field = coli_wt(m, nm, O, I)
+        CV(in_ln, "input_layernorm.weight", D);
+        CV(post_ln, "post_attention_layernorm.weight", D);
+        if (c->layer_is_gdn[i]) {
+            /* GDN params kept under resident HF names in the package. */
+            CV(A_log, "linear_attn.A_log", c->lin_v_heads);
+            CV(dt_bias, "linear_attn.dt_bias", c->lin_v_heads);
+            CV(conv1d, "linear_attn.conv1d.weight", (int64_t)C * c->conv_kernel);
+            CW(in_a, "linear_attn.in_proj_a.weight", c->lin_v_heads, D);
+            CW(in_b, "linear_attn.in_proj_b.weight", c->lin_v_heads, D);
+            CW(in_qkv, "linear_attn.in_proj_qkv.weight", C, D);
+            CW(in_z, "linear_attn.in_proj_z.weight", vdim, D);
+            CV(gdn_norm, "attn_norm.weight", c->lin_v_dim);
+            CW(gdn_out, "linear_attn.out_proj.weight", D, vdim);
+        } else {
+            /* full_attention uses canonical attn.* names. */
+            CW(q, "attn.q_proj.weight", 2 * H * hd, D);
+            CW(k, "attn.k_proj.weight", kv * hd, D);
+            CW(v, "attn.v_proj.weight", kv * hd, D);
+            CW(o, "attn.o_proj.weight", D, H * hd);
+            CV(qn, "attn.q_norm.weight", hd);
+            CV(kn, "attn.k_norm.weight", hd);
+        }
+        CW(router, "ffn.gate.weight", c->n_experts, D);
+        /* Shared-expert projections: gate_proj survived only under the resident
+         * HF name; up/down and the shared_expert_gate row-vector are stored
+         * under canonical ffn.shared_experts.* names (a frontend key collision
+         * put gate_proj elsewhere — see note in qwen_moe_frontend.rs). */
+        CW(se_gate, "ffn.shared_experts.gate_proj.weight", c->shared_inter, D);
+        CW(se_up,   "ffn.shared_experts.up.weight",   c->shared_inter, D);
+        CW(se_down, "ffn.shared_experts.down.weight", D, c->shared_inter);
+        CW(se_g,    "ffn.shared_experts.gate.weight", 1, D);
+        #undef CV
+        #undef CW
+    }
+    /* expert cache slots are allocated by the caller (model_init) after the
+     * dense-load branch, shared with the snapshot path — do NOT allocate here. */
+    m->dense_load_s = now_s() - t0;
+}
+
+/* Expert matrices: role 1=gate,2=up,3=down (colic lower_exact_expert). */
+static int coli_emx(const ColiExpertInfo *ei, int role){
+    for (int i = 0; i < 3; i++) if (ei->matrices[i].role == role) return i;
+    return -1;
+}
+
+static int coli_exact_bf16_matrix(const ColiExpertMatrixInfo *mi,
+                                   uint64_t rows, uint64_t columns){
+    if (!mi || mi->math_format != COLI_CSF_MATH_BF16 ||
+        mi->scale_format != COLI_CSF_SCALE_NONE ||
+        mi->weight_codec != COLI_CSF_CODEC_NONE ||
+        mi->scale_codec != COLI_CSF_CODEC_NONE ||
+        mi->layout != COLI_CSF_LAYOUT_CANONICAL ||
+        mi->rows != rows || mi->columns != columns) return 0;
+    if (columns && rows > UINT64_MAX / columns) return 0;
+    uint64_t elements = rows * columns;
+    return elements <= UINT64_MAX / 2 &&
+           mi->weight_stored_bytes == elements * 2 &&
+           mi->weight_decoded_bytes == elements * 2 &&
+           mi->scale_stored_bytes == 0 && mi->scale_decoded_bytes == 0;
+}
+
+static void load_expert_coli(Model *m, int layer, int eid, Slot *s){
+    Cfg *cc = &m->c;
+    int64_t ng = (int64_t)cc->moe_inter * cc->hidden;
+    int64_t nd = (int64_t)cc->hidden * cc->moe_inter;
+    const ColiRecordInfo *erec = coli_executor_expert(m->coli, layer, eid);
+    ColiExpertInfo ei;
+    if (!erec || erec->codec != COLI_CSF_CODEC_NONE ||
+        coli_executor_expert_info(m->coli, layer, eid, &ei, NULL, 0)) {
+        fprintf(stderr, "qwen coli: missing/invalid expert (%d,%d)\n", layer, eid); exit(1);
+    }
+    int gi = coli_emx(&ei, 1), ui = coli_emx(&ei, 2), di = coli_emx(&ei, 3);
+    if (gi < 0 || ui < 0 || di < 0 ||
+        !coli_exact_bf16_matrix(&ei.matrices[gi], cc->moe_inter, cc->hidden) ||
+        !coli_exact_bf16_matrix(&ei.matrices[ui], cc->moe_inter, cc->hidden) ||
+        !coli_exact_bf16_matrix(&ei.matrices[di], cc->hidden, cc->moe_inter)) {
+        fprintf(stderr, "qwen coli: expert (%d,%d) exact BF16 layout broken\n", layer, eid); exit(1);
+    }
+    slot_alloc_bf16(s, ng, nd); s->fmt = 16; s->pinned = 0;
+    const ColiPackage *pkg = coli_executor_package(m->coli);
+    if (coli_package_read_range(pkg, erec, ei.matrices[gi].weight_offset,
+                                s->bgu, (size_t)ng * 2, NULL, 0) ||
+        coli_package_read_range(pkg, erec, ei.matrices[ui].weight_offset,
+                                s->bgu + ng, (size_t)ng * 2, NULL, 0) ||
+        coli_package_read_range(pkg, erec, ei.matrices[di].weight_offset,
+                                s->bd, (size_t)nd * 2, NULL, 0)) {
+        fprintf(stderr, "qwen coli: read expert (%d,%d) failed\n", layer, eid); exit(1);
+    }
+}
+/* ============================================ COLLACOLI end ============= */
+
+
 static float *load_t(Model *m, const char *name, int64_t want){
     char nm[512]; snprintf(nm, sizeof(nm), "%s%s", g_prefix, name);
     int64_t n = st_numel(&m->S, nm);
@@ -645,6 +888,19 @@ static void matmul(float *y, const float *x, const float *w, int S, int O, int I
 }
 
 /* int8 weights + per-row f32 scales (dequant on use) */
+static void matmul_bf16(float *y, const float *x, const uint16_t *w, int S, int O, int I){
+    #pragma omp parallel for schedule(static)
+    for (int so = 0; so < S * O; so++) {
+        int s = so / O, o = so % O;
+        const float *xs = x + (int64_t)s * I;
+        const uint16_t *wr = w + (int64_t)o * I;
+        float acc = 0.f;
+        #pragma omp simd reduction(+:acc)
+        for (int i = 0; i < I; i++) acc += xs[i] * coli_bf16_decode(wr[i]);
+        y[(int64_t)so] = acc;
+    }
+}
+
 static void matmul_q8(float *y, const float *x, const int8_t *q, const float *sc,
                       int S, int O, int I){
     #pragma omp parallel for schedule(static)
@@ -661,8 +917,9 @@ static void matmul_q8(float *y, const float *x, const int8_t *q, const float *sc
 
 /* WT dispatch: row-int8 when the snapshot supplied it, f32 otherwise */
 static void wt_mul(float *y, const float *x, WT *w, int S, int O, int I){
-    if (w->q) matmul_q8(y, x, w->q, w->s, S, O, I);
-    else      matmul(y, x, w->f, S, O, I);
+    if (w->q)          matmul_q8(y, x, w->q, w->s, S, O, I);
+    else if (w->bf16)  matmul_bf16(y, x, w->bf16, S, O, I);
+    else               matmul(y, x, w->f, S, O, I);
 }
 
 /* ---------- packed expert kernels (copied from quant.h per the standalone-
@@ -978,6 +1235,22 @@ static void slot_alloc_f32(Slot *s, int64_t ng, int64_t nd){
     s->d = s->gu + 2 * ng;
     s->fmt = 0;
 }
+static void slot_alloc_bf16(Slot *s, int64_t ng, int64_t nd){
+    if (s->bgu) return;
+    int64_t twice, total;
+    if (!i64_mul_ok(ng, 2, &twice) || nd < 0 || twice > INT64_MAX - nd) {
+        fprintf(stderr, "expert BF16 allocation overflows\n"); exit(1);
+    }
+    total = twice + nd;
+    if ((uint64_t)total > SIZE_MAX / sizeof(uint16_t)) {
+        fprintf(stderr, "expert BF16 allocation overflows\n"); exit(1);
+    }
+    s->bgu = malloc((size_t)total * sizeof(uint16_t));
+    if (!s->bgu) { fprintf(stderr, "OOM BF16 expert\n"); exit(1); }
+    s->bd = s->bgu + 2 * ng;
+    s->fmt = 16;
+}
+
 static void slot_alloc_q8(Model *m, Slot *s){
     if (s->g) return;
     Cfg *c = &m->c;
@@ -1029,6 +1302,7 @@ static void slot_alloc_packed(Model *m, Slot *s, int fmt){
 }
 
 static void load_expert(Model *m, int layer, int eid, Slot *s){
+    if (coli_mode) { load_expert_coli(m, layer, eid, s); return; }
     char nm[512], qsnm[512];
     Cfg *cc = &m->c;
     int64_t ng = (int64_t)cc->moe_inter * cc->hidden;
@@ -1696,6 +1970,15 @@ static void expert_apply(Model *m, Slot *s, const float *x, float *acc){
         else             matmul_i3(y, h, s->d4, s->d4s, 1, I, D);
         for (int d = 0; d < D; d++) acc[d] += y[d];
         free(gate); free(up); free(h); free(y);
+    } else if (s->fmt == 16) {
+    float *gu = falloc(2 * I);
+    matmul_bf16(gu, x, s->bgu, 1, 2 * I, D);
+    float *h = falloc(I);
+    for (int i = 0; i < I; i++) h[i] = silu(gu[i]) * gu[I + i];
+    float *y = falloc(D);
+    matmul_bf16(y, h, s->bd, 1, D, I);
+    for (int d = 0; d < D; d++) acc[d] += y[d];
+    free(gu); free(h); free(y);
     } else if (s->fmt == 8) {
         float *gate = falloc(I), *up = falloc(I);
         matmul_q8(gate, x, s->g, s->gs, 1, I, D);
@@ -1876,6 +2159,9 @@ static void embed_row(Model *m, int token, float *out){
         const int8_t *row = m->embed.q + (int64_t)token * D;
         float sc = m->embed.s[token];
         for (int d = 0; d < D; d++) out[d] = (float)row[d] * sc;
+    } else if (m->embed.bf16) {
+        const uint16_t *row = m->embed.bf16 + (int64_t)token * D;
+        for (int d = 0; d < D; d++) out[d] = coli_bf16_decode(row[d]);
     } else {
         memcpy(out, m->embed.f + (int64_t)token * D, (size_t)D * sizeof(float));
     }
@@ -2093,8 +2379,8 @@ static void arena_free(ArenaSlot *a, int n){
 #ifdef COLI_METAL
         if (g_metal_compute) { coli_metal_unregister(s->g); coli_metal_unregister(s->g4); coli_metal_unregister(s->gs); coli_metal_unregister(s->g4s); }
 #endif
-        free(s->gu); free(s->g); free(s->g4); free(s->g4s);
-        s->gu = NULL; s->g = NULL; s->g4 = NULL; s->g4s = NULL;
+        free(s->gu); free(s->bgu); free(s->g); free(s->g4); free(s->g4s);
+        s->gu = NULL; s->bgu = NULL; s->bd = NULL; s->g = NULL; s->g4 = NULL; s->g4s = NULL;
     }
 }
 
@@ -2226,8 +2512,17 @@ static void moe_batch(Model *m, Layer *l, int layer, const float *xs, int C, flo
                 if (s->fmt == 4) matmul_i4_grouped(yscratch, h, s->d4, s->d4s, st, I, D, 64);
                 else             matmul_i3(yscratch, h, s->d4, s->d4s, st, I, D);
                 free(gate); free(up); free(h);
-            } else if (s->fmt == 8) {
-                float *gate = falloc((int64_t)st * I), *up = falloc((int64_t)st * I);
+            } else if (s->fmt == 16) {
+            float *gu = falloc((int64_t)st * 2 * I);
+            matmul_bf16(gu, xscratch, s->bgu, st, 2 * I, D);
+            float *h = falloc((int64_t)st * I);
+            for (int r = 0; r < st; r++)
+                for (int i = 0; i < I; i++) h[(int64_t)r * I + i] =
+                    silu(gu[(int64_t)r * 2 * I + i]) * gu[(int64_t)r * 2 * I + I + i];
+            matmul_bf16(yscratch, h, s->bd, st, D, I);
+            free(gu); free(h);
+        } else if (s->fmt == 8) {
+            float *gate = falloc((int64_t)st * I), *up = falloc((int64_t)st * I);
                 matmul_q8(gate, xscratch, s->g, s->gs, st, I, D);
                 matmul_q8(up,   xscratch, s->u, s->us, st, I, D);
                 float *h = falloc((int64_t)st * I);
@@ -2280,7 +2575,7 @@ static void moe_batch(Model *m, Layer *l, int layer, const float *xs, int C, flo
 #ifdef COLI_METAL
             if (g_metal_compute) { coli_metal_unregister(s->g4); coli_metal_unregister(s->g4s); }
 #endif
-            free(s->gu); free(s->g); free(s->gs); free(s->g4); free(s->g4s);
+            free(s->gu); free(s->bgu); free(s->g); free(s->gs); free(s->g4); free(s->g4s);
         }
     }
     free(uniq); free(eid_slot); free(wave); free(xscratch); free(yscratch);
@@ -2376,6 +2671,9 @@ static void forward_token(Model *m, int token, int pos, float *out){
         const int8_t *row = m->embed.q + (int64_t)token * D;
         float sc = m->embed.s[token];
         for (int d = 0; d < D; d++) out[d] = (float)row[d] * sc;
+    } else if (m->embed.bf16) {
+        const uint16_t *row = m->embed.bf16 + (int64_t)token * D;
+        for (int d = 0; d < D; d++) out[d] = coli_bf16_decode(row[d]);
     } else {
         memcpy(out, m->embed.f + (int64_t)token * D, (size_t)D * sizeof(float));
     }
@@ -2450,10 +2748,28 @@ static float *step(Model *m, const int *ids, int n, int pos_base){
 
 static void model_init(Model *m, const char *snap, int cap){
     memset(m, 0, sizeof(*m));
-    load_cfg(&m->c, snap);
-    st_init(&m->S, snap);
-    Cfg *c = &m->c;
+    /* Detect COLI first: a package dir has no config.json, so the Cfg source
+     * (HF dir via COLI_CONFIG) must be chosen before the first load_cfg. */
+    int is_coli = coli_open(m, snap);
+    if (is_coli) {
+        const char *hfx = getenv("COLI_CONFIG");
+        if (!hfx || !*hfx) { fprintf(stderr, "qwen coli: set COLI_CONFIG=<HF dir with config.json>\n"); exit(1); }
+        load_cfg(&m->c, hfx);
+        m->coli_load = 1;
+    } else {
+        load_cfg(&m->c, snap);
+        m->coli_load = 0;
+    }
+    Cfg *c = &m->c;                        /* hoisted above the COLI jump */
     double t0 = now_s();
+    if (is_coli) {
+        /* Real checkpoints nest text weights under model.language_model.*; the
+         * snapshot path probes this, but we jump past the probe, so set it. */
+        snprintf(g_prefix, sizeof(g_prefix), "model.language_model.");
+        coli_load_model(m);            /* fills embed/lm_head/norm/L/cache */
+        goto coli_dense_done;
+    }
+    st_init(&m->S, snap);
 
     /* weight prefix probe: real checkpoints nest text weights under
      * model.language_model.*; the tiny fixtures use model.*; lm_head.weight
@@ -2517,6 +2833,7 @@ static void model_init(Model *m, const char *snap, int cap){
         #undef LD
         #undef LDW
     }
+coli_dense_done:
     m->cache = calloc_checked((size_t)c->n_layers, sizeof(LCache), "expert cache rows");
     for (int i = 0; i < c->n_layers; i++) {
         m->cache[i].cap = cap;
@@ -2902,7 +3219,7 @@ static void serve_tiers_emap(Model *m) {
     for (int i = 0; i < c->n_layers; i++) filled += m->cache[i].n;
     int64_t I = c->moe_inter, D = c->hidden;
     /* per-expert resident bytes: int8 gate/up/down + one f32 scale per row */
-    int64_t slotb = 3*I*D + (2*I+D)*4;
+    int64_t slotb = coli_mode ? 3*I*D*2 : 3*I*D + (2*I+D)*4;
     int64_t total_experts = (int64_t)c->n_layers * E;
     printf("TIERS 0 %d %lld 0.00 %.2f\n", filled,
            (long long)(total_experts - filled), filled*(double)slotb/1e9);
@@ -3080,7 +3397,9 @@ int main(int argc, char **argv){
         if (getenv("RAM_GB") && atoi(getenv("RAM_GB")) > 0) {
             cap = atoi(getenv("RAM_GB")) / 2;
         } else {
-            Cfg cfg0; load_cfg(&cfg0, snap);   /* config-only pre-pass for topk */
+            Cfg cfg0;
+            if (getenv("COLI_CONFIG")) load_cfg(&cfg0, getenv("COLI_CONFIG"));
+            else load_cfg(&cfg0, snap);   /* config-only pre-pass for topk */
             cap = cfg0.topk;
             free(cfg0.layer_is_gdn);
         }
@@ -3103,7 +3422,9 @@ int main(int argc, char **argv){
 
     Model m; model_init(&m, snap, cap);
     Tok T;
-    char tokpath[2048]; snprintf(tokpath, sizeof(tokpath), "%s/tokenizer.json", snap);
+    char tokpath[2048];
+    if (coli_mode) snprintf(tokpath, sizeof(tokpath), "%s/tokenizer.json", getenv("COLI_CONFIG") ? getenv("COLI_CONFIG") : snap);
+    else           snprintf(tokpath, sizeof(tokpath), "%s/tokenizer.json", snap);
     tok_load(&T, tokpath);
     m.tok = &T;
     int ctx_cap = getenv("CTX") ? atoi(getenv("CTX")) : 65536;

@@ -7,6 +7,7 @@ use crate::source::TensorRef;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Architecture {
     DeepSeekV4Flash,
+    Qwen3_5MoeMoE,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,6 +22,8 @@ pub struct ModelGeometry {
     pub experts_per_token: u32,
     pub attention_heads: u32,
     pub head_dim: u32,
+    pub num_key_value_heads: u32,
+    pub linear_key_head_dim: u32,
     pub q_lora_rank: u32,
     pub o_groups: u32,
     pub o_lora_rank: u32,

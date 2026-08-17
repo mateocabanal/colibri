@@ -4,6 +4,7 @@ use crate::{
     error::{ColicError, Result},
     ir::SemanticModel,
     model::deepseek_v4::DeepSeekV4Frontend,
+    model::qwen_moe::QwenMoeFrontend,
     source,
     storage::{self, LoweredRecord, ManifestRecord, StoragePlan},
     target, verify,
@@ -164,6 +165,8 @@ pub fn inspect_source(source_path: &std::path::Path) -> Result<source::SourceInv
 pub fn build_semantic_ir(inventory: &source::SourceInventory) -> Result<Option<SemanticModel>> {
     if DeepSeekV4Frontend::probe(inventory)? {
         Ok(Some(DeepSeekV4Frontend::build(inventory)?))
+    } else if QwenMoeFrontend::probe(inventory)? {
+        Ok(Some(QwenMoeFrontend::build(inventory)?))
     } else {
         Ok(None)
     }
@@ -776,6 +779,8 @@ mod tests {
                 experts_per_token: 1,
                 attention_heads: 1,
                 head_dim: 1,
+                num_key_value_heads: 0,
+                linear_key_head_dim: 0,
                 q_lora_rank: 1,
                 o_groups: 1,
                 o_lora_rank: 1,
