@@ -125,6 +125,10 @@ COLI_V4_UNIT_LAYER_RESIDENT.o: CFLAGS += $(V4_LAYER_RESIDENT_CFLAGS)
 
 TARGET_OBJS = $(addsuffix .o,$(V4_TARGET_UNITS))
 TEST_UNIT_OBJS = $(addsuffix .o,$(V4_TEST_UNITS))
+# #3's resource planner is now a normal source file rather than an amalgamated
+# unit. Keep the object/symbol name unchanged so runtime and unit-test link
+# contracts stay identical while the planner can evolve independently.
+V4_AMALGAMATED_OBJS = $(filter-out COLI_V4_UNIT_RESOURCE_PLAN.o,$(sort $(TARGET_OBJS) $(TEST_UNIT_OBJS)))
 V4_COLI_OBJS = coli_v4_expert_store.o coli_v4_static.o coli_executor.o coli_format.o
 V4_OBJS = $(TARGET_OBJS) $(V4_COLI_OBJS) $(V4_METAL_OBJS)
 V4_BUILD_CONFIG = .deepseek-v4-build-config
@@ -153,10 +157,16 @@ coli_executor.o: coli_executor.c coli_executor.h coli_format.h
 coli_format.o: coli_format.c coli_format.h compat.h coli_v4_macos_uncached_io.h
 	$(CC) $(CFLAGS) -include coli_v4_macos_uncached_io.h -c coli_format.c -o $@
 
+# Split out of deepseek_v4.c so #3 can change planner semantics without a
+# whole-amalgamation rewrite. This source exports the exact same public/internal
+# symbols as the old COLI_V4_UNIT_RESOURCE_PLAN section.
+COLI_V4_UNIT_RESOURCE_PLAN.o: coli_v4_resource_plan.c deepseek_v4_internal.h coli_v4_residency.h
+	$(CC) $(CFLAGS) -c coli_v4_resource_plan.c -o $@
+
 $(V4_BINARY): $(V4_OBJS)
 	$(CC) $(V4_OBJS) -o $@ $(LDFLAGS)
 
-$(TARGET_OBJS) $(TEST_UNIT_OBJS): %.o: deepseek_v4.c deepseek_v4.h \
+$(V4_AMALGAMATED_OBJS): %.o: deepseek_v4.c deepseek_v4.h \
 	deepseek_v4_internal.h deepseek_v4_dspark.inc st.h json.h compat.h tensor.h quant.h \
 	native_quant.h native_quant_batch.h native_quant_dual.h \
 	native_quant_fp4_rows16.h
