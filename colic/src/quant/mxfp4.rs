@@ -170,41 +170,47 @@ pub fn quantize_bf16_row(
     Ok(())
 }
 
-/// Choose the smallest representable power-of-two scale that can hold the
+/// Choose the smallest runtime-supported power-of-two scale that can hold the
 /// largest magnitude without E2M1 saturation. This is a deterministic PTQ
-/// policy; the resulting bytes use the runtime's native MXFP4 representation.
+/// policy; OCP permits conversion algorithms other than its baseline recipe.
+///
+/// The existing kernels decode E8M0 through the Float32 exponent-bit fast path,
+/// which is exact for codes 1..=254. Code 0 is a valid OCP E8M0 encoding for
+/// 2^-127, but those kernels intentionally do not implement that denormal edge.
+/// We therefore never emit code 0; an all-zero block uses scale 1.0 instead.
 fn choose_scale(values: &[f32]) -> (u8, f32) {
     let max_abs = values
         .iter()
         .fold(0.0_f32, |acc, value| acc.max(value.abs()));
     if max_abs == 0.0 {
-        return (0, 0.0);
+        return (127, 1.0);
     }
 
-    // For a normal f32, floor(log2(max_abs)) is encoded directly in the IEEE
-    // exponent. BF16 source values below the f32 normal range do not exist, so
-    // treating exponent==0 as -126 is sufficient here.
-    let biased = ((max_abs.to_bits() >> 23) & 0xff) as i32;
-    let max_exp = if biased == 0 { -126 } else { biased - 127 };
+    let bits = max_abs.to_bits();
+    let biased = ((bits >> 23) & 0xff) as i32;
+    let max_exp = if biased == 0 {
+        // f32 subnormal: value = mantissa * 2^-149.
+        let mantissa = bits & 0x007f_ffff;
+        (31 - mantissa.leading_zeros() as i32) - 149
+    } else {
+        biased - 127
+    };
     let mut scale_exp = max_exp - 2; // E2M1's largest power-of-two magnitude is 4.
     scale_exp = scale_exp.clamp(-126, 127);
     let mut scale_code = (scale_exp + 127) as u8;
-    let mut scale = e8m0_to_f32(scale_code);
+    let mut scale = runtime_e8m0_to_f32(scale_code);
 
     // Values in [6*scale, 8*scale) need the next power-of-two scale to avoid
     // clipping at the E2M1 maximum magnitude 6.
     if max_abs > MAX_E2M1 * scale && scale_exp < 127 {
         scale_exp += 1;
         scale_code = (scale_exp + 127) as u8;
-        scale = e8m0_to_f32(scale_code);
+        scale = runtime_e8m0_to_f32(scale_code);
     }
     (scale_code, scale)
 }
 
 fn quantize_value(value: f32, scale: f32) -> u8 {
-    if scale == 0.0 {
-        return if value.is_sign_negative() { 0x8 } else { 0x0 };
-    }
     let magnitude = (value.abs() / scale).min(MAX_E2M1);
     let mut best_code = 0_u8;
     let mut best_error = f32::INFINITY;
@@ -228,7 +234,8 @@ fn quantize_value(value: f32, scale: f32) -> u8 {
 }
 
 #[inline]
-pub fn e8m0_to_f32(code: u8) -> f32 {
+pub fn runtime_e8m0_to_f32(code: u8) -> f32 {
+    debug_assert!((1..=254).contains(&code));
     f32::from_bits(u32::from(code) << 23)
 }
 
@@ -236,7 +243,7 @@ pub fn e8m0_to_f32(code: u8) -> f32 {
 fn decode_nibble(code: u8, scale: u8) -> f32 {
     let magnitude = E2M1_MAGNITUDES[(code & 0x7) as usize];
     let signed = if code & 0x8 != 0 { -magnitude } else { magnitude };
-    signed * e8m0_to_f32(scale)
+    signed * runtime_e8m0_to_f32(scale)
 }
 
 #[cfg(test)]
@@ -266,6 +273,16 @@ mod tests {
         quantize_bf16_row(&bf16_bytes(&values), &mut weights, &mut scales).unwrap();
         assert_eq!(scales, vec![127]);
         assert_eq!(weights, vec![0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe]);
+    }
+
+    #[test]
+    fn zero_block_uses_finite_nonzero_e8m0_scale() {
+        let values = [0.0_f32; GROUP_SIZE];
+        let mut weights = Vec::new();
+        let mut scales = Vec::new();
+        quantize_bf16_row(&bf16_bytes(&values), &mut weights, &mut scales).unwrap();
+        assert_eq!(scales, vec![127]);
+        assert!(weights.iter().all(|byte| *byte == 0));
     }
 
     #[test]
