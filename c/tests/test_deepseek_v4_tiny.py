@@ -179,6 +179,116 @@ def check_session(
     return actual["full_ids"]
 
 
+def read_jsonl(path: Path) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise AssertionError(f"{path.name}:{number}: malformed JSON: {exc}") from exc
+        if not isinstance(row, dict):
+            raise AssertionError(f"{path.name}:{number}: expected JSON object")
+        rows.append(row)
+    if not rows:
+        raise AssertionError(f"{path.name}: empty trace")
+    return rows
+
+
+def check_route_trace(
+    binary: Path, model: Path, case: dict[str, object], temporary: Path
+) -> None:
+    """Gate #56's physical-v1 + logical-v2 split on a real target execution."""
+    physical = temporary / "experts.jsonl"
+    routes = temporary / "routes.jsonl"
+    max_new = min(2, int(case["max_new_tokens"]))
+    env = dict(
+        os.environ,
+        V4_EXPERT_TRACE=physical.as_posix(),
+        V4_ROUTE_TRACE=routes.as_posix(),
+        V4_EXPERT_TRACE_CAP="65536",
+        V4_ROUTE_TRACE_CAP="65536",
+        V4_ROUTE_REQUEST_ID="77",
+    )
+    result = run(
+        "target explicit route trace",
+        [
+            binary.as_posix(),
+            model.as_posix(),
+            token_prompt(case["prompt_ids"]),
+            "--raw-prompt",
+            "--max-tokens",
+            str(max_new),
+            "--no-dspark",
+        ],
+        env=env,
+    )
+    if "v4_expert_trace status=written" not in result.stderr:
+        raise AssertionError("physical expert trace was not flushed")
+    if "v4_route_trace status=written" not in result.stderr:
+        raise AssertionError("logical route trace was not flushed")
+
+    physical_rows = read_jsonl(physical)
+    route_rows = read_jsonl(routes)
+    if physical_rows[0].get("schema") != "colibri.v4.expert_trace.v1":
+        raise AssertionError(f"unexpected physical trace header: {physical_rows[0]}")
+    header = route_rows[0]
+    if header.get("schema") != "colibri.v4.expert_trace.v2":
+        raise AssertionError(f"unexpected logical trace header: {header}")
+    if header.get("source") != "route_selected" or header.get("dropped") != 0:
+        raise AssertionError(f"bad logical trace metadata: {header}")
+
+    selections = [row for row in route_rows[1:] if row.get("event") == "request"]
+    if not selections:
+        raise AssertionError("logical route trace contains no selections")
+    prompt_count = len(case["prompt_ids"])
+    positions: set[int] = set()
+    groups: dict[tuple[int, int], list[int]] = {}
+    for row in selections:
+        if row.get("request_id") != 77:
+            raise AssertionError(f"route request id was not preserved: {row}")
+        position = row.get("token_position")
+        layer = row.get("layer")
+        expert = row.get("expert")
+        rank = row.get("route_rank")
+        weight = row.get("route_weight")
+        if not isinstance(position, int) or position < 0:
+            raise AssertionError(f"route is missing token position: {row}")
+        if not isinstance(layer, int) or layer < 0:
+            raise AssertionError(f"route is missing layer identity: {row}")
+        if not isinstance(expert, int) or expert < 0:
+            raise AssertionError(f"route is missing expert identity: {row}")
+        if not isinstance(rank, int) or rank < 0:
+            raise AssertionError(f"route is missing rank identity: {row}")
+        if not isinstance(weight, (int, float)):
+            raise AssertionError(f"route is missing numeric weight: {row}")
+        positions.add(position)
+        groups.setdefault((position, layer), []).append(rank)
+
+    # Prompt route positions must be explicit. With two generated tokens the
+    # first generated token comes from the prompt head, then one decode token is
+    # fed at absolute position prompt_count to produce the second token.
+    if not set(range(prompt_count)).issubset(positions):
+        raise AssertionError(
+            f"route trace missed prompt positions: expected 0..{prompt_count - 1}, "
+            f"got {sorted(positions)}"
+        )
+    if max_new > 1 and prompt_count not in positions:
+        raise AssertionError("route trace missed the first decode input position")
+
+    # Every (token, layer) route group must carry a dense 0..topk-1 rank set.
+    # This specifically catches losing original router ranks when the execution
+    # path later sorts/merges experts by id.
+    for key, ranks in groups.items():
+        ordered = sorted(ranks)
+        if ordered != list(range(len(ordered))):
+            raise AssertionError(f"non-dense route ranks for {key}: {ranks}")
+
+    print(
+        "PASS target trace: physical v1 + explicit logical v2 "
+        f"({len(selections)} selections, {len(positions)} token positions)"
+    )
+
+
 def check_serve(binary: Path, model: Path, case: dict[str, object]) -> None:
     engine = openai_server.Engine(
         binary,
@@ -281,6 +391,7 @@ def main() -> int:
             )
         # The 72-token case crosses the 64-token target prefill chunk boundary.
         check_session(binary, fixture, "long", cases["long"], temporary)
+        check_route_trace(binary, fixture, cases["short"], temporary)
         check_cli_uses_engine_context(binary, fixture, temporary)
         check_serve(binary, fixture, cases["short"])
 
