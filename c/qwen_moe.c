@@ -322,6 +322,8 @@ typedef struct {
     int last_route[64];            /* most recent top-k (for lookahead prefetch) */
     int last_route_k;
     uint64_t prefetch_misses;      /* loads triggered by lookahead prefetch */
+    uint64_t prof_expert_requests; /* logical routed expert applications */
+    uint64_t prof_expert_loads;    /* physical expert loads from storage */
     double t_attn, t_gdn, t_moe, t_expio, t_head; /* legacy PROF + generic profile sources */
     double dense_load_s;
     ColiExecutor *coli; /* COLLACOLI: non-NULL = COLI package backend */
@@ -342,13 +344,21 @@ enum {
     QPROF_METAL_SUBMIT,
     QPROF_METAL_WAIT,
     QPROF_METAL_KERNEL,
+    QPROF_METAL_MOE_SETUP,
+    QPROF_METAL_MOE_WAIT,
+    QPROF_METAL_MOE_KERNEL,
+    QPROF_METAL_MOE_SCATTER,
     QPROF_COUNT
 };
 enum {
-    QPC_EXPERT_REQUESTS = 0,
-    QPC_EXPERT_HITS,
-    QPC_EXPERT_MISSES,
+    QPC_ROUTED_EXPERT_REQUESTS = 0,
+    QPC_EXPERT_LOADS,
+    QPC_CACHE_HITS,
+    QPC_CACHE_MISSES,
     QPC_PREFETCH_MISSES,
+    QPC_METAL_MOE_BLOCKS,
+    QPC_METAL_MOE_FALLBACKS,
+    QPC_METAL_MOE_EXPERTS,
     QPC_COUNT
 };
 static const ColiProfilePhaseDef qprof_phases[QPROF_COUNT] = {
@@ -365,12 +375,20 @@ static const ColiProfilePhaseDef qprof_phases[QPROF_COUNT] = {
     [QPROF_METAL_SUBMIT]  = {"metal_submit", 0},
     [QPROF_METAL_WAIT]    = {"metal_wait", 0},
     [QPROF_METAL_KERNEL]  = {"metal_kernel", 0},
+    [QPROF_METAL_MOE_SETUP]   = {"metal_moe_setup", 0},
+    [QPROF_METAL_MOE_WAIT]    = {"metal_moe_wait", 0},
+    [QPROF_METAL_MOE_KERNEL]  = {"metal_moe_kernel", 0},
+    [QPROF_METAL_MOE_SCATTER] = {"metal_moe_scatter", 0},
 };
 static const ColiProfileCounterDef qprof_counters[QPC_COUNT] = {
-    [QPC_EXPERT_REQUESTS] = {"expert_requests"},
-    [QPC_EXPERT_HITS] = {"expert_hits"},
-    [QPC_EXPERT_MISSES] = {"expert_misses"},
+    [QPC_ROUTED_EXPERT_REQUESTS] = {"routed_expert_requests"},
+    [QPC_EXPERT_LOADS] = {"expert_loads"},
+    [QPC_CACHE_HITS] = {"cache_hits"},
+    [QPC_CACHE_MISSES] = {"cache_misses"},
     [QPC_PREFETCH_MISSES] = {"prefetch_misses"},
+    [QPC_METAL_MOE_BLOCKS] = {"metal_moe_blocks"},
+    [QPC_METAL_MOE_FALLBACKS] = {"metal_moe_fallbacks"},
+    [QPC_METAL_MOE_EXPERTS] = {"metal_moe_experts"},
 };
 static ColiProfile g_qprof;
 
@@ -406,9 +424,10 @@ static void qprof_sync(Model *m) {
     coli_profile_phase_set(&g_qprof, QPROF_MOE, qprof_s_to_ns(m->t_moe));
     coli_profile_phase_set(&g_qprof, QPROF_EXPERT_IO, qprof_s_to_ns(m->t_expio));
     coli_profile_phase_set(&g_qprof, QPROF_HEAD, qprof_s_to_ns(m->t_head));
-    coli_profile_counter_set(&g_qprof, QPC_EXPERT_REQUESTS, m->hits + m->miss);
-    coli_profile_counter_set(&g_qprof, QPC_EXPERT_HITS, m->hits);
-    coli_profile_counter_set(&g_qprof, QPC_EXPERT_MISSES, m->miss);
+    coli_profile_counter_set(&g_qprof, QPC_ROUTED_EXPERT_REQUESTS, m->prof_expert_requests);
+    coli_profile_counter_set(&g_qprof, QPC_EXPERT_LOADS, m->prof_expert_loads);
+    coli_profile_counter_set(&g_qprof, QPC_CACHE_HITS, m->hits);
+    coli_profile_counter_set(&g_qprof, QPC_CACHE_MISSES, m->miss);
     coli_profile_counter_set(&g_qprof, QPC_PREFETCH_MISSES, m->prefetch_misses);
 #ifdef COLI_METAL
     uint64_t encode = 0, submit = 0, wait = 0, kernel = 0;
@@ -417,6 +436,19 @@ static void qprof_sync(Model *m) {
     coli_profile_phase_set(&g_qprof, QPROF_METAL_SUBMIT, submit);
     coli_profile_phase_set(&g_qprof, QPROF_METAL_WAIT, wait);
     coli_profile_phase_set(&g_qprof, QPROF_METAL_KERNEL, kernel);
+
+    double moe_setup = 0.0, moe_wait = 0.0, moe_scatter = 0.0;
+    uint64_t moe_ok = 0, moe_fb = 0, moe_experts = 0;
+    coli_metal_moe_times(&moe_setup, &moe_wait, &moe_scatter);
+    coli_metal_moe_counts(&moe_ok, &moe_fb, &moe_experts);
+    coli_profile_phase_set(&g_qprof, QPROF_METAL_MOE_SETUP, qprof_s_to_ns(moe_setup));
+    coli_profile_phase_set(&g_qprof, QPROF_METAL_MOE_WAIT, qprof_s_to_ns(moe_wait));
+    coli_profile_phase_set(&g_qprof, QPROF_METAL_MOE_KERNEL,
+                           qprof_s_to_ns(coli_metal_moe_kernel_time()));
+    coli_profile_phase_set(&g_qprof, QPROF_METAL_MOE_SCATTER, qprof_s_to_ns(moe_scatter));
+    coli_profile_counter_set(&g_qprof, QPC_METAL_MOE_BLOCKS, moe_ok);
+    coli_profile_counter_set(&g_qprof, QPC_METAL_MOE_FALLBACKS, moe_fb);
+    coli_profile_counter_set(&g_qprof, QPC_METAL_MOE_EXPERTS, moe_experts);
 #endif
 }
 
@@ -1537,6 +1569,7 @@ static void slot_alloc_packed(Model *m, Slot *s, int fmt){
 }
 
 static void load_expert(Model *m, int layer, int eid, Slot *s){
+    m->prof_expert_loads++;
     if (coli_mode) { load_expert_coli(m, layer, eid, s); return; }
     char nm[512], qsnm[512];
     Cfg *cc = &m->c;
@@ -2278,6 +2311,7 @@ static void expert_prefetch_next_early(Model *m, int layer, int nr){
 
 static void moe_token(Model *m, Layer *l, int layer, const float *x, float *out){
     Cfg *c = &m->c; int E = c->n_experts, K = c->topk, D = c->hidden;
+    m->prof_expert_requests += (uint64_t)K;
     float *logits = falloc(E);
     wt_mul(logits, x, &l->router, 1, E, D);
     softmax_row(logits, E);
@@ -2652,6 +2686,7 @@ static void arena_free(ArenaSlot *a, int n){
 
 static void moe_batch(Model *m, Layer *l, int layer, const float *xs, int C, float *out){
     Cfg *c = &m->c; int E = c->n_experts, K = c->topk, D = c->hidden;
+    m->prof_expert_requests += (uint64_t)C * (uint64_t)K;
     double t0 = now_s();
     /* router over the whole chunk */
     float *rlogits = falloc((int64_t)C * E);
