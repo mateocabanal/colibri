@@ -21,7 +21,8 @@ jobs:
       - name: Build and run focused tests
         shell: bash
         run: |
-          make -C c tests/test_mxfp4_runtime tests/test_mxfp4_expert tests/test_qwen_moe
+          make -C c -f Makefile.csf tests/test_mxfp4_runtime tests/test_mxfp4_expert
+          make -C c tests/test_qwen_moe
           ./c/tests/test_mxfp4_runtime
           ./c/tests/test_mxfp4_expert
           ./c/tests/test_qwen_moe
