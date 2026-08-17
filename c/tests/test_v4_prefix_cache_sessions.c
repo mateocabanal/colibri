@@ -70,15 +70,22 @@ static int generated_text(ColiV4Session *session, char **output) {
     return 0;
 }
 
-static int open_engine(ColiV4Engine **engine, const char *model,
-                       char *error, size_t error_size) {
+static int open_engine_with_limit(ColiV4Engine **engine, const char *model,
+                                  uint64_t memory_limit_bytes,
+                                  char *error, size_t error_size) {
     ColiV4EngineOpenOptions options = {
         .target_model_dir = model,
+        .memory_limit_bytes = memory_limit_bytes,
         .context_tokens = 128,
         .pin_slots_per_layer = -1,
         .no_dspark = 1,
     };
     return coli_v4_engine_open(engine, &options, error, error_size);
+}
+
+static int open_engine(ColiV4Engine **engine, const char *model,
+                       char *error, size_t error_size) {
+    return open_engine_with_limit(engine, model, 0, error, error_size);
 }
 
 static int open_session(ColiV4Session **session, ColiV4Engine *engine,
@@ -109,14 +116,16 @@ int main(int argc, char **argv) {
     const char *model = argv[1];
     const char *initial_prompt = argv[2];
     char error[1024] = {0};
-    ColiV4Engine *shared_engine = NULL, *cold_engine = NULL;
+    ColiV4Engine *shared_engine = NULL, *cold_engine = NULL, *rejected_engine = NULL;
     ColiV4Session *first = NULL, *equal = NULL, *extended = NULL;
     ColiV4Session *longest = NULL, *cold = NULL;
     char *extension_token = NULL, *prompt_plus_one = NULL, *prompt_plus_two = NULL;
     char *longest_text = NULL, *cold_text = NULL;
+    uint64_t reserve = (uint64_t)coli_v4_prefix_cache_budget_bytes();
+    const uint64_t explicit_limit = 3ULL * 1024ULL * 1024ULL * 1024ULL;
     int status = 1;
 
-    if (!getenv("V4_PREFIX_CACHE_MB") || !atoi(getenv("V4_PREFIX_CACHE_MB"))) {
+    if (!reserve) {
         fprintf(stderr, "V4_PREFIX_CACHE_MB must be positive for this test\n");
         goto cleanup;
     }
@@ -221,14 +230,28 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
 
-    /* A different engine pointer is a strict cache namespace, so its first
-     * request is the cold-prefill oracle even though the process cache remains
-     * enabled globally. */
-    if (open_engine(&cold_engine, model, error, sizeof(error)) ||
+    /* Use an explicit API memory envelope for the cold correctness oracle and
+     * assert the planner leaves the resident prefix budget inside that same
+     * envelope. This is the Apple-UMA safety contract: cache bytes are not a
+     * hidden allocation on top of --memory-gb. */
+    if (open_engine_with_limit(&cold_engine, model, explicit_limit,
+                               error, sizeof(error)) ||
         open_session(&cold, cold_engine, error, sizeof(error))) {
         fprintf(stderr, "cold engine/session open failed: %s\n", error);
         goto cleanup;
     }
+    ColiV4EngineMemorySummary memory = {0};
+    coli_v4_engine_memory_summary(cold_engine, &memory);
+    if (reserve > explicit_limit ||
+        memory.projected_bytes > explicit_limit - reserve) {
+        fprintf(stderr,
+                "prefix-cache memory envelope exceeded: projected=%llu reserve=%llu limit=%llu\n",
+                (unsigned long long)memory.projected_bytes,
+                (unsigned long long)reserve,
+                (unsigned long long)explicit_limit);
+        goto cleanup;
+    }
+
     if (run_generation(cold, prompt_plus_two, error, sizeof(error))) {
         fprintf(stderr, "cold generation failed: %s\n", error);
         goto cleanup;
@@ -249,6 +272,21 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
 
+    /* A user limit no larger than the explicit cache reserve must fail for the
+     * cache-reserve reason, rather than allowing planning to proceed and exceed
+     * the requested process envelope later. */
+    memset(error, 0, sizeof(error));
+    if (!open_engine_with_limit(&rejected_engine, model, reserve,
+                                error, sizeof(error))) {
+        fprintf(stderr, "cache-exhausted memory limit unexpectedly opened\n");
+        goto cleanup;
+    }
+    if (!strstr(error, "prefix-cache reserve")) {
+        fprintf(stderr,
+                "cache-exhausted limit failed for wrong reason: %s\n", error);
+        goto cleanup;
+    }
+
     ColiV4PrefixCacheStats cache = {0};
     coli_v4_prefix_cache_stats(&cache);
     uint64_t expected_matched = (uint64_t)base_tokens + (uint64_t)extended_tokens;
@@ -264,10 +302,13 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
 
-    printf("PASS cross-session prefix cache: base=%d extended=%d longest=%d prompt tokens, %.3f MiB restored in %.3f ms, output identical to cold prefill\n",
+    printf("PASS cross-session prefix cache: base=%d extended=%d longest=%d prompt tokens, %.3f MiB restored in %.3f ms, output identical to cold prefill; memory projected=%.3fGiB reserve=%.3fGiB limit=%.3fGiB\n",
            base_tokens, extended_tokens, longest->prefix_reused,
            cache.restore_bytes / (1024.0 * 1024.0),
-           cache.restore_ns / 1.0e6);
+           cache.restore_ns / 1.0e6,
+           memory.projected_bytes / 1073741824.0,
+           reserve / 1073741824.0,
+           explicit_limit / 1073741824.0);
     status = 0;
 
 cleanup:
@@ -283,5 +324,6 @@ cleanup:
     if (cold) coli_v4_session_destroy(cold);
     if (shared_engine) coli_v4_engine_destroy(shared_engine);
     if (cold_engine) coli_v4_engine_destroy(cold_engine);
+    if (rejected_engine) coli_v4_engine_destroy(rejected_engine);
     return status;
 }
