@@ -1,0 +1,28 @@
+name: Repair Qwen MXFP4 runtime stager
+
+on:
+  push:
+    branches: [feat/qwen36-mxfp4]
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/qwen36-mxfp4
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Remove invalid YAML guard
+        shell: bash
+        run: |
+          sed -i "/^[[:space:]]*if: github.actor != 'github-actions\[bot\]'/d" .github/workflows/qwen-mxfp4-runtime-integration.yml
+          if git diff --quiet; then exit 0; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/workflows/qwen-mxfp4-runtime-integration.yml
+          git commit -m "ci: fix Qwen MXFP4 runtime stager"
+          git push origin HEAD:feat/qwen36-mxfp4
