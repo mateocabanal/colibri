@@ -30,5 +30,14 @@ jobs:
           workspaces: colic
       - name: Test
         run: cargo test --manifest-path colic/Cargo.toml --all-targets
-      - name: Format
-        run: cargo fmt --manifest-path colic/Cargo.toml --all -- --check
+      - name: Format working tree
+        run: cargo fmt --manifest-path colic/Cargo.toml --all
+      - name: Save rustfmt patch
+        shell: bash
+        run: git diff -- colic > rustfmt-${{ matrix.os }}.patch
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rustfmt-${{ matrix.os }}
+          path: rustfmt-${{ matrix.os }}.patch
+      - name: Verify formatting
+        run: git diff --exit-code -- colic
