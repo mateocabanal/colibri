@@ -187,16 +187,16 @@ COLI_V4_UNIT_EXPERT_STORE_AUTO.o: coli_v4_expert_store_auto_prefix.c coli_v4_exp
 	$(CC) $(CFLAGS) -c coli_v4_expert_store_auto_prefix.c -o $@
 COLI_V4_UNIT_COMPRESSOR_SNAPSHOT.o: coli_v4_compressor_snapshot_size.c deepseek_v4.c deepseek_v4_internal.h coli_v4_prefix_cache.h
 	$(CC) $(CFLAGS) -DCOLI_V4_UNIT_COMPRESSOR_SNAPSHOT -c coli_v4_compressor_snapshot_size.c -o $@
-COLI_V4_UNIT_INDEXER_SNAPSHOT.o: coli_v4_indexer_snapshot_size.c deepseek_v4.c deepseek_v4_internal.h coli_v4_prefix_cache.h
+COLI_V4_UNIT_INDEXER_SNAPSHOT.o: coli_v4_indexer_snapshot_size.c coli_v4_compressor_snapshot_size.c deepseek_v4.c deepseek_v4_internal.h coli_v4_prefix_cache.h
 	$(CC) $(CFLAGS) -DCOLI_V4_UNIT_INDEXER_SNAPSHOT -c coli_v4_indexer_snapshot_size.c -o $@
-COLI_V4_UNIT_ATTENTION_TRANSACTION.o: coli_v4_attention_snapshot_size.c deepseek_v4.c deepseek_v4_internal.h coli_v4_prefix_cache.h
+COLI_V4_UNIT_ATTENTION_TRANSACTION.o: coli_v4_attention_snapshot_size.c coli_v4_compressor_snapshot_size.c coli_v4_indexer_snapshot_size.c deepseek_v4.c deepseek_v4_internal.h coli_v4_prefix_cache.h
 	$(CC) $(CFLAGS) -DCOLI_V4_UNIT_ATTENTION_TRANSACTION -c coli_v4_attention_snapshot_size.c -o $@
 COLI_V4_UNIT_RUNTIME.o: coli_v4_runtime_prefix_cache.c deepseek_v4.c deepseek_v4.h deepseek_v4_internal.h coli_v4_prefix_cache.h
 	$(CC) $(CFLAGS) -DCOLI_V4_UNIT_RUNTIME -c coli_v4_runtime_prefix_cache.c -o $@
-# Test-only clones of the public runtime/generation APIs. The amalgamated
-# runtime and generate-stat units each contain a CLI entry point, so give them
-# distinct renamed mains before linking the helper's own main. This keeps the
-# production SERVE protocol unchanged while the oracle exercises the real API.
+# Test-only clones of the public runtime/generation APIs. The runtime clone
+# renames its CLI main. The generation overlay converts its test-only `main`
+# define into COLI_V4_SKIP_GENERATE_MAIN before including the amalgamated unit.
+# Production SERVE behavior remains unchanged while the oracle uses the real API.
 $(V4_PREFIX_TEST_RUNTIME_OBJ): coli_v4_runtime_prefix_cache.c deepseek_v4.c deepseek_v4.h deepseek_v4_internal.h coli_v4_prefix_cache.h
 	$(CC) $(CFLAGS) -Dmain=coli_v4_runtime_main_unused -DCOLI_V4_UNIT_RUNTIME -c coli_v4_runtime_prefix_cache.c -o $@
 COLI_V4_UNIT_GENERATE_STATS.o: coli_v4_generate_stats_cache.c deepseek_v4.c deepseek_v4.h deepseek_v4_internal.h coli_v4_prefix_cache.h kv_prefix.h

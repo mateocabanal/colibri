@@ -101,13 +101,6 @@ static int run_generation(ColiV4Session *session, const char *prompt,
                                     NULL, NULL, &stats, error, error_size);
 }
 
-static int prefix_mismatch(const int *left, const int *right, int count) {
-    if (!left || !right || count < 0) return 0;
-    for (int index = 0; index < count; index++)
-        if (left[index] != right[index]) return index + 1;
-    return 0;
-}
-
 int main(int argc, char **argv) {
     if (argc != 3) {
         fprintf(stderr, "usage: %s MODEL_DIR INITIAL_PROMPT\n", argv[0]);
@@ -185,32 +178,6 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
     if (extended->prefix_reused != base_tokens) {
-        int mismatch = 0;
-        if (!extended->prompt_ids || extended->prompt_count < base_tokens)
-            mismatch = -1;
-        else
-            mismatch = prefix_mismatch(first->prompt_ids,
-                                       extended->prompt_ids, base_tokens);
-        int direct_restore = extended->prompt_ids && extended->prompt_count > 1
-            ? coli_v4_prefix_cache_restore(extended, extended->prompt_ids,
-                                           extended->prompt_count)
-            : 0;
-        if (mismatch > 0) {
-            int index = mismatch - 1;
-            fprintf(stderr,
-                    "cross-session cache miss diagnostics: token_prefix=mismatch index=%d cached=%d prompt=%d direct_restore=%d prompt_tokens=%d base=%d\n",
-                    index, first->prompt_ids[index], extended->prompt_ids[index],
-                    direct_restore, extended->prompt_count, base_tokens);
-        } else {
-            fprintf(stderr,
-                    "cross-session cache miss diagnostics: token_prefix=%s direct_restore=%d prompt_tokens=%d base=%d engine_same=%d layers=%d/%d fed_cap=%d\n",
-                    mismatch < 0 ? "too-short" : "exact",
-                    direct_restore, extended->prompt_count, base_tokens,
-                    first->engine == extended->engine,
-                    first->config.num_hidden_layers,
-                    extended->config.num_hidden_layers,
-                    extended->fed.cap);
-        }
         fprintf(stderr,
                 "cross-session cache did not restore base prefix: got=%d expected=%d\n",
                 extended->prefix_reused, base_tokens);

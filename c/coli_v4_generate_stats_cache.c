@@ -58,19 +58,10 @@ static ColiV4Session *session_from_prefix(const kv_prefix *prefix) {
 
 static int coli_v4_cached_kv_prefix_reuse(const kv_prefix *prefix,
                                           const int *ids, int count) {
-    ColiV4Session *session = session_from_prefix(prefix);
     int reused = kv_prefix_reuse(prefix, ids, count);
-    if (getenv("V4_PREFIX_LOG"))
-        fprintf(stderr,
-                "[PREFIX-CACHE] reuse_hook prompt=%d same_session=%d fed_len=%d fed_cap=%d engine=%p\n",
-                count, reused, prefix ? prefix->len : -1,
-                prefix ? prefix->cap : -1,
-                session ? (void *)session->engine : NULL);
     if (!reused) {
+        ColiV4Session *session = session_from_prefix(prefix);
         reused = coli_v4_prefix_cache_restore(session, ids, count);
-        if (getenv("V4_PREFIX_LOG"))
-            fprintf(stderr, "[PREFIX-CACHE] reuse_hook cache_restore=%d\n",
-                    reused);
         if (reused && coli_v4_full_dspark_wanted)
             v4_ds_reset_history();
     }
