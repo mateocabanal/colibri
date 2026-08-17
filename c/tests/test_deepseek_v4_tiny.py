@@ -162,15 +162,6 @@ def check_session(
             f"prompt={prompt_count} generated={generated_count}"
         )
     if compatibility_flag:
-        # --no-dspark used to be a no-op that only printed a notice, because the
-        # engine was target-only and had nothing to disable. It now disables
-        # verified speculative drafting for real, so asserting the old notice
-        # would require the engine to keep claiming it does nothing.
-        #
-        # What matters either way is that the run stays token-exact, which the
-        # checks above already prove, and that the flag actually suppresses
-        # speculation: with drafting off no attempt is ever made, so the
-        # counters the engine prints at exit must be zero.
         attempts = re.search(r"v4_dspark attempts=(\d+)", result.stderr)
         if attempts and int(attempts.group(1)) != 0:
             raise AssertionError(
@@ -197,15 +188,12 @@ def read_jsonl(path: Path) -> list[dict[str, object]]:
 def check_route_trace(
     binary: Path, model: Path, case: dict[str, object], temporary: Path
 ) -> None:
-    """Gate #56's physical-v1 + logical-v2 split on a real target execution."""
-    physical = temporary / "experts.jsonl"
+    """Gate #56's logical v2 producer independent of the storage backend."""
     routes = temporary / "routes.jsonl"
     max_new = min(2, int(case["max_new_tokens"]))
     env = dict(
         os.environ,
-        V4_EXPERT_TRACE=physical.as_posix(),
         V4_ROUTE_TRACE=routes.as_posix(),
-        V4_EXPERT_TRACE_CAP="65536",
         V4_ROUTE_TRACE_CAP="65536",
         V4_ROUTE_REQUEST_ID="77",
     )
@@ -222,15 +210,10 @@ def check_route_trace(
         ],
         env=env,
     )
-    if "v4_expert_trace status=written" not in result.stderr:
-        raise AssertionError("physical expert trace was not flushed")
     if "v4_route_trace status=written" not in result.stderr:
         raise AssertionError("logical route trace was not flushed")
 
-    physical_rows = read_jsonl(physical)
     route_rows = read_jsonl(routes)
-    if physical_rows[0].get("schema") != "colibri.v4.expert_trace.v1":
-        raise AssertionError(f"unexpected physical trace header: {physical_rows[0]}")
     header = route_rows[0]
     if header.get("schema") != "colibri.v4.expert_trace.v2":
         raise AssertionError(f"unexpected logical trace header: {header}")
@@ -264,9 +247,6 @@ def check_route_trace(
         positions.add(position)
         groups.setdefault((position, layer), []).append(rank)
 
-    # Prompt route positions must be explicit. With two generated tokens the
-    # first generated token comes from the prompt head, then one decode token is
-    # fed at absolute position prompt_count to produce the second token.
     if not set(range(prompt_count)).issubset(positions):
         raise AssertionError(
             f"route trace missed prompt positions: expected 0..{prompt_count - 1}, "
@@ -275,16 +255,15 @@ def check_route_trace(
     if max_new > 1 and prompt_count not in positions:
         raise AssertionError("route trace missed the first decode input position")
 
-    # Every (token, layer) route group must carry a dense 0..topk-1 rank set.
-    # This specifically catches losing original router ranks when the execution
-    # path later sorts/merges experts by id.
+    # Every (token, layer) route group must preserve the original dense rank set
+    # even though execution later sorts/merges experts by id.
     for key, ranks in groups.items():
         ordered = sorted(ranks)
         if ordered != list(range(len(ordered))):
             raise AssertionError(f"non-dense route ranks for {key}: {ranks}")
 
     print(
-        "PASS target trace: physical v1 + explicit logical v2 "
+        "PASS target trace: explicit logical v2 "
         f"({len(selections)} selections, {len(positions)} token positions)"
     )
 
@@ -337,11 +316,6 @@ def check_cli_uses_engine_context(binary: Path, model: Path, temporary: Path) ->
         ],
         env=dict(os.environ, CTX="768"),
     )
-    # `coli tune` compares candidates from tokens-and-elapsed, and before #898
-    # only the GLM engine emitted a parseable line -- so the tuner ran GLM at
-    # every checkpoint. Assert the line here rather than trusting a one-off
-    # manual check: the first placement of it compiled fine and sat in a branch
-    # text mode never reaches, so it never printed and nothing noticed.
     tune = re.search(r"TUNE decode: (\d+) tokens in ([0-9.]+)s", result.stdout)
     if not tune:
         raise AssertionError(
