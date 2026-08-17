@@ -27,15 +27,16 @@ typedef struct {
  * Process-local exact prefix cache for issue #12.
  *
  * The first implementation is deliberately opt-in: V4_PREFIX_CACHE_MB must be
- * set to a positive value. This prevents prompt snapshots from silently
- * allocating outside the engine's global RAM plan while the residency planner
- * does not yet reserve a cache budget.
+ * set to a positive value. The expert-store planner reserves this byte budget
+ * before assigning optional RAM to dense/expert residency, so enabling prompt
+ * snapshots cannot silently exceed the engine's requested memory envelope.
  *
  * A hit restores all per-layer target attention state and returns the number
  * of prompt tokens already represented by that state. Only strict prefixes are
  * returned (matched < prompt_tokens), preserving the existing generation
  * contract that always executes at least one fresh prompt token.
  */
+size_t coli_v4_prefix_cache_budget_bytes(void);
 int coli_v4_prefix_cache_restore(ColiV4Session *session,
                                  const int *prompt_ids,
                                  int prompt_tokens);
