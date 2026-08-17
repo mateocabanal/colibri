@@ -2,6 +2,24 @@
 #define COLI_V4_STATIC_H
 #include "deepseek_v4_internal.h"
 #include "coli_executor.h"
+
+typedef struct {
+    uint64_t budget_bytes;
+    uint64_t resident_bytes;
+    uint64_t hits;
+    uint64_t misses;
+    uint64_t inserts;
+    uint64_t evictions;
+    uint64_t stored_bytes_avoided;
+} ColiV4DenseCacheStats;
+
+/* Configure the process-local immutable tensor cache. The cache stores decoded
+ * execution payloads and returns caller-owned copies, so existing layer free
+ * semantics remain unchanged. A zero budget disables and empties the cache. */
+void coli_v4_dense_cache_configure(uint64_t budget_bytes);
+void coli_v4_dense_cache_stats(ColiV4DenseCacheStats *stats);
+void coli_v4_dense_cache_shutdown(void);
+
 int coli_v4_coli_layer_load(ColiExecutor *executor, ColiDeepSeekV4LayerWeights *weights,
                             const ColiDeepSeekV4Config *config, int layer,
                             char *error, size_t error_size);
