@@ -2,11 +2,11 @@
 #define _GNU_SOURCE
 #endif
 
-#include "deepseek_v4_internal.h"
-#include "coli_v4_prefix_cache.h"
-
-/* Existing transaction implementation + private-layout byte accounting. */
+/* Existing transaction implementation + private-layout byte accounting. Keep
+ * the amalgamation's include order intact so any unit-local symbol remapping is
+ * applied to deepseek_v4_internal.h declarations before its include guard. */
 #include "deepseek_v4.c"
+#include "coli_v4_prefix_cache.h"
 
 static size_t add_snapshot_bytes(size_t total, size_t amount) {
     return total > SIZE_MAX - amount ? SIZE_MAX : total + amount;
