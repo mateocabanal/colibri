@@ -2571,7 +2571,8 @@ static void attention_batch(Model *m, Layer *l, int layer, const float *xs, int 
 /* GDN per-token core (conv + delta-rule recurrence + RMSNormGated), shared by
  * gdn_token and gdn_batch. Reads/writes conv + recurrence state in order. */
 static void gdn_token_core(Model *m, Layer *l, int layer,
-                           const float *qkv_row, float a, float b,
+                           const float *qkv_row,
+                           const float *a_row, const float *b_row,
                            const float *z_row, float *y_out){
     Cfg *c = &m->c;
     int kd = c->lin_k_dim, kheads = c->lin_k_heads;
@@ -2620,9 +2621,9 @@ static void gdn_token_core(Model *m, Layer *l, int layer,
     float *Snew = falloc((int64_t)vheads * kd * vd);
     float *kv_mem = falloc(vd);
     for (int h = 0; h < vheads; h++) {
-        float ga = -expf(l->A_log[h]) * logf(1.f + expf(a + l->dt_bias[h]));
+        float ga = -expf(l->A_log[h]) * logf(1.f + expf(a_row[h] + l->dt_bias[h]));
         float gt = expf(ga);
-        float bt = 1.f / (1.f + expf(-b));
+        float bt = 1.f / (1.f + expf(-b_row[h]));
         const float *Sh = S + (int64_t)h * kd * vd;
         float *Sn = Snew + (int64_t)h * kd * vd;
         const float *qhh = qh + (int64_t)h * kd, *khh = kh + (int64_t)h * kd;
@@ -2673,7 +2674,9 @@ static void gdn_batch(Model *m, Layer *l, int layer, const float *xs, int C, flo
     wt_mul(z, xs, &l->in_z, C, vdim, D);
     float *y = falloc((int64_t)C * vdim);
     for (int g = 0; g < C; g++)
-        gdn_token_core(m, l, layer, qkv + (int64_t)g * Cdim, a[g], b[g],
+        gdn_token_core(m, l, layer, qkv + (int64_t)g * Cdim,
+                       a + (int64_t)g * vheads,
+                       b + (int64_t)g * vheads,
                        z + (int64_t)g * vdim, y + (int64_t)g * vdim);
     float *outs = falloc((int64_t)C * D);
     wt_mul(outs, y, &l->gdn_out, C, D, vdim);
