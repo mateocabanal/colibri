@@ -31,6 +31,15 @@ ifneq ($(COLI_V4_OK),1)
 $(error Makefile.deepseek-v4 supports x86-64/aarch64 Linux, Windows/MSYS2, and arm64 macOS)
 endif
 
+# The parent Makefile's V4 unit-test link deliberately does not link the Metal
+# Objective-C++ backend.  Keep those object files CPU-only even though normal
+# macOS V4 engine builds default METAL=1.  Without this, native_quant.h emits
+# references to coli_metal_* and `make check` fails at link time on arm64 macOS.
+# A real `deepseek-v4` target still gets the default Metal path below.
+ifneq (,$(filter deepseek-v4-test-objs,$(MAKECMDGOALS)))
+METAL := 0
+endif
+
 ifneq ($(IS_WIN),)
 CC = gcc
 ARCH ?= x86-64-v3
