@@ -129,13 +129,19 @@ def main() -> int:
     import json
 
     reference = json.loads((args.fixture / "ref.json").read_text("utf-8"))
-    short = list(reference["cases"]["short"]["prompt_ids"])
-    mixed = list(reference["cases"]["mixed"]["prompt_ids"])
+    short_case = reference["cases"]["short"]
+    mixed_case = reference["cases"]["mixed"]
+    short = list(short_case["prompt_ids"])
+    mixed = list(mixed_case["prompt_ids"])
     if mixed[: len(short)] != short or len(mixed) <= len(short):
         raise AssertionError("tiny fixture lost the strict short -> mixed prefix pair")
 
     short_prompt = token_prompt(short)
     mixed_prompt = token_prompt(mixed)
+    expected_short = token_prompt(list(short_case["greedy_new_ids"])[:4])
+    expected_mixed = token_prompt(list(mixed_case["greedy_new_ids"])[:4])
+    if not expected_short or not expected_mixed:
+        raise AssertionError("tiny oracle must contain non-empty generated tokens")
 
     warm = Serve(args.binary, args.fixture)
     try:
@@ -159,10 +165,10 @@ def main() -> int:
     finally:
         cold_repeat.close()
 
-    if first != repeated or repeated != cold_short:
+    if first != expected_short or repeated != expected_short or cold_short != expected_short:
         raise AssertionError(
-            "repeating an identical prompt changed output; strict-prefix miss "
-            "did not behave like a cold full prefill"
+            "short serve output did not match the Transformers-generated token oracle; "
+            f"expected={expected_short!r} first={first!r} repeated={repeated!r} cold={cold_short!r}"
         )
     expected_hit = f"[QWEN-PREFIX] hit matched={len(short)} prompt={len(mixed)}"
     hits = [line for line in warm_log.splitlines() if "[QWEN-PREFIX] hit" in line]
@@ -180,10 +186,11 @@ def main() -> int:
         )
     if "[QWEN-PREFIX] hit" in cold_log:
         raise AssertionError("fresh engine unexpectedly reported a prefix hit")
-    if reused != cold_mixed:
+    if reused != expected_mixed or cold_mixed != expected_mixed:
         raise AssertionError(
-            "restoring the hybrid prompt state changed generation:\n"
-            f"  warm={reused!r}\n  cold={cold_mixed!r}"
+            "restoring the hybrid prompt state changed generation or diverged from "
+            "the Transformers-generated token oracle:\n"
+            f"  expected={expected_mixed!r}\n  warm={reused!r}\n  cold={cold_mixed!r}"
         )
 
     print(
