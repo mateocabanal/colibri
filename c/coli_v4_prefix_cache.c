@@ -31,6 +31,11 @@ typedef struct {
     ColiV4PrefixCacheEntry *entries[COLI_V4_PREFIX_CACHE_MAX_ENTRIES];
     size_t count;
     size_t resident_bytes;
+    /* Snapshot cloning happens outside the cache mutex. Reserve its exact
+     * allocation geometry before cloning so concurrent admissions and a full
+     * LRU cannot transiently exceed the configured UMA/RAM budget. */
+    size_t reserved_bytes;
+    size_t reserved_entries;
     size_t budget_bytes;
     int min_tokens;
     uint64_t clock;
@@ -157,20 +162,56 @@ static int same_tokens(const ColiV4PrefixCacheEntry *entry,
            memcmp(entry->tokens, tokens, (size_t)count * sizeof(*tokens)) == 0;
 }
 
+static ColiV4PrefixCacheEntry *find_exact_locked(ColiV4Engine *engine,
+                                                  const int *tokens,
+                                                  int count) {
+    for (size_t index = 0; index < g_prefix_cache.count; index++) {
+        ColiV4PrefixCacheEntry *entry = g_prefix_cache.entries[index];
+        if (same_tokens(entry, engine, tokens, count)) return entry;
+    }
+    return NULL;
+}
+
 static int cache_already_has(ColiV4Engine *engine,
                              const int *tokens, int count) {
     int found = 0;
     pthread_mutex_lock(&g_prefix_cache.mutex);
-    for (size_t index = 0; index < g_prefix_cache.count; index++) {
-        ColiV4PrefixCacheEntry *entry = g_prefix_cache.entries[index];
-        if (same_tokens(entry, engine, tokens, count)) {
-            entry->last_used = ++g_prefix_cache.clock;
-            found = 1;
-            break;
-        }
+    ColiV4PrefixCacheEntry *entry = find_exact_locked(engine, tokens, count);
+    if (entry) {
+        entry->last_used = ++g_prefix_cache.clock;
+        found = 1;
     }
     pthread_mutex_unlock(&g_prefix_cache.mutex);
     return found;
+}
+
+/* Allocation-free exact preflight. These bytes mirror capture_entry(): entry
+ * metadata, exact token IDs, per-layer snapshot pointers, and each transaction
+ * snapshot's requested allocations. */
+static size_t entry_snapshot_bytes(const ColiV4Session *session) {
+    if (!session || !session->engine || !session->attention ||
+        !session->fed.fed || session->fed.tainted || session->fed.len <= 0)
+        return SIZE_MAX;
+    int layers = session->config.num_hidden_layers;
+    if (layers <= 0 || layers > COLI_V4_MAX_LAYERS) return SIZE_MAX;
+
+    size_t token_count = (size_t)session->fed.len;
+    if (token_count > SIZE_MAX / sizeof(int) ||
+        (size_t)layers > SIZE_MAX / sizeof(ColiV4AttentionSnapshot *))
+        return SIZE_MAX;
+    size_t bytes = sizeof(ColiV4PrefixCacheEntry);
+    bytes = safe_add_size(bytes, token_count * sizeof(int));
+    bytes = safe_add_size(bytes,
+                          (size_t)layers * sizeof(ColiV4AttentionSnapshot *));
+    if (bytes == SIZE_MAX) return SIZE_MAX;
+
+    for (int layer = 0; layer < layers; layer++) {
+        size_t snapshot =
+            coli_v4_attention_state_snapshot_bytes(session->attention[layer]);
+        bytes = safe_add_size(bytes, snapshot);
+        if (bytes == SIZE_MAX) return SIZE_MAX;
+    }
+    return bytes;
 }
 
 static ColiV4PrefixCacheEntry *capture_entry(ColiV4Session *session) {
@@ -203,8 +244,7 @@ static ColiV4PrefixCacheEntry *capture_entry(ColiV4Session *session) {
         size_t snapshot_bytes =
             coli_v4_attention_snapshot_bytes(entry->attention[layer]);
         bytes = safe_add_size(bytes, snapshot_bytes);
-        if (bytes == SIZE_MAX || bytes > g_prefix_cache.budget_bytes)
-            goto failed;
+        if (bytes == SIZE_MAX) goto failed;
     }
     entry->bytes = bytes;
     return entry;
@@ -214,17 +254,46 @@ failed:
     return NULL;
 }
 
-static int evict_until_fits_locked(size_t bytes) {
-    for (;;) {
-        size_t used = g_prefix_cache.resident_bytes;
-        int bytes_fit = used <= g_prefix_cache.budget_bytes &&
-                        bytes <= g_prefix_cache.budget_bytes - used;
-        int count_fit = g_prefix_cache.count < COLI_V4_PREFIX_CACHE_MAX_ENTRIES;
-        if (bytes_fit && count_fit) return 1;
+static int reserved_geometry_fits_locked(size_t bytes) {
+    if (g_prefix_cache.resident_bytes > g_prefix_cache.budget_bytes)
+        return 0;
+    size_t remaining = g_prefix_cache.budget_bytes - g_prefix_cache.resident_bytes;
+    if (g_prefix_cache.reserved_bytes > remaining) return 0;
+    remaining -= g_prefix_cache.reserved_bytes;
+    if (bytes > remaining) return 0;
+    if (g_prefix_cache.count > COLI_V4_PREFIX_CACHE_MAX_ENTRIES ||
+        g_prefix_cache.reserved_entries >
+            COLI_V4_PREFIX_CACHE_MAX_ENTRIES - g_prefix_cache.count)
+        return 0;
+    return g_prefix_cache.reserved_entries <
+           COLI_V4_PREFIX_CACHE_MAX_ENTRIES - g_prefix_cache.count;
+}
+
+static int reserve_snapshot_capacity(size_t bytes) {
+    if (!bytes || bytes == SIZE_MAX || bytes > g_prefix_cache.budget_bytes)
+        return 0;
+    pthread_mutex_lock(&g_prefix_cache.mutex);
+    while (!reserved_geometry_fits_locked(bytes)) {
         size_t victim = oldest_evictable_locked();
-        if (victim == SIZE_MAX) return 0;
+        if (victim == SIZE_MAX) {
+            pthread_mutex_unlock(&g_prefix_cache.mutex);
+            return 0;
+        }
         remove_index_locked(victim, 1);
     }
+    g_prefix_cache.reserved_bytes += bytes;
+    g_prefix_cache.reserved_entries++;
+    pthread_mutex_unlock(&g_prefix_cache.mutex);
+    return 1;
+}
+
+static void release_snapshot_reservation_locked(size_t bytes) {
+    if (bytes <= g_prefix_cache.reserved_bytes)
+        g_prefix_cache.reserved_bytes -= bytes;
+    else
+        g_prefix_cache.reserved_bytes = 0;
+    if (g_prefix_cache.reserved_entries)
+        g_prefix_cache.reserved_entries--;
 }
 
 void coli_v4_prefix_cache_store(ColiV4Session *session) {
@@ -235,27 +304,61 @@ void coli_v4_prefix_cache_store(ColiV4Session *session) {
     if (cache_already_has(session->engine, session->fed.fed, session->fed.len))
         return;
 
+    size_t reserved = entry_snapshot_bytes(session);
+    if (!reserve_snapshot_capacity(reserved)) return;
+
     ColiV4PrefixCacheEntry *entry = capture_entry(session);
-    if (!entry || !entry->bytes || entry->bytes > g_prefix_cache.budget_bytes) {
+    if (!entry || !entry->bytes || entry->bytes > reserved) {
+        pthread_mutex_lock(&g_prefix_cache.mutex);
+        release_snapshot_reservation_locked(reserved);
+        pthread_mutex_unlock(&g_prefix_cache.mutex);
         entry_free(entry);
         return;
     }
 
     int stored_tokens = entry->token_count;
     size_t stored_bytes = entry->bytes;
+    int inserted = 0;
+    size_t resident = 0, entries = 0;
+
     pthread_mutex_lock(&g_prefix_cache.mutex);
-    if (!evict_until_fits_locked(entry->bytes)) {
-        pthread_mutex_unlock(&g_prefix_cache.mutex);
+    /* Another thread may have admitted the same exact prefix while this clone
+     * was being built. Recheck under the insertion lock instead of installing
+     * duplicates and wasting the byte budget. */
+    ColiV4PrefixCacheEntry *duplicate = find_exact_locked(
+        entry->engine, entry->tokens, entry->token_count);
+    release_snapshot_reservation_locked(reserved);
+    if (duplicate) {
+        duplicate->last_used = ++g_prefix_cache.clock;
+    } else {
+        /* Replacing our reservation with an equal-or-smaller resident entry is
+         * guaranteed to preserve both the byte and entry-count budgets. Keep a
+         * defensive check so a future snapshot-layout change fails closed. */
+        size_t remaining = g_prefix_cache.resident_bytes <= g_prefix_cache.budget_bytes
+            ? g_prefix_cache.budget_bytes - g_prefix_cache.resident_bytes : 0;
+        if (g_prefix_cache.reserved_bytes <= remaining)
+            remaining -= g_prefix_cache.reserved_bytes;
+        else
+            remaining = 0;
+        int count_ok = g_prefix_cache.count < COLI_V4_PREFIX_CACHE_MAX_ENTRIES &&
+            g_prefix_cache.reserved_entries <
+                COLI_V4_PREFIX_CACHE_MAX_ENTRIES - g_prefix_cache.count;
+        if (entry->bytes <= remaining && count_ok) {
+            entry->last_used = ++g_prefix_cache.clock;
+            g_prefix_cache.entries[g_prefix_cache.count++] = entry;
+            g_prefix_cache.resident_bytes += entry->bytes;
+            g_prefix_cache.stores++;
+            inserted = 1;
+        }
+    }
+    resident = g_prefix_cache.resident_bytes;
+    entries = g_prefix_cache.count;
+    pthread_mutex_unlock(&g_prefix_cache.mutex);
+
+    if (!inserted) {
         entry_free(entry);
         return;
     }
-    entry->last_used = ++g_prefix_cache.clock;
-    g_prefix_cache.entries[g_prefix_cache.count++] = entry;
-    g_prefix_cache.resident_bytes += entry->bytes;
-    g_prefix_cache.stores++;
-    size_t resident = g_prefix_cache.resident_bytes;
-    size_t entries = g_prefix_cache.count;
-    pthread_mutex_unlock(&g_prefix_cache.mutex);
 
     if (getenv("V4_PREFIX_LOG"))
         fprintf(stderr,

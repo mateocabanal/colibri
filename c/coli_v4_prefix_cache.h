@@ -9,6 +9,9 @@ typedef struct ColiV4Session ColiV4Session;
 typedef struct ColiV4AttentionSnapshot ColiV4AttentionSnapshot;
 typedef struct ColiV4CompressorSnapshot ColiV4CompressorSnapshot;
 typedef struct ColiV4IndexerSnapshot ColiV4IndexerSnapshot;
+struct ColiDeepSeekV4WindowAttentionState;
+struct ColiDeepSeekV4CompressorState;
+struct ColiDeepSeekV4Indexer;
 
 typedef struct {
     uint64_t lookups;
@@ -45,10 +48,17 @@ void coli_v4_prefix_cache_forget_engine(ColiV4Engine *engine);
 void coli_v4_prefix_cache_stats(ColiV4PrefixCacheStats *stats);
 
 /* Exact allocated payload accounting for the existing V4 transaction
- * snapshots. These are implemented next to the private snapshot structs by
- * small split-unit overlays, so the cache does not duplicate their layout. */
+ * snapshots. The state variants are allocation-free preflight estimators used
+ * to reserve/evict cache capacity before cloning a snapshot; they must stay
+ * byte-identical to the corresponding snapshot_create allocation geometry. */
 size_t coli_v4_compressor_snapshot_bytes(const ColiV4CompressorSnapshot *snapshot);
 size_t coli_v4_indexer_snapshot_bytes(const ColiV4IndexerSnapshot *snapshot);
 size_t coli_v4_attention_snapshot_bytes(const ColiV4AttentionSnapshot *snapshot);
+size_t coli_v4_compressor_state_snapshot_bytes(
+    const struct ColiDeepSeekV4CompressorState *state);
+size_t coli_v4_indexer_state_snapshot_bytes(
+    const struct ColiDeepSeekV4Indexer *state);
+size_t coli_v4_attention_state_snapshot_bytes(
+    const struct ColiDeepSeekV4WindowAttentionState *state);
 
 #endif /* COLIBRI_V4_PREFIX_CACHE_H */
