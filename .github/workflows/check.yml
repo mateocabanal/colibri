@@ -1,6 +1,7 @@
 # CI: run the repo's own dependency-free gate (`make check` = clean + portable
 # CPU build + C unit suites + Python stdlib tests) on the three claimed
-# platforms. No model downloads, no CUDA, no external deps — by design (#140).
+# platforms. The generated V4 jobs additionally exercise target correctness and
+# the #56 tracing lifecycle without downloading a production checkpoint.
 name: check
 
 on:
@@ -79,6 +80,45 @@ jobs:
           make -C c deepseek-v4-tiny-check V4_TRACE_EXEC=1
           python c/tests/test_v4_execution_trace_tiny.py \
             --binary c/deepseek_v4 --fixture c/deepseek_v4_tiny
+      - name: Publish tiny V4 source fixture
+        uses: actions/upload-artifact@v4
+        with:
+          name: deepseek-v4-tiny-source
+          path: c/deepseek_v4_tiny
+          if-no-files-found: error
+
+  v4-tiny-coli-macos:
+    # Compile the Linux-generated source fixture into the actual native Apple
+    # COLI profile, then exercise the package-only runtime and reusable expert
+    # slot generations on Apple Silicon. No torch/transformers install is needed
+    # on this runner because the source fixture crosses jobs as a tiny artifact.
+    name: macOS (native exact COLI V4 trace)
+    needs: v4-tiny
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: install libomp
+        run: brew install libomp
+      - name: Download generated V4 fixture
+        uses: actions/download-artifact@v4
+        with:
+          name: deepseek-v4-tiny-source
+          path: c/deepseek_v4_tiny
+      - name: Compile native exact COLI package
+        run: |
+          cargo run --manifest-path colic/Cargo.toml -- \
+            compile c/deepseek_v4_tiny \
+            --target native --quant exact --codec none --opt default \
+            -o c/deepseek_v4_tiny.coli --verify
+      - name: Build detailed-trace V4 runtime
+        run: |
+          make -C c -f Makefile.deepseek-v4 deepseek-v4-clean
+          make -C c -f Makefile.deepseek-v4 V4_TRACE_EXEC=1 deepseek-v4
+      - name: Validate exact COLI physical/logical/execution lifecycle
+        run: |
+          python3 c/tests/test_v4_exact_coli_trace_tiny.py \
+            --binary c/deepseek_v4 --package c/deepseek_v4_tiny.coli
 
   macos:
     # clang; libomp for the threaded path (Makefile falls back to
