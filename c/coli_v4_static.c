@@ -249,7 +249,7 @@ static void dense_cache_admit(const char *name, const void *data,
     }
     memcpy(copy, data, (size_t)resident_bytes);
 
-    entry = &g_dense_cache.entries[g_dense_cache.count++];
+    DenseCacheEntry *entry = &g_dense_cache.entries[g_dense_cache.count++];
     memset(entry, 0, sizeof(*entry));
     snprintf(entry->name, sizeof(entry->name), "%s", name);
     entry->data = copy;
