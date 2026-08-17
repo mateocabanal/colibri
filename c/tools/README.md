@@ -13,185 +13,173 @@ not runtime dependencies of the C engine.
 - `benchmark_cuda_fixture.py`, `eval_glm.py`, `fetch_benchmarks.py`: benchmarks
 - `benchmark_v4_perf.py`: DeepSeek-V4 end-to-end benchmark runner. The default
   `quick` profile is **one** short-prompt, 8-token decode run with a hard 120 s
-  subprocess timeout, so the normal edit/build/benchmark loop stays around the
-  1-minute scale on the current M2 baseline and can never exceed 2 minutes.
-  `standard` adds 512/2k prefill cases (one output token each); `full` restores
-  sustained 32/128-token decode plus 8k prefill and has no default timeout. The
-  runner parses stable V4 CLI diagnostics and emits JSONL/CSV with TTFT,
-  generated throughput, expert-cache traffic, wall time, git SHA, platform, and
+  subprocess timeout. `standard` adds 512/2k prefill cases; `full` restores
+  sustained 32/128-token decode plus 8k prefill. The runner emits JSONL/CSV with
+  TTFT, throughput, expert-cache traffic, wall time, git SHA, platform and
   relevant environment.
-- `analyze_v4_expert_trace.py`: offline routed-expert analysis. The physical
-  lifecycle trace at `V4_EXPERT_TRACE` remains schema v1 and reports request,
-  hit/inflight/load/evict/release activity with stable `(layer, expert, tier,
-  generation)` identity. When detailed tracing is enabled, the V4 block runtime
-  also emits an explicit logical-route schema-v2 sidecar at
-  `<V4_EXPERT_TRACE>.routes.jsonl` (or `V4_ROUTE_TRACE=<path>`). That sidecar
-  records every top-k route selection before batch-union lookups collapse many
-  logical selections into one physical lease. It includes request id, token
-  position, prefill/decode phase, layer, expert, route rank/weight, and the
-  physical lookup correlation (`lookup_id`, lookup duration, fanout, result,
-  lease generation). Both schemas are accepted by the analyzer. It reports
-  activation skew, exact LRU stack/reuse distance, hypothetical cache curves,
-  co-routing, unique logical experts/token and adjacent-token overlap. Old v1
-  traces still fall back to layer-wrap token inference; explicit v2 route traces
-  use authoritative request/token/phase identity.
-- `analyze_v4_request_overlap.py`: schema-v2 serving-locality view for #56.
-  It keeps analysis linear in request count by comparing consecutive generation
-  requests instead of doing an O(requests²) all-pairs sweep. It reports shared
-  logical experts, Jaccard overlap, previous-working-set retention, next-request
-  reuse, and per-layer adjacent-request overlap. Duplicate route selections do
-  not inflate the working set.
+- `analyze_v4_expert_trace.py`: physical/logical routed-expert analysis. Physical
+  `V4_EXPERT_TRACE` data is schema v1 and records residency lifecycle with stable
+  `(layer, expert, tier, generation)` identity. A detailed route build can also
+  emit schema v2 logical selections carrying request id, token position, phase,
+  route rank/weight and physical lookup correlation. The analyzer reports
+  activation skew, reuse distance, cache curves, co-routing and adjacent-token
+  overlap.
+- `analyze_v4_request_overlap.py`: adjacent-request working-set overlap for v2
+  traces, including Jaccard/retention/reuse and per-layer overlap in O(requests).
 - `validate_v4_trace_pair.py`: exact-COLI identity/lifecycle closure gate. It
-  verifies every logical v2 lease joins the physical v1 lifecycle by
-  `(layer, expert, generation)`, checks many-to-one lookup fanout, rejects
-  dropped/corrupt traces, and can additionally validate a compile-gated expert
-  execution trace with `--execution`.
+  verifies logical v2 leases join physical v1 lifecycle by
+  `(layer, expert, generation)`, checks lookup fanout, and optionally validates
+  one expert execution per routed selection.
+- `analyze_v4_expert_stalls.py`: combines physical v1, logical v2 and execution
+  traces to compare worker-side lookup time with the canonical owner-thread
+  expert-loader wait. It reports cold-vs-resident lookup groups, cold exposure,
+  phase totals, and top experts/layers by exposed stall.
 - `analyze_v4_residency_value.py`: offline policy-reference tool for #3. It
   compares deterministic residency and global hot-expert capacity using
   estimated **exposed I/O milliseconds avoided per resident GiB**. Repeated
-  `--dense-point` inputs can also produce a finite-difference marginal dense
-  frontier, but those points must be from the same workload and differ only in
-  residency budget.
+  `--dense-point` inputs produce a finite-difference marginal dense frontier
+  only when the points are the same workload with different residency budgets.
 - `gen_unicode.py`: tokenizer table generation
 
-Run them from `c/`, for example:
+## V4 tracing modes
+
+Detailed routing/execution instrumentation is **compile-gated**. The ordinary
+binary compiles the original block and generation units directly, so it has no
+logical-route wrapper and no expert-forward trace wrapper on the hot path.
+Physical store counters and the #1 phase profiler remain available normally.
 
 ```sh
-python3 tools/convert_fp8_to_int4.py --selftest
-python3 tools/make_glm_bench_model.py --output /tmp/colibri-bench
-python3 tools/benchmark_v4_perf.py --selftest
+# Normal inference / aggregate profiling build: detailed wrappers absent.
+make deepseek-v4
 
-# Default developer loop: one decode8 run, hard-capped at 120 s total.
-python3 tools/benchmark_v4_perf.py --model /path/to/v4 \
-  --engine ./deepseek_v4 --memory-gb 10 \
-  --keep-logs /tmp/v4-perf --output /tmp/v4-perf.jsonl
+# Logical route + physical lookup correlation, no execution wrapper.
+make deepseek-v4-clean
+make deepseek-v4 V4_TRACE_ROUTE=1
 
-# Broader but still bounded profile.
-python3 tools/benchmark_v4_perf.py --profile standard --model /path/to/v4 \
-  --engine ./deepseek_v4 --memory-gb 10 --output /tmp/v4-standard.jsonl
+# Full #56 build: route tracing + expert execution/owner-wait trace.
+# V4_TRACE_EXEC=1 enables V4_TRACE_ROUTE by default.
+make deepseek-v4-clean
+make deepseek-v4 V4_TRACE_EXEC=1
+```
 
-# Long regression/sustained matrix; intentionally not time-bounded.
-python3 tools/benchmark_v4_perf.py --profile full --model /path/to/v4 \
-  --engine ./deepseek_v4 --memory-gb 10 --output /tmp/v4-full.jsonl
+`V4_EXPERT_TRACE` itself is runtime-gated in the expert store. In a normal build
+it can still capture the physical v1 lifecycle. The automatic logical
+`<V4_EXPERT_TRACE>.routes.jsonl` sidecar only exists in a build compiled with
+`V4_TRACE_ROUTE=1` (or `V4_TRACE_EXEC=1`).
 
-# Target a specific path while retaining a hard wall-time cap.
-python3 tools/benchmark_v4_perf.py --model /path/to/v4 \
-  --cases prefill2k --timeout-sec 120
+## Capture and analyze
 
-# Capture physical residency lifecycle plus explicit logical route identity.
-# The second file is created automatically as /tmp/v4-experts.jsonl.routes.jsonl.
-V4_EXPERT_TRACE=/tmp/v4-experts.jsonl ./deepseek_v4 /path/to/model.coli hi
+```sh
+# Physical v1 only; works in a normal build.
+V4_EXPERT_TRACE=/tmp/v4-experts.jsonl \
+./deepseek_v4 /path/to/model.coli hi
 
-# Analyze physical cache/load behavior (schema v1).
 python3 tools/analyze_v4_expert_trace.py /tmp/v4-experts.jsonl \
   --capacities 1,2,4,8,16,32,64,128 \
-  --persistent-capacities 1,2,4,8 \
-  --prompt-tokens 5
+  --persistent-capacities 1,2,4,8
 
-# Analyze authoritative logical route selections (schema v2).
+# Full detailed lifecycle build.
+make deepseek-v4-clean
+make deepseek-v4 V4_TRACE_EXEC=1
+V4_PROFILE=1 \
+V4_EXPERT_TRACE=/tmp/v4-experts.jsonl \
+V4_EXEC_TRACE=/tmp/v4-exec.jsonl \
+V4_EXPERT_TRACE_CAP=131072 \
+V4_EXEC_TRACE_CAP=131072 \
+./deepseek_v4 /path/to/model.coli hi
+
+# Logical v2 sidecar is automatic for a route-enabled build.
 python3 tools/analyze_v4_expert_trace.py \
   /tmp/v4-experts.jsonl.routes.jsonl --top 10
 
-# For a multi-request/serve trace, quantify how much of each request's logical
-# expert working set is reused by the next request.
-python3 tools/analyze_v4_request_overlap.py \
-  /tmp/v4-experts.jsonl.routes.jsonl --top-layers 10
-
-# Validate physical-v1 <-> logical-v2 lease identity on an exact COLI run.
-python3 tools/validate_v4_trace_pair.py \
-  /tmp/v4-experts.jsonl /tmp/v4-experts.jsonl.routes.jsonl
-
-# Optional execution lifecycle capture. This is COMPILE-GATED so normal builds
-# do not put a tracing wrapper on expert-forward at all. The execution stream is
-# still buffered/bounded and written only at process teardown.
-make deepseek-v4-clean
-make deepseek-v4 V4_TRACE_EXEC=1
-V4_EXPERT_TRACE=/tmp/v4-experts.jsonl \
-V4_EXEC_TRACE=/tmp/v4-exec.jsonl \
-V4_EXEC_TRACE_CAP=131072 \
-./deepseek_v4 /path/to/model.coli hi
+# Exact physical-v1 <-> logical-v2 <-> execution identity/lifecycle check.
 python3 tools/validate_v4_trace_pair.py \
   /tmp/v4-experts.jsonl /tmp/v4-experts.jsonl.routes.jsonl \
   --execution /tmp/v4-exec.jsonl
 
-# Optional explicit route-sidecar controls. Request ids are assigned
-# monotonically at the session-generate boundary. V4_ROUTE_REQUEST_ID changes
-# the first id in that sequence (useful for deterministic fixtures), rather than
-# pinning every generation request to one id.
+# Cold expert storage work vs actually exposed owner-thread stall.
+python3 tools/analyze_v4_expert_stalls.py \
+  /tmp/v4-experts.jsonl /tmp/v4-experts.jsonl.routes.jsonl \
+  /tmp/v4-exec.jsonl --stall-threshold-ms 1
+
+# Cross-request locality from a serving/multi-generation v2 trace.
+python3 tools/analyze_v4_request_overlap.py \
+  /tmp/v4-experts.jsonl.routes.jsonl --top-layers 10
+
+# Optional explicit logical-sidecar controls.
 V4_ROUTE_TRACE=/tmp/v4-routes.jsonl \
 V4_ROUTE_TRACE_CAP=131072 \
 V4_ROUTE_REQUEST_ID=42 \
 ./deepseek_v4 /path/to/model.coli hi
+```
 
-# Compare residency classes in the #3 policy metric. This example uses one
-# dense point; repeat --dense-point with SAME-WORKLOAD fixed-memory A/B points
-# to obtain a marginal dense frontier.
+Request ids are allocated monotonically at the session-generation boundary.
+`V4_ROUTE_REQUEST_ID` changes the first id in that sequence for deterministic
+fixtures; it does not pin all generations to the same id.
+
+Detailed buffers never write synchronously on the routing/execution hot path.
+They flush at normal process teardown and report `dropped` instead of blocking
+when a configured cap is exhausted. Logical v2 additionally reports
+`physical_lookups`, `correlation_misses`, and `uncorrelated_routes`.
+
+One physical lookup can serve multiple logical prompt positions during
+batch-union prefill. Those routes share `lookup_id`, `lookup_ns`, result,
+fanout and `lease_generation`. The stable
+`(layer, expert, lease_generation)` triple joins logical v2 selections to the
+physical residency lifecycle and to the optional execution stream.
+
+`lookup_ns` is worker-side physical lookup latency and can overlap other work.
+With `V4_PROFILE=1`, the execution stream also records `owner_wait_ns`, derived
+from the canonical `COLI_V4_PROF_EXPERT_LOADER_WAIT` bucket immediately before
+that expert executes. That is the exposed owner-thread stall measurement. Do not
+substitute `lookup_ns` for it. `analyze_v4_expert_stalls.py` keeps the two
+separate and treats `1 - owner_wait/lookup` only as an overlap estimate.
+
+The execution stream also records resident bytes, tensor execution formats,
+route weight, duration, result and exact lease generation. Its event count is
+validated against logical selections, including many-to-one prefill fanout.
+
+## CI correctness gates
+
+The generated tiny V4 target has two complementary gates:
+
+1. Linux runs the source fixture token-exact against the Transformers-derived
+   oracle with `V4_TRACE_EXEC=1`, checking request/token/rank/weight identity,
+   lookup fanout, execution count and owner-wait measurement.
+2. An Apple-Silicon macOS job compiles that fixture with
+   `colic compile --target native --quant exact --codec none`, runs the
+   package-only COLI runtime, and validates the physical v1 + logical v2 +
+   execution streams together. The first green exact-COLI gate observed 54
+   logical routes, 17 loaded lease generations, 0.289 ms of exposed owner wait
+   and a 31.18% cold lookup exposure ratio while preserving exact output.
+
+The ordinary Linux/macOS/Windows `make check` jobs keep detailed tracing compiled
+out, so the default hot path is independently exercised without those wrappers.
+
+## Performance telemetry and residency analysis
+
+The V4 benchmark runner forces `--no-dspark` so results measure the exact target
+path. It does **not** claim to flush the OS page cache; use `--warm-cache` for an
+explicit cold/warm pair.
+
+By default the runner sets `V4_PROFILE=1`, and the engine emits one
+`v4_phases scope=startup|run|prompt|decode` line per scope with dense/expert/head
+read time+bytes, expert read-work/wait/compute, router/shared-expert, HC,
+attention/compressor/indexer/sparse-attention, head, and Metal timing. Worker I/O
+and Metal kernel time are overlapping diagnostics and are excluded from the
+owner-thread accounted sum. `--no-profile` disables this telemetry.
+
+The policy metric for #3 is **expected recurring exposed I/O time avoided per
+resident byte**. Raw bytes avoided/resident byte is a stable fallback but can
+mis-rank residency classes because expert reads often overlap compute while
+dense reads are more exposed. Compare the marginal dense tail against an expert
+capacity band using fixed-memory, same-workload A/B runs rather than cache-wide
+averages or auto-detected free RAM.
+
+```sh
 python3 tools/analyze_v4_residency_value.py /tmp/v4-experts.jsonl \
   --dense-point 3.16,69.58,68.27,39612.6 \
   --expert-read-gib 70.68 \
   --expert-wait-ms 7776.5 \
   --expert-capacities 43,86,172,344
 ```
-
-The V4 runner forces `--no-dspark` so results measure the exact target path.
-It does **not** claim to flush the OS page cache; use `--warm-cache` for an
-explicit cold/warm pair (trial 2 = page-cache warm).
-
-Detailed route tracing is bounded in memory and writes the JSONL only at normal
-process teardown. The v2 header reports `dropped`, `physical_lookups`,
-`correlation_misses`, and `uncorrelated_routes`; a clean trace should have all
-three loss/error counters at zero. One physical lookup can legitimately have
-`lookup_routes > 1` during batch-union prefill. All logical routes in that group
-share the same `lookup_id`, lookup duration, result and `lease_generation`.
-The `(layer, expert, lease_generation)` triple is the stable join key back to the
-physical v1 lifecycle and, for a `V4_TRACE_EXEC=1` build, to the expert execution
-stream. The execution stream reports one `execute` record per routed expert
-forward with resident bytes, tensor execution formats, duration, result and
-lease generation. Its buffer obeys `V4_EXEC_TRACE_CAP` (falling back to the route
-or expert trace cap) and reports drops rather than blocking inference.
-
-`lookup_ns` is physical lookup latency and may overlap other pipeline work; do
-not relabel it as exposed token-wall wait without an owner-thread wait
-measurement. Likewise, the sum of per-expert execution durations is diagnostic:
-backend work can overlap or include accelerator waits already represented by the
-canonical #1 phase profiler.
-
-Phase telemetry: by default the runner sets `V4_PROFILE=1`, and the engine
-emits one `v4_phases scope=startup|run|prompt|decode` line per scope with
-per-phase ms and byte buckets (dense/expert/head read, expert lookup/read
-work/wait/compute, shared expert, router, HC pre/post, attention projection,
-compressor, indexer, sparse attention, head, and Metal encode/submit/wait).
-The runner parses these into `result.phases` and checks the reconciliation
-gate: run-scope `unaccounted_ms <= max(5 ms, 1% of wall)` →
-`phases_reconcile`. Expert read work and Metal kernel time are reported as
-overlapping diagnostics and are deliberately excluded from the accounted sum
-(lanes/GPU run concurrently). `--no-profile` disables telemetry for a pure
-wall-clock comparison.
-
-## Interpreting residency traces
-
-The policy metric for #3 is now **expected recurring exposed I/O time avoided
-per resident byte**. Raw bytes avoided/resident byte remains a useful stable
-fallback, but it can mis-rank expert and deterministic residency because expert
-storage reads are often hidden behind concurrent compute/read lanes while dense
-reads are much more exposed to token wall time.
-
-The short zero-copy M2 run kept 3.70 GiB of deterministic tensors resident and
-avoided 33.28 GiB of rereads. The longer 33-token run kept 3.16 GiB resident and
-avoided 69.58 GiB. The latter also showed that persistent-expert frequency value
-is generation-horizon dependent: a global perfect-hot 43-slot oracle reached
-about 19.5 bytes avoided/resident byte. That does **not** mean the runtime should
-allocate those slots by default: in the same run dense I/O exposed about
-39.61 s for 68.27 GiB read while expert I/O exposed only about 7.78 s for
-70.68 GiB read.
-
-For planner decisions, compare the **marginal** dense tail against an expert
-capacity band, not cache-wide averages. Use fixed-memory, same-workload A/Bs to
-measure the dense marginal frontier; auto-detected free RAM can shift the dense
-budget enough to confound small performance differences.
-
-Do not confuse storage reduction with end-to-end speedup. PR #64 established
-that zero-copy deterministic residency can materially reduce decode I/O while
-four global transient expert slots are enough for the measured three-lane M2
-pipeline (`peak_inflight=3`, `slot_waits=0`). Persistent expert capacity remains
-a trace-driven optional tier rather than a fixed per-layer allocation.
