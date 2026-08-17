@@ -157,7 +157,8 @@ void coli_v4_dense_cache_stats(ColiV4DenseCacheStats *out) {
 
 /* Return 1 and a caller-owned copy on hit, 0 on miss. Cache entries are never
  * evicted during a configured generation, so the immutable source pointer can
- * safely be copied after dropping the mutex. */
+ * safely be copied after dropping the mutex. A failed caller allocation is a
+ * real fallback/miss: do not overstate cache hits or bytes avoided. */
 static int dense_cache_copy(const char *name, uint64_t resident_bytes,
                             void **output) {
     if (!name || !output || resident_bytes > SIZE_MAX) return 0;
@@ -168,21 +169,31 @@ static int dense_cache_copy(const char *name, uint64_t resident_bytes,
     pthread_mutex_lock(&g_dense_cache.mutex);
     DenseCacheEntry *entry = dense_cache_find_locked(name);
     if (entry && entry->resident_bytes == resident_bytes) {
-        entry->hits++;
-        g_dense_cache.hits++;
-        g_dense_cache.bytes_avoided += entry->stored_bytes_avoided;
         source = entry->data;
         stored_bytes_avoided = entry->stored_bytes_avoided;
     } else {
         g_dense_cache.misses++;
     }
     pthread_mutex_unlock(&g_dense_cache.mutex);
-
-    (void)stored_bytes_avoided;
     if (!source) return 0;
+
     void *copy = malloc((size_t)resident_bytes);
-    if (!copy) return 0;
+    if (!copy) {
+        pthread_mutex_lock(&g_dense_cache.mutex);
+        g_dense_cache.misses++;
+        pthread_mutex_unlock(&g_dense_cache.mutex);
+        return 0;
+    }
     memcpy(copy, source, (size_t)resident_bytes);
+
+    pthread_mutex_lock(&g_dense_cache.mutex);
+    entry = dense_cache_find_locked(name);
+    if (entry && entry->data == source && entry->resident_bytes == resident_bytes)
+        entry->hits++;
+    g_dense_cache.hits++;
+    g_dense_cache.bytes_avoided += stored_bytes_avoided;
+    pthread_mutex_unlock(&g_dense_cache.mutex);
+
     *output = copy;
     return 1;
 }
@@ -198,15 +209,14 @@ static void dense_cache_admit(const char *name, const void *data,
 
     double benefit = (double)stored_bytes_avoided / (double)resident_bytes;
     pthread_mutex_lock(&g_dense_cache.mutex);
+    DenseCacheEntry *existing = dense_cache_find_locked(name);
+    int no_room = g_dense_cache.resident_bytes > g_dense_cache.budget_bytes ||
+                  resident_bytes > g_dense_cache.budget_bytes -
+                                   g_dense_cache.resident_bytes;
     if (!g_dense_cache.budget_bytes ||
-        benefit < g_dense_cache.minimum_benefit ||
-        resident_bytes > g_dense_cache.budget_bytes -
-                         (g_dense_cache.resident_bytes <= g_dense_cache.budget_bytes
-                              ? g_dense_cache.resident_bytes : g_dense_cache.budget_bytes) ||
-        dense_cache_find_locked(name)) {
+        benefit < g_dense_cache.minimum_benefit || no_room || existing) {
         if (g_dense_cache.budget_bytes &&
-            benefit >= g_dense_cache.minimum_benefit &&
-            !dense_cache_find_locked(name))
+            benefit >= g_dense_cache.minimum_benefit && !existing && no_room)
             g_dense_cache.rejected_bytes += resident_bytes;
         pthread_mutex_unlock(&g_dense_cache.mutex);
         return;
@@ -239,7 +249,7 @@ static void dense_cache_admit(const char *name, const void *data,
     }
     memcpy(copy, data, (size_t)resident_bytes);
 
-    DenseCacheEntry *entry = &g_dense_cache.entries[g_dense_cache.count++];
+    entry = &g_dense_cache.entries[g_dense_cache.count++];
     memset(entry, 0, sizeof(*entry));
     snprintf(entry->name, sizeof(entry->name), "%s", name);
     entry->data = copy;
