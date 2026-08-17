@@ -6,6 +6,7 @@ from pathlib import Path
 from tools.analyze_v4_expert_trace import (
     analyze,
     capacity_curve,
+    explicit_route_groups,
     global_frequency_oracle_curve,
     infer_route_groups,
     per_layer_frequency_oracle_curve,
@@ -16,14 +17,14 @@ from tools.analyze_v4_expert_trace import (
 
 
 class V4ExpertTraceAnalysisTest(unittest.TestCase):
-    def write_trace(self, rows):
+    def write_trace(self, rows, schema="colibri.v4.expert_trace.v1"):
         temp = tempfile.TemporaryDirectory()
         path = Path(temp.name) / "trace.jsonl"
         with path.open("w", encoding="utf-8") as handle:
             handle.write(
                 json.dumps(
                     {
-                        "schema": "colibri.v4.expert_trace.v1",
+                        "schema": schema,
                         "build": "test",
                         "record_bytes": 1024,
                         "events": len(rows),
@@ -37,7 +38,6 @@ class V4ExpertTraceAnalysisTest(unittest.TestCase):
         return temp, path
 
     def test_exact_reuse_distance_and_lru_curve(self):
-        # Logical request stream: A B A C A B.
         rows = [
             {"event": "request", "layer": 0, "expert": 1},
             {"event": "request", "layer": 0, "expert": 2},
@@ -55,6 +55,7 @@ class V4ExpertTraceAnalysisTest(unittest.TestCase):
         self.addCleanup(temp.cleanup)
 
         result = analyze(path)
+        self.assertEqual(result.schema, "colibri.v4.expert_trace.v1")
         self.assertEqual(result.cold_requests, 3)
         self.assertEqual(result.reuse_distances, [1, 1, 2])
         self.assertEqual(result.dropped, 2)
@@ -114,9 +115,7 @@ class V4ExpertTraceAnalysisTest(unittest.TestCase):
         )
 
         summary = summary_dict(result, [2], 2, [1, 2])
-        self.assertEqual(
-            summary["persistent_per_layer_lru_curve"][0]["hits"], 2
-        )
+        self.assertEqual(summary["persistent_per_layer_lru_curve"][0]["hits"], 2)
         self.assertEqual(
             summary["persistent_per_layer_frequency_oracle_curve"][0]["hits"], 3
         )
@@ -154,9 +153,6 @@ class V4ExpertTraceAnalysisTest(unittest.TestCase):
         )
 
     def test_inferred_token_groups_corouting_and_adjacent_overlap(self):
-        # Two tokens, two routed layers/token, two experts/layer. Layer wrapping
-        # from 1 -> 0 starts token 1. Each layer retains one expert across the
-        # token boundary, giving Jaccard overlap 1/3.
         rows = [
             {"event": "request", "layer": 0, "expert": 1},
             {"event": "request", "layer": 0, "expert": 2},
@@ -181,20 +177,75 @@ class V4ExpertTraceAnalysisTest(unittest.TestCase):
         self.assertEqual(routing["token_ids"], "inferred-from-layer-wraps")
         self.assertEqual(routing["token_count"], 2)
         self.assertEqual(routing["route_groups"], 4)
-        self.assertEqual(
-            routing["unique_logical_experts_per_token"]["mean"], 4.0
-        )
+        self.assertEqual(routing["unique_logical_experts_per_token"]["mean"], 4.0)
         self.assertEqual(routing["adjacent_token_overlap"]["samples"], 2)
         self.assertEqual(routing["adjacent_token_overlap"]["mean_shared"], 1.0)
         self.assertAlmostEqual(
             routing["adjacent_token_overlap"]["mean_jaccard"], 1.0 / 3.0
         )
-        self.assertEqual(routing["phase"]["prompt_requests"], 4)
+        self.assertEqual(routing["phase"]["source"], "inferred")
+        self.assertEqual(routing["phase"]["prefill_requests"], 4)
         self.assertEqual(routing["phase"]["decode_requests"], 4)
         self.assertIn(
             {"layer": 0, "experts": [1, 2], "co_routes": 1},
             routing["top_co_routing_pairs"],
         )
+
+    def test_v2_explicit_context_wins_over_stream_order(self):
+        # Deliberately interleave request IDs. Explicit identity must group and
+        # compare tokens within each request rather than infer boundaries from
+        # global layer ordering.
+        rows = [
+            {
+                "event": "request", "layer": 0, "expert": 1,
+                "request_id": 10, "token_position": 7, "phase": "prefill",
+                "route_rank": 0, "route_weight": 0.7,
+            },
+            {
+                "event": "request", "layer": 0, "expert": 2,
+                "request_id": 10, "token_position": 7, "phase": "prefill",
+                "route_rank": 1, "route_weight": 0.3,
+            },
+            {
+                "event": "request", "layer": 0, "expert": 9,
+                "request_id": 22, "token_position": 3, "phase": "decode",
+                "route_rank": 0, "route_weight": 1.0,
+            },
+            {
+                "event": "request", "layer": 0, "expert": 1,
+                "request_id": 10, "token_position": 8, "phase": "decode",
+                "route_rank": 0, "route_weight": 0.6,
+            },
+            {
+                "event": "request", "layer": 0, "expert": 3,
+                "request_id": 10, "token_position": 8, "phase": "decode",
+                "route_rank": 1, "route_weight": 0.4,
+            },
+        ]
+        temp, path = self.write_trace(rows, "colibri.v4.expert_trace.v2")
+        self.addCleanup(temp.cleanup)
+        result = analyze(path)
+        self.assertEqual(result.schema, "colibri.v4.expert_trace.v2")
+        groups = explicit_route_groups(result)
+        self.assertIsNotNone(groups)
+        self.assertEqual(len(groups), 3)
+        self.assertEqual(groups[0].request_id, 10)
+        self.assertEqual(groups[0].token, 7)
+        self.assertEqual(groups[0].experts, (1, 2))
+
+        routing = routing_locality_summary(result, 5)
+        self.assertEqual(routing["token_ids"], "explicit")
+        self.assertEqual(routing["request_count"], 2)
+        self.assertEqual(routing["token_count"], 3)
+        self.assertEqual(routing["explicit_context_requests"], 5)
+        self.assertEqual(routing["route_rank_coverage"], 5)
+        self.assertEqual(routing["route_weight_coverage"], 5)
+        self.assertEqual(routing["adjacent_token_overlap"]["samples"], 1)
+        self.assertEqual(routing["phase"]["source"], "explicit")
+        self.assertEqual(routing["phase"]["prefill_requests"], 2)
+        self.assertEqual(routing["phase"]["decode_requests"], 3)
+        self.assertEqual(routing["phase"]["prefill_tokens"], 1)
+        self.assertEqual(routing["phase"]["decode_tokens"], 2)
 
     def test_invalid_request_event_is_rejected(self):
         temp, path = self.write_trace([{"event": "request", "layer": "x"}])
