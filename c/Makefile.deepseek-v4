@@ -102,9 +102,9 @@ LDFLAGS += -flto
 endif
 
 # #56 detailed instrumentation is compile-gated so the normal inference binary
-# compiles the original block and generation units directly. There is therefore
-# no route-wrapper, pthread_once, trace-state check, or expert-forward wrapper on
-# the default hot path. Aggregate store/profile counters remain available.
+# compiles the original block directly. There is therefore no route-wrapper or
+# expert-forward wrapper on the default block hot path. Aggregate store/profile
+# counters remain available.
 #
 # V4_TRACE_ROUTE=1 enables logical route + lookup correlation. V4_TRACE_EXEC=1
 # defaults route tracing on as well because execution validation needs the
@@ -125,15 +125,24 @@ TARGET_OBJS = $(addsuffix .o,$(V4_TARGET_UNITS))
 TEST_UNIT_OBJS = $(addsuffix .o,$(V4_TEST_UNITS))
 V4_TRACE_SPLIT_OBJS =
 ifeq ($(V4_TRACE_ROUTE),1)
-V4_TRACE_SPLIT_OBJS = COLI_V4_UNIT_BLOCK_HYBRID.o COLI_V4_UNIT_GENERATE_STATS.o
+V4_TRACE_SPLIT_OBJS = COLI_V4_UNIT_BLOCK_HYBRID.o
+COLI_V4_UNIT_GENERATE_STATS.o: CFLAGS += -DCOLI_V4_TRACE_ROUTE=1
 endif
-# Planner units are permanent standalone sources. The large block/generation
-# units only leave the amalgamation in a detailed-trace build.
+# Planner units remain standalone. #12 also splits the runtime/generation and
+# transaction snapshot units so the prefix-cache overlays can hook request and
+# engine lifetime without editing the large amalgamation, while snapshot byte
+# accounting stays next to each private snapshot layout.
 V4_SPLIT_OBJS = COLI_V4_UNIT_RESOURCE_PLAN.o \
 	COLI_V4_UNIT_EXPERT_STORE_AUTO.o \
+	COLI_V4_UNIT_COMPRESSOR_SNAPSHOT.o \
+	COLI_V4_UNIT_INDEXER_SNAPSHOT.o \
+	COLI_V4_UNIT_ATTENTION_TRANSACTION.o \
+	COLI_V4_UNIT_RUNTIME.o \
+	COLI_V4_UNIT_GENERATE_STATS.o \
 	$(V4_TRACE_SPLIT_OBJS)
 V4_AMALGAMATED_OBJS = $(filter-out $(V4_SPLIT_OBJS),$(sort $(TARGET_OBJS) $(TEST_UNIT_OBJS)))
-V4_COLI_OBJS = coli_v4_expert_store.o coli_v4_static.o coli_executor.o coli_format.o $(V4_TRACE_EXEC_OBJS)
+V4_COLI_OBJS = coli_v4_expert_store.o coli_v4_static.o coli_executor.o coli_format.o \
+	coli_v4_prefix_cache.o $(V4_TRACE_EXEC_OBJS)
 V4_OBJS = $(TARGET_OBJS) $(V4_COLI_OBJS) $(V4_METAL_OBJS)
 V4_BUILD_CONFIG = .deepseek-v4-build-config
 
@@ -156,6 +165,8 @@ coli_executor.o: coli_executor.c coli_executor.h coli_format.h
 	$(CC) $(CFLAGS) -c coli_executor.c -o $@
 coli_format.o: coli_format.c coli_format.h compat.h coli_v4_macos_uncached_io.h
 	$(CC) $(CFLAGS) -include coli_v4_macos_uncached_io.h -c coli_format.c -o $@
+coli_v4_prefix_cache.o: coli_v4_prefix_cache.c coli_v4_prefix_cache.h deepseek_v4_internal.h kv_prefix.h
+	$(CC) $(CFLAGS) -c coli_v4_prefix_cache.c -o $@
 coli_v4_expert_execute_trace.o: coli_v4_expert_execute_trace.c deepseek_v4_internal.h expert_store.h tensor.h
 	$(CC) $(CFLAGS) -c coli_v4_expert_execute_trace.c -o $@
 
@@ -163,6 +174,16 @@ COLI_V4_UNIT_RESOURCE_PLAN.o: coli_v4_resource_plan.c deepseek_v4_internal.h col
 	$(CC) $(CFLAGS) -c coli_v4_resource_plan.c -o $@
 COLI_V4_UNIT_EXPERT_STORE_AUTO.o: coli_v4_expert_store_auto.c deepseek_v4_internal.h coli_v4_expert_store.h coli_v4_residency.h coli_executor.h st.h
 	$(CC) $(CFLAGS) -c coli_v4_expert_store_auto.c -o $@
+COLI_V4_UNIT_COMPRESSOR_SNAPSHOT.o: coli_v4_compressor_snapshot_size.c deepseek_v4.c deepseek_v4_internal.h coli_v4_prefix_cache.h
+	$(CC) $(CFLAGS) -DCOLI_V4_UNIT_COMPRESSOR_SNAPSHOT -c coli_v4_compressor_snapshot_size.c -o $@
+COLI_V4_UNIT_INDEXER_SNAPSHOT.o: coli_v4_indexer_snapshot_size.c deepseek_v4.c deepseek_v4_internal.h coli_v4_prefix_cache.h
+	$(CC) $(CFLAGS) -DCOLI_V4_UNIT_INDEXER_SNAPSHOT -c coli_v4_indexer_snapshot_size.c -o $@
+COLI_V4_UNIT_ATTENTION_TRANSACTION.o: coli_v4_attention_snapshot_size.c deepseek_v4.c deepseek_v4_internal.h coli_v4_prefix_cache.h
+	$(CC) $(CFLAGS) -DCOLI_V4_UNIT_ATTENTION_TRANSACTION -c coli_v4_attention_snapshot_size.c -o $@
+COLI_V4_UNIT_RUNTIME.o: coli_v4_runtime_prefix_cache.c deepseek_v4.c deepseek_v4.h deepseek_v4_internal.h coli_v4_prefix_cache.h
+	$(CC) $(CFLAGS) -DCOLI_V4_UNIT_RUNTIME -c coli_v4_runtime_prefix_cache.c -o $@
+COLI_V4_UNIT_GENERATE_STATS.o: coli_v4_generate_stats_cache.c deepseek_v4.c deepseek_v4.h deepseek_v4_internal.h coli_v4_prefix_cache.h kv_prefix.h
+	$(CC) $(CFLAGS) -DCOLI_V4_UNIT_GENERATE_STATS -c coli_v4_generate_stats_cache.c -o $@
 
 ifeq ($(V4_TRACE_ROUTE),1)
 # Detailed route tracing needs authoritative position before batch-union lookups
@@ -174,12 +195,6 @@ endif
 COLI_V4_UNIT_BLOCK_HYBRID.o: coli_v4_block_hybrid_trace.c deepseek_v4.c deepseek_v4.h \
 	deepseek_v4_internal.h expert_store.h tensor.h
 	$(CC) $(CFLAGS) -DCOLI_V4_UNIT_BLOCK_HYBRID -c coli_v4_block_hybrid_trace.c -o $@
-
-# coli_v4_session_generate() lives in GENERATE_STATS. The route build intercepts
-# its one kv-prefix decision to establish the request boundary and prompt length.
-COLI_V4_UNIT_GENERATE_STATS.o: coli_v4_generate_stats_trace.c deepseek_v4.c deepseek_v4.h \
-	deepseek_v4_internal.h kv_prefix.h
-	$(CC) $(CFLAGS) -DCOLI_V4_UNIT_GENERATE_STATS -c coli_v4_generate_stats_trace.c -o $@
 endif
 
 $(V4_BINARY): $(V4_OBJS)
