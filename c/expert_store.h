@@ -18,6 +18,24 @@ typedef struct {
     int expert;
 } ColiExpertKey;
 
+typedef enum {
+    COLI_EXPERT_PHASE_UNKNOWN = 0,
+    COLI_EXPERT_PHASE_PREFILL = 1,
+    COLI_EXPERT_PHASE_DECODE = 2,
+} ColiExpertPhase;
+
+/* Optional logical request identity for routed-expert telemetry. This is kept
+ * separate from ColiExpertKey: `(layer, expert)` is stable storage identity,
+ * while request/token/rank/weight describe one use of that identity. Stores
+ * that do not consume tracing context may ignore this structure entirely. */
+typedef struct {
+    uint64_t request_id;
+    int64_t token_position;
+    int route_rank;
+    float route_weight;
+    ColiExpertPhase phase;
+} ColiExpertRequestContext;
+
 typedef struct {
     ColiExpertKey key;
     ColiTensorView gate;
@@ -60,6 +78,8 @@ typedef struct {
  *   on the same view (same store). Do not copy ColiExpertView; the lease is
  *   not shareable. Do not pass a view that already holds an active lease to
  *   lookup().
+ * - lookup_context(), when implemented, has exactly the same lease semantics;
+ *   its context is observational metadata and must never change model output.
  * - On lookup failure the view is cleared; the caller must not use it and
  *   must not call release().
  * - release() clears the entire view. release() on an already-cleared or
@@ -85,6 +105,11 @@ typedef struct {
                     size_t count);
     void (*stats)(const ColiExpertStore *store, ColiExpertStoreStats *stats);
     void (*destroy)(ColiExpertStore *store);
+    /* Optional context-aware lookup. Appended so existing positional ops
+     * initializers remain source-compatible and default this field to NULL. */
+    int (*lookup_context)(ColiExpertStore *store, ColiExpertKey key,
+                          const ColiExpertRequestContext *context,
+                          ColiExpertView *view);
 } ColiExpertStoreOps;
 
 struct ColiExpertStore {
@@ -100,6 +125,26 @@ static inline int coli_expert_lookup(ColiExpertStore *store,
         return -1;
     }
     int result = store->ops->lookup(store, key, view);
+    if (result != 0 && view) memset(view, 0, sizeof(*view));
+    return result;
+}
+
+static inline int coli_expert_lookup_context(
+        ColiExpertStore *store, ColiExpertKey key,
+        const ColiExpertRequestContext *context, ColiExpertView *view) {
+    if (!store || !store->ops) {
+        if (view) memset(view, 0, sizeof(*view));
+        return -1;
+    }
+    int result;
+    if (store->ops->lookup_context)
+        result = store->ops->lookup_context(store, key, context, view);
+    else if (store->ops->lookup)
+        result = store->ops->lookup(store, key, view);
+    else {
+        if (view) memset(view, 0, sizeof(*view));
+        return -1;
+    }
     if (result != 0 && view) memset(view, 0, sizeof(*view));
     return result;
 }
