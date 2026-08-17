@@ -28,7 +28,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: colic
-      - name: Format
-        run: cargo fmt --manifest-path colic/Cargo.toml --all -- --check
       - name: Test
         run: cargo test --manifest-path colic/Cargo.toml --all-targets
+      - name: Format
+        run: cargo fmt --manifest-path colic/Cargo.toml --all -- --check
