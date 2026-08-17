@@ -5,6 +5,13 @@ Unlike the safetensors tiny oracle, this exercises `coli_v4_expert_store.c`: the
 physical lifecycle has real reusable slot generations, so the full v1 <-> v2 <->
 execution join can be checked. Intended for the arm64 macOS CI runner after
 `colic compile --target native --quant exact --codec none`.
+
+Do not use the CLI's `--record-oracle` helper here. That diagnostic currently
+rebuilds its teacher-forcing state with safetensors-only `load_embedding()` and
+`final_hidden()` calls, so a package-only engine (`target_index == NULL`) exits 1
+after otherwise successful generation. The normal runtime path is package-aware;
+this gate compares its emitted `generated_text=` against the fixture's exact
+expected token text instead.
 """
 
 from __future__ import annotations
@@ -17,7 +24,6 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-
 
 ROOT = Path(__file__).resolve().parent.parent
 TOOLS = ROOT / "tools"
@@ -40,6 +46,13 @@ def token_prompt(ids: list[int]) -> str:
     return "".join(f"<t{token:03d}>" for token in ids)
 
 
+def emitted_generated_text(stderr: str) -> str:
+    for line in stderr.splitlines():
+        if line.startswith("generated_text="):
+            return line.removeprefix("generated_text=")
+    raise AssertionError(f"runtime did not emit generated_text=:\n{stderr}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", type=Path, required=True)
@@ -51,12 +64,13 @@ def main() -> int:
     reference = json.loads((package / "ref.json").read_text(encoding="utf-8"))
     case = reference["cases"]["short"]
     max_new = min(2, int(case["max_new_tokens"]))
+    expected_ids = list(case["greedy_new_ids"][:max_new])
+    expected_text = token_prompt([token for token in expected_ids if token != 1])
 
     with tempfile.TemporaryDirectory(prefix="colibri-v4-coli-trace-") as directory:
         temporary = Path(directory)
         physical = temporary / "physical.jsonl"
         execution = temporary / "execution.jsonl"
-        record = temporary / "record.json"
         logical = Path(str(physical) + ".routes.jsonl")
         env = dict(
             os.environ,
@@ -76,8 +90,6 @@ def main() -> int:
                 "--max-tokens",
                 str(max_new),
                 "--no-dspark",
-                "--record-oracle",
-                record.as_posix(),
             ],
             text=True,
             encoding="utf-8",
@@ -101,12 +113,12 @@ def main() -> int:
             if marker not in result.stderr:
                 raise AssertionError(f"missing runtime marker {marker!r}:\n{result.stderr}")
 
-        actual = json.loads(record.read_text(encoding="utf-8"))
-        expected_full = list(case["prompt_ids"]) + list(case["greedy_new_ids"][:max_new])
-        if actual.get("full_ids") != expected_full:
+        actual_text = emitted_generated_text(result.stderr)
+        if actual_text != expected_text:
             raise AssertionError(
                 "exact COLI + detailed tracing changed model output: "
-                f"expected {expected_full}, got {actual.get('full_ids')}"
+                f"expected ids={expected_ids} text={expected_text!r}, "
+                f"got text={actual_text!r}"
             )
 
         pair = VALIDATOR.validate_pair(physical, logical, execution)
@@ -129,12 +141,14 @@ def main() -> int:
                 f"stall/validator route counts disagree: stalls={stalls} pair={pair}"
             )
 
+        exposure = stalls["cold_lookup_exposure_ratio"]
+        exposure_text = "n/a" if exposure is None else f"{100.0 * exposure:.2f}%"
         print(
             "PASS exact COLI trace: token-exact + physical/logical/execution join + "
             f"owner wait ({pair['logical_routes']} routes, "
             f"{pair['loaded_lease_identities']} loaded generations, "
             f"{pair['owner_wait_total_ns'] / 1e6:.3f} ms owner wait, "
-            f"cold exposure={stalls['cold_lookup_exposure_ratio']})"
+            f"cold exposure={exposure_text})"
         )
     return 0
 
