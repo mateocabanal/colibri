@@ -13,6 +13,8 @@ import json
 import os
 import re
 import subprocess
+import sys
+import tempfile
 from pathlib import Path
 
 
@@ -151,9 +153,7 @@ def check_growing_conversation(binary: Path, model: Path,
           f"output identical to a cold prefill")
 
 
-def check_cross_session_cache(binary: Path, model: Path,
-                              case: dict[str, object]) -> None:
-    """Two actual sessions share one engine/cache; a second engine is cold."""
+def build_prefix_helpers(binary: Path) -> Path:
     c_dir = binary.resolve().parent
     make = os.environ.get("MAKE", "make")
     build = subprocess.run(
@@ -168,9 +168,16 @@ def check_cross_session_cache(binary: Path, model: Path,
     )
     if build.returncode:
         raise AssertionError(
-            "cross-session helper build failed:\n"
+            "prefix-cache helper build failed:\n"
             f"stdout:\n{build.stdout}\nstderr:\n{build.stderr}"
         )
+    return c_dir
+
+
+def check_cross_session_cache(binary: Path, model: Path,
+                              case: dict[str, object]) -> None:
+    """Two actual sessions share one engine/cache; a second engine is cold."""
+    c_dir = build_prefix_helpers(binary)
     helper = c_dir / (
         "test_v4_prefix_cache_sessions.exe"
         if os.name == "nt" else "test_v4_prefix_cache_sessions"
@@ -201,6 +208,89 @@ def check_cross_session_cache(binary: Path, model: Path,
             f"cross-session helper did not report success: {result.stdout!r}"
         )
     print(result.stdout.strip())
+
+
+def check_prefix_benchmark_ab(binary: Path, model: Path,
+                              case: dict[str, object]) -> None:
+    """The public A/B wrapper must compare matched second-request workloads."""
+    c_dir = binary.resolve().parent
+    helper = c_dir / (
+        "benchmark_v4_prefix_cache_sessions.exe"
+        if os.name == "nt" else "benchmark_v4_prefix_cache_sessions"
+    )
+    wrapper = c_dir / "tools" / "benchmark_v4_prefix_cache.py"
+    if not helper.exists():
+        c_dir = build_prefix_helpers(binary)
+    prompt = token_prompt(list(case["prompt_ids"]))  # type: ignore[arg-type]
+    handle = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", suffix=".txt", delete=False
+    )
+    try:
+        handle.write(prompt)
+        handle.close()
+        result = subprocess.run(
+            [sys.executable, wrapper.as_posix(),
+             "--binary", helper.as_posix(),
+             "--model", model.resolve().as_posix(),
+             "--prefix-file", handle.name,
+             "--cache-mb", "64",
+             "--min-prefix-tokens", "1",
+             "--memory-gb", "3",
+             "--context", "128",
+             "--max-new", "1",
+             "--trials", "1",
+             "--timeout-sec", "180",
+             "--repo", c_dir.parent.as_posix()],
+            cwd=c_dir,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=360,
+        )
+    finally:
+        try:
+            Path(handle.name).unlink()
+        except OSError:
+            pass
+    if result.returncode:
+        raise AssertionError(
+            "prefix-cache A/B wrapper failed:\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+
+    record = None
+    for line in result.stdout.splitlines():
+        try:
+            candidate = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if candidate.get("schema") == "colibri.v4.prefix_cache_ab.v1":
+            record = candidate
+    if not record or len(record.get("pairs", [])) != 1:
+        raise AssertionError(f"A/B wrapper produced invalid JSON: {result.stdout!r}")
+    pair = record["pairs"][0]
+    off = pair["cache_off"]
+    on = pair["cache_on"]
+    if (off["prefix_tokens"] != on["prefix_tokens"] or
+            off["second_prompt_tokens"] != on["second_prompt_tokens"]):
+        raise AssertionError(f"A/B token workloads differ: {pair}")
+    if int(off["second_prefix_reused"]) != 0 or int(off["cache_hits_delta"]) != 0:
+        raise AssertionError(f"cache-off A/B probe reused state: {off}")
+    if int(on["second_prefix_reused"]) != int(on["prefix_tokens"]) or \
+            int(on["cache_hits_delta"]) < 1 or int(on["restore_bytes"]) <= 0:
+        raise AssertionError(f"cache-on A/B probe failed to restore prefix: {on}")
+    if int(off["cache_budget_bytes"]) != 0 or int(on["cache_budget_bytes"]) <= 0:
+        raise AssertionError(f"A/B cache budgets are invalid: {pair}")
+    for probe in (off, on):
+        projected = int(probe["memory_projected_bytes"])
+        reserve = int(probe["cache_budget_bytes"])
+        limit = int(probe["memory_limit_bytes"])
+        if projected <= 0 or projected + reserve > limit:
+            raise AssertionError(f"A/B memory envelope invalid: {probe}")
+    print("PASS prefix-cache A/B benchmark: matched cache-off/cache-on "
+          "second-request workloads with hard memory envelopes")
 
 
 def check_divergent_prompt_resets(binary: Path, model: Path,
@@ -268,6 +358,7 @@ def main() -> int:
 
     check_growing_conversation(arguments.binary, arguments.fixture, case)
     check_cross_session_cache(arguments.binary, arguments.fixture, case)
+    check_prefix_benchmark_ab(arguments.binary, arguments.fixture, case)
     check_repeated_prompt(arguments.binary, arguments.fixture, case)
     check_divergent_prompt_resets(arguments.binary, arguments.fixture, case)
     print("PASS DeepSeek V4 prefix reuse/cache: all checks completed")

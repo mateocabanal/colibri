@@ -2,17 +2,18 @@
 #define _GNU_SOURCE
 #endif
 
-/* Real process-local prefix-cache performance probe.
+/* Controlled process-local prefix-cache performance probe.
  *
- * One engine, two independent sessions:
- *   1. cold-prefill a supplied long prefix P, which admits P;
- *   2. build a tokenizer-verified strict extension P+X and run it in a fresh
- *      session, which must restore P and prefill only X.
+ * One process performs the same two-request workload in either cache-off or
+ * cache-on mode:
+ *   1. fresh session A prefills a supplied prefix P, warming the engine;
+ *   2. fresh session B runs a tokenizer-verified strict extension P+X.
  *
- * Comparing P cold against the strictly-longer P+X warm request is conservative:
- * absent caching the second request has at least as much prompt work. Keeping one
- * engine also reflects the intended long-lived agent/server workload instead of
- * conflating prefix reuse with a second engine's residency/page-cache state.
+ * The Python A/B driver runs this probe in separate cache-off/cache-on
+ * processes under the same total memory limit and compares only request 2.
+ * That avoids crediting ordinary same-engine warmup to the prefix cache, while
+ * still charging cache-on for the RAM it reserves away from dense/expert
+ * residency. The first request is deliberately reported for diagnostics only.
  */
 #include "../deepseek_v4_internal.h"
 #include "../coli_v4_prefix_cache.h"
@@ -102,11 +103,8 @@ static char *verified_strict_extension(ColiV4Session *session,
         free(candidate);
     }
 
-    /* Added tokens split the preceding text into its own tokenizer chunk, so
-     * they are a robust fallback when ordinary punctuation merges across the
-     * user's exact prefix boundary. Prefer a non-control added token when the
-     * tokenizer exposes one, but correctness only depends on strict token-ID
-     * verification below. */
+    /* Added tokens force a tokenizer chunk boundary and are a robust fallback
+     * when ordinary punctuation merges across the exact supplied prefix. */
     for (int pass = 0; pass < 2; pass++) {
         for (int index = 0; index < session->tokenizer.nsp; index++) {
             Special *special = &session->tokenizer.sp[index];
@@ -208,13 +206,6 @@ int main(int argc, char **argv) {
         }
     }
 
-    const char *cache_mb = getenv("V4_PREFIX_CACHE_MB");
-    if (!cache_mb || !*cache_mb || strtod(cache_mb, NULL) <= 0.0) {
-        fprintf(stderr,
-                "V4_PREFIX_CACHE_MB must be set to a positive cache budget\n");
-        return 2;
-    }
-
     size_t prefix_length = 0;
     char *prefix = read_text_file(prefix_path, &prefix_length);
     if (!prefix || !prefix_length) {
@@ -226,7 +217,7 @@ int main(int argc, char **argv) {
 
     char error[1024] = {0};
     ColiV4Engine *engine = NULL;
-    ColiV4Session *source = NULL, *warm = NULL;
+    ColiV4Session *source = NULL, *second = NULL;
     char *extended = NULL;
     int status = 1;
 
@@ -249,7 +240,7 @@ int main(int argc, char **argv) {
     };
     if (coli_v4_session_create(&source, engine, &session_options,
                                error, sizeof(error)) ||
-        coli_v4_session_create(&warm, engine, &session_options,
+        coli_v4_session_create(&second, engine, &session_options,
                                error, sizeof(error))) {
         fprintf(stderr, "session create failed: %s\n", error);
         goto cleanup;
@@ -265,12 +256,26 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
 
-    ColiV4SessionGenerateStats cold_stats = {0}, warm_stats = {0};
     ColiV4PrefixCacheStats cache0 = {0}, cache1 = {0}, cache2 = {0};
     coli_v4_prefix_cache_stats(&cache0);
+    int cache_enabled = cache0.budget_bytes != 0;
+
+    ColiV4EngineMemorySummary memory = {0};
+    coli_v4_engine_memory_summary(engine, &memory);
+    if (memory_limit && (!memory.projected_bytes ||
+        cache0.budget_bytes > memory_limit ||
+        memory.projected_bytes > memory_limit - cache0.budget_bytes)) {
+        fprintf(stderr,
+                "probe memory envelope invalid: projected=%llu reserve=%zu limit=%llu\n",
+                (unsigned long long)memory.projected_bytes,
+                cache0.budget_bytes, (unsigned long long)memory_limit);
+        goto cleanup;
+    }
+
+    ColiV4SessionGenerateStats first_stats = {0}, second_stats = {0};
     if (run_request(source, prefix, prefix_length, max_new,
-                    &cold_stats, error, sizeof(error))) {
-        fprintf(stderr, "cold prefix request failed: %s\n", error);
+                    &first_stats, error, sizeof(error))) {
+        fprintf(stderr, "first prefix request failed: %s\n", error);
         goto cleanup;
     }
     if (source->prompt_count != prefix_tokens) {
@@ -280,53 +285,70 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
     coli_v4_prefix_cache_stats(&cache1);
-    if (cache1.stores <= cache0.stores) {
+    if (cache_enabled && cache1.stores <= cache0.stores) {
         fprintf(stderr,
-                "cold prefix was not admitted (tokens=%d); lower "
+                "cache-on first request was not admitted (tokens=%d); lower "
                 "V4_PREFIX_CACHE_MIN_TOKENS or increase prefix length\n",
                 prefix_tokens);
         goto cleanup;
     }
-
-    size_t extended_length = strlen(extended);
-    if (run_request(warm, extended, extended_length, max_new,
-                    &warm_stats, error, sizeof(error))) {
-        fprintf(stderr, "warm extension request failed: %s\n", error);
+    if (!cache_enabled && cache1.stores != cache0.stores) {
+        fprintf(stderr, "cache-off probe unexpectedly stored a prefix\n");
         goto cleanup;
     }
-    if (warm->prompt_count != extended_tokens || warm->prefix_reused != prefix_tokens) {
+
+    size_t extended_length = strlen(extended);
+    if (run_request(second, extended, extended_length, max_new,
+                    &second_stats, error, sizeof(error))) {
+        fprintf(stderr, "second extension request failed: %s\n", error);
+        goto cleanup;
+    }
+    if (second->prompt_count != extended_tokens) {
         fprintf(stderr,
-                "warm request did not restore full prefix: prompt=%d/%d reused=%d/%d\n",
-                warm->prompt_count, extended_tokens, warm->prefix_reused, prefix_tokens);
+                "second tokenizer count changed: preflight=%d runtime=%d\n",
+                extended_tokens, second->prompt_count);
         goto cleanup;
     }
     coli_v4_prefix_cache_stats(&cache2);
-    if (cache2.hits <= cache1.hits) {
-        fprintf(stderr, "warm request produced no prefix-cache hit\n");
+    if (cache_enabled) {
+        if (second->prefix_reused != prefix_tokens || cache2.hits <= cache1.hits) {
+            fprintf(stderr,
+                    "cache-on second request missed: reused=%d/%d hits=%llu/%llu\n",
+                    second->prefix_reused, prefix_tokens,
+                    (unsigned long long)cache2.hits,
+                    (unsigned long long)cache1.hits);
+            goto cleanup;
+        }
+    } else if (second->prefix_reused != 0 || cache2.hits != cache1.hits) {
+        fprintf(stderr,
+                "cache-off second request unexpectedly reused state: reused=%d hits=%llu/%llu\n",
+                second->prefix_reused,
+                (unsigned long long)cache2.hits,
+                (unsigned long long)cache1.hits);
         goto cleanup;
     }
 
-    ColiV4EngineMemorySummary memory = {0};
-    coli_v4_engine_memory_summary(engine, &memory);
+    uint64_t hit_delta = cache2.hits >= cache1.hits
+        ? cache2.hits - cache1.hits : 0;
+    uint64_t store_delta = cache1.stores >= cache0.stores
+        ? cache1.stores - cache0.stores : 0;
     uint64_t restore_bytes = cache2.restore_bytes >= cache1.restore_bytes
         ? cache2.restore_bytes - cache1.restore_bytes : 0;
     uint64_t restore_ns = cache2.restore_ns >= cache1.restore_ns
         ? cache2.restore_ns - cache1.restore_ns : 0;
-    double cold_ttft = cold_stats.time_to_first_token_sec;
-    double warm_ttft = warm_stats.time_to_first_token_sec;
-    double saved = cold_ttft - warm_ttft;
-    double speedup = warm_ttft > 0.0 ? cold_ttft / warm_ttft : 0.0;
 
-    printf("{\"schema\":\"colibri.v4.prefix_cache_bench.v1\","
-           "\"prefix_tokens\":%d,\"warm_prompt_tokens\":%d,"
-           "\"matched_tokens\":%d,\"cold_prefix_ttft_sec\":%.9f,"
-           "\"warm_extension_ttft_sec\":%.9f,\"ttft_saved_sec\":%.9f,"
-           "\"ttft_speedup\":%.6f,\"restore_bytes\":%llu,"
-           "\"restore_ms\":%.6f,\"cache_resident_bytes\":%zu,"
-           "\"cache_budget_bytes\":%zu,\"memory_projected_bytes\":%llu,"
-           "\"memory_limit_bytes\":%llu}\n",
-           prefix_tokens, warm->prompt_count, warm->prefix_reused,
-           cold_ttft, warm_ttft, saved, speedup,
+    printf("{\"schema\":\"colibri.v4.prefix_cache_probe.v1\","
+           "\"mode\":\"%s\",\"prefix_tokens\":%d,"
+           "\"second_prompt_tokens\":%d,\"second_prefix_reused\":%d,"
+           "\"first_ttft_sec\":%.9f,\"second_ttft_sec\":%.9f,"
+           "\"cache_hits_delta\":%llu,\"cache_stores_delta\":%llu,"
+           "\"restore_bytes\":%llu,\"restore_ms\":%.6f,"
+           "\"cache_resident_bytes\":%zu,\"cache_budget_bytes\":%zu,"
+           "\"memory_projected_bytes\":%llu,\"memory_limit_bytes\":%llu}\n",
+           cache_enabled ? "cache_on" : "cache_off",
+           prefix_tokens, second->prompt_count, second->prefix_reused,
+           first_stats.time_to_first_token_sec, second_stats.time_to_first_token_sec,
+           (unsigned long long)hit_delta, (unsigned long long)store_delta,
            (unsigned long long)restore_bytes, restore_ns / 1.0e6,
            cache2.resident_bytes, cache2.budget_bytes,
            (unsigned long long)memory.projected_bytes,
@@ -337,7 +359,7 @@ cleanup:
     free(extended);
     free(prefix);
     if (source) coli_v4_session_destroy(source);
-    if (warm) coli_v4_session_destroy(warm);
+    if (second) coli_v4_session_destroy(second);
     if (engine) coli_v4_engine_destroy(engine);
     return status;
 }
