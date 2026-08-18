@@ -56,7 +56,6 @@ static void test_store_observer_contract(void) {
     assert(entry->decode_activations == 2);
     assert(entry->logical_activations == 13);
 
-    /* Unsupported stores ignore policy signals rather than affecting inference. */
     ColiExpertStore no_observer = {0};
     coli_expert_observe_activations(&no_observer, samples, 2);
 }
@@ -113,12 +112,26 @@ static void test_decode_weight_and_hysteresis(void) {
     uint64_t cold = coli_expert_residency_policy_hotness(decode, 10, 0, &config);
     uint64_t resident = coli_expert_residency_policy_hotness(decode, 10, 1, &config);
     assert(resident > cold);
-
-    /* Planner reuse is expected route frequency, not local residency bias. */
     assert(coli_expert_residency_policy_reuse_weight(
                prefill, 10, &config) ==
            coli_expert_residency_policy_reuse_weight(
                decode, 10, &config));
+}
+
+static void test_planner_confidence_ramp(void) {
+    ColiExpertActivationEntry entries[16];
+    ColiExpertActivationTracker tracker;
+    assert(coli_expert_activation_init(&tracker, entries, 16) == 0);
+    ColiExpertResidencyPolicyConfig config =
+        coli_expert_residency_policy_default();
+
+    ColiExpertActivationEntry *entry = observe(
+        &tracker, 6, 6, COLI_EXPERT_PHASE_DECODE, 1, 1);
+    assert(coli_expert_residency_policy_hotness(entry, 1, 0, &config) > 0);
+    assert(coli_expert_residency_policy_reuse_weight(entry, 1, &config) == 0);
+
+    entry = observe(&tracker, 6, 6, COLI_EXPERT_PHASE_DECODE, 7, 2);
+    assert(coli_expert_residency_policy_reuse_weight(entry, 2, &config) > 0);
 }
 
 static void test_bounded_common_horizon(void) {
@@ -130,11 +143,9 @@ static void test_bounded_common_horizon(void) {
     for (uint64_t epoch = 1; epoch <= 4096; epoch++)
         entry = observe(&tracker, 8, 42, COLI_EXPERT_PHASE_DECODE, 1, epoch);
     assert(entry);
-
-    /* Lifetime telemetry keeps the exact process history while decision mass
-     * converges to a bounded recent-rate state instead of growing to 4096. */
     assert(entry->logical_activations == 4096);
     assert(entry->decode_activations == 4096);
+
     uint64_t unknown = 0, prefill = 0, decode = 0;
     coli_expert_activation_recent_at(
         entry, 4096, &unknown, &prefill, &decode);
@@ -143,8 +154,6 @@ static void test_bounded_common_horizon(void) {
 
     ColiExpertResidencyPolicyConfig config =
         coli_expert_residency_policy_default();
-    /* One logical use per epoch should project to roughly one use for every
-     * epoch in the shared 256-epoch planning horizon. */
     uint64_t reuse = coli_expert_residency_policy_reuse_weight(
         entry, 4096, &config);
     assert(reuse >= 240 && reuse <= 256);
@@ -205,6 +214,7 @@ int main(void) {
     test_frequency_beats_pure_recency();
     test_stale_frequency_decays();
     test_decode_weight_and_hysteresis();
+    test_planner_confidence_ramp();
     test_bounded_common_horizon();
     test_burst_fades_out();
     test_benefit_per_byte();
