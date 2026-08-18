@@ -22,7 +22,14 @@ extern "C" {
  * The tracker is caller-allocated, bounded, allocation-free, and uses an
  * open-addressed power-of-two table. A full table drops only previously unseen
  * keys; observations for already-known keys continue to accumulate.
+ *
+ * Exact lifetime counters remain available for telemetry. Policy decisions use
+ * a separate lazy-decayed activity mass with one shared half-life quantum so a
+ * long-lived server cannot make experts hot forever merely because they were
+ * popular early in the process lifetime.
  */
+
+#define COLI_EXPERT_ACTIVITY_DECAY_QUANTUM_EPOCHS UINT64_C(64)
 
 typedef struct ColiExpertActivationSample {
     ColiExpertKey key;
@@ -39,11 +46,22 @@ typedef struct ColiExpertActivationSample {
 
 typedef struct {
     ColiExpertKey key;
+
+    /* Lifetime telemetry. These counters saturate rather than wrap. */
     uint64_t logical_activations;
     uint64_t prefill_activations;
     uint64_t decode_activations;
     uint64_t observations;
     uint64_t last_epoch;
+
+    /* Bounded policy signal. Every complete decay quantum halves these values.
+     * Unknown is explicit here because recent logical total cannot be recovered
+     * from lifetime counters after independent lazy decay. */
+    uint64_t recent_unknown_activations;
+    uint64_t recent_prefill_activations;
+    uint64_t recent_decode_activations;
+    uint64_t recent_decay_epoch;
+
     uint64_t hash_tag; /* zero means empty */
 } ColiExpertActivationEntry;
 
@@ -58,6 +76,51 @@ typedef struct {
 
 static inline uint64_t coli_expert_activation_sat_add(uint64_t a, uint64_t b) {
     return UINT64_MAX - a < b ? UINT64_MAX : a + b;
+}
+
+static inline uint64_t coli_expert_activation_decay_value(uint64_t value,
+                                                          uint64_t buckets) {
+    if (buckets >= 64) return 0;
+    return value >> (unsigned)buckets;
+}
+
+/* Mutating lazy decay used immediately before adding a newer observation. */
+static inline void coli_expert_activation_decay_recent(
+    ColiExpertActivationEntry *entry, uint64_t epoch) {
+    if (!entry || epoch <= entry->recent_decay_epoch) return;
+    uint64_t delta = epoch - entry->recent_decay_epoch;
+    uint64_t buckets = delta / COLI_EXPERT_ACTIVITY_DECAY_QUANTUM_EPOCHS;
+    if (!buckets) return;
+    entry->recent_unknown_activations = coli_expert_activation_decay_value(
+        entry->recent_unknown_activations, buckets);
+    entry->recent_prefill_activations = coli_expert_activation_decay_value(
+        entry->recent_prefill_activations, buckets);
+    entry->recent_decode_activations = coli_expert_activation_decay_value(
+        entry->recent_decode_activations, buckets);
+    /* buckets * quantum <= delta, so this cannot advance past epoch. */
+    entry->recent_decay_epoch +=
+        buckets * COLI_EXPERT_ACTIVITY_DECAY_QUANTUM_EPOCHS;
+}
+
+/* Read the recent phase masses as of current_epoch without mutating the entry.
+ * This lets ranking remain const/read-only while preserving the same decay
+ * semantics used on observation. */
+static inline void coli_expert_activation_recent_at(
+    const ColiExpertActivationEntry *entry, uint64_t current_epoch,
+    uint64_t *unknown, uint64_t *prefill, uint64_t *decode) {
+    uint64_t u = entry ? entry->recent_unknown_activations : 0;
+    uint64_t p = entry ? entry->recent_prefill_activations : 0;
+    uint64_t d = entry ? entry->recent_decode_activations : 0;
+    if (entry && current_epoch > entry->recent_decay_epoch) {
+        uint64_t buckets = (current_epoch - entry->recent_decay_epoch) /
+            COLI_EXPERT_ACTIVITY_DECAY_QUANTUM_EPOCHS;
+        u = coli_expert_activation_decay_value(u, buckets);
+        p = coli_expert_activation_decay_value(p, buckets);
+        d = coli_expert_activation_decay_value(d, buckets);
+    }
+    if (unknown) *unknown = u;
+    if (prefill) *prefill = p;
+    if (decode) *decode = d;
 }
 
 static inline int coli_expert_activation_capacity_valid(size_t capacity) {
@@ -101,6 +164,10 @@ static inline int coli_expert_activation_init(
         storage[i].decode_activations = 0;
         storage[i].observations = 0;
         storage[i].last_epoch = 0;
+        storage[i].recent_unknown_activations = 0;
+        storage[i].recent_prefill_activations = 0;
+        storage[i].recent_decode_activations = 0;
+        storage[i].recent_decay_epoch = 0;
         storage[i].hash_tag = 0;
     }
     return 0;
@@ -177,21 +244,35 @@ static inline int coli_expert_activation_observe(
         entry->decode_activations = 0;
         entry->observations = 0;
         entry->last_epoch = 0;
+        entry->recent_unknown_activations = 0;
+        entry->recent_prefill_activations = 0;
+        entry->recent_decode_activations = 0;
+        entry->recent_decay_epoch = sample.epoch;
         /* Publish the occupied marker last for simple debugger/read-only
          * inspection. Mutation is intentionally owned by one policy thread;
          * concurrency belongs above this tiny accounting primitive. */
         entry->hash_tag = hash;
         tracker->used++;
+    } else {
+        coli_expert_activation_decay_recent(entry, sample.epoch);
     }
 
     entry->logical_activations = coli_expert_activation_sat_add(
         entry->logical_activations, sample.multiplicity);
-    if (sample.phase == COLI_EXPERT_PHASE_PREFILL)
+    if (sample.phase == COLI_EXPERT_PHASE_PREFILL) {
         entry->prefill_activations = coli_expert_activation_sat_add(
             entry->prefill_activations, sample.multiplicity);
-    else if (sample.phase == COLI_EXPERT_PHASE_DECODE)
+        entry->recent_prefill_activations = coli_expert_activation_sat_add(
+            entry->recent_prefill_activations, sample.multiplicity);
+    } else if (sample.phase == COLI_EXPERT_PHASE_DECODE) {
         entry->decode_activations = coli_expert_activation_sat_add(
             entry->decode_activations, sample.multiplicity);
+        entry->recent_decode_activations = coli_expert_activation_sat_add(
+            entry->recent_decode_activations, sample.multiplicity);
+    } else {
+        entry->recent_unknown_activations = coli_expert_activation_sat_add(
+            entry->recent_unknown_activations, sample.multiplicity);
+    }
     entry->observations = coli_expert_activation_sat_add(
         entry->observations, UINT64_C(1));
     if (sample.epoch > entry->last_epoch) entry->last_epoch = sample.epoch;
