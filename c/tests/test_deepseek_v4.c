@@ -769,6 +769,61 @@ static int test_sparse_attention(void) {
     if (!close_enough_sparse(output[0], coli_bf16_round(2.0f / denominator)) ||
         !close_enough_sparse(output[1], coli_bf16_round(1.0f / denominator)))
         return 1;
+    {
+    float window[6] = {1, 0, 0, 1, 1, 1};
+    float compressed[4] = {2, 0, 0, 2};
+    float joined[10];
+    memcpy(joined, window, sizeof(window));
+    memcpy(joined + 6, compressed, sizeof(compressed));
+    ColiDeepSeekV4SparseKVView view = {window, 3, compressed, 2};
+    float reference[2], split[2];
+
+    /* Wrapped ring order plus indexer-style reversed compressed rows. */
+    int wrapped_indexed[4] = {2, 0, 4, 3};
+    if (coli_v4_sparse_attention_ref(reference, query, joined, sink,
+                                     wrapped_indexed, 1, 2, 5, 4, 1.0f) ||
+        coli_v4_sparse_attention_view_ref(split, query, &view, sink,
+                                          wrapped_indexed, 1, 2, 4, 1.0f) ||
+        !close_enough_sparse(reference[0], split[0]) ||
+        !close_enough_sparse(reference[1], split[1]))
+        return 1;
+
+    /* Non-indexer sequential compressed selection. */
+    int sequential[5] = {0, 1, 2, 3, 4};
+    if (coli_v4_sparse_attention_ref(reference, query, joined, sink,
+                                     sequential, 1, 2, 5, 5, 1.0f) ||
+        coli_v4_sparse_attention_view_ref(split, query, &view, sink,
+                                          sequential, 1, 2, 5, 1.0f) ||
+        !close_enough_sparse(reference[0], split[0]) ||
+        !close_enough_sparse(reference[1], split[1]))
+        return 1;
+
+    /* Zero and one compressed row boundaries. */
+    view.compressed = NULL;
+    view.compressed_count = 0;
+    int window_only[3] = {0, 1, 2};
+    if (coli_v4_sparse_attention_ref(reference, query, window, sink,
+                                     window_only, 1, 2, 3, 3, 1.0f) ||
+        coli_v4_sparse_attention_view_ref(split, query, &view, sink,
+                                          window_only, 1, 2, 3, 1.0f) ||
+        !close_enough_sparse(reference[0], split[0]) ||
+        !close_enough_sparse(reference[1], split[1]))
+        return 1;
+    view.compressed = compressed;
+    view.compressed_count = 1;
+    int one_compressed[3] = {0, 3, 1};
+    if (coli_v4_sparse_attention_ref(reference, query, joined, sink,
+                                     one_compressed, 1, 2, 4, 3, 1.0f) ||
+        coli_v4_sparse_attention_view_ref(split, query, &view, sink,
+                                          one_compressed, 1, 2, 3, 1.0f) ||
+        !close_enough_sparse(reference[0], split[0]) ||
+        !close_enough_sparse(reference[1], split[1]))
+        return 1;
+    int invalid_split[1] = {4};
+    if (coli_v4_sparse_attention_view_ref(split, query, &view, sink,
+                                          invalid_split, 1, 2, 1, 1.0f) == 0)
+        return 1;
+}
     int invalid[1] = {3};
     if (coli_v4_sparse_attention_ref(output, query, kv, sink, invalid,
                                      1, 2, 3, 1, 1.0f) == 0)
