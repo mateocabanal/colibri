@@ -223,7 +223,10 @@ def make_tokenizer() -> dict:
             "lstrip": False,
             "rstrip": False,
             "normalized": False,
-            "special": True,
+            # Added tokens must stay atomic for the tiny tokenizer, but only
+            # EOS is a generation stop. Marking every <tNNN> special makes
+            # sample.h arm the entire vocabulary as hard stops in SERVE=1.
+            "special": token == EOS,
         }
         for token in range(VOCAB)
     ]

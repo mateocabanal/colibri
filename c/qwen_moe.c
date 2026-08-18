@@ -72,6 +72,7 @@
 #endif
 #include "omp_tune.h"
 #include "route_trace.h"
+#include "qwen_prefix_cache.h"
 #include "profile.h"
 #ifdef COLI_METALIO
 #include "metalio.h"
@@ -317,6 +318,7 @@ typedef struct {
     int kv_len, max_t;
     float **gdn_S;                 /* [n_layers][v_heads*k_dim*v_dim] state */
     float **gdn_conv;              /* [n_layers][conv_dim*(k-1)] conv state */
+    QwenPrefixCache prefix_cache;  /* exact end-of-prefill hybrid snapshots */
     uint32_t **freq;               /* route_trace heatmap alias */
     int hot_pinned, hot_n, warmup_tokens, token_count;
     uint8_t *is_pinned;            /* [n_layers*n_experts] */
@@ -569,6 +571,22 @@ static uint16_t f32_to_f16(float x){
 }
 
 static int g_kv_f16 = 1;             /* QWEN_KV_F16=0 disables (f32 KV) */
+
+static QwenPrefixStateView qwen_prefix_state_view(Model *m){
+    QwenPrefixStateView view = {
+        .layer_count = m->c.n_layers,
+        .layer_is_gdn = m->c.layer_is_gdn,
+        .n_kv_heads = m->c.n_kv_heads,
+        .head_dim = m->c.head_dim,
+        .max_t = m->max_t,
+        .kv_f16 = g_kv_f16,
+        .K = m->K, .V = m->V, .K16 = m->K16, .V16 = m->V16,
+        .gdn_S = m->gdn_S, .gdn_conv = m->gdn_conv,
+        .gdn_state_elems = gdn_state_count(&m->c),
+        .gdn_conv_elems = gdn_conv_count(&m->c),
+    };
+    return view;
+}
 
 static void kv_store_row(Model *m, int layer, int g, int pos, const float *row, int hd){
     int64_t off = ((int64_t)g * m->max_t + pos) * hd;
@@ -2996,7 +3014,7 @@ static float *step_batched(Model *m, const int *ids, int n, int pos_base){
             for (int j = 0; j < cj; j++)
                 rmsnorm_row(normed + (int64_t)j * D, hbuf + (int64_t)j * D, L->in_ln, D, c->eps);
             if (c->layer_is_gdn[l]) gdn_batch(m, L, l, normed, cj, hbuf);
-            else                    attention_batch(m, L, l, normed, cj, j0, hbuf);
+            else                    attention_batch(m, L, l, normed, cj, pos_base + j0, hbuf);
             for (int j = 0; j < cj; j++)
                 rmsnorm_row(normed + (int64_t)j * D, hbuf + (int64_t)j * D, L->post_ln, D, c->eps);
             moe_batch(m, L, l, normed, cj, hbuf);
@@ -3468,13 +3486,12 @@ static int mode_chat(Model *m, Tok *T){
  * full above its own SUBMIT handling) so the shared openai_server.py gateway
  * drives this engine unchanged.
  *
- * v1 scope, same as olmoe: one request in flight, full re-prefill every turn,
- * no cross-request KV reuse. The payload arrives already rendered by
- * openai_server.py's render_chat_qwen — this engine tokenizes it as-is.
- * Expert-cache contents, route counts, and immutable weights persist.  Before
- * each prefill we clear GDN recurrence/conv state; KV storage need not be
- * cleared because position-zero prefill overwrites every position attention
- * reads for the new request. */
+ * One request is in flight at a time. With QWEN_PREFIX_CACHE_MB>0, exact
+ * end-of-prefill snapshots can reuse the longest strict token prefix across
+ * requests; snapshots include both full-attention KV and GDN recurrence/conv
+ * state. A miss keeps the old full re-prefill behavior. The payload arrives
+ * already rendered by openai_server.py's render_chat_qwen and is tokenized
+ * as-is. Expert-cache contents, route counts, and immutable weights persist. */
 typedef struct { char id[64]; int max_tok; float temp, top_p; char *payload; int plen; } SReq;
 #define SRV_QMAX 16
 static SReq g_q[SRV_QMAX]; static int g_qn = 0;
@@ -3507,6 +3524,17 @@ static int serve_read_cmd(const char *cur_id) {
     return 0;
 }
 
+static void qwen_prefix_capture_once(Model *m,
+                                     const QwenPrefixStateView *view,
+                                     const int *ids, int np,
+                                     int *captured, double *capture_ms) {
+    if (*captured) return;
+    double began = now_s();
+    qwen_prefix_cache_store(&m->prefix_cache, view, ids, np);
+    *capture_ms += (now_s() - began) * 1000.0;
+    *captured = 1;
+}
+
 static void serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
     int cap = q->plen + 16;
     int *ids = malloc(size_mul_or_die((size_t)cap, sizeof(int), "serve prompt ids"));
@@ -3526,19 +3554,49 @@ static void serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
      * long prefill no longer looks like a dead client and draws a spurious
      * CANCEL that would arrive mid-turn and truncate the reply. */
     printf("ACCEPT %s %d\n", q->id, np); fflush(stdout);
-    request_state_reset(m);
-    float *logit = step(m, ids, np, 0);
+    QwenPrefixStateView prefix_view = qwen_prefix_state_view(m);
+    QwenPrefixCacheStats prefix_before;
+    qwen_prefix_cache_stats(&m->prefix_cache, &prefix_before);
+    double prefix_restore_t0 = now_s();
+    int prefix_reused = qwen_prefix_cache_restore(&m->prefix_cache,
+                                                   &prefix_view, ids, np);
+    double prefix_restore_ms = (now_s() - prefix_restore_t0) * 1000.0;
+    if (!prefix_reused) request_state_reset(m);
+    double prefix_prefill_t0 = now_s();
+    float *logit = step(m, ids + prefix_reused, np - prefix_reused,
+                        prefix_reused);
+    double prefix_prefill_ms = (now_s() - prefix_prefill_t0) * 1000.0;
     qprof_prefill_end(m, np);
+    size_t prefix_snapshot_bytes = 0, prefix_kv_bytes = 0, prefix_gdn_elems = 0;
+    (void)qwen_prefix_cache_entry_bytes(&prefix_view, np,
+                                        &prefix_snapshot_bytes,
+                                        &prefix_kv_bytes,
+                                        &prefix_gdn_elems);
+    int prefix_captured = 0;
+    double prefix_capture_ms = 0.0;
     int hist_len = np, gen = 0, limited = 1, cancelled = 0;
     char buf[512];
     for (int s = 0; s < q->max_tok && !cancelled; s++) {
         int nt = qwen_pick_token(m, logit, -1);
         logits_free(&logit);
-        if (is_stop(nt)) { limited = 0; break; }
+        if (is_stop(nt)) {
+            /* No DATA will be emitted. Capture while the live state is
+             * still exactly end-of-prefill, then finish the request. */
+            qwen_prefix_capture_once(m, &prefix_view, ids, np,
+                                     &prefix_captured, &prefix_capture_ms);
+            limited = 0; break;
+        }
         int nb = tok_decode(T, &nt, 1, buf, sizeof(buf)-1);
         printf("DATA %s %d\n", q->id, nb);
         fwrite(buf, 1, (size_t)nb, stdout);
         fputc('\n', stdout); fflush(stdout);
+        /* Sampling/decoding does not mutate sequence state. Emit the first
+         * token before copying the potentially 100+ MiB hybrid snapshot,
+         * then capture before the first generated-token step can advance
+         * attention KV or GDN recurrence. This removes capture memcpy from
+         * TTFT without changing the state being cached. */
+        qwen_prefix_capture_once(m, &prefix_view, ids, np,
+                                 &prefix_captured, &prefix_capture_ms);
         gen++; hist_len++;
         while (coli_stdin_readable()) {
             int r = serve_read_cmd(q->id);
@@ -3549,6 +3607,24 @@ static void serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
         logit = step(m, &nt, 1, hist_len - 1);
     }
     logits_free(&logit);
+    /* Defensive fallback: all normal first-token/stop paths already captured
+     * the exact end-of-prefill state before any generated-token step. */
+    qwen_prefix_capture_once(m, &prefix_view, ids, np,
+                             &prefix_captured, &prefix_capture_ms);
+    QwenPrefixCacheStats prefix_after;
+    qwen_prefix_cache_stats(&m->prefix_cache, &prefix_after);
+    if (m->prefix_cache.log) {
+        unsigned long long restore_bytes =
+            (unsigned long long)(prefix_after.restore_bytes - prefix_before.restore_bytes);
+        unsigned long long stores =
+            (unsigned long long)(prefix_after.stores - prefix_before.stores);
+        fprintf(stderr,
+                "[QWEN-PREFIX] request=%s prompt=%d matched=%d restore_bytes=%llu restore_ms=%.3f prefill_ms=%.3f snapshot_bytes=%zu capture_stored=%llu capture_ms=%.3f entries=%zu resident_bytes=%zu budget_bytes=%zu\n",
+                q->id, np, prefix_reused, restore_bytes, prefix_restore_ms,
+                prefix_prefill_ms, prefix_snapshot_bytes, stores,
+                prefix_capture_ms, prefix_after.entries,
+                prefix_after.resident_bytes, prefix_after.budget_bytes);
+    }
     qprof_request_end(m, np, gen);
     double dt = now_s() - t0;
     double tot = (double)(m->hits - h0 + m->miss - m0);
@@ -3793,7 +3869,8 @@ int main(int argc, char **argv){
     rt_trace_open();
     const char *snap;
     int cap;
-    if (getenv("SERVE") && getenv("SERVE")[0] == '1') {
+    int serving = getenv("SERVE") && getenv("SERVE")[0] == '1';
+    if (serving) {
         /* serve protocol (openai_server.py): argv[1] is the cap sentinel and
          * SNAP env carries the model dir — same convention as olmoe.c. */
         snap = getenv("SNAP");
@@ -3803,12 +3880,23 @@ int main(int argc, char **argv){
         cap = argc > 2 ? atoi(argv[2]) : (getenv("CACHE") ? atoi(getenv("CACHE")) : 0);
     }
     if (!snap || !*snap) { fprintf(stderr, "set SNAP=<snapshot directory>\n"); return 1; }
+    int explicit_cap = cap != 0;
+    size_t prefix_budget = serving ? qwen_prefix_cache_budget_from_env() : 0;
     if (cap == 0) {
         /* Default: ONLY the experts currently in use stay resident — one
          * cache slot per selected expert per layer (topk). Everything else
-         * is streamed from disk on demand. Raise CACHE/RAM_GB for more. */
-        if (getenv("RAM_GB") && atoi(getenv("RAM_GB")) > 0) {
-            cap = atoi(getenv("RAM_GB")) / 2;
+         * is streamed from disk on demand. Raise CACHE/RAM_GB for more.
+         *
+         * RAM_GB is a total host/UMA budget. Its existing expert-residency
+         * heuristic is 2 decimal GB per cache slot/layer, so reserve the
+         * opt-in prompt cache before deriving that cap. */
+        int ram_valid = 0;
+        cap = qwen_prefix_cache_ram_cap(getenv("RAM_GB"), prefix_budget, &ram_valid);
+        if (ram_valid) {
+            if (prefix_budget)
+                fprintf(stderr,
+                        "[QWEN-PREFIX] RAM_GB reserves %.2fMiB for prompt snapshots; expert cap=%d under 2GB/slot heuristic\n",
+                        (double)prefix_budget / (1024.0 * 1024.0), cap);
         } else {
             Cfg cfg0;
             if (getenv("COLI_CONFIG")) load_cfg(&cfg0, getenv("COLI_CONFIG"));
@@ -3816,6 +3904,10 @@ int main(int argc, char **argv){
             cap = cfg0.topk;
             free(cfg0.layer_is_gdn);
         }
+    } else if (serving && explicit_cap && prefix_budget) {
+        fprintf(stderr,
+                "[QWEN-PREFIX] explicit expert cap=%d; %.2fMiB prompt-cache budget is additive to expert residency\n",
+                cap, (double)prefix_budget / (1024.0 * 1024.0));
     }
     if (cap < 1 || cap > 4096) { fprintf(stderr, "CACHE must be 1..4096 (got %d)\n", cap); return 1; }
     /* page-cache discipline: DONTNEED after every file read (experts and
@@ -3948,6 +4040,7 @@ int main(int argc, char **argv){
 #ifdef COLI_CUDA
     if (g_cuda_compute) coli_cuda_shutdown();
 #endif
+    qwen_prefix_cache_clear(&m.prefix_cache);
     tok_free(&T);
     return rc;
 }
