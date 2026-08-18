@@ -401,6 +401,18 @@ static inline int coli_prefix_enforce_ram_budget(ColiPrefixCache *cache,
 static inline int coli_prefix_cache_rewrite_disk(ColiPrefixCache *cache) {
     if (!cache || !(cache->policy & COLI_PREFIX_CACHE_SSD) || !cache->disk_path[0])
         return 0;
+
+    /* Do not leave a header-only file behind while reporting zero live bytes.
+     * This also makes a configured budget smaller than the file header literal. */
+    int has_persisted = 0;
+    for (size_t i = 0; i < cache->count; ++i)
+        if (cache->entries[i]->disk_record_bytes) { has_persisted = 1; break; }
+    if (!has_persisted) {
+        if (remove(cache->disk_path) != 0 && errno != ENOENT) return -1;
+        cache->disk_live_bytes = 0;
+        return 0;
+    }
+
     char temp[COLI_PREFIX_CACHE_PATH_MAX + 8];
     if (snprintf(temp, sizeof(temp), "%s.tmp", cache->disk_path) >= (int)sizeof(temp))
         return -1;
@@ -560,6 +572,28 @@ static inline int coli_prefix_cache_load_index(ColiPrefixCache *cache) {
     }
     fclose(f);
     cache->disk_live_bytes = physical_live;
+
+    /* The SSD cap is a restart invariant, not merely a store-time admission
+     * rule: a previous process may have used a larger budget. Zero means this
+     * process owns no SSD cache bytes at all. */
+    if (!cache->disk_budget_bytes) {
+        for (size_t i = cache->count; i > 0; --i) {
+            size_t index = i - 1;
+            if (cache->entries[index]->disk_record_bytes)
+                (void)coli_prefix_drop_disk_copy(cache, index);
+        }
+        if (remove(cache->disk_path) != 0 && errno != ENOENT) return -1;
+        cache->disk_live_bytes = 0;
+        return 0;
+    }
+
+    /* Over-budget files and corrupt tails are compacted before init returns.
+     * Kept SSD-cold entries still refer to the old file until the atomic
+     * replacement is published, so rewrite can safely read their payloads. */
+    if (physical_live > cache->disk_budget_bytes || cache->stats.corrupt_entries) {
+        coli_prefix_enforce_disk_budget(cache, NULL);
+        if (coli_prefix_cache_rewrite_disk(cache) != 0) return -1;
+    }
     return 0;
 }
 
