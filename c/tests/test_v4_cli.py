@@ -114,6 +114,7 @@ class V4CliTest(unittest.TestCase):
         env = self.cli.env_for_engine(args, "deepseek_v4")
         self.assertEqual(env["NGEN"], "8")
         self.assertEqual(env["RAM_GB"], "64")
+        self.assertEqual(env["COLI_MEMORY_GB"], "64")
         self.assertEqual(env["CTX"], "4096")
 
     def test_v4_build_defaults_to_metal_on_macos(self):
@@ -144,6 +145,7 @@ class V4CliTest(unittest.TestCase):
         args = argparse.Namespace(ngen=8, temp=0.0, ram=242, ctx=0)
         env = self.cli.env_for_engine(args, "kimi")
         self.assertEqual(env["RAM_GB"], "242")
+        self.assertEqual(env["COLI_MEMORY_GB"], "242")
 
     def test_kimi_without_ram_stays_unset(self):
         """Absent --ram, the engine budgets from MemAvailable itself. Sending an
@@ -151,6 +153,7 @@ class V4CliTest(unittest.TestCase):
         args = argparse.Namespace(ngen=8, temp=0.0, ram=0, ctx=0)
         env = self.cli.env_for_engine(args, "kimi")
         self.assertNotIn("RAM_GB", env)
+        self.assertNotIn("COLI_MEMORY_GB", env)
 
     def test_ngen_default_differs_for_interactive_commands(self):
         """#889: `coli web` passed --max-tokens 1024, and openai_server clamps a
@@ -179,6 +182,20 @@ class V4CliTest(unittest.TestCase):
         env = self.cli.env_for_engine(args, "kimi")
         self.assertNotIn("CTX", env)
         self.assertNotIn("V4_MTP", env)
+
+    def test_resource_request_reads_common_memory_aliases(self):
+        args = argparse.Namespace(ram=0, ctx=0, vram=0, gpu=None)
+        ram, ctx, devices, vram = self.cli.resource_request(
+            args, {"COLI_MEMORY_GB": "48", "COLI_VRAM_GB": "12"})
+        self.assertEqual((ram, ctx, devices, vram), (48.0, 4096, None, 12.0))
+
+    def test_resource_request_prefers_explicit_flags_over_aliases(self):
+        args = argparse.Namespace(ram=24, ctx=0, vram=6, gpu=None)
+        ram, _ctx, _devices, vram = self.cli.resource_request(
+            args, {"COLI_MEMORY_GB": "48", "COLI_VRAM_GB": "12",
+                   "RAM_GB": "20", "CUDA_EXPERT_GB": "4"})
+        self.assertEqual(ram, 24)
+        self.assertEqual(vram, 6)
 
     def test_windows_v4_run_passes_chinese_prompt_as_utf8_file(self):
         directory, root = self.make_model()

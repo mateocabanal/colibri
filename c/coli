@@ -408,7 +408,9 @@ def env_for_engine(a, arch):
     # --ram 242` on Kimi K3 set an environment variable nobody looked at and the
     # user's session ran itself out of memory with the flag apparently set.
     if arch in ("deepseek_v4", "kimi", "qwen3_moe"):
-        if a.ram: env["RAM_GB"] = str(a.ram)
+        if a.ram:
+            env["RAM_GB"] = str(a.ram)
+            env["COLI_MEMORY_GB"] = str(a.ram)
     if arch == "qwen3_moe":
         env["CHAT"] = "1"
         env["MAX_NEW"] = str(ngen_for(a))
@@ -461,8 +463,8 @@ def resource_request(a, env):
     def num(v):
         try: return float(v)
         except ValueError: return 0.0  # "auto": the planner sizes it; the engine reads the string itself
-    ram=a.ram or num(env.get("RAM_GB",0))
-    vram=a.vram or num(env.get("CUDA_EXPERT_GB",0))
+    ram=a.ram or num(env.get("COLI_MEMORY_GB", env.get("RAM_GB",0)))
+    vram=a.vram or num(env.get("COLI_VRAM_GB", env.get("CUDA_EXPERT_GB",0)))
     gpu=a.gpu
     if gpu is None:
         gpu=env.get("COLI_GPUS",env.get("COLI_GPU","auto"))
@@ -525,7 +527,10 @@ def env_for(a):
         e.setdefault("PIPE", "1")
         e.setdefault("PILOT_REAL", "1")
     e["COLI_POLICY"]=a.policy
-    if a.ram:  e["RAM_GB"]=str(a.ram)
+    e["COLI_MEMORY_POLICY"]=a.policy
+    if a.ram:
+        e["RAM_GB"]=str(a.ram)
+        e["COLI_MEMORY_GB"]=str(a.ram)
     e["NGEN"]=str(ngen_for(a))
     if a.topp: e["TOPP"]=str(a.topp)
     if a.topk: e["TOPK"]=str(a.topk)
@@ -538,12 +543,14 @@ def env_for(a):
         if a.gpu is not None:
             e.pop("COLI_GPU",None); e.pop("COLI_GPUS",None)
             if a.gpu=="none":
-                e["COLI_CUDA"]="0"; e.pop("CUDA_EXPERT_GB",None); e.pop("CUDA_DENSE",None)
+                e["COLI_CUDA"]="0"; e.pop("CUDA_EXPERT_GB",None); e.pop("COLI_VRAM_GB",None); e.pop("CUDA_DENSE",None)
             else: e.pop("COLI_CUDA",None)
         elif e.get("COLI_CUDA")=="0":
             e.pop("COLI_GPU",None); e.pop("COLI_GPUS",None)
-            e.pop("CUDA_EXPERT_GB",None); e.pop("CUDA_DENSE",None)
-        if a.vram and a.gpu!="none": e["CUDA_EXPERT_GB"]=str(a.vram)
+            e.pop("CUDA_EXPERT_GB",None); e.pop("COLI_VRAM_GB",None); e.pop("CUDA_DENSE",None)
+        if a.vram and a.gpu!="none":
+            e["CUDA_EXPERT_GB"]=str(a.vram)
+            e["COLI_VRAM_GB"]=str(a.vram)
         try:
             ram,ctx,devices,vram=resource_request(a,e)
             plan=build_plan(a.model,ram,ctx,devices,vram,policy=a.policy)
@@ -611,13 +618,13 @@ def env_for(a):
             # honoured off-switch: also drop stale device/sizing vars so the
             # engine can't be re-enabled by leftovers (same as --gpu none).
             e.pop("COLI_GPU",None); e.pop("COLI_GPUS",None)
-            e.pop("CUDA_EXPERT_GB",None); e.pop("CUDA_DENSE",None)
+            e.pop("CUDA_EXPERT_GB",None); e.pop("COLI_VRAM_GB",None); e.pop("CUDA_DENSE",None)
         # --gpu/--vram SENZA --auto-tier: prima venivano ignorati in silenzio e il run
         # partiva CPU-only senza alcun avviso — benchmark "GPU" pubblicati per errore (#121).
         if a.gpu is not None:
             e.pop("COLI_GPU",None); e.pop("COLI_GPUS",None)
             if a.gpu=="none":
-                e["COLI_CUDA"]="0"; e.pop("CUDA_EXPERT_GB",None); e.pop("CUDA_DENSE",None)
+                e["COLI_CUDA"]="0"; e.pop("CUDA_EXPERT_GB",None); e.pop("COLI_VRAM_GB",None); e.pop("CUDA_DENSE",None)
             else:
                 if not cuda_binary():
                     sys.exit(f"{C.yel}--gpu needs the CUDA build:{C.r} make colibri CUDA=1 (this binary is CPU-only)")
@@ -627,7 +634,7 @@ def env_for(a):
         if a.vram and a.gpu!="none":
             if not cuda_binary():
                 sys.exit(f"{C.yel}--vram needs the CUDA build:{C.r} make colibri CUDA=1 (this binary is CPU-only)")
-            e["COLI_CUDA"]="1"; e["CUDA_EXPERT_GB"]=str(a.vram)
+            e["COLI_CUDA"]="1"; e["CUDA_EXPERT_GB"]=str(a.vram); e["COLI_VRAM_GB"]=str(a.vram)
     return e
 
 # ---------- rendering markdown in STREAMING per il terminale ----------
@@ -1582,7 +1589,7 @@ def main():
     common.add_argument("--gpu",default=None,help="auto, none, or a device list such as 0,1")
     common.add_argument("--vram",type=float,default=0,help="total VRAM budget in GB (0=auto)")
     common.add_argument("--policy",choices=("quality","balanced","experimental-fast"),
-                        default=os.environ.get("COLI_POLICY","quality"),
+                        default=os.environ.get("COLI_MEMORY_POLICY", os.environ.get("COLI_POLICY","quality")),
                         help="resource policy (explicit --topk/--topp overrides warn and proceed)")
     common.add_argument("--repin", type=int, default=0, help="adapt RAM/VRAM experts every N tokens")
     # Absent (None) = not explicitly set: the glm engine gets the 0 sentinel and picks
