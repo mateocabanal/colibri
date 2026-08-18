@@ -2,6 +2,10 @@
 
 Keep changes focused and preserve Colibri's dependency-free default CPU path.
 
+All contributions must follow [`PROJECT_POLICY.md`](PROJECT_POLICY.md). In particular,
+shared performance/runtime mechanisms should be multi-engine by default, and safe
+high-performance execution should be automatic rather than requiring enable flags.
+
 ## Branches
 
 - **`main`** is the stable branch. It's what users clone, and it stays known-good
