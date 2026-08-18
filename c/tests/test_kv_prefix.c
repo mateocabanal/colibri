@@ -271,6 +271,62 @@ static void test_prefix_cache_budgets(void) {
           cache.disk_live_bytes <= cache.disk_budget_bytes,
           "mixed cache exceeded a hard budget");
     coli_prefix_cache_close(&cache);
+
+    /* Reopening a cache written under a larger previous SSD cap must reconcile
+     * physical storage before init returns. The newest entry fits; the older one
+     * is evicted and the file is atomically compacted to the smaller hard cap. */
+    remove(path);
+    CHECK(coli_prefix_cache_init(&cache, COLI_PREFIX_CACHE_SSD,
+                                 4096, 4096, path) == 0,
+          "restart-budget seed init failed");
+    source.position = 3;
+    memset(source.bytes, 0x31, sizeof(source.bytes));
+    CHECK(coli_prefix_cache_store(&cache, &ns, a, 3, 3, &src) == 1,
+          "restart-budget first store failed");
+    source.position = 4;
+    memset(source.bytes, 0x42, sizeof(source.bytes));
+    CHECK(coli_prefix_cache_store(&cache, &ns, b, 4, 4, &src) == 1,
+          "restart-budget second store failed");
+    size_t ib_seed = coli_prefix_find_exact_index(&cache, &ns, b, 4);
+    CHECK(ib_seed < cache.count, "restart-budget newest entry missing");
+    uint64_t one_record_budget = sizeof(ColiPrefixFileHeader);
+    if (ib_seed < cache.count)
+        one_record_budget += cache.entries[ib_seed]->disk_record_bytes;
+    coli_prefix_cache_close(&cache);
+
+    CHECK(coli_prefix_cache_init(&cache, COLI_PREFIX_CACHE_SSD,
+                                 4096, one_record_budget, path) == 0,
+          "smaller restart budget init failed");
+    CHECK(cache.count == 1 &&
+          coli_prefix_find_exact_index(&cache, &ns, b, 4) < cache.count &&
+          cache.disk_live_bytes <= cache.disk_budget_bytes,
+          "restart did not compact to newest fitting entry");
+    FILE *budget_file = fopen(path, "rb");
+    CHECK(budget_file != NULL, "compacted restart file missing");
+    if (budget_file) {
+        CHECK(coli_prefix_fseek(budget_file, 0, SEEK_END) == 0,
+              "seek compacted restart file failed");
+        long long physical = (long long)coli_prefix_ftell(budget_file);
+        CHECK(physical >= 0 && (uint64_t)physical <= one_record_budget &&
+              (uint64_t)physical == cache.disk_live_bytes,
+              "physical restart bytes=%lld live=%llu budget=%llu",
+              physical, (unsigned long long)cache.disk_live_bytes,
+              (unsigned long long)one_record_budget);
+        fclose(budget_file);
+    }
+    coli_prefix_cache_close(&cache);
+
+    /* A zero SSD budget is literal after restart: no header-only cache file may
+     * survive while accounting reports zero bytes. */
+    CHECK(coli_prefix_cache_init(&cache, COLI_PREFIX_CACHE_SSD,
+                                 4096, 0, path) == 0,
+          "zero restart budget init failed");
+    CHECK(cache.count == 0 && cache.disk_live_bytes == 0,
+          "zero restart budget retained disk state");
+    budget_file = fopen(path, "rb");
+    CHECK(budget_file == NULL, "zero restart budget left cache file behind");
+    if (budget_file) fclose(budget_file);
+    coli_prefix_cache_close(&cache);
     remove(path); remove(temp);
 }
 
