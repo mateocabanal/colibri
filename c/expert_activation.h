@@ -24,7 +24,7 @@ extern "C" {
  * keys; observations for already-known keys continue to accumulate.
  */
 
-typedef struct {
+typedef struct ColiExpertActivationSample {
     ColiExpertKey key;
     ColiExpertPhase phase;
     /* Number of logical route selections represented by this observation.
@@ -201,6 +201,15 @@ static inline int coli_expert_activation_observe(
     tracker->total_observations = coli_expert_activation_sat_add(
         tracker->total_observations, UINT64_C(1));
     return inserted;
+}
+
+static inline void coli_expert_activation_observe_many(
+    ColiExpertActivationTracker *tracker,
+    const ColiExpertActivationSample *samples,
+    size_t count) {
+    if (!tracker || !samples) return;
+    for (size_t i = 0; i < count; i++)
+        (void)coli_expert_activation_observe(tracker, samples[i]);
 }
 
 #ifdef __cplusplus
