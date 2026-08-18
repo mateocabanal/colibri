@@ -94,6 +94,8 @@ static void test_stale_frequency_decays(void) {
     uint64_t new_hotness = coli_expert_residency_policy_hotness(
         recent, 4097, 0, &config);
     assert(old_hotness < new_hotness);
+    assert(coli_expert_residency_policy_reuse_weight(
+        stale, 4097, &config) == 0);
 }
 
 static void test_decode_weight_and_hysteresis(void) {
@@ -111,6 +113,62 @@ static void test_decode_weight_and_hysteresis(void) {
     uint64_t cold = coli_expert_residency_policy_hotness(decode, 10, 0, &config);
     uint64_t resident = coli_expert_residency_policy_hotness(decode, 10, 1, &config);
     assert(resident > cold);
+
+    /* Planner reuse is expected route frequency, not local residency bias. */
+    assert(coli_expert_residency_policy_reuse_weight(
+               prefill, 10, &config) ==
+           coli_expert_residency_policy_reuse_weight(
+               decode, 10, &config));
+}
+
+static void test_bounded_common_horizon(void) {
+    ColiExpertActivationEntry entries[16];
+    ColiExpertActivationTracker tracker;
+    assert(coli_expert_activation_init(&tracker, entries, 16) == 0);
+
+    ColiExpertActivationEntry *entry = NULL;
+    for (uint64_t epoch = 1; epoch <= 4096; epoch++)
+        entry = observe(&tracker, 8, 42, COLI_EXPERT_PHASE_DECODE, 1, epoch);
+    assert(entry);
+
+    /* Lifetime telemetry keeps the exact process history while decision mass
+     * converges to a bounded recent-rate state instead of growing to 4096. */
+    assert(entry->logical_activations == 4096);
+    assert(entry->decode_activations == 4096);
+    uint64_t unknown = 0, prefill = 0, decode = 0;
+    coli_expert_activation_recent_at(
+        entry, 4096, &unknown, &prefill, &decode);
+    assert(unknown == 0 && prefill == 0);
+    assert(decode <= 128 && decode >= 120);
+
+    ColiExpertResidencyPolicyConfig config =
+        coli_expert_residency_policy_default();
+    /* One logical use per epoch should project to roughly one use for every
+     * epoch in the shared 256-epoch planning horizon. */
+    uint64_t reuse = coli_expert_residency_policy_reuse_weight(
+        entry, 4096, &config);
+    assert(reuse >= 240 && reuse <= 256);
+
+    ColiExpertResidencyCandidate candidate =
+        coli_expert_residency_policy_candidate(
+            entry, 4096, 13 * 1024 * 1024, 12000, 0, &config);
+    assert(candidate.reuse_weight == reuse);
+}
+
+static void test_burst_fades_out(void) {
+    ColiExpertActivationEntry entries[16];
+    ColiExpertActivationTracker tracker;
+    assert(coli_expert_activation_init(&tracker, entries, 16) == 0);
+    ColiExpertActivationEntry *entry = observe(
+        &tracker, 9, 5, COLI_EXPERT_PHASE_PREFILL, 512, 1);
+    ColiExpertResidencyPolicyConfig config =
+        coli_expert_residency_policy_default();
+    uint64_t far_epoch = 1 +
+        10 * COLI_EXPERT_ACTIVITY_DECAY_QUANTUM_EPOCHS;
+    assert(coli_expert_residency_policy_hotness(
+        entry, far_epoch, 0, &config) == 0);
+    assert(coli_expert_residency_policy_reuse_weight(
+        entry, far_epoch, &config) == 0);
 }
 
 static void test_benefit_per_byte(void) {
@@ -147,6 +205,8 @@ int main(void) {
     test_frequency_beats_pure_recency();
     test_stale_frequency_decays();
     test_decode_weight_and_hysteresis();
+    test_bounded_common_horizon();
+    test_burst_fades_out();
     test_benefit_per_byte();
     test_deterministic_tie_break();
     puts("test_expert_residency_policy: ok");
