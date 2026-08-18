@@ -28,6 +28,7 @@ typedef struct {
     uint32_t resident_hysteresis_percent;
     uint64_t recency_quantum_epochs;
     uint64_t planning_horizon_epochs;
+    uint64_t planner_confidence_mass;
     uint64_t max_reuse_weight;
 } ColiExpertResidencyPolicyConfig;
 
@@ -53,6 +54,10 @@ coli_expert_residency_policy_default(void) {
     config.resident_hysteresis_percent = 20;
     config.recency_quantum_epochs = COLI_EXPERT_ACTIVITY_DECAY_QUANTUM_EPOCHS;
     config.planning_horizon_epochs = 256;
+    /* Require a small amount of recent evidence before optional planner bytes
+     * move away from established dense/prefix resources. Large prefill routing
+     * multiplicity can satisfy this immediately; one-off decode routes cannot. */
+    config.planner_confidence_mass = 8;
     config.max_reuse_weight = UINT64_C(1) << 32;
     return config;
 }
@@ -66,7 +71,8 @@ static inline int coli_expert_residency_policy_config_valid(
     return config && config->prefill_weight && config->decode_weight &&
         config->recency_quantum_epochs ==
             COLI_EXPERT_ACTIVITY_DECAY_QUANTUM_EPOCHS &&
-        config->planning_horizon_epochs && config->max_reuse_weight;
+        config->planning_horizon_epochs && config->planner_confidence_mass &&
+        config->max_reuse_weight;
 }
 
 static inline uint64_t coli_expert_residency_policy_recent_mass(
@@ -97,9 +103,24 @@ static inline uint64_t coli_expert_residency_policy_recent_mass(
     return coli_expert_activation_sat_add(mass, weighted_decode);
 }
 
+static inline uint64_t coli_expert_residency_scale_div(
+    uint64_t value, uint64_t numerator, uint64_t denominator) {
+    if (!value || !numerator || !denominator) return 0;
+    uint64_t quotient = value / denominator;
+    uint64_t remainder = value % denominator;
+    uint64_t scaled = coli_expert_residency_sat_mul(quotient, numerator);
+    uint64_t tail_product = coli_expert_residency_sat_mul(remainder, numerator);
+    uint64_t tail = tail_product / denominator;
+    return coli_expert_activation_sat_add(scaled, tail);
+}
+
 /* The lazy half-life accumulator has a steady-state effective window of roughly
  * 2 * decay_quantum epochs. Project that recent unweighted route mass onto a
- * fixed future horizon. The result is bounded and process-age independent. */
+ * fixed future horizon. The result is bounded and process-age independent.
+ *
+ * A small evidence ramp prevents a single cold-start observation from claiming
+ * optional global memory immediately. This confidence affects only HOW MANY
+ * bytes the planner gives experts; local expert ranking remains responsive. */
 static inline uint64_t coli_expert_residency_policy_reuse_weight(
     const ColiExpertActivationEntry *entry,
     uint64_t current_epoch,
@@ -113,14 +134,14 @@ static inline uint64_t coli_expert_residency_policy_reuse_weight(
     if (!mass) return 0;
 
     uint64_t denominator = config->recency_quantum_epochs * 2;
-    uint64_t quotient = mass / denominator;
-    uint64_t remainder = mass % denominator;
-    uint64_t projected = coli_expert_residency_sat_mul(
-        quotient, config->planning_horizon_epochs);
-    uint64_t tail_product = coli_expert_residency_sat_mul(
-        remainder, config->planning_horizon_epochs);
-    uint64_t tail = tail_product / denominator;
-    projected = coli_expert_activation_sat_add(projected, tail);
+    uint64_t projected = coli_expert_residency_scale_div(
+        mass, config->planning_horizon_epochs, denominator);
+
+    uint64_t confidence = mass < config->planner_confidence_mass
+        ? mass : config->planner_confidence_mass;
+    projected = coli_expert_residency_scale_div(
+        projected, confidence, config->planner_confidence_mass);
+
     if (projected > config->max_reuse_weight)
         projected = config->max_reuse_weight;
     return projected;
