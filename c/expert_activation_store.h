@@ -3,7 +3,6 @@
 
 #include "expert_activation.h"
 
-#include <stdio.h>
 #include <stdlib.h>
 
 #ifdef __cplusplus
@@ -59,8 +58,13 @@ static inline int coli_expert_activation_store_prefetch(
 static inline void coli_expert_activation_store_stats(
     const ColiExpertStore *store, ColiExpertStoreStats *stats) {
     ColiExpertActivationStoreState *state = store ? store->state : NULL;
-    if (state && state->inner && state->inner->ops && state->inner->ops->stats)
+    if (!state || !stats) return;
+    if (state->inner && state->inner->ops && state->inner->ops->stats)
         state->inner->ops->stats(state->inner, stats);
+    stats->logical_activations = state->tracker.total_logical_activations;
+    stats->activation_observations = state->tracker.total_observations;
+    stats->activation_keys = state->tracker.used;
+    stats->activation_dropped_new_keys = state->tracker.dropped_new_keys;
 }
 
 static inline void coli_expert_activation_store_observe(
@@ -76,12 +80,6 @@ static inline void coli_expert_activation_store_observe(
 static inline void coli_expert_activation_store_destroy(ColiExpertStore *store) {
     ColiExpertActivationStoreState *state = store ? store->state : NULL;
     if (state) {
-        fprintf(stderr,
-                "expert_activation logical=%llu observations=%llu keys=%zu dropped_new_keys=%llu\n",
-                (unsigned long long)state->tracker.total_logical_activations,
-                (unsigned long long)state->tracker.total_observations,
-                state->tracker.used,
-                (unsigned long long)state->tracker.dropped_new_keys);
         if (state->inner && state->inner->ops && state->inner->ops->destroy)
             state->inner->ops->destroy(state->inner);
         free(state->entries);
