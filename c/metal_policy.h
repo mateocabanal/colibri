@@ -48,7 +48,7 @@ static inline const char *coli_metal_policy_name(ColiMetalPolicy policy) {
 }
 
 static inline ColiMetalPolicy coli_metal_platform_default_policy(void) {
-#if defined(__APPLE__) && defined(__aarch64__)
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
     return COLI_METAL_POLICY_AUTO;
 #else
     return COLI_METAL_POLICY_OFF;
