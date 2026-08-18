@@ -69,8 +69,8 @@ typedef struct {
     size_t snapshot_bytes;
     size_t metadata_bytes;
     uint64_t last_used;
-    uint64_t disk_snapshot_offset;
-    uint64_t disk_record_bytes;
+    uint64_t disk_snapshot_offset; /* zero means this entry is RAM-only */
+    uint64_t disk_record_bytes;    /* zero means do not persist on rewrite */
     uint32_t payload_crc32c;
 } ColiPrefixCacheEntry;
 
@@ -79,7 +79,7 @@ typedef struct {
     size_t count;
     size_t ram_resident_bytes;
     size_t ram_budget_bytes;
-    uint64_t disk_live_bytes;
+    uint64_t disk_live_bytes;      /* actual indexed/persisted bytes incl header */
     uint64_t disk_budget_bytes;
     ColiPrefixCachePolicy policy;
     char disk_path[COLI_PREFIX_CACHE_PATH_MAX];
@@ -216,13 +216,35 @@ static inline int coli_prefix_file_header_read(FILE *f) {
     return 0;
 }
 
+static inline int coli_prefix_flush_durable(FILE *f) {
+    if (!f || fflush(f) != 0) return -1;
+#ifdef _WIN32
+    return _commit(_fileno(f)) == 0 ? 0 : -1;
+#else
+    return fsync(fileno(f)) == 0 ? 0 : -1;
+#endif
+}
+
+static inline uint64_t coli_prefix_recompute_disk_live(const ColiPrefixCache *cache) {
+    if (!cache || !(cache->policy & COLI_PREFIX_CACHE_SSD)) return 0;
+    uint64_t live = sizeof(ColiPrefixFileHeader);
+    int any = 0;
+    for (size_t i = 0; i < cache->count; ++i) {
+        const ColiPrefixCacheEntry *e = cache->entries[i];
+        if (!e->disk_record_bytes) continue;
+        if (UINT64_MAX - live < e->disk_record_bytes) return UINT64_MAX;
+        live += e->disk_record_bytes;
+        any = 1;
+    }
+    return any ? live : 0;
+}
+
 static inline int coli_prefix_read_snapshot_from_disk(
         const ColiPrefixCache *cache, const ColiPrefixCacheEntry *entry,
         unsigned char **out) {
     if (!cache || !entry || !out || !entry->disk_snapshot_offset ||
-        !entry->snapshot_bytes || !cache->disk_path[0])
+        !entry->disk_record_bytes || !entry->snapshot_bytes || !cache->disk_path[0])
         return -1;
-    if (entry->snapshot_bytes > SIZE_MAX) return -1;
     FILE *f = fopen(cache->disk_path, "rb");
     if (!f) return -1;
     if (coli_prefix_fseek(f, (long long)entry->disk_snapshot_offset, SEEK_SET) != 0) {
@@ -241,57 +263,141 @@ static inline int coli_prefix_read_snapshot_from_disk(
     return 0;
 }
 
-static inline void coli_prefix_cache_drop_index(ColiPrefixCache *cache,
-                                                 size_t index,
-                                                 int disk_eviction) {
+static inline void coli_prefix_remove_index(ColiPrefixCache *cache,
+                                            size_t index,
+                                            int count_ram_eviction,
+                                            int count_disk_eviction) {
+    if (!cache || index >= cache->count) return;
     ColiPrefixCacheEntry *e = cache->entries[index];
     size_t ram = coli_prefix_entry_ram_bytes(e);
     cache->ram_resident_bytes = ram <= cache->ram_resident_bytes
         ? cache->ram_resident_bytes - ram : 0;
-    if (e->disk_record_bytes <= cache->disk_live_bytes)
-        cache->disk_live_bytes -= e->disk_record_bytes;
-    else cache->disk_live_bytes = 0;
     for (size_t i = index + 1; i < cache->count; ++i)
         cache->entries[i - 1] = cache->entries[i];
     cache->entries[--cache->count] = NULL;
-    if (disk_eviction) cache->stats.evictions_ssd++;
+    if (count_ram_eviction) cache->stats.evictions_ram++;
+    if (count_disk_eviction && e->disk_record_bytes) cache->stats.evictions_ssd++;
     coli_prefix_entry_free(e);
+    cache->disk_live_bytes = coli_prefix_recompute_disk_live(cache);
 }
 
 static inline size_t coli_prefix_oldest_index(const ColiPrefixCache *cache,
                                                const ColiPrefixCacheEntry *protect,
-                                               int require_snapshot) {
+                                               int require_snapshot,
+                                               int require_disk) {
     size_t best = cache ? cache->count : 0;
     uint64_t oldest = UINT64_MAX;
     if (!cache) return best;
     for (size_t i = 0; i < cache->count; ++i) {
         ColiPrefixCacheEntry *e = cache->entries[i];
-        if (e == protect || (require_snapshot && !e->snapshot)) continue;
+        if (e == protect || (require_snapshot && !e->snapshot) ||
+            (require_disk && !e->disk_record_bytes))
+            continue;
         if (e->last_used < oldest) { oldest = e->last_used; best = i; }
     }
     return best;
 }
 
-static inline void coli_prefix_enforce_ram_budget(ColiPrefixCache *cache,
-                                                   ColiPrefixCacheEntry *protect) {
-    if (!cache) return;
-    while (cache->ram_resident_bytes > cache->ram_budget_bytes) {
-        size_t victim = coli_prefix_oldest_index(cache, protect, 1);
-        if (victim == cache->count) break;
-        ColiPrefixCacheEntry *e = cache->entries[victim];
-        if (!e->disk_snapshot_offset) {
-            /* RAM-only entry cannot be demoted; evict it entirely. */
-            coli_prefix_cache_drop_index(cache, victim, 0);
-            cache->stats.evictions_ram++;
-            continue;
+/* Remove disk ownership while preserving a usable RAM entry when possible. If
+ * the payload is already SSD-cold, the entry has no remaining state bytes and
+ * must disappear from the index entirely. */
+static inline int coli_prefix_drop_disk_copy(ColiPrefixCache *cache,
+                                             size_t index) {
+    if (!cache || index >= cache->count) return 0;
+    ColiPrefixCacheEntry *e = cache->entries[index];
+    if (!e->disk_record_bytes) return 0;
+    cache->stats.evictions_ssd++;
+    e->disk_record_bytes = 0;
+    e->disk_snapshot_offset = 0;
+    cache->disk_live_bytes = coli_prefix_recompute_disk_live(cache);
+    if (!e->snapshot) {
+        coli_prefix_remove_index(cache, index, 0, 0);
+        return 1;
+    }
+    return 0;
+}
+
+/* Enforce SSD ownership before rewriting. The new entry is protected while old
+ * persisted records remain available to evict; if it alone cannot fit, it is
+ * demoted to RAM-only rather than violating the declared disk cap. */
+static inline void coli_prefix_enforce_disk_budget(ColiPrefixCache *cache,
+                                                    ColiPrefixCacheEntry *protect) {
+    if (!cache || !(cache->policy & COLI_PREFIX_CACHE_SSD)) return;
+    cache->disk_live_bytes = coli_prefix_recompute_disk_live(cache);
+    while (cache->disk_budget_bytes && cache->disk_live_bytes > cache->disk_budget_bytes) {
+        size_t victim = coli_prefix_oldest_index(cache, protect, 0, 1);
+        if (victim == cache->count) {
+            if (protect && protect->disk_record_bytes) {
+                size_t p = cache->count;
+                for (size_t i = 0; i < cache->count; ++i)
+                    if (cache->entries[i] == protect) { p = i; break; }
+                if (p < cache->count) coli_prefix_drop_disk_copy(cache, p);
+            }
+            break;
         }
-        free(e->snapshot);
-        e->snapshot = NULL;
-        cache->ram_resident_bytes -= e->snapshot_bytes;
-        cache->stats.evictions_ram++;
+        coli_prefix_drop_disk_copy(cache, victim);
     }
 }
 
+/* RAM budget includes both payloads and index metadata. Persisted payloads are
+ * demoted first. RAM-only payloads or metadata-only entries are evicted whole.
+ * Return nonzero when an indexed persisted record was removed and disk rewrite
+ * should compact it away. */
+static inline int coli_prefix_enforce_ram_budget(ColiPrefixCache *cache,
+                                                  ColiPrefixCacheEntry *protect) {
+    if (!cache) return 0;
+    int disk_dirty = 0;
+    while (cache->ram_resident_bytes > cache->ram_budget_bytes) {
+        size_t victim = coli_prefix_oldest_index(cache, protect, 1, 0);
+        if (victim < cache->count) {
+            ColiPrefixCacheEntry *e = cache->entries[victim];
+            if (e->disk_record_bytes && e->disk_snapshot_offset) {
+                free(e->snapshot);
+                e->snapshot = NULL;
+                cache->ram_resident_bytes -= e->snapshot_bytes;
+                cache->stats.evictions_ram++;
+                continue;
+            }
+            if (e->disk_record_bytes) disk_dirty = 1;
+            coli_prefix_remove_index(cache, victim, 1, e->disk_record_bytes != 0);
+            continue;
+        }
+
+        /* Snapshot demotion was insufficient: metadata itself is over budget. */
+        victim = coli_prefix_oldest_index(cache, protect, 0, 0);
+        if (victim == cache->count) {
+            /* A protected entry cannot be allowed to violate a hard budget. */
+            if (protect) {
+                for (size_t i = 0; i < cache->count; ++i) {
+                    if (cache->entries[i] != protect) continue;
+                    if (protect->snapshot && protect->disk_record_bytes &&
+                        protect->disk_snapshot_offset) {
+                        free(protect->snapshot);
+                        protect->snapshot = NULL;
+                        cache->ram_resident_bytes -= protect->snapshot_bytes;
+                        cache->stats.evictions_ram++;
+                        protect = NULL;
+                        break;
+                    }
+                    if (protect->disk_record_bytes) disk_dirty = 1;
+                    coli_prefix_remove_index(cache, i, 1,
+                                             protect->disk_record_bytes != 0);
+                    protect = NULL;
+                    break;
+                }
+                continue;
+            }
+            break;
+        }
+        if (cache->entries[victim]->disk_record_bytes) disk_dirty = 1;
+        coli_prefix_remove_index(cache, victim, 1,
+                                 cache->entries[victim]->disk_record_bytes != 0);
+    }
+    return disk_dirty;
+}
+
+/* Rebuild only entries explicitly marked persisted. RAM-only entries are never
+ * accidentally promoted to disk by compaction. */
 static inline int coli_prefix_cache_rewrite_disk(ColiPrefixCache *cache) {
     if (!cache || !(cache->policy & COLI_PREFIX_CACHE_SSD) || !cache->disk_path[0])
         return 0;
@@ -303,11 +409,12 @@ static inline int coli_prefix_cache_rewrite_disk(ColiPrefixCache *cache) {
     if (coli_prefix_file_header_write(out) != 0) { fclose(out); remove(temp); return -1; }
 
     uint64_t new_snapshot_offsets[COLI_PREFIX_CACHE_MAX_ENTRIES] = {0};
-    uint64_t new_record_bytes[COLI_PREFIX_CACHE_MAX_ENTRIES] = {0};
     uint64_t live = sizeof(ColiPrefixFileHeader);
-
+    int any = 0;
     for (size_t i = 0; i < cache->count; ++i) {
         ColiPrefixCacheEntry *e = cache->entries[i];
+        if (!e->disk_record_bytes) continue;
+        any = 1;
         unsigned char *owned = NULL;
         const unsigned char *blob = e->snapshot;
         if (!blob) {
@@ -317,7 +424,8 @@ static inline int coli_prefix_cache_rewrite_disk(ColiPrefixCache *cache) {
         }
         uint64_t rec_bytes = coli_prefix_record_bytes(
             e->token_count, e->segment_count, e->snapshot_bytes);
-        if (rec_bytes == UINT64_MAX || UINT64_MAX - live < rec_bytes) {
+        if (rec_bytes == UINT64_MAX || rec_bytes != e->disk_record_bytes ||
+            UINT64_MAX - live < rec_bytes) {
             free(owned); fclose(out); remove(temp); return -1;
         }
         ColiPrefixRecordHeader h;
@@ -344,32 +452,20 @@ static inline int coli_prefix_cache_rewrite_disk(ColiPrefixCache *cache) {
         }
         free(owned);
         new_snapshot_offsets[i] = (uint64_t)snapshot_pos;
-        new_record_bytes[i] = rec_bytes;
+        e->payload_crc32c = h.payload_crc32c;
         live += rec_bytes;
     }
-    if (fflush(out) != 0 || fclose(out) != 0) { remove(temp); return -1; }
-    if (rename(temp, cache->disk_path) != 0) { remove(temp); return -1; }
-    cache->disk_live_bytes = live;
-    for (size_t i = 0; i < cache->count; ++i) {
-        cache->entries[i]->disk_snapshot_offset = new_snapshot_offsets[i];
-        cache->entries[i]->disk_record_bytes = new_record_bytes[i];
-        cache->entries[i]->payload_crc32c = cache->entries[i]->snapshot
-            ? coli_prefix_entry_crc(cache->entries[i], cache->entries[i]->snapshot)
-            : cache->entries[i]->payload_crc32c;
-    }
-    cache->stats.write_bytes += live;
-    return 0;
-}
 
-static inline void coli_prefix_enforce_disk_budget(ColiPrefixCache *cache,
-                                                    ColiPrefixCacheEntry *protect) {
-    if (!cache || !(cache->policy & COLI_PREFIX_CACHE_SSD)) return;
-    while (cache->disk_budget_bytes &&
-           cache->disk_live_bytes > cache->disk_budget_bytes) {
-        size_t victim = coli_prefix_oldest_index(cache, protect, 0);
-        if (victim == cache->count) break;
-        coli_prefix_cache_drop_index(cache, victim, 1);
+    if (coli_prefix_flush_durable(out) != 0 || fclose(out) != 0) {
+        remove(temp); return -1;
     }
+    if (rename(temp, cache->disk_path) != 0) { remove(temp); return -1; }
+    cache->disk_live_bytes = any ? live : 0;
+    for (size_t i = 0; i < cache->count; ++i)
+        cache->entries[i]->disk_snapshot_offset = cache->entries[i]->disk_record_bytes
+            ? new_snapshot_offsets[i] : 0;
+    cache->stats.write_bytes += any ? live : sizeof(ColiPrefixFileHeader);
+    return 0;
 }
 
 static inline int coli_prefix_cache_load_index(ColiPrefixCache *cache) {
@@ -378,20 +474,50 @@ static inline int coli_prefix_cache_load_index(ColiPrefixCache *cache) {
     FILE *f = fopen(cache->disk_path, "rb");
     if (!f) return errno == ENOENT ? 0 : -1;
     if (coli_prefix_file_header_read(f) != 0) { fclose(f); return -1; }
-    cache->disk_live_bytes = sizeof(ColiPrefixFileHeader);
-    while (cache->count < COLI_PREFIX_CACHE_MAX_ENTRIES) {
+    uint64_t physical_live = sizeof(ColiPrefixFileHeader);
+    while (1) {
         ColiPrefixRecordHeader h;
         size_t got = fread(&h, 1, sizeof(h), f);
         if (!got) break;
         if (got != sizeof(h) || h.magic != COLI_PREFIX_CACHE_RECORD_MAGIC ||
             !h.token_count || h.token_count > COLI_PREFIX_CACHE_MAX_TOKENS ||
             !h.segment_count || h.segment_count > COLI_PREFIX_CACHE_MAX_SEGMENTS ||
-            !h.state_abi || !h.snapshot_bytes || h.snapshot_bytes > SIZE_MAX)
-            { cache->stats.corrupt_entries++; break; }
+            !h.state_abi || !h.snapshot_bytes || h.snapshot_bytes > SIZE_MAX) {
+            cache->stats.corrupt_entries++; break;
+        }
         uint64_t expected = coli_prefix_record_bytes(
             h.token_count, h.segment_count, h.snapshot_bytes);
-        if (expected == UINT64_MAX || expected != h.record_bytes)
-            { cache->stats.corrupt_entries++; break; }
+        if (expected == UINT64_MAX || expected != h.record_bytes ||
+            UINT64_MAX - physical_live < h.record_bytes) {
+            cache->stats.corrupt_entries++; break;
+        }
+        physical_live += h.record_bytes;
+
+        size_t token_bytes, segment_bytes, meta = sizeof(ColiPrefixCacheEntry);
+        if (coli_prefix_size_mul(h.token_count, sizeof(int), &token_bytes) != 0 ||
+            coli_prefix_size_mul(h.segment_count, sizeof(ColiSequenceSegmentDesc),
+                                 &segment_bytes) != 0 ||
+            coli_prefix_size_add(meta, token_bytes, &meta) != 0 ||
+            coli_prefix_size_add(meta, segment_bytes, &meta) != 0) {
+            fclose(f); return -1;
+        }
+
+        long long token_pos = (long long)coli_prefix_ftell(f);
+        if (token_pos <= 0) { cache->stats.corrupt_entries++; break; }
+        uint64_t skip = (uint64_t)token_bytes + (uint64_t)segment_bytes + h.snapshot_bytes;
+        if (skip > INT64_MAX) { cache->stats.corrupt_entries++; break; }
+
+        /* An SSD cache still needs bounded RAM for its exact-token index. Skip
+         * records whose metadata cannot fit rather than violating RAM policy. */
+        if (cache->count == COLI_PREFIX_CACHE_MAX_ENTRIES ||
+            meta > cache->ram_budget_bytes ||
+            cache->ram_resident_bytes > cache->ram_budget_bytes - meta) {
+            if (coli_prefix_fseek(f, (long long)skip, SEEK_CUR) != 0) {
+                cache->stats.corrupt_entries++; break;
+            }
+            cache->stats.evictions_ram++;
+            continue;
+        }
 
         ColiPrefixCacheEntry *e = (ColiPrefixCacheEntry *)calloc(1, sizeof(*e));
         if (!e) { fclose(f); return -1; }
@@ -402,14 +528,6 @@ static inline int coli_prefix_cache_load_index(ColiPrefixCache *cache) {
         e->payload_crc32c = h.payload_crc32c;
         e->ns.state_abi = h.state_abi;
         memcpy(e->ns.fingerprint, h.fingerprint, sizeof(h.fingerprint));
-        size_t token_bytes, segment_bytes, meta = sizeof(*e);
-        if (coli_prefix_size_mul(e->token_count, sizeof(int), &token_bytes) != 0 ||
-            coli_prefix_size_mul(e->segment_count, sizeof(ColiSequenceSegmentDesc),
-                                 &segment_bytes) != 0 ||
-            coli_prefix_size_add(meta, token_bytes, &meta) != 0 ||
-            coli_prefix_size_add(meta, segment_bytes, &meta) != 0) {
-            coli_prefix_entry_free(e); fclose(f); return -1;
-        }
         e->metadata_bytes = meta;
         e->tokens = (int *)malloc(token_bytes);
         e->segments = (ColiSequenceSegmentDesc *)malloc(segment_bytes);
@@ -418,24 +536,30 @@ static inline int coli_prefix_cache_load_index(ColiPrefixCache *cache) {
             fread(e->segments, 1, segment_bytes, f) != segment_bytes) {
             coli_prefix_entry_free(e); cache->stats.corrupt_entries++; break;
         }
-        for (uint32_t s = 0; s < e->segment_count; ++s)
+        for (uint32_t s = 0; s < e->segment_count; ++s) {
             if (!coli_sequence_segment_valid(&e->segments[s])) {
                 coli_prefix_entry_free(e); cache->stats.corrupt_entries++;
                 fclose(f); return -1;
             }
-        long long pos = (long long)coli_prefix_ftell(f);
-        if (pos <= 0 || coli_prefix_fseek(f, (long long)e->snapshot_bytes, SEEK_CUR) != 0) {
+            for (uint32_t p = 0; p < s; ++p)
+                if (e->segments[p].segment_id == e->segments[s].segment_id) {
+                    coli_prefix_entry_free(e); cache->stats.corrupt_entries++;
+                    fclose(f); return -1;
+                }
+        }
+        long long snapshot_pos = (long long)coli_prefix_ftell(f);
+        if (snapshot_pos <= 0 ||
+            coli_prefix_fseek(f, (long long)e->snapshot_bytes, SEEK_CUR) != 0) {
             coli_prefix_entry_free(e); cache->stats.corrupt_entries++; break;
         }
-        e->disk_snapshot_offset = (uint64_t)pos;
+        e->disk_snapshot_offset = (uint64_t)snapshot_pos;
         e->disk_record_bytes = h.record_bytes;
         e->last_used = ++cache->clock;
         cache->entries[cache->count++] = e;
         cache->ram_resident_bytes += e->metadata_bytes;
-        cache->disk_live_bytes += e->disk_record_bytes;
     }
     fclose(f);
-    coli_prefix_enforce_ram_budget(cache, NULL);
+    cache->disk_live_bytes = physical_live;
     return 0;
 }
 
@@ -488,7 +612,8 @@ static inline int coli_prefix_cache_promote_blob(ColiPrefixCache *cache,
                                                   unsigned char *blob) {
     if (!cache || !entry || !blob) return -1;
     if (!(cache->policy & COLI_PREFIX_CACHE_RAM) ||
-        entry->metadata_bytes + entry->snapshot_bytes > cache->ram_budget_bytes)
+        entry->metadata_bytes > cache->ram_budget_bytes ||
+        entry->snapshot_bytes > cache->ram_budget_bytes - entry->metadata_bytes)
         return 0;
     entry->snapshot = blob;
     cache->ram_resident_bytes += entry->snapshot_bytes;
@@ -592,6 +717,9 @@ static inline int coli_prefix_cache_store(
         coli_prefix_entry_free(e); return -1;
     }
     e->metadata_bytes = meta;
+    if (e->metadata_bytes > cache->ram_budget_bytes) {
+        coli_prefix_entry_free(e); return 0;
+    }
     e->tokens = (int *)malloc(token_bytes);
     e->segments = (ColiSequenceSegmentDesc *)malloc(segment_bytes);
     if (!e->tokens || !e->segments) { coli_prefix_entry_free(e); return -1; }
@@ -616,44 +744,62 @@ static inline int coli_prefix_cache_store(
         coli_prefix_entry_free(e); return -1;
     }
     e->payload_crc32c = coli_prefix_entry_crc(e, e->snapshot);
-    e->disk_record_bytes = coli_prefix_record_bytes(
+    uint64_t rec_bytes = coli_prefix_record_bytes(
         e->token_count, e->segment_count, e->snapshot_bytes);
+    if (rec_bytes == UINT64_MAX) { coli_prefix_entry_free(e); return -1; }
     e->last_used = ++cache->clock;
 
     if (cache->count == COLI_PREFIX_CACHE_MAX_ENTRIES) {
-        size_t victim = coli_prefix_oldest_index(cache, NULL, 0);
-        coli_prefix_cache_drop_index(cache, victim, 1);
+        size_t victim = coli_prefix_oldest_index(cache, NULL, 0, 0);
+        if (victim < cache->count)
+            coli_prefix_remove_index(cache, victim, 1,
+                                     cache->entries[victim]->disk_record_bytes != 0);
     }
     cache->entries[cache->count++] = e;
     cache->ram_resident_bytes += coli_prefix_entry_ram_bytes(e);
-    cache->disk_live_bytes += e->disk_record_bytes;
 
     if ((cache->policy & COLI_PREFIX_CACHE_SSD) && cache->disk_budget_bytes &&
-        e->disk_record_bytes + sizeof(ColiPrefixFileHeader) > cache->disk_budget_bytes) {
-        /* Too large for the declared cold tier. Keep only if RAM policy can own it. */
-        cache->disk_live_bytes -= e->disk_record_bytes;
-        e->disk_record_bytes = 0;
-        if (!(cache->policy & COLI_PREFIX_CACHE_RAM)) {
-            coli_prefix_cache_drop_index(cache, cache->count - 1, 0);
-            return 0;
+        rec_bytes <= cache->disk_budget_bytes &&
+        sizeof(ColiPrefixFileHeader) <= cache->disk_budget_bytes - rec_bytes) {
+        e->disk_record_bytes = rec_bytes;
+        cache->disk_live_bytes = coli_prefix_recompute_disk_live(cache);
+        coli_prefix_enforce_disk_budget(cache, e);
+        if (e->disk_record_bytes) {
+            if (coli_prefix_cache_rewrite_disk(cache) != 0) {
+                /* Existing cache file remains intact because publication uses a
+                 * temporary path. Treat this admission as RAM-only. */
+                e->disk_record_bytes = 0;
+                e->disk_snapshot_offset = 0;
+                cache->disk_live_bytes = coli_prefix_recompute_disk_live(cache);
+            }
         }
     }
 
-    if (e->disk_record_bytes) {
-        coli_prefix_enforce_disk_budget(cache, e);
-        if (coli_prefix_cache_rewrite_disk(cache) != 0) {
-            /* Persistence failure must not corrupt inference. The entry remains
-             * a RAM optimization if RAM is enabled, otherwise discard it. */
-            if (!(cache->policy & COLI_PREFIX_CACHE_RAM)) {
-                size_t idx = coli_prefix_find_exact_index(cache, ns, tokens, token_count);
-                if (idx < cache->count) coli_prefix_cache_drop_index(cache, idx, 0);
+    /* If persistence succeeded, the new payload may be demoted immediately.
+     * No entry is permitted to remain protected above the hard RAM cap. */
+    int disk_dirty = coli_prefix_enforce_ram_budget(cache, NULL);
+    if (disk_dirty && (cache->policy & COLI_PREFIX_CACHE_SSD) && cache->disk_path[0])
+        (void)coli_prefix_cache_rewrite_disk(cache);
+
+    /* In SSD-only mode, a successfully persisted snapshot should not consume
+     * hot-payload RAM even if the metadata budget had room for it. */
+    size_t idx = coli_prefix_find_exact_index(cache, ns, tokens, token_count);
+    if (idx < cache->count) {
+        e = cache->entries[idx];
+        if (!(cache->policy & COLI_PREFIX_CACHE_RAM) && e->snapshot) {
+            if (e->disk_record_bytes && e->disk_snapshot_offset) {
+                free(e->snapshot);
+                e->snapshot = NULL;
+                cache->ram_resident_bytes -= e->snapshot_bytes;
+            } else {
+                coli_prefix_remove_index(cache, idx, 1, 0);
                 return 0;
             }
-            e->disk_snapshot_offset = 0;
-            e->disk_record_bytes = 0;
         }
+    } else {
+        return 0;
     }
-    coli_prefix_enforce_ram_budget(cache, e);
+
     cache->stats.stores++;
     return 1;
 }
