@@ -2,6 +2,8 @@
 #define _GNU_SOURCE
 #endif
 #include "../profile.h"
+#include "../metal_policy.h"
+#include "../metal_runtime.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,7 +18,117 @@ static const ColiProfileCounterDef counters[] = {
     {"bytes"}, {"hits"},
 };
 
+static int fake_metal_init_result;
+static int fake_metal_init_calls;
+static int fake_metal_shutdown_calls;
+static int fake_metal_init(void) {
+    fake_metal_init_calls++;
+    return fake_metal_init_result;
+}
+static void fake_metal_shutdown(void) {
+    fake_metal_shutdown_calls++;
+}
+
+static int test_metal_policy(void) {
+    ColiMetalPolicyResolution r;
+    ColiMetalRuntime runtime;
+    char error[160];
+
+    if (coli_metal_policy_resolve_values(
+            "strict", "QWEN_METAL_COMPUTE", "0", COLI_METAL_POLICY_OFF,
+            &r, error, sizeof(error)) != 0 ||
+        r.policy != COLI_METAL_POLICY_STRICT ||
+        r.source != COLI_METAL_POLICY_SOURCE_GLOBAL ||
+        strcmp(r.source_name, "COLI_METAL") != 0)
+        return 20;
+
+    if (coli_metal_policy_resolve_values(
+            NULL, "QWEN_METAL_COMPUTE", "1", COLI_METAL_POLICY_OFF,
+            &r, error, sizeof(error)) != 0 ||
+        r.policy != COLI_METAL_POLICY_ON ||
+        r.source != COLI_METAL_POLICY_SOURCE_LEGACY)
+        return 21;
+
+    if (coli_metal_policy_resolve_values(
+            NULL, "V4_METAL_EXPERTS", "0", COLI_METAL_POLICY_AUTO,
+            &r, error, sizeof(error)) != 0 ||
+        r.policy != COLI_METAL_POLICY_OFF ||
+        r.source != COLI_METAL_POLICY_SOURCE_LEGACY)
+        return 22;
+
+    if (coli_metal_policy_resolve_values(
+            NULL, NULL, NULL, COLI_METAL_POLICY_AUTO,
+            &r, error, sizeof(error)) != 0 ||
+        r.policy != COLI_METAL_POLICY_AUTO ||
+        r.source != COLI_METAL_POLICY_SOURCE_DEFAULT)
+        return 23;
+
+    if (coli_metal_policy_resolve_values(
+            "OFF", "QWEN_METAL_COMPUTE", "1", COLI_METAL_POLICY_AUTO,
+            &r, error, sizeof(error)) != 0 ||
+        r.policy != COLI_METAL_POLICY_OFF)
+        return 24;
+
+    memset(error, 0, sizeof(error));
+    if (coli_metal_policy_resolve_values(
+            "sometimes", NULL, NULL, COLI_METAL_POLICY_OFF,
+            &r, error, sizeof(error)) == 0 ||
+        !strstr(error, "invalid COLI_METAL"))
+        return 25;
+
+    memset(error, 0, sizeof(error));
+    if (coli_metal_policy_resolve_values(
+            NULL, "QWEN_METAL_COMPUTE", "strict", COLI_METAL_POLICY_OFF,
+            &r, error, sizeof(error)) == 0 ||
+        !strstr(error, "legacy Metal flags accept 0|1"))
+        return 26;
+
+    if (strcmp(coli_metal_policy_name(COLI_METAL_POLICY_AUTO), "auto") != 0 ||
+        !coli_metal_policy_should_init(COLI_METAL_POLICY_AUTO) ||
+        coli_metal_policy_should_init(COLI_METAL_POLICY_OFF) ||
+        !coli_metal_policy_is_strict(COLI_METAL_POLICY_STRICT))
+        return 27;
+
+    fake_metal_init_result = 1;
+    fake_metal_init_calls = fake_metal_shutdown_calls = 0;
+    if (coli_metal_runtime_open_values(
+            &runtime, 1, "auto", NULL, NULL, COLI_METAL_POLICY_OFF,
+            fake_metal_init, error, sizeof(error)) != 0 ||
+        !coli_metal_runtime_enabled(&runtime) || fake_metal_init_calls != 1)
+        return 28;
+    coli_metal_runtime_close(&runtime, fake_metal_shutdown);
+    if (fake_metal_shutdown_calls != 1 || coli_metal_runtime_enabled(&runtime))
+        return 29;
+
+    fake_metal_init_result = 0;
+    fake_metal_init_calls = 0;
+    if (coli_metal_runtime_open_values(
+            &runtime, 1, "auto", NULL, NULL, COLI_METAL_POLICY_OFF,
+            fake_metal_init, error, sizeof(error)) != 0 ||
+        coli_metal_runtime_enabled(&runtime) || fake_metal_init_calls != 1)
+        return 30;
+
+    memset(error, 0, sizeof(error));
+    if (coli_metal_runtime_open_values(
+            &runtime, 1, "strict", NULL, NULL, COLI_METAL_POLICY_OFF,
+            fake_metal_init, error, sizeof(error)) == 0 ||
+        !strstr(error, "backend is unavailable"))
+        return 31;
+
+    fake_metal_init_calls = 0;
+    if (coli_metal_runtime_open_values(
+            &runtime, 1, "0", NULL, NULL, COLI_METAL_POLICY_AUTO,
+            fake_metal_init, error, sizeof(error)) != 0 ||
+        fake_metal_init_calls != 0 || coli_metal_runtime_enabled(&runtime))
+        return 32;
+
+    return 0;
+}
+
 int main(void) {
+    int metal_rc = test_metal_policy();
+    if (metal_rc) return metal_rc;
+
 #ifdef _WIN32
     _putenv_s("COLI_PROFILE", "1");
 #else
@@ -65,6 +177,6 @@ int main(void) {
 #endif
     coli_profile_reset(&p, &config);
     if (coli_profile_enabled(&p)) return 5;
-    puts("PASS generic profile");
+    puts("PASS generic profile + metal policy/runtime");
     return 0;
 }
