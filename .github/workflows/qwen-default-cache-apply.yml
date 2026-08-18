@@ -20,7 +20,8 @@ jobs:
         run: python3 .github/scripts/apply_qwen_default_cache.py
       - name: Validate
         run: |
-          make -C c test-qwen-prefix-cache
+          make -C c tests/test_qwen_prefix_cache
+          ./c/tests/test_qwen_prefix_cache
           make -C c qwen_moe ARCH=x86-64-v3
       - name: Publish implementation
         run: |
