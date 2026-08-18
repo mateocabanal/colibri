@@ -106,7 +106,7 @@ static void configure_cache(void) {
     if (!base || !*base) base = ".";
     snprintf(dir, sizeof(dir), "%s/coli-v4-prefix-disk-%lu-%llu", base,
              (unsigned long)getpid(), (unsigned long long)time(NULL));
-    _putenv_s("COLI_PREFIX_CACHE", "auto");
+    _putenv_s("COLI_PREFIX_CACHE", "ssd");
     _putenv_s("COLI_PREFIX_CACHE_DIR", dir);
     _putenv_s("COLI_PREFIX_CACHE_DISK_GB", "0.125");
     _putenv_s("COLI_PREFIX_CACHE_MIN_FREE_GB", "0");
@@ -115,7 +115,7 @@ static void configure_cache(void) {
 #else
     snprintf(dir, sizeof(dir), "/tmp/coli-v4-prefix-disk-%lu-%llu",
              (unsigned long)getpid(), (unsigned long long)time(NULL));
-    setenv("COLI_PREFIX_CACHE", "auto", 1);
+    setenv("COLI_PREFIX_CACHE", "ssd", 1);
     setenv("COLI_PREFIX_CACHE_DIR", dir, 1);
     setenv("COLI_PREFIX_CACHE_DISK_GB", "0.125", 1);
     setenv("COLI_PREFIX_CACHE_MIN_FREE_GB", "0", 1);
@@ -124,11 +124,11 @@ static void configure_cache(void) {
 #endif
 }
 
-static void disk_off_for_cold_engine(void) {
+static void cache_off_for_cold_engine(void) {
 #ifdef _WIN32
-    _putenv_s("COLI_PREFIX_CACHE", "ram");
+    _putenv_s("COLI_PREFIX_CACHE", "off");
 #else
-    setenv("COLI_PREFIX_CACHE", "ram", 1);
+    setenv("COLI_PREFIX_CACHE", "off", 1);
 #endif
 }
 
@@ -149,9 +149,19 @@ int main(int argc, char **argv) {
     if (open_engine(&a_engine, model, error, sizeof(error)) ||
         open_session(&a, a_engine, error, sizeof(error)) ||
         generate(a, prefix, error, sizeof(error))) {
-        fprintf(stderr, "writer generation failed: %s\n", error);
+        fprintf(stderr, "SSD-only writer generation failed: %s\n", error);
         goto cleanup;
     }
+
+    ColiV4PrefixCacheStats ram_stats = {0};
+    coli_v4_prefix_cache_stats(&ram_stats);
+    if (ram_stats.budget_bytes || ram_stats.entries || ram_stats.resident_bytes) {
+        fprintf(stderr,
+                "SSD-only writer unexpectedly retained RAM prefix state: budget=%zu entries=%zu resident=%zu\n",
+                ram_stats.budget_bytes, ram_stats.entries, ram_stats.resident_bytes);
+        goto cleanup;
+    }
+
     if (!a->prompt_ids || a->prompt_count <= 0 ||
         decode_token_string(a, a->prompt_ids, 1, &extension)) {
         fprintf(stderr, "writer did not retain a usable prompt\n");
@@ -161,8 +171,8 @@ int main(int argc, char **argv) {
     extended = append_text(prefix, extension);
     if (!extended) goto cleanup;
 
-    /* Destroying the engine retires all process-local entries. The immutable
-     * SSD object must survive this boundary. */
+    /* No RAM cache entry exists in SSD-only mode. Destroying engine A also
+     * exercises namespace retirement; only the immutable SSD object survives. */
     coli_v4_session_destroy(a); a = NULL;
     coli_v4_engine_destroy(a_engine); a_engine = NULL;
 
@@ -170,7 +180,7 @@ int main(int argc, char **argv) {
     if (open_engine(&b_engine, model, error, sizeof(error)) ||
         open_session(&b, b_engine, error, sizeof(error)) ||
         generate(b, extended, error, sizeof(error))) {
-        fprintf(stderr, "restart generation failed: %s\n", error);
+        fprintf(stderr, "SSD-only restart generation failed: %s\n", error);
         goto cleanup;
     }
     if (b->prefix_reused != base_tokens) {
@@ -183,9 +193,10 @@ int main(int argc, char **argv) {
     coli_v4_session_destroy(b); b = NULL;
     coli_v4_engine_destroy(b_engine); b_engine = NULL;
 
-    /* Same process, new engine, but no SSD registration. Process RAM entries
-     * were retired with engine B, so this is a genuine cold oracle. */
-    disk_off_for_cold_engine();
+    /* Disable both tiers before opening the oracle engine. The global RAM cache
+     * was initialized with a zero budget by SSD-only mode, so this is a genuine
+     * cold execution with no process or persistent reuse path. */
+    cache_off_for_cold_engine();
     memset(error, 0, sizeof(error));
     if (open_engine(&cold_engine, model, error, sizeof(error)) ||
         open_session(&cold, cold_engine, error, sizeof(error)) ||
@@ -204,7 +215,7 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
 
-    printf("PASS V4 persistent prefix cache: restored %d tokens after engine restart; 4-token output identical to cold execution\n",
+    printf("PASS V4 SSD-only prefix cache: zero RAM-hot bytes, restored %d tokens after engine restart; 4-token output identical to cold execution\n",
            base_tokens);
     status = 0;
 

@@ -68,8 +68,14 @@ static void coli_v4_cached_kv_prefix_record(kv_prefix *prefix,
      * state coverage equals prompt_count. Decode/speculative records point at
      * generated/input temporaries instead and therefore cannot admit here. */
     if (ids == session->prompt_ids + position &&
-        prefix->len == session->prompt_count && !prefix->tainted)
+        prefix->len == session->prompt_count && !prefix->tainted) {
         coli_v4_prefix_cache_store(session);
+        /* If the RAM tier captured the boundary this is a cheap exact-entry
+         * check and SSD publication stays post-generation. In SSD-only mode or
+         * when RAM admission cannot fit, persist the live state now while it
+         * still denotes the canonical pre-decode prompt boundary. */
+        coli_v4_prefix_disk_publish_live_prefix(session);
+    }
 }
 
 #define kv_prefix_reuse coli_v4_cached_kv_prefix_reuse
@@ -107,8 +113,8 @@ int coli_v4_session_generate(ColiV4Session *session,
      * it remains the exact immutable request prefix even though live attention
      * state has advanced. Stream that pinned entry now: SSD I/O is outside TTFT
      * and token streaming, at the cost of delaying return/DONE in this first
-     * bounded implementation. A later shared writer queue can make this fully
-     * asynchronous without changing the payload or cache API. */
+     * bounded implementation. If no RAM entry existed, the end-of-prefill hook
+     * already used the live one-layer-at-a-time publisher instead. */
     if (!result)
         coli_v4_prefix_disk_publish_session(session);
 
