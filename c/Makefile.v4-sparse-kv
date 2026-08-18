@@ -1,0 +1,17 @@
+CC ?= cc
+CFLAGS ?= -O2 -Wall -Wextra -Werror
+EXE :=
+ifeq ($(OS),Windows_NT)
+EXE := .exe
+endif
+
+.PHONY: check clean
+
+check: test_v4_sparse_kv$(EXE)
+	./test_v4_sparse_kv$(EXE)
+
+test_v4_sparse_kv$(EXE): tests/test_v4_sparse_kv.c coli_v4_sparse_kv.h
+	$(CC) $(CFLAGS) tests/test_v4_sparse_kv.c -o $@
+
+clean:
+	rm -f test_v4_sparse_kv test_v4_sparse_kv.exe
