@@ -48,6 +48,9 @@ typedef struct {
     ColiRecordIoKey key;
     uint64_t generation;
     ColiRecordIoPriority priority;
+    /* OWNER/JOIN participate in the in-flight waiter count and must release.
+     * READY hits do not, so releasing a hit is a harmless handle clear. */
+    int retained;
 } ColiRecordIoHandle;
 
 static inline int coli_record_io_key_equal(ColiRecordIoKey a,
@@ -83,8 +86,23 @@ static inline void coli_record_io_escalate(ColiRecordIoEntry *entry,
                memory_order_acq_rel, memory_order_acquire)) {}
 }
 
+static inline void coli_record_io_fill_handle(ColiRecordIoHandle *handle,
+                                               ColiRecordIoEntry *entry,
+                                               uint64_t generation,
+                                               ColiRecordIoPriority priority,
+                                               int retained) {
+    memset(handle, 0, sizeof(*handle));
+    handle->entry = entry;
+    handle->key = entry->key;
+    handle->generation = generation;
+    handle->priority = priority;
+    handle->retained = retained;
+}
+
 /* The generation identifies one physical read/prepare attempt. One contender
- * owns IDLE/FAILED/CANCELLED -> QUEUED; all others join that generation. */
+ * owns IDLE/FAILED/CANCELLED -> QUEUED; all others join that generation.
+ * Failed/cancelled attempts cannot be reused until every old retained handle
+ * has been reaped, preventing generation advance from invalidating releases. */
 static inline ColiRecordIoRequestResult coli_record_io_request(
         ColiRecordIoEntry *entry, ColiRecordIoPriority priority,
         ColiRecordIoHandle *handle) {
@@ -99,10 +117,7 @@ static inline ColiRecordIoRequestResult coli_record_io_request(
             uint64_t generation = atomic_load_explicit(
                 &entry->generation, memory_order_acquire);
             if (!generation) return COLI_RECORD_IO_INVALID;
-            handle->entry = entry;
-            handle->key = entry->key;
-            handle->generation = generation;
-            handle->priority = priority;
+            coli_record_io_fill_handle(handle, entry, generation, priority, 0);
             return COLI_RECORD_IO_HIT;
         }
         if (state == COLI_RECORD_IO_QUEUED || state == COLI_RECORD_IO_READING) {
@@ -113,11 +128,9 @@ static inline ColiRecordIoRequestResult coli_record_io_request(
                                           memory_order_acq_rel);
             uint64_t generation = atomic_load_explicit(
                 &entry->generation, memory_order_acquire);
+            int after = atomic_load_explicit(&entry->state, memory_order_acquire);
             if (!generation ||
-                (atomic_load_explicit(&entry->state, memory_order_acquire) !=
-                    COLI_RECORD_IO_QUEUED &&
-                 atomic_load_explicit(&entry->state, memory_order_acquire) !=
-                    COLI_RECORD_IO_READING)) {
+                (after != COLI_RECORD_IO_QUEUED && after != COLI_RECORD_IO_READING)) {
                 atomic_fetch_sub_explicit(&entry->waiters, 1,
                                           memory_order_acq_rel);
                 if (priority == COLI_RECORD_IO_BLOCKING)
@@ -125,14 +138,15 @@ static inline ColiRecordIoRequestResult coli_record_io_request(
                                               memory_order_acq_rel);
                 continue;
             }
-            handle->entry = entry;
-            handle->key = entry->key;
-            handle->generation = generation;
-            handle->priority = priority;
+            coli_record_io_fill_handle(handle, entry, generation, priority, 1);
             return COLI_RECORD_IO_JOIN;
         }
         if (state != COLI_RECORD_IO_IDLE && state != COLI_RECORD_IO_FAILED &&
             state != COLI_RECORD_IO_CANCELLED)
+            return COLI_RECORD_IO_INVALID;
+
+        if (atomic_load_explicit(&entry->waiters, memory_order_acquire) != 0 ||
+            atomic_load_explicit(&entry->blocking_waiters, memory_order_acquire) != 0)
             return COLI_RECORD_IO_INVALID;
 
         int expected = state;
@@ -140,6 +154,15 @@ static inline ColiRecordIoRequestResult coli_record_io_request(
                 &entry->state, &expected, COLI_RECORD_IO_QUEUED,
                 memory_order_acq_rel, memory_order_acquire))
             continue;
+
+        /* Recheck after winning the state CAS. A final old-handle release can
+         * race this transition only if the old attempt had not actually been
+         * fully reaped; fail back to the terminal state instead of advancing. */
+        if (atomic_load_explicit(&entry->waiters, memory_order_acquire) != 0 ||
+            atomic_load_explicit(&entry->blocking_waiters, memory_order_acquire) != 0) {
+            atomic_store_explicit(&entry->state, state, memory_order_release);
+            return COLI_RECORD_IO_INVALID;
+        }
 
         uint64_t generation = atomic_fetch_add_explicit(
             &entry->generation, 1, memory_order_acq_rel) + 1;
@@ -150,16 +173,13 @@ static inline ColiRecordIoRequestResult coli_record_io_request(
                               memory_order_release);
         atomic_store_explicit(&entry->stored_bytes, 0, memory_order_release);
         atomic_store_explicit(&entry->error_code, 0, memory_order_release);
-        handle->entry = entry;
-        handle->key = entry->key;
-        handle->generation = generation;
-        handle->priority = priority;
+        coli_record_io_fill_handle(handle, entry, generation, priority, 1);
         return COLI_RECORD_IO_OWNER;
     }
 }
 
 static inline int coli_record_io_begin_read(ColiRecordIoHandle *handle) {
-    if (!handle || !handle->entry || !handle->generation ||
+    if (!handle || !handle->entry || !handle->generation || !handle->retained ||
         atomic_load_explicit(&handle->entry->generation, memory_order_acquire) !=
             handle->generation)
         return -1;
@@ -173,7 +193,8 @@ static inline int coli_record_io_begin_read(ColiRecordIoHandle *handle) {
  * N can never publish bytes after the entry has advanced to generation N+1. */
 static inline int coli_record_io_complete(ColiRecordIoHandle *handle,
                                           uint64_t stored_bytes) {
-    if (!handle || !handle->entry || !handle->generation || !stored_bytes ||
+    if (!handle || !handle->entry || !handle->generation || !handle->retained ||
+        !stored_bytes ||
         atomic_load_explicit(&handle->entry->generation, memory_order_acquire) !=
             handle->generation ||
         atomic_load_explicit(&handle->entry->state, memory_order_acquire) !=
@@ -188,7 +209,7 @@ static inline int coli_record_io_complete(ColiRecordIoHandle *handle,
 
 static inline int coli_record_io_fail(ColiRecordIoHandle *handle,
                                       int error_code) {
-    if (!handle || !handle->entry || !handle->generation ||
+    if (!handle || !handle->entry || !handle->generation || !handle->retained ||
         atomic_load_explicit(&handle->entry->generation, memory_order_acquire) !=
             handle->generation)
         return -1;
@@ -205,7 +226,8 @@ static inline int coli_record_io_fail(ColiRecordIoHandle *handle,
 /* Speculative work may be cancelled only while still queued and only if no
  * blocking waiter has joined/escalated it. */
 static inline int coli_record_io_cancel_prefetch(ColiRecordIoHandle *handle) {
-    if (!handle || !handle->entry || handle->priority != COLI_RECORD_IO_PREFETCH ||
+    if (!handle || !handle->entry || !handle->retained ||
+        handle->priority != COLI_RECORD_IO_PREFETCH ||
         atomic_load_explicit(&handle->entry->generation, memory_order_acquire) !=
             handle->generation ||
         atomic_load_explicit(&handle->entry->blocking_waiters,
@@ -219,10 +241,16 @@ static inline int coli_record_io_cancel_prefetch(ColiRecordIoHandle *handle) {
 
 static inline int coli_record_io_release(ColiRecordIoHandle *handle) {
     if (!handle || !handle->entry || !handle->generation ||
-        !coli_record_io_key_equal(handle->entry->key, handle->key) ||
-        atomic_load_explicit(&handle->entry->generation, memory_order_acquire) !=
-            handle->generation)
+        !coli_record_io_key_equal(handle->entry->key, handle->key))
         return -1;
+    if (!handle->retained) {
+        memset(handle, 0, sizeof(*handle));
+        return 0;
+    }
+    if (atomic_load_explicit(&handle->entry->generation, memory_order_acquire) !=
+        handle->generation)
+        return -1;
+
     unsigned waiters = atomic_load_explicit(&handle->entry->waiters,
                                             memory_order_acquire);
     for (;;) {
