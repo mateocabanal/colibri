@@ -7,11 +7,15 @@ endif
 
 .PHONY: check clean
 
-check: test_record_io$(EXE)
+check: test_record_io$(EXE) test_expert_residency$(EXE)
 	./test_record_io$(EXE)
+	./test_expert_residency$(EXE)
 
 test_record_io$(EXE): tests/test_record_io.c record_io.h
 	$(CC) $(CFLAGS) tests/test_record_io.c -o $@
 
+test_expert_residency$(EXE): tests/test_expert_residency.c expert_residency.h expert_store.h
+	$(CC) $(CFLAGS) tests/test_expert_residency.c -o $@
+
 clean:
-	rm -f test_record_io test_record_io.exe
+	rm -f test_record_io test_record_io.exe test_expert_residency test_expert_residency.exe
