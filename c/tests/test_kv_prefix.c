@@ -83,15 +83,21 @@ static const ColiSequenceStateOps pfx_ops = {
     pfx_describe, pfx_read, pfx_write, pfx_reset, pfx_finish
 };
 
+static void make_ns(ColiPrefixNamespace *ns) {
+    memset(ns, 0, sizeof(*ns));
+    ns->state_abi = 11;
+    for (size_t i = 0; i < sizeof(ns->fingerprint); ++i)
+        ns->fingerprint[i] = (unsigned char)(i * 3u + 1u);
+}
+
 static void test_global_prefix_cache(void) {
     char path[256];
     snprintf(path, sizeof(path), ".test_coli_prefix_%ld.bin", (long)getpid());
     remove(path);
     char temp[264]; snprintf(temp, sizeof(temp), "%s.tmp", path); remove(temp);
 
-    ColiPrefixNamespace ns = {{0}, 11};
-    for (size_t i = 0; i < sizeof(ns.fingerprint); ++i)
-        ns.fingerprint[i] = (unsigned char)(i * 3u + 1u);
+    ColiPrefixNamespace ns;
+    make_ns(&ns);
     const int prefix[] = {10, 20, 30};
     const int extended[] = {10, 20, 30, 40, 50};
     const int divergent[] = {10, 20, 99, 40};
@@ -127,6 +133,13 @@ static void test_global_prefix_cache(void) {
           "RAM stats hits=%llu stores=%llu",
           (unsigned long long)stats.hits_ram,
           (unsigned long long)stats.stores);
+    CHECK(stats.ram_resident_bytes <= stats.ram_budget_bytes,
+          "RAM budget exceeded: %zu > %zu",
+          stats.ram_resident_bytes, stats.ram_budget_bytes);
+    CHECK(stats.disk_live_bytes <= stats.disk_budget_bytes,
+          "disk budget exceeded: %llu > %llu",
+          (unsigned long long)stats.disk_live_bytes,
+          (unsigned long long)stats.disk_budget_bytes);
     coli_prefix_cache_close(&cache);
 
     /* New process-equivalent object loads only metadata. Snapshot bytes remain
@@ -149,7 +162,8 @@ static void test_global_prefix_cache(void) {
     coli_prefix_cache_close(&cache);
 
     /* Corrupt the snapshot byte, then restart. Index parsing may succeed, but
-     * restore must verify CRC and become a safe miss. */
+     * restore must verify CRC and become a safe miss. SSD still needs RAM for
+     * exact-token/segment metadata; it just does not keep the payload hot. */
     FILE *f = fopen(path, "r+b");
     CHECK(f != NULL, "open persisted cache for corruption failed");
     if (f) {
@@ -169,7 +183,7 @@ static void test_global_prefix_cache(void) {
     }
     memset(&restart, 0, sizeof(restart));
     CHECK(coli_prefix_cache_init(&cache, COLI_PREFIX_CACHE_SSD,
-                                 0, 1024 * 1024, path) == 0,
+                                 4096, 1024 * 1024, path) == 0,
           "corrupt restart index init failed");
     matched = -1;
     CHECK(coli_prefix_cache_restore(&cache, &ns, extended, 5,
@@ -177,6 +191,85 @@ static void test_global_prefix_cache(void) {
           "corrupt SSD state must miss");
     coli_prefix_cache_get_stats(&cache, &stats);
     CHECK(stats.corrupt_entries >= 1, "corruption counter not incremented");
+    coli_prefix_cache_close(&cache);
+    remove(path); remove(temp);
+}
+
+static void test_prefix_cache_budgets(void) {
+    char path[256];
+    snprintf(path, sizeof(path), ".test_coli_prefix_budget_%ld.bin", (long)getpid());
+    remove(path);
+    char temp[264]; snprintf(temp, sizeof(temp), "%s.tmp", path); remove(temp);
+
+    ColiPrefixNamespace ns;
+    make_ns(&ns);
+    PrefixFakeState source = {0};
+    source.position = 3;
+    memset(source.bytes, 0x6d, sizeof(source.bytes));
+    ColiSequenceStateAdapter src = {&source, &pfx_ops};
+    const int a[] = {1, 2, 3};
+    const int b[] = {1, 2, 3, 4};
+    size_t metadata = sizeof(ColiPrefixCacheEntry) +
+        sizeof(a) + sizeof(ColiSequenceSegmentDesc);
+
+    /* RAM-only admission that cannot fit its own payload must be rejected, not
+     * retained above the cap. */
+    ColiPrefixCache cache;
+    CHECK(coli_prefix_cache_init(&cache, COLI_PREFIX_CACHE_RAM,
+                                 metadata + 4, 0, NULL) == 0,
+          "RAM-only budget cache init failed");
+    CHECK(coli_prefix_cache_store(&cache, &ns, a, 3, 3, &src) == 0,
+          "oversized RAM-only admission should be rejected");
+    CHECK(cache.count == 0 && cache.ram_resident_bytes <= cache.ram_budget_bytes,
+          "RAM-only hard cap violated");
+    coli_prefix_cache_close(&cache);
+
+    /* SSD can own the payload while RAM owns metadata only. */
+    remove(path);
+    CHECK(coli_prefix_cache_init(&cache, COLI_PREFIX_CACHE_SSD,
+                                 metadata + 64, 4096, path) == 0,
+          "SSD-only budget cache init failed");
+    CHECK(coli_prefix_cache_store(&cache, &ns, a, 3, 3, &src) == 1,
+          "SSD-only admission failed");
+    CHECK(cache.count == 1 && cache.entries[0]->snapshot == NULL &&
+          cache.entries[0]->disk_record_bytes != 0 &&
+          cache.ram_resident_bytes <= cache.ram_budget_bytes &&
+          cache.disk_live_bytes <= cache.disk_budget_bytes,
+          "SSD-only hot/cold accounting wrong");
+    coli_prefix_cache_close(&cache);
+
+    /* A record too large for the current SSD budget stays RAM-only. Raising the
+     * budget later and compacting another entry must not accidentally persist
+     * that first RAM-only record. */
+    remove(path);
+    CHECK(coli_prefix_cache_init(&cache, COLI_PREFIX_CACHE_AUTO,
+                                 1024 * 1024, 1, path) == 0,
+          "mixed budget cache init failed");
+    CHECK(coli_prefix_cache_store(&cache, &ns, a, 3, 3, &src) == 1,
+          "RAM fallback admission failed");
+    CHECK(cache.count == 1 && cache.entries[0]->disk_record_bytes == 0 &&
+          cache.entries[0]->snapshot != NULL,
+          "too-large disk record should remain RAM-only");
+    cache.disk_budget_bytes = 4096;
+    source.position = 4;
+    source.bytes[0] ^= 0x11;
+    CHECK(coli_prefix_cache_store(&cache, &ns, b, 4, 4, &src) == 1,
+          "second persisted admission failed");
+    size_t ia = coli_prefix_find_exact_index(&cache, &ns, a, 3);
+    size_t ib = coli_prefix_find_exact_index(&cache, &ns, b, 4);
+    CHECK(ia < cache.count && ib < cache.count,
+          "expected both RAM and persisted entries");
+    if (ia < cache.count && ib < cache.count) {
+        CHECK(cache.entries[ia]->disk_record_bytes == 0 &&
+              cache.entries[ia]->disk_snapshot_offset == 0,
+              "disk rewrite persisted a RAM-only entry");
+        CHECK(cache.entries[ib]->disk_record_bytes != 0 &&
+              cache.entries[ib]->disk_snapshot_offset != 0,
+              "new entry was not persisted");
+    }
+    CHECK(cache.ram_resident_bytes <= cache.ram_budget_bytes &&
+          cache.disk_live_bytes <= cache.disk_budget_bytes,
+          "mixed cache exceeded a hard budget");
     coli_prefix_cache_close(&cache);
     remove(path); remove(temp);
 }
@@ -250,6 +343,7 @@ int main(void) {
     CHECK(p.fed == NULL && p.cap == 0, "free must clear the record");
 
     test_global_prefix_cache();
+    test_prefix_cache_budgets();
 
     if (failures) { fprintf(stderr, "%d check(s) failed\n", failures); return 1; }
     puts("kv_prefix + global RAM/SSD prefix cache: ok");
