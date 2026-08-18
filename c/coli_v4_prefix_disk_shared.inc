@@ -1,7 +1,14 @@
-/* Compile the existing V4 SSD adapter exactly once. Its helper name `ascii_ieq`
- * overlaps the process-RAM implementation now sharing this TU, so namespace
- * that private helper. Rename the old post-generation publisher so the public
- * wrapper below can keep that fast path and add a safe live-state fallback. */
+/* Compile the shared persistent-store helpers and the V4 SSD adapter exactly
+ * once in this composition TU. Both the process-RAM cache and the shared disk
+ * header define a private `ascii_ieq`, while coli_v4_prefix_disk.c defines its
+ * own helper with the same spelling. Give each included implementation a
+ * distinct preprocessor namespace instead of collapsing both helpers onto one
+ * symbol. The prefix_cache_disk.h include guard then keeps the V4 adapter's
+ * own include from expanding the shared implementation a second time. */
+#define ascii_ieq coli_v4_prefix_store_ascii_ieq
+#include "prefix_cache_disk.h"
+#undef ascii_ieq
+
 #define ascii_ieq coli_v4_disk_ascii_ieq
 #define coli_v4_prefix_disk_publish_session \
     coli_v4_prefix_disk_publish_session_from_ram
