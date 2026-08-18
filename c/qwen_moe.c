@@ -3881,7 +3881,7 @@ int main(int argc, char **argv){
     }
     if (!snap || !*snap) { fprintf(stderr, "set SNAP=<snapshot directory>\n"); return 1; }
     int explicit_cap = cap != 0;
-    size_t prefix_budget = serving ? qwen_prefix_cache_budget_from_env() : 0;
+    size_t prefix_budget = serving ? qwen_prefix_cache_budget_for_serve() : 0;
     if (cap == 0) {
         /* Default: ONLY the experts currently in use stay resident — one
          * cache slot per selected expert per layer (topk). Everything else
@@ -3927,6 +3927,17 @@ int main(int argc, char **argv){
 
     qprof_reset();
     Model m; model_init(&m, snap, cap);
+    if (serving) {
+        qwen_prefix_cache_init(&m.prefix_cache, prefix_budget,
+                               qwen_prefix_cache_min_tokens_from_env(),
+                               getenv("QWEN_PREFIX_LOG") != NULL);
+        if (m.prefix_cache.log)
+            fprintf(stderr,
+                    "[QWEN-PREFIX] budget=%.2fMiB min_tokens=%d mode=process-local-exact-hybrid%s\n",
+                    (double)m.prefix_cache.budget_bytes / (1024.0 * 1024.0),
+                    m.prefix_cache.min_tokens,
+                    getenv("QWEN_PREFIX_CACHE_MB") ? " explicit" : " default-on");
+    }
     Tok T;
     char tokpath[2048];
     if (coli_mode) snprintf(tokpath, sizeof(tokpath), "%s/tokenizer.json", getenv("COLI_CONFIG") ? getenv("COLI_CONFIG") : snap);

@@ -27,6 +27,7 @@
 
 #define QWEN_PREFIX_CACHE_MAX_ENTRIES 64
 #define QWEN_PREFIX_CACHE_DEFAULT_MIN_TOKENS 256
+#define QWEN_PREFIX_CACHE_DEFAULT_SERVE_MB 256u
 
 typedef struct {
     int layer_count;
@@ -140,15 +141,38 @@ static inline int qwen_prefix_cache_ram_cap(const char *value,
     return slots > 0.0L ? (int)slots : 0;
 }
 
-static inline size_t qwen_prefix_cache_budget_from_env(void) {
-    const char *value = getenv("QWEN_PREFIX_CACHE_MB");
-    if (!value || !*value) return 0;
+static inline int qpc_ascii_ieq(const char *a, const char *b) {
+    if (!a || !b) return 0;
+    while (*a && *b) {
+        unsigned char ca = (unsigned char)*a++, cb = (unsigned char)*b++;
+        if (ca >= 'A' && ca <= 'Z') ca = (unsigned char)(ca - 'A' + 'a');
+        if (cb >= 'A' && cb <= 'Z') cb = (unsigned char)(cb - 'A' + 'a');
+        if (ca != cb) return 0;
+    }
+    return *a == 0 && *b == 0;
+}
+
+static inline size_t qwen_prefix_cache_budget_parse(const char *value,
+                                                     size_t fallback_bytes) {
+    if (!value || !*value) return fallback_bytes;
+    if (qpc_ascii_ieq(value, "off")) return 0;
     char *end = NULL;
-    double mib = strtod(value, &end);
-    if (end == value || mib <= 0.0) return 0;
-    long double bytes = (long double)mib * 1024.0L * 1024.0L;
+    long double mib = strtold(value, &end);
+    if (end == value || !(mib > 0.0L)) return 0;
+    while (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n') end++;
+    if (*end) return 0;
+    long double bytes = mib * 1024.0L * 1024.0L;
     if (bytes >= (long double)SIZE_MAX) return SIZE_MAX;
     return (size_t)bytes;
+}
+
+static inline size_t qwen_prefix_cache_budget_from_env(void) {
+    return qwen_prefix_cache_budget_parse(getenv("QWEN_PREFIX_CACHE_MB"), 0);
+}
+
+static inline size_t qwen_prefix_cache_budget_for_serve(void) {
+    const size_t fallback = (size_t)QWEN_PREFIX_CACHE_DEFAULT_SERVE_MB * 1024u * 1024u;
+    return qwen_prefix_cache_budget_parse(getenv("QWEN_PREFIX_CACHE_MB"), fallback);
 }
 
 static inline int qwen_prefix_cache_min_tokens_from_env(void) {

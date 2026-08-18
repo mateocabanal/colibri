@@ -183,6 +183,19 @@ static void test_ram_cap_reservation(void) {
     assert(qwen_prefix_cache_ram_cap("1", 2ULL * 1000000000ULL, &valid) == 0 && valid);
 }
 
+static void test_budget_policy(void) {
+    const size_t mib = 1024u * 1024u;
+    const size_t fallback = 256u * mib;
+    assert(qwen_prefix_cache_budget_parse(NULL, fallback) == fallback);
+    assert(qwen_prefix_cache_budget_parse("", fallback) == fallback);
+    assert(qwen_prefix_cache_budget_parse("0", fallback) == 0);
+    assert(qwen_prefix_cache_budget_parse("off", fallback) == 0);
+    assert(qwen_prefix_cache_budget_parse("OFF", fallback) == 0);
+    assert(qwen_prefix_cache_budget_parse("64", fallback) == 64u * mib);
+    assert(qwen_prefix_cache_budget_parse("garbage", fallback) == 0);
+    assert(qwen_prefix_cache_budget_parse("64garbage", fallback) == 0);
+}
+
 static void test_hard_budget(void) {
     Fixture f;
     fixture_init(&f, 1);
@@ -212,6 +225,7 @@ int main(void) {
     test_restore(1);
     test_restore(0);
     test_ram_cap_reservation();
+    test_budget_policy();
     test_hard_budget();
     puts("qwen prefix cache: ok");
     return 0;
