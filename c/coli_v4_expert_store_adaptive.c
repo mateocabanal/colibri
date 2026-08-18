@@ -86,6 +86,10 @@ static int v4_adaptive_executor_load_expert(
 #undef coli_executor_load_expert
 #undef pthread_cond_wait
 
+/* This adapter intentionally comes after the base implementation include: it
+ * consumes the base State/Slot helpers without duplicating physical ownership. */
+#include "coli_v4_adaptive_resource_planner.h"
+
 struct ColiV4AdaptiveExpertStoreState {
     ColiExpertStore *inner;
     ColiExpertActivationTracker tracker;
@@ -94,6 +98,7 @@ struct ColiV4AdaptiveExpertStoreState {
     size_t key_count;
     uint64_t current_epoch;
     ColiExpertResidencyPolicyConfig policy;
+    ColiV4AdaptiveResourcePlanner resource_planner;
 };
 
 static size_t v4_adaptive_tracker_capacity(size_t keys) {
@@ -165,10 +170,13 @@ static void v4_adaptive_project_layer_locked(
 
     for (int expert = 0; expert < inner->experts; expert++) {
         ColiExpertKey key = {layer, expert};
+        size_t key_index = (size_t)layer * (size_t)inner->experts +
+                           (size_t)expert;
         const ColiExpertActivationEntry *entry =
             coli_expert_activation_find_const(&state->tracker, key);
         uint64_t rank = 0;
-        if (entry) {
+        if (entry && coli_v4_adaptive_resource_selected(
+                &state->resource_planner, key_index)) {
             ColiExpertResidencyCandidate candidate =
                 coli_expert_residency_policy_candidate(
                     entry, state->current_epoch, inner->slot_bytes, quanta,
@@ -176,8 +184,7 @@ static void v4_adaptive_project_layer_locked(
                     &state->policy);
             rank = v4_adaptive_project_rank(&candidate, state->current_epoch);
         }
-        inner->usage[(size_t)layer * (size_t)inner->experts +
-                     (size_t)expert] = rank;
+        inner->usage[key_index] = rank;
     }
 }
 
@@ -289,19 +296,29 @@ static void v4_adaptive_observe(
         if (samples[i].epoch > state->current_epoch)
             state->current_epoch = samples[i].epoch;
 
-    /* One route batch can contain UNKNOWN/PREFILL/DECODE samples for the same
-     * layer. Reproject each distinct layer once after the complete batch has
-     * entered the tracker. Counts are small, so a dependency-free O(n^2)
-     * distinct check is cheaper than extra hot-path allocation. */
-    for (size_t i = 0; i < count; i++) {
-        int layer = samples[i].key.layer;
-        int seen = 0;
-        for (size_t j = 0; j < i; j++)
-            if (samples[j].key.layer == layer) {
-                seen = 1;
-                break;
-            }
-        if (!seen) v4_adaptive_project_layer_locked(state, inner, layer);
+    int replanned = coli_v4_adaptive_resource_replan_locked(
+        &state->resource_planner, inner, &state->tracker,
+        state->current_epoch, &state->policy);
+    if (replanned > 0) {
+        /* A global allocation can change any layer even when this route batch
+         * touched only one of them, so refresh the complete local admission map. */
+        for (int layer = 0; layer < inner->layers; layer++)
+            v4_adaptive_project_layer_locked(state, inner, layer);
+    } else {
+        /* One route batch can contain UNKNOWN/PREFILL/DECODE samples for the same
+         * layer. Reproject each distinct layer once after the complete batch has
+         * entered the tracker. Counts are small, so a dependency-free O(n^2)
+         * distinct check is cheaper than extra hot-path allocation. */
+        for (size_t i = 0; i < count; i++) {
+            int layer = samples[i].key.layer;
+            int seen = 0;
+            for (size_t j = 0; j < i; j++)
+                if (samples[j].key.layer == layer) {
+                    seen = 1;
+                    break;
+                }
+            if (!seen) v4_adaptive_project_layer_locked(state, inner, layer);
+        }
     }
     pthread_mutex_unlock(&inner->mutex);
 }
@@ -316,6 +333,7 @@ static void v4_adaptive_destroy(ColiExpertStore *store) {
                    state->key_count * sizeof(*state->physical_usage));
             pthread_mutex_unlock(&inner->mutex);
         }
+        coli_v4_adaptive_resource_destroy(&state->resource_planner);
         if (state->inner && state->inner->ops && state->inner->ops->destroy)
             state->inner->ops->destroy(state->inner);
         free(state->physical_usage);
@@ -387,6 +405,14 @@ int coli_v4_coli_expert_store_open(const ColiV4ColiExpertStoreOptions *options,
     state->key_count = key_count;
     state->policy = coli_expert_residency_policy_default();
 
+    int planner_result = coli_v4_adaptive_resource_init(
+        &state->resource_planner, base);
+    if (planner_result < 0) {
+        fprintf(stderr,
+                "v4_resource_planner status=disabled reason=initialization "
+                "fallback=base-residency\n");
+    }
+
     /* The shared policy already gives currently-resident candidates percentage
      * hysteresis. Disable the base store's old absolute request-count margin so
      * it does not double-apply a V4-specific threshold. Byte geometry and the
@@ -402,12 +428,13 @@ int coli_v4_coli_expert_store_open(const ColiV4ColiExpertStoreOptions *options,
             "v4_residency adaptive_policy=frequency-decay "
             "prefill_weight=%u decode_weight=%u resident_hysteresis=%u%% "
             "recency_quantum=%llu planner_horizon=%llu confidence_mass=%llu "
-            "persistent_slots_per_layer=%d\n",
+            "persistent_budget=%s dense_budget=%.2fGiB\n",
             state->policy.prefill_weight, state->policy.decode_weight,
             state->policy.resident_hysteresis_percent,
             (unsigned long long)state->policy.recency_quantum_epochs,
             (unsigned long long)state->policy.planning_horizon_epochs,
             (unsigned long long)state->policy.planner_confidence_mass,
-            base->persistent_slots_per_layer);
+            state->resource_planner.enabled ? "global-planner" : "base-layout",
+            base->dense_cache_budget_bytes / (1024.0 * 1024.0 * 1024.0));
     return 0;
 }
