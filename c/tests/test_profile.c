@@ -4,6 +4,7 @@
 #include "../profile.h"
 #include "../metal_policy.h"
 #include "../metal_runtime.h"
+#include "../metal_region.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -125,8 +126,73 @@ static int test_metal_policy(void) {
     return 0;
 }
 
+static int test_metal_region(void) {
+    unsigned char storage[256];
+    ColiMetalRegion region;
+    ColiMetalRegionRef old_ref, new_ref;
+
+    if (coli_metal_region_init(&region, storage, sizeof(storage), 7) != 0)
+        return 40;
+    if (coli_metal_region_generation(&region) != 0 ||
+        coli_metal_region_inflight(&region) != 0 ||
+        coli_metal_region_can_overwrite(&region) == 0)
+        return 41;
+    if (coli_metal_region_ref(&region, 1, 0, 16, &old_ref) == 0)
+        return 42;
+
+    if (coli_metal_region_publish(&region, 1) != 0 ||
+        coli_metal_region_generation(&region) != 1)
+        return 43;
+    if (coli_metal_region_ref(&region, 1, 32, 64, &old_ref) != 0 ||
+        old_ref.region_id != 7 || old_ref.generation != 1 ||
+        old_ref.offset != 32 || old_ref.bytes != 64 ||
+        !coli_metal_region_ref_matches(&region, &old_ref))
+        return 44;
+    if (coli_metal_region_ref(&region, 1, 240, 32, &new_ref) == 0)
+        return 45;
+
+    if (coli_metal_region_retain(&region, 1) != 0 ||
+        coli_metal_region_inflight(&region) != 1)
+        return 46;
+
+    coli_metal_region_begin_overwrite(&region);
+    if (coli_metal_region_ref_matches(&region, &old_ref) ||
+        coli_metal_region_retain(&region, 1) == 0 ||
+        coli_metal_region_can_overwrite(&region))
+        return 47;
+
+    if (coli_metal_region_release(&region, 1) != 0 ||
+        coli_metal_region_inflight(&region) != 0 ||
+        !coli_metal_region_can_overwrite(&region))
+        return 48;
+    if (coli_metal_region_release(&region, 1) == 0)
+        return 49;
+
+    if (coli_metal_region_publish(&region, 2) != 0 ||
+        coli_metal_region_generation(&region) != 2 ||
+        coli_metal_region_ref_matches(&region, &old_ref))
+        return 50;
+    if (coli_metal_region_ref(&region, 2, 32, 64, &new_ref) != 0 ||
+        !coli_metal_region_ref_matches(&region, &new_ref) ||
+        coli_metal_region_retain(&region, 1) == 0 ||
+        coli_metal_region_retain(&region, 2) != 0)
+        return 51;
+    if (coli_metal_region_release(&region, 2) != 0)
+        return 52;
+
+    coli_metal_region_begin_overwrite(&region);
+    if (!coli_metal_region_can_overwrite(&region) ||
+        coli_metal_region_publish(&region, 3) != 0 ||
+        coli_metal_region_generation(&region) != 3)
+        return 53;
+
+    return 0;
+}
+
 int main(void) {
     int metal_rc = test_metal_policy();
+    if (metal_rc) return metal_rc;
+    metal_rc = test_metal_region();
     if (metal_rc) return metal_rc;
 
 #ifdef _WIN32
@@ -177,6 +243,6 @@ int main(void) {
 #endif
     coli_profile_reset(&p, &config);
     if (coli_profile_enabled(&p)) return 5;
-    puts("PASS generic profile + metal policy/runtime");
+    puts("PASS generic profile + metal policy/runtime/regions");
     return 0;
 }
