@@ -10,30 +10,35 @@ extern "C" {
 #endif
 
 /*
- * Model-neutral first-pass policy signal for adaptive expert residency.
+ * Model-neutral adaptive expert-residency policy.
  *
- * This file deliberately ranks candidates only; it does not own bytes, slots,
- * I/O, or eviction state. The global resource planner decides how many bytes
- * expert residency receives, and the residency manager owns generations and
- * leases. This policy answers only: among eligible experts, which bytes are
- * likely to repay themselves best?
+ * This layer ranks candidates only; it does not own bytes, slots, I/O, or
+ * eviction state. The global resource planner decides how many bytes expert
+ * residency receives, and the residency manager owns generations and leases.
  *
- * Frequency is preferred over pure recency because long layer-to-layer reuse
- * distances can make a small global LRU churn without hits. Recency still
- * matters through lazy age decay, and currently resident candidates receive a
- * small hysteresis bonus to avoid replacement oscillation near the cutoff.
+ * Two related signals are intentionally separate:
+ *   - hotness: phase-weighted recent activity for choosing WHICH experts stay;
+ *   - reuse_weight: unweighted recent route rate projected onto one bounded
+ *     common horizon for deciding HOW MANY expert bytes compete with dense,
+ *     prefix and other optional resources in the global planner.
  */
 typedef struct {
     uint32_t prefill_weight;
     uint32_t decode_weight;
     uint32_t resident_hysteresis_percent;
     uint64_t recency_quantum_epochs;
+    uint64_t planning_horizon_epochs;
+    uint64_t max_reuse_weight;
 } ColiExpertResidencyPolicyConfig;
 
 typedef struct {
     ColiExpertKey key;
     uint64_t score;
     uint64_t hotness;
+    /* Planner-ready expected logical route uses over planning_horizon_epochs.
+     * Resident hysteresis and decode preference are deliberately excluded so
+     * this stays comparable with other resource classes. */
+    uint64_t reuse_weight;
     uint64_t resident_bytes;
     uint64_t expected_miss_cost_us;
     uint64_t last_epoch;
@@ -46,7 +51,9 @@ coli_expert_residency_policy_default(void) {
     config.prefill_weight = 1;
     config.decode_weight = 4;
     config.resident_hysteresis_percent = 20;
-    config.recency_quantum_epochs = 64;
+    config.recency_quantum_epochs = COLI_EXPERT_ACTIVITY_DECAY_QUANTUM_EPOCHS;
+    config.planning_horizon_epochs = 256;
+    config.max_reuse_weight = UINT64_C(1) << 32;
     return config;
 }
 
@@ -54,37 +61,78 @@ static inline uint64_t coli_expert_residency_sat_mul(uint64_t a, uint64_t b) {
     return a && b > UINT64_MAX / a ? UINT64_MAX : a * b;
 }
 
+static inline int coli_expert_residency_policy_config_valid(
+    const ColiExpertResidencyPolicyConfig *config) {
+    return config && config->prefill_weight && config->decode_weight &&
+        config->recency_quantum_epochs ==
+            COLI_EXPERT_ACTIVITY_DECAY_QUANTUM_EPOCHS &&
+        config->planning_horizon_epochs && config->max_reuse_weight;
+}
+
+static inline uint64_t coli_expert_residency_policy_recent_mass(
+    const ColiExpertActivationEntry *entry, uint64_t current_epoch,
+    const ColiExpertResidencyPolicyConfig *config,
+    int apply_phase_weights) {
+    if (!entry || !entry->hash_tag ||
+        !coli_expert_residency_policy_config_valid(config))
+        return 0;
+
+    uint64_t unknown = 0, prefill = 0, decode = 0;
+    coli_expert_activation_recent_at(
+        entry, current_epoch, &unknown, &prefill, &decode);
+
+    if (!apply_phase_weights) {
+        uint64_t mass = coli_expert_activation_sat_add(unknown, prefill);
+        return coli_expert_activation_sat_add(mass, decode);
+    }
+
+    uint64_t weighted_prefill = coli_expert_residency_sat_mul(
+        prefill, config->prefill_weight);
+    uint64_t weighted_decode = coli_expert_residency_sat_mul(
+        decode, config->decode_weight);
+    uint64_t weighted_unknown = coli_expert_residency_sat_mul(
+        unknown, config->prefill_weight);
+    uint64_t mass = coli_expert_activation_sat_add(
+        weighted_unknown, weighted_prefill);
+    return coli_expert_activation_sat_add(mass, weighted_decode);
+}
+
+/* The lazy half-life accumulator has a steady-state effective window of roughly
+ * 2 * decay_quantum epochs. Project that recent unweighted route mass onto a
+ * fixed future horizon. The result is bounded and process-age independent. */
+static inline uint64_t coli_expert_residency_policy_reuse_weight(
+    const ColiExpertActivationEntry *entry,
+    uint64_t current_epoch,
+    const ColiExpertResidencyPolicyConfig *config) {
+    if (!coli_expert_residency_policy_config_valid(config) ||
+        config->recency_quantum_epochs > UINT64_MAX / 2)
+        return 0;
+
+    uint64_t mass = coli_expert_residency_policy_recent_mass(
+        entry, current_epoch, config, 0);
+    if (!mass) return 0;
+
+    uint64_t denominator = config->recency_quantum_epochs * 2;
+    uint64_t quotient = mass / denominator;
+    uint64_t remainder = mass % denominator;
+    uint64_t projected = coli_expert_residency_sat_mul(
+        quotient, config->planning_horizon_epochs);
+    uint64_t tail_product = coli_expert_residency_sat_mul(
+        remainder, config->planning_horizon_epochs);
+    uint64_t tail = tail_product / denominator;
+    projected = coli_expert_activation_sat_add(projected, tail);
+    if (projected > config->max_reuse_weight)
+        projected = config->max_reuse_weight;
+    return projected;
+}
+
 static inline uint64_t coli_expert_residency_policy_hotness(
     const ColiExpertActivationEntry *entry,
     uint64_t current_epoch,
     int currently_resident,
     const ColiExpertResidencyPolicyConfig *config) {
-    if (!entry || !entry->hash_tag || !config ||
-        !config->recency_quantum_epochs)
-        return 0;
-
-    uint64_t prefill = coli_expert_residency_sat_mul(
-        entry->prefill_activations, config->prefill_weight);
-    uint64_t decode = coli_expert_residency_sat_mul(
-        entry->decode_activations, config->decode_weight);
-    uint64_t weighted = coli_expert_activation_sat_add(prefill, decode);
-
-    /* UNKNOWN-phase observations still carry useful frequency. Count them at
-     * the conservative prefill weight rather than discarding the signal. */
-    uint64_t known = coli_expert_activation_sat_add(
-        entry->prefill_activations, entry->decode_activations);
-    uint64_t unknown = entry->logical_activations > known
-        ? entry->logical_activations - known : 0;
-    weighted = coli_expert_activation_sat_add(
-        weighted,
-        coli_expert_residency_sat_mul(unknown, config->prefill_weight));
-
-    uint64_t age = current_epoch > entry->last_epoch
-        ? current_epoch - entry->last_epoch : 0;
-    uint64_t buckets = age / config->recency_quantum_epochs;
-    unsigned shift = buckets > 63 ? 63u : (unsigned)buckets;
-    uint64_t hotness = weighted >> shift;
-
+    uint64_t hotness = coli_expert_residency_policy_recent_mass(
+        entry, current_epoch, config, 1);
     if (currently_resident && hotness && config->resident_hysteresis_percent) {
         uint64_t bonus = coli_expert_residency_sat_mul(
             hotness, config->resident_hysteresis_percent) / 100u;
@@ -106,6 +154,8 @@ coli_expert_residency_policy_candidate(
     candidate.key = entry->key;
     candidate.hotness = coli_expert_residency_policy_hotness(
         entry, current_epoch, currently_resident, config);
+    candidate.reuse_weight = coli_expert_residency_policy_reuse_weight(
+        entry, current_epoch, config);
     candidate.resident_bytes = resident_bytes;
     candidate.expected_miss_cost_us = expected_miss_cost_us;
     candidate.last_epoch = entry->last_epoch;
