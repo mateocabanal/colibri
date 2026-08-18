@@ -73,6 +73,9 @@ static inline int coli_v4_residency_select(
 }
 
 void coli_v4_dense_cache_configure(uint64_t budget_bytes);
+/* Change only the admission ceiling. Existing immutable borrowed entries are
+ * never evicted; lowering below resident_bytes clamps to that mandatory floor. */
+uint64_t coli_v4_dense_cache_set_budget(uint64_t budget_bytes);
 void coli_v4_dense_cache_reset(void);
 void coli_v4_dense_cache_stats(ColiV4DenseCacheStats *out);
 

@@ -136,6 +136,15 @@ void coli_v4_dense_cache_configure(uint64_t budget_bytes) {
     }
 }
 
+uint64_t coli_v4_dense_cache_set_budget(uint64_t budget_bytes) {
+    pthread_mutex_lock(&g_dense_cache.mutex);
+    if (budget_bytes < g_dense_cache.resident_bytes)
+        budget_bytes = g_dense_cache.resident_bytes;
+    g_dense_cache.budget_bytes = budget_bytes;
+    pthread_mutex_unlock(&g_dense_cache.mutex);
+    return budget_bytes;
+}
+
 void coli_v4_dense_cache_reset(void) {
     ColiV4DenseCacheStats snapshot = {0};
     pthread_mutex_lock(&g_dense_cache.mutex);

@@ -1,0 +1,404 @@
+#ifndef COLI_V4_ADAPTIVE_RESOURCE_PLANNER_H
+#define COLI_V4_ADAPTIVE_RESOURCE_PLANNER_H
+
+#include "expert_residency_policy.h"
+#include "resource_planner.h"
+
+#include <limits.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+/*
+ * V4 adapter from shared activation telemetry to the global resource planner.
+ *
+ * The physical expert store still owns generations, leases, slot storage and
+ * I/O. This adapter owns only the optional-byte decision. In balanced mode the
+ * per-layer persistent array becomes a lazy logical admission surface: every
+ * expert has a metadata slot, but backing storage is allocated only when the
+ * global planner selects that expert. Unselected experts continue through the
+ * global transient pool.
+ *
+ * Dense package tensors are immutable borrowed allocations and currently have
+ * no per-entry refcount, so already-resident dense bytes are a mandatory floor
+ * for the current engine generation. The planner can reduce future dense
+ * admissions without invalidating borrowed pointers. This preserves a hard
+ * UMA/RAM envelope while still allowing hot experts to take bytes that dense
+ * has not already materialized.
+ */
+typedef struct {
+    int enabled;
+    size_t key_count;
+    size_t candidate_capacity;
+    ColiResourceCandidate *candidates;
+    unsigned char *candidate_selected;
+    unsigned char *expert_selected;
+    uint64_t last_replan_epoch;
+    uint64_t replan_count;
+    uint64_t selected_dense_bytes;
+    uint64_t selected_expert_bytes;
+} ColiV4AdaptiveResourcePlanner;
+
+static inline ColiResourceTier coli_v4_adaptive_resource_tier(void) {
+#ifdef __APPLE__
+    return COLI_RESOURCE_TIER_UMA;
+#else
+    return COLI_RESOURCE_TIER_HOST;
+#endif
+}
+
+static inline int coli_v4_adaptive_resource_key_index(
+    const State *inner, ColiExpertKey key, size_t *index) {
+    if (!inner || !index || key.layer < 0 || key.layer >= inner->layers ||
+        key.expert < 0 || key.expert >= inner->experts)
+        return 0;
+    *index = (size_t)key.layer * (size_t)inner->experts +
+             (size_t)key.expert;
+    return 1;
+}
+
+static inline int coli_v4_adaptive_resource_slot_resident(
+    const State *inner, ColiExpertKey key) {
+    if (!inner) return 0;
+    Slot *slots = persistent_for((State *)inner, key.layer);
+    for (int i = 0; slots && i < inner->persistent_slots_per_layer; i++) {
+        const Slot *slot = &slots[i];
+        if (slot->state == SLOT_RESIDENT && same_key(slot, key)) return 1;
+    }
+    return 0;
+}
+
+static inline void coli_v4_adaptive_resource_reset_slot_locked(
+    State *inner, Slot *slot) {
+    if (!inner || !slot || slot->refs || slot->state == SLOT_LOADING) return;
+    if (slot->data) {
+#ifdef COLI_METAL
+        coli_metal_unregister(slot->data);
+#endif
+        compat_aligned_free(slot->data);
+        slot->data = NULL;
+        if (inner->stats.resident_bytes >= inner->slot_bytes)
+            inner->stats.resident_bytes -= inner->slot_bytes;
+        else
+            inner->stats.resident_bytes = 0;
+    }
+    slot->generation++;
+    if (!slot->generation) slot->generation = 1;
+    slot->layer = -1;
+    slot->expert = -1;
+    /* Deliberately not EMPTY: an unselected rank-0 expert must not claim a
+     * persistent slot merely because metadata is unused. The base chooser sees
+     * this as a zero-value victim and admits only a planner-selected rank > 0. */
+    slot->state = SLOT_RESIDENT;
+    slot->last_use = 0;
+}
+
+static inline uint64_t coli_v4_adaptive_resource_forced_bytes_locked(
+    ColiV4AdaptiveResourcePlanner *planner, State *inner) {
+    uint64_t forced = 0;
+    if (!planner || !inner) return 0;
+    for (int layer = 0; layer < inner->layers; layer++) {
+        Slot *slots = persistent_for(inner, layer);
+        for (int i = 0; slots && i < inner->persistent_slots_per_layer; i++) {
+            Slot *slot = &slots[i];
+            if (!slot->data || (!slot->refs && slot->state != SLOT_LOADING))
+                continue;
+            size_t index = 0;
+            if (coli_v4_adaptive_resource_key_index(
+                    inner, (ColiExpertKey){slot->layer, slot->expert}, &index))
+                planner->expert_selected[index] = 1;
+            forced = coli_resource_saturating_add(forced, inner->slot_bytes);
+        }
+    }
+    return forced;
+}
+
+static inline void coli_v4_adaptive_resource_reclaim_locked(
+    ColiV4AdaptiveResourcePlanner *planner, State *inner) {
+    if (!planner || !inner) return;
+    for (int layer = 0; layer < inner->layers; layer++) {
+        Slot *slots = persistent_for(inner, layer);
+        for (int i = 0; slots && i < inner->persistent_slots_per_layer; i++) {
+            Slot *slot = &slots[i];
+            size_t index = 0;
+            int selected = coli_v4_adaptive_resource_key_index(
+                inner, (ColiExpertKey){slot->layer, slot->expert}, &index)
+                ? planner->expert_selected[index] != 0 : 0;
+            if (!selected)
+                coli_v4_adaptive_resource_reset_slot_locked(inner, slot);
+        }
+    }
+}
+
+/* Dense capacity is fungible at this layer. Powers-of-two budget chunks provide
+ * an exact ratio-1 baseline with at most 64 candidates, so arbitrary expert
+ * slot sizes can displace dense bytes without exploding planner work. */
+static inline size_t coli_v4_adaptive_resource_append_dense(
+    ColiV4AdaptiveResourcePlanner *planner, size_t count,
+    uint64_t optional_budget) {
+    if (!planner || !optional_budget) return count;
+    uint32_t id = 0;
+    for (int bit = 63; bit >= 0; bit--) {
+        uint64_t bytes = UINT64_C(1) << (unsigned)bit;
+        if (bytes > optional_budget) continue;
+        if (count >= planner->candidate_capacity) return count;
+        ColiResourceBenefitEstimate estimate = {
+            .kind = COLI_RESOURCE_DENSE_TENSOR,
+            .id = id++,
+            .resident_bytes = bytes,
+            .reuse_weight = 1,
+            .bytes_per_miss = bytes,
+            .exposed_ns_per_miss = 0,
+        };
+        (void)coli_resource_candidate_from_benefit(
+            &estimate, &planner->candidates[count++]);
+    }
+    return count;
+}
+
+static inline int coli_v4_adaptive_resource_init(
+    ColiV4AdaptiveResourcePlanner *planner, State *inner) {
+    if (!planner) return -1;
+    memset(planner, 0, sizeof(*planner));
+    if (!inner || inner->legacy_layout || inner->layers < 1 ||
+        inner->experts < 1 || !inner->slot_bytes ||
+        (size_t)inner->layers > SIZE_MAX / (size_t)inner->experts)
+        return 0;
+
+    size_t key_count = (size_t)inner->layers * (size_t)inner->experts;
+    if (key_count > UINT32_MAX || key_count > SIZE_MAX - 64)
+        return -1;
+    size_t candidate_capacity = key_count + 64;
+    if (candidate_capacity > SIZE_MAX / sizeof(ColiResourceCandidate))
+        return -1;
+
+    ColiResourceCandidate *candidates = calloc(
+        candidate_capacity, sizeof(*candidates));
+    unsigned char *candidate_selected = calloc(candidate_capacity, 1);
+    unsigned char *expert_selected = calloc(key_count, 1);
+    if (!candidates || !candidate_selected || !expert_selected) {
+        free(expert_selected);
+        free(candidate_selected);
+        free(candidates);
+        return -1;
+    }
+
+    if (key_count > (size_t)(INT_MAX - inner->transient_slots) ||
+        key_count > SIZE_MAX / sizeof(Slot)) {
+        free(expert_selected);
+        free(candidate_selected);
+        free(candidates);
+        return -1;
+    }
+    size_t total_slots = key_count + (size_t)inner->transient_slots;
+    if (total_slots > SIZE_MAX / sizeof(Slot)) {
+        free(expert_selected);
+        free(candidate_selected);
+        free(candidates);
+        return -1;
+    }
+    Slot *slots = calloc(total_slots, sizeof(*slots));
+    if (!slots) {
+        free(expert_selected);
+        free(candidate_selected);
+        free(candidates);
+        return -1;
+    }
+
+    /* No lookup can occur before the outer store is returned, so the base
+     * metadata allocated during open has no backing expert storage or leases. */
+    free(inner->slots);
+    inner->slots = slots;
+    inner->persistent_slots_per_layer = inner->experts;
+    inner->total_slots = (int)total_slots;
+    for (int layer = 0; layer < inner->layers; layer++) {
+        Slot *persistent = persistent_for(inner, layer);
+        for (int expert = 0; expert < inner->experts; expert++) {
+            persistent[expert].layer = -1;
+            persistent[expert].expert = -1;
+            persistent[expert].home_layer = layer;
+            persistent[expert].tier = SLOT_TIER_PERSISTENT;
+            persistent[expert].state = SLOT_RESIDENT;
+        }
+    }
+    Slot *transient = transient_base(inner);
+    for (int i = 0; i < inner->transient_slots; i++) {
+        transient[i].layer = -1;
+        transient[i].expert = -1;
+        transient[i].home_layer = -1;
+        transient[i].tier = SLOT_TIER_TRANSIENT;
+        transient[i].state = SLOT_EMPTY;
+    }
+
+    uint64_t transient_bytes = (uint64_t)inner->transient_slots *
+                               inner->slot_bytes;
+    if (transient_bytes > inner->offered_cache_bytes) {
+        free(inner->slots);
+        inner->slots = NULL;
+        free(expert_selected);
+        free(candidate_selected);
+        free(candidates);
+        return -1;
+    }
+    inner->stats.capacity_bytes = transient_bytes;
+    inner->dense_cache_budget_bytes = inner->offered_cache_bytes - transient_bytes;
+    (void)coli_v4_dense_cache_set_budget(inner->dense_cache_budget_bytes);
+
+    planner->key_count = key_count;
+    planner->candidate_capacity = candidate_capacity;
+    planner->candidates = candidates;
+    planner->candidate_selected = candidate_selected;
+    planner->expert_selected = expert_selected;
+    planner->selected_dense_bytes = inner->dense_cache_budget_bytes;
+    planner->enabled = 1;
+    return 0;
+}
+
+static inline void coli_v4_adaptive_resource_destroy(
+    ColiV4AdaptiveResourcePlanner *planner) {
+    if (!planner) return;
+    free(planner->expert_selected);
+    free(planner->candidate_selected);
+    free(planner->candidates);
+    memset(planner, 0, sizeof(*planner));
+}
+
+static inline int coli_v4_adaptive_resource_selected(
+    const ColiV4AdaptiveResourcePlanner *planner, size_t key_index) {
+    return !planner || !planner->enabled ||
+        (key_index < planner->key_count && planner->expert_selected[key_index]);
+}
+
+static inline int coli_v4_adaptive_resource_should_replan(
+    const ColiV4AdaptiveResourcePlanner *planner,
+    const ColiExpertActivationTracker *tracker,
+    uint64_t current_epoch,
+    const ColiExpertResidencyPolicyConfig *policy) {
+    if (!planner || !planner->enabled || !tracker || !policy) return 0;
+    if (!planner->replan_count)
+        return tracker->total_logical_activations >=
+               policy->planner_confidence_mass;
+    if (current_epoch <= planner->last_replan_epoch) return 0;
+    return current_epoch - planner->last_replan_epoch >=
+           policy->recency_quantum_epochs;
+}
+
+/* Called with the base expert-store mutex held. */
+static inline int coli_v4_adaptive_resource_replan_locked(
+    ColiV4AdaptiveResourcePlanner *planner, State *inner,
+    const ColiExpertActivationTracker *tracker,
+    uint64_t current_epoch,
+    const ColiExpertResidencyPolicyConfig *policy) {
+    if (!coli_v4_adaptive_resource_should_replan(
+            planner, tracker, current_epoch, policy))
+        return 0;
+
+    ColiV4DenseCacheStats dense = {0};
+    coli_v4_dense_cache_stats(&dense);
+    uint64_t transient_bytes = (uint64_t)inner->transient_slots *
+                               inner->slot_bytes;
+    if (transient_bytes > inner->offered_cache_bytes ||
+        dense.resident_bytes > inner->offered_cache_bytes - transient_bytes)
+        return -1;
+
+    memset(planner->expert_selected, 0, planner->key_count);
+    uint64_t forced_expert_bytes =
+        coli_v4_adaptive_resource_forced_bytes_locked(planner, inner);
+    if (forced_expert_bytes > inner->offered_cache_bytes - transient_bytes -
+                              dense.resident_bytes)
+        return -1;
+
+    ColiResourcePlan plan;
+    coli_resource_plan_init(&plan);
+    ColiResourceTier tier = coli_v4_adaptive_resource_tier();
+    if (coli_resource_plan_set_budget(
+            &plan, tier, inner->offered_cache_bytes) != 0 ||
+        coli_resource_plan_reserve_mandatory(
+            &plan, tier, transient_bytes) != 0 ||
+        coli_resource_plan_reserve_mandatory(
+            &plan, tier, dense.resident_bytes) != 0 ||
+        coli_resource_plan_reserve_mandatory(
+            &plan, tier, forced_expert_bytes) != 0)
+        return -1;
+
+    size_t count = coli_v4_adaptive_resource_append_dense(
+        planner, 0, plan.tier[tier].free_bytes);
+    size_t dense_count = count;
+    uint64_t exposed_ns_per_miss =
+        coli_expert_store_stats_exposed_ns_per_miss(&inner->stats);
+
+    /* V4 currently has comparable stored-byte measurements for dense and expert
+     * misses, but no matching exposed-I/O timing for dense package tensors.
+     * Select in bytes mode until that measurement exists; do not give dense a
+     * fabricated latency. Experts at or below the dense ratio-1 baseline can be
+     * omitted exactly because deterministic kind ordering would reject them. */
+    for (size_t slot = 0; slot < tracker->capacity; slot++) {
+        const ColiExpertActivationEntry *entry = &tracker->entries[slot];
+        if (!entry->hash_tag) continue;
+        size_t key_index = 0;
+        if (!coli_v4_adaptive_resource_key_index(
+                inner, entry->key, &key_index) ||
+            planner->expert_selected[key_index])
+            continue;
+
+        ColiExpertResidencyCandidate expert =
+            coli_expert_residency_policy_candidate(
+                entry, current_epoch, inner->slot_bytes, 1,
+                coli_v4_adaptive_resource_slot_resident(inner, entry->key),
+                policy);
+        ColiResourceBenefitEstimate estimate;
+        if (coli_expert_residency_policy_resource_estimate(
+                &expert, (uint32_t)key_index, inner->record_bytes,
+                exposed_ns_per_miss, &estimate) != 0)
+            continue;
+        ColiResourceCandidate candidate;
+        if (coli_resource_candidate_from_benefit(&estimate, &candidate) != 0)
+            continue;
+        if (coli_resource_ratio_compare(
+                candidate.expected_bytes_avoided, candidate.resident_bytes,
+                1, 1) <= 0)
+            continue;
+        if (count >= planner->candidate_capacity) return -1;
+        planner->candidates[count++] = candidate;
+    }
+
+    ColiResourceSelection selection;
+    if (coli_resource_plan_select_optional(
+            &plan, tier, planner->candidates, count,
+            COLI_RESOURCE_VALUE_BYTES,
+            planner->candidate_selected, &selection) != 0)
+        return -1;
+
+    uint64_t selected_dense = 0;
+    uint64_t selected_optional_experts = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (!planner->candidate_selected[i]) continue;
+        const ColiResourceCandidate *candidate = &planner->candidates[i];
+        if (i < dense_count || candidate->kind == COLI_RESOURCE_DENSE_TENSOR) {
+            selected_dense = coli_resource_saturating_add(
+                selected_dense, candidate->resident_bytes);
+        } else if (candidate->kind == COLI_RESOURCE_PERSISTENT_EXPERT &&
+                   candidate->id < planner->key_count) {
+            planner->expert_selected[candidate->id] = 1;
+            selected_optional_experts = coli_resource_saturating_add(
+                selected_optional_experts, candidate->resident_bytes);
+        }
+    }
+
+    coli_v4_adaptive_resource_reclaim_locked(planner, inner);
+    uint64_t dense_budget = coli_resource_saturating_add(
+        dense.resident_bytes, selected_dense);
+    dense_budget = coli_v4_dense_cache_set_budget(dense_budget);
+    inner->dense_cache_budget_bytes = dense_budget;
+    planner->selected_dense_bytes = dense_budget;
+    planner->selected_expert_bytes = coli_resource_saturating_add(
+        forced_expert_bytes, selected_optional_experts);
+    inner->stats.capacity_bytes = coli_resource_saturating_add(
+        transient_bytes, planner->selected_expert_bytes);
+    planner->last_replan_epoch = current_epoch;
+    planner->replan_count++;
+    return 1;
+}
+
+#endif /* COLI_V4_ADAPTIVE_RESOURCE_PLANNER_H */

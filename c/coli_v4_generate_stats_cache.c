@@ -27,6 +27,9 @@
 
 static void v4_ds_reset_history(void);
 
+#ifdef COLI_V4_ADAPTIVE_ACTIVATION
+void coli_v4_activation_begin_request(int prompt_tokens, int reused_tokens);
+#endif
 #ifdef COLI_V4_TRACE_ROUTE
 void coli_v4_route_trace_begin_request(int prompt_tokens, int reused_tokens);
 #endif
@@ -48,6 +51,11 @@ static int coli_v4_cached_kv_prefix_reuse(const kv_prefix *prefix,
         if (reused && coli_v4_full_dspark_wanted)
             v4_ds_reset_history();
     }
+#ifdef COLI_V4_ADAPTIVE_ACTIVATION
+    /* The lightweight block overlay uses this only to distinguish fresh prompt
+     * positions from decode positions. It does not inspect token values. */
+    coli_v4_activation_begin_request(count, reused);
+#endif
 #ifdef COLI_V4_TRACE_ROUTE
     coli_v4_route_trace_begin_request(count, reused);
 #endif

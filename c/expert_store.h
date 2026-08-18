@@ -12,6 +12,7 @@ extern "C" {
 #endif
 
 typedef struct ColiExpertStore ColiExpertStore;
+struct ColiExpertActivationSample;
 
 typedef struct {
     int layer;
@@ -69,7 +70,42 @@ typedef struct {
     uint64_t evictions;
     uint64_t slot_waits;
     uint64_t peak_inflight;
+
+    /* Logical routing/adaptive-policy diagnostics. These count pre-union route
+     * selections, not physical expert-store requests. */
+    uint64_t logical_activations;
+    uint64_t activation_observations;
+    uint64_t activation_keys;
+    uint64_t activation_dropped_new_keys;
+
+    /* Shared miss-cost telemetry for the resource planner.
+     *
+     * physical_load_* measures successful storage/decode attempts owned by this
+     * store. exposed_wait_* measures successful blocking lookup calls that did
+     * not find a resident expert immediately. That includes load owners,
+     * in-flight joiners and slot-pressure waits. A prefetched read that finishes
+     * before lookup therefore adds physical service time but zero exposed time,
+     * which is exactly the distinction the planner needs.
+     *
+     * All values are observational and saturating implementations are preferred;
+     * inability to measure time must never affect inference correctness. */
+    uint64_t physical_load_samples;
+    uint64_t physical_load_ns;
+    uint64_t exposed_wait_samples;
+    uint64_t exposed_wait_ns;
 } ColiExpertStoreStats;
+
+static inline uint64_t coli_expert_store_stats_exposed_ns_per_miss(
+        const ColiExpertStoreStats *stats) {
+    return stats && stats->exposed_wait_samples
+        ? stats->exposed_wait_ns / stats->exposed_wait_samples : 0;
+}
+
+static inline uint64_t coli_expert_store_stats_physical_load_ns_average(
+        const ColiExpertStoreStats *stats) {
+    return stats && stats->physical_load_samples
+        ? stats->physical_load_ns / stats->physical_load_samples : 0;
+}
 
 /*
  * ExpertStore lease contract:
@@ -80,6 +116,13 @@ typedef struct {
  *   lookup().
  * - lookup_context(), when implemented, has exactly the same lease semantics;
  *   its context is observational metadata and must never change model output.
+ * - Logical activation observation is also non-failing/observational. Engines
+ *   may report routing multiplicity before batching/union; a store/runtime that
+ *   does not consume adaptive residency signals simply ignores it. Policy
+ *   accounting must never become a model-correctness dependency.
+ * - Timing/statistics are likewise observational. In particular a store must
+ *   never turn a successful lookup into an error because a timing source is
+ *   unavailable or a counter saturates.
  * - On lookup failure the view is cleared; the caller must not use it and
  *   must not call release().
  * - release() clears the entire view. release() on an already-cleared or
@@ -110,6 +153,13 @@ typedef struct {
     int (*lookup_context)(ColiExpertStore *store, ColiExpertKey key,
                           const ColiExpertRequestContext *context,
                           ColiExpertView *view);
+    /* Optional shared adaptive-residency signal. The sample type is forward
+     * declared to keep expert_store.h independent from the tracker/policy
+     * implementation and avoid a header cycle. */
+    void (*observe_activations)(
+        ColiExpertStore *store,
+        const struct ColiExpertActivationSample *samples,
+        size_t count);
 } ColiExpertStoreOps;
 
 struct ColiExpertStore {
@@ -147,6 +197,15 @@ static inline int coli_expert_lookup_context(
     }
     if (result != 0 && view) memset(view, 0, sizeof(*view));
     return result;
+}
+
+static inline void coli_expert_observe_activations(
+        ColiExpertStore *store,
+        const struct ColiExpertActivationSample *samples,
+        size_t count) {
+    if (store && store->ops && store->ops->observe_activations &&
+        samples && count)
+        store->ops->observe_activations(store, samples, count);
 }
 
 static inline void coli_expert_release(ColiExpertStore *store,

@@ -7,9 +7,12 @@ endif
 
 .PHONY: check clean
 
-check: test_record_io$(EXE) test_expert_residency$(EXE) test_resource_planner$(EXE)
+check: test_record_io$(EXE) test_expert_residency$(EXE) test_expert_activation$(EXE) test_expert_residency_policy$(EXE) test_expert_resource_bridge$(EXE) test_resource_planner$(EXE)
 	./test_record_io$(EXE)
 	./test_expert_residency$(EXE)
+	./test_expert_activation$(EXE)
+	./test_expert_residency_policy$(EXE)
+	./test_expert_resource_bridge$(EXE)
 	./test_resource_planner$(EXE)
 
 test_record_io$(EXE): tests/test_record_io.c record_io.h
@@ -18,9 +21,21 @@ test_record_io$(EXE): tests/test_record_io.c record_io.h
 test_expert_residency$(EXE): tests/test_expert_residency.c expert_residency.h expert_store.h
 	$(CC) $(CFLAGS) tests/test_expert_residency.c -o $@
 
+test_expert_activation$(EXE): tests/test_expert_activation.c expert_activation.h expert_store.h
+	$(CC) $(CFLAGS) tests/test_expert_activation.c -o $@
+
+test_expert_residency_policy$(EXE): tests/test_expert_residency_policy.c expert_residency_policy.h expert_activation.h expert_store.h resource_planner.h
+	$(CC) $(CFLAGS) tests/test_expert_residency_policy.c -o $@
+
+test_expert_resource_bridge$(EXE): tests/test_expert_resource_bridge.c expert_residency_policy.h expert_activation.h expert_store.h resource_planner.h
+	$(CC) $(CFLAGS) tests/test_expert_resource_bridge.c -o $@
+
 test_resource_planner$(EXE): tests/test_resource_planner.c resource_planner.h
 	$(CC) $(CFLAGS) tests/test_resource_planner.c -o $@
 
 clean:
 	rm -f test_record_io test_record_io.exe test_expert_residency test_expert_residency.exe \
+		test_expert_activation test_expert_activation.exe \
+		test_expert_residency_policy test_expert_residency_policy.exe \
+		test_expert_resource_bridge test_expert_resource_bridge.exe \
 		test_resource_planner test_resource_planner.exe

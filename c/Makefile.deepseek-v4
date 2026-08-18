@@ -107,14 +107,12 @@ CFLAGS += -flto
 LDFLAGS += -flto
 endif
 
-# #56 detailed instrumentation is compile-gated so the normal inference binary
-# compiles the original block directly. There is therefore no route-wrapper or
-# expert-forward wrapper on the default block hot path. Aggregate store/profile
-# counters remain available.
-#
-# V4_TRACE_ROUTE=1 enables logical route + lookup correlation. V4_TRACE_EXEC=1
-# defaults route tracing on as well because execution validation needs the
-# logical stream. A caller may build route-only tracing explicitly.
+# Logical activation accounting is part of the normal fast path. The default
+# block overlay records compact pre-union multiplicity only and publishes it to
+# the shared runtime observer; it performs no file I/O and owns no cache policy.
+# #56 detailed route instrumentation remains explicitly compile-gated because
+# it buffers per-route correlation events and is diagnostic rather than normal
+# execution policy.
 V4_TRACE_EXEC ?= 0
 V4_TRACE_ROUTE ?= $(V4_TRACE_EXEC)
 V4_TRACE_EXEC_OBJS =
@@ -131,10 +129,13 @@ TARGET_OBJS = $(addsuffix .o,$(V4_TARGET_UNITS))
 TEST_UNIT_OBJS = $(addsuffix .o,$(V4_TEST_UNITS))
 V4_PREFIX_TEST_RUNTIME_OBJ = COLI_V4_UNIT_RUNTIME_PREFIX_TEST.o
 V4_PREFIX_TEST_GENERATE_OBJ = COLI_V4_UNIT_GENERATE_STATS_PREFIX_TEST.o
-V4_TRACE_SPLIT_OBJS =
+# The hybrid block is always split now: normal builds use the lightweight
+# activation overlay; explicit route-trace builds use the detailed overlay.
+V4_BLOCK_SPLIT_OBJS = COLI_V4_UNIT_BLOCK_HYBRID.o
 ifeq ($(V4_TRACE_ROUTE),1)
-V4_TRACE_SPLIT_OBJS = COLI_V4_UNIT_BLOCK_HYBRID.o
 COLI_V4_UNIT_GENERATE_STATS.o $(V4_PREFIX_TEST_GENERATE_OBJ): CFLAGS += -DCOLI_V4_TRACE_ROUTE=1
+else
+COLI_V4_UNIT_GENERATE_STATS.o $(V4_PREFIX_TEST_GENERATE_OBJ): CFLAGS += -DCOLI_V4_ADAPTIVE_ACTIVATION=1
 endif
 # Planner units remain standalone. #12 also splits the runtime/generation and
 # transaction snapshot units so the prefix-cache overlays can hook request and
@@ -147,7 +148,7 @@ V4_SPLIT_OBJS = COLI_V4_UNIT_RESOURCE_PLAN.o \
 	COLI_V4_UNIT_ATTENTION_TRANSACTION.o \
 	COLI_V4_UNIT_RUNTIME.o \
 	COLI_V4_UNIT_GENERATE_STATS.o \
-	$(V4_TRACE_SPLIT_OBJS)
+	$(V4_BLOCK_SPLIT_OBJS)
 V4_AMALGAMATED_OBJS = $(filter-out $(V4_SPLIT_OBJS),$(sort $(TARGET_OBJS) $(TEST_UNIT_OBJS)))
 V4_COLI_OBJS = coli_v4_expert_store.o coli_v4_static.o coli_executor.o coli_format.o \
 	coli_profile_v4.o coli_v4_prefix_cache.o $(V4_TRACE_EXEC_OBJS)
@@ -173,8 +174,8 @@ deepseek-v4-prefix-cache-test: $(V4_PREFIX_TEST_BINARY) $(V4_PREFIX_BENCH_BINARY
 
 deepseek-v4-prefix-cache-bench: $(V4_PREFIX_BENCH_BINARY)
 
-coli_v4_expert_store.o: coli_v4_expert_store.c coli_v4_expert_store.h coli_v4_residency.h coli_executor.h coli_format.h expert_store.h tensor.h compat.h
-	$(CC) $(CFLAGS) -c coli_v4_expert_store.c -o $@
+coli_v4_expert_store.o: coli_v4_expert_store_adaptive.c coli_v4_expert_store.c coli_v4_expert_store.h coli_v4_residency.h coli_executor.h coli_format.h expert_store.h expert_activation.h expert_residency_policy.h tensor.h compat.h
+	$(CC) $(CFLAGS) -c coli_v4_expert_store_adaptive.c -o $@
 coli_v4_static.o: coli_v4_static.c coli_v4_static.h coli_v4_residency.h coli_executor.h coli_format.h deepseek_v4_internal.h
 	$(CC) $(CFLAGS) -c coli_v4_static.c -o $@
 coli_executor.o: coli_executor.c coli_executor.h coli_format.h
@@ -192,7 +193,7 @@ coli_v4_expert_execute_trace.o: coli_v4_expert_execute_trace.c deepseek_v4_inter
 
 COLI_V4_UNIT_RESOURCE_PLAN.o: coli_v4_resource_plan.c deepseek_v4_internal.h coli_v4_residency.h
 	$(CC) $(CFLAGS) -c coli_v4_resource_plan.c -o $@
-COLI_V4_UNIT_EXPERT_STORE_AUTO.o: coli_v4_expert_store_auto_prefix.c coli_v4_expert_store_auto.c coli_v4_prefix_cache.h deepseek_v4_internal.h coli_v4_expert_store.h coli_v4_residency.h coli_executor.h st.h
+COLI_V4_UNIT_EXPERT_STORE_AUTO.o: coli_v4_expert_store_auto_prefix.c coli_v4_expert_store_auto.c coli_v4_prefix_cache.h expert_activation_store.h deepseek_v4_internal.h coli_v4_expert_store.h coli_v4_residency.h coli_executor.h st.h
 	$(CC) $(CFLAGS) -c coli_v4_expert_store_auto_prefix.c -o $@
 COLI_V4_UNIT_COMPRESSOR_SNAPSHOT.o: coli_v4_compressor_snapshot_size.c deepseek_v4.c deepseek_v4_internal.h coli_v4_prefix_cache.h
 	$(CC) $(CFLAGS) -DCOLI_V4_UNIT_COMPRESSOR_SNAPSHOT -c coli_v4_compressor_snapshot_size.c -o $@
@@ -216,13 +217,20 @@ $(V4_PREFIX_TEST_GENERATE_OBJ): coli_v4_generate_stats_cache.c deepseek_v4.c dee
 ifeq ($(V4_TRACE_ROUTE),1)
 # Detailed route tracing needs authoritative position before batch-union lookups
 # collapse logical selections into a physical lease. Compile the existing large
-# block through the overlay only in the explicit tracing build.
+# block through the diagnostic overlay only in the explicit tracing build.
 ifeq ($(V4_TRACE_EXEC),1)
 COLI_V4_UNIT_BLOCK_HYBRID.o: CFLAGS += -Dcoli_v4_expert_forward_ref=coli_v4_trace_expert_forward_ref
 endif
 COLI_V4_UNIT_BLOCK_HYBRID.o: coli_v4_block_hybrid_trace.c deepseek_v4.c deepseek_v4.h \
 	deepseek_v4_internal.h expert_store.h tensor.h
 	$(CC) $(CFLAGS) -DCOLI_V4_UNIT_BLOCK_HYBRID -c coli_v4_block_hybrid_trace.c -o $@
+else
+# Normal execution uses only the allocation-bounded activation overlay. It
+# records routing multiplicity before union and is a no-op when the shared store
+# does not expose an adaptive-residency observer.
+COLI_V4_UNIT_BLOCK_HYBRID.o: coli_v4_block_hybrid_activation.c deepseek_v4.c deepseek_v4.h \
+	deepseek_v4_internal.h expert_activation.h expert_store.h tensor.h
+	$(CC) $(CFLAGS) -DCOLI_V4_UNIT_BLOCK_HYBRID -c coli_v4_block_hybrid_activation.c -o $@
 endif
 
 $(V4_BINARY): $(V4_OBJS)

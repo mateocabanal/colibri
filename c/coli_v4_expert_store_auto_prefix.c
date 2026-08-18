@@ -23,6 +23,7 @@
 #include "deepseek_v4_internal.h"
 #include "coli_v4_expert_store.h"
 #include "coli_v4_prefix_cache.h"
+#include "expert_activation_store.h"
 
 #include <stdio.h>
 
@@ -121,6 +122,21 @@ int coli_v4_expert_store_open_planned(
         engine->summary.projected_bytes = coli_v4_prefix_final_plan.projected_bytes;
     coli_v4_prefix_active_plan = NULL;
     coli_v4_prefix_final_plan_valid = 0;
+
+    /* Package-mode COLI stores already own the shared tracker/scorer through
+     * coli_v4_expert_store_adaptive.c. Keep the generic best-effort wrapper only
+     * for the legacy safetensors store until that path migrates into #95. This
+     * avoids double tracking and keeps package admission decisions at the same
+     * physical residency boundary that owns the slots. */
+    if (!result && !engine->coli_static && output && *output && options &&
+        options->layers > 0 && options->experts_per_layer > 0 &&
+        (size_t)options->layers <= SIZE_MAX / (size_t)options->experts_per_layer) {
+        size_t key_hint = (size_t)options->layers *
+                          (size_t)options->experts_per_layer;
+        ColiExpertStore *wrapped = NULL;
+        if (coli_expert_activation_store_wrap(*output, key_hint, &wrapped) == 1)
+            *output = wrapped;
+    }
 
     if (!result && reserve && getenv("V4_PREFIX_LOG"))
         fprintf(stderr,
