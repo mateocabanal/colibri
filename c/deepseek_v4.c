@@ -9501,7 +9501,8 @@ static int v4_serve_main(void) {
         .pin_slots_per_layer = -1,
         .no_dspark = 0,
     };
-    const char *ram = getenv("RAM_GB");
+    const char *ram = getenv("COLI_MEMORY_GB");
+    if (!ram || !*ram) ram = getenv("RAM_GB");
     if (ram && atof(ram) > 0.0)
         open_options.memory_limit_bytes =
             (uint64_t)(atof(ram) * 1073741824.0);

@@ -3891,7 +3891,9 @@ int main(int argc, char **argv){
          * heuristic is 2 decimal GB per cache slot/layer, so reserve the
          * opt-in prompt cache before deriving that cap. */
         int ram_valid = 0;
-        cap = qwen_prefix_cache_ram_cap(getenv("RAM_GB"), prefix_budget, &ram_valid);
+        const char *memory_gb = getenv("COLI_MEMORY_GB");
+        if (!memory_gb || !*memory_gb) memory_gb = getenv("RAM_GB");
+        cap = qwen_prefix_cache_ram_cap(memory_gb, prefix_budget, &ram_valid);
         if (ram_valid) {
             if (prefix_budget)
                 fprintf(stderr,

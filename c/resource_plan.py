@@ -712,6 +712,7 @@ def environment_for_plan(plan, env=None, cuda_enabled=True):
     """Apply a plan without overriding explicit user environment settings."""
     result = dict(env or {})
     result.setdefault("COLI_POLICY", plan["policy"]["name"])
+    result.setdefault("COLI_MEMORY_POLICY", plan["policy"]["name"])
     result.setdefault("OMP_NUM_THREADS", str(plan["cpu"]["physical_cores"]))
     # NOTE: we intentionally do NOT set OMP_PROC_BIND / OMP_PLACES here.
     # The engine's own hot-thread tuning (glm.c main(), the COLI_OMP_TUNED
@@ -733,6 +734,7 @@ def environment_for_plan(plan, env=None, cuda_enabled=True):
     if plan["policy"]["name"] == "balanced":
         result.setdefault("REPIN", "64")
     ram = plan["tiers"]["ram"]
+    result.setdefault("COLI_MEMORY_GB", f"{ram['budget_bytes'] / GB:.3f}")
     result.setdefault("RAM_GB", f"{ram['budget_bytes'] / GB:.3f}")
 
     vram = plan["tiers"]["vram"]
@@ -746,6 +748,7 @@ def environment_for_plan(plan, env=None, cuda_enabled=True):
     if "COLI_GPU" not in result and "COLI_GPUS" not in result:
         key = "COLI_GPU" if len(devices) == 1 else "COLI_GPUS"
         result[key] = ",".join(map(str, devices))
+    result.setdefault("COLI_VRAM_GB", f"{vram['budget_bytes'] / GB:.3f}")
     result.setdefault("CUDA_EXPERT_GB", f"{vram['budget_bytes'] / GB:.3f}")
     if result.get("PIN"):
         result.setdefault("PIN_GB", f"{vram['budget_bytes'] / GB:.3f}")

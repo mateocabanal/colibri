@@ -325,6 +325,7 @@ class ResourcePlanTest(unittest.TestCase):
         env = environment_for_plan(plan, {"RAM_GB": "12", "PIN": "stats.txt",
                                                "COLI_GPUS": "1"})
         self.assertEqual(env["RAM_GB"], "12")
+        self.assertIn("COLI_MEMORY_GB", env)
         self.assertEqual(env["COLI_CUDA"], "1")
         self.assertEqual(env["COLI_GPUS"], "1")
         self.assertEqual(env["OMP_NUM_THREADS"], str(plan["cpu"]["physical_cores"]))
@@ -336,6 +337,8 @@ class ResourcePlanTest(unittest.TestCase):
         self.assertNotIn("OMP_PROC_BIND", env)
         self.assertNotIn("OMP_PLACES", env)
         self.assertEqual(env["PIN_GB"], env["CUDA_EXPERT_GB"])
+        self.assertEqual(env["COLI_VRAM_GB"], env["CUDA_EXPERT_GB"])
+        self.assertEqual(env["COLI_MEMORY_POLICY"], env["COLI_POLICY"])
 
         explicit_threads = environment_for_plan(plan, {"OMP_NUM_THREADS": "7",
                                                         "OMP_PROC_BIND": "close"})
@@ -432,10 +435,12 @@ class ResourcePlanTest(unittest.TestCase):
                                  "free_bytes": 8 * GB}])
         env = environment_for_plan(plan, cuda_enabled=False)
         self.assertIn("RAM_GB", env)
+        self.assertIn("COLI_MEMORY_GB", env)
         self.assertNotIn("COLI_CUDA", env)
         disabled = environment_for_plan(plan, {"COLI_CUDA": "0"}, cuda_enabled=True)
         self.assertNotIn("COLI_GPU", disabled)
         self.assertNotIn("CUDA_EXPERT_GB", disabled)
+        self.assertNotIn("COLI_VRAM_GB", disabled)
 
     def test_rejects_unknown_policy_and_marks_experimental_policy(self):
         with self.assertRaisesRegex(ValueError, "unknown policy"):
@@ -451,6 +456,7 @@ class ResourcePlanTest(unittest.TestCase):
                           gpus=[], policy="balanced")
         env = environment_for_plan(plan)
         self.assertEqual(env["COLI_POLICY"], "balanced")
+        self.assertEqual(env["COLI_MEMORY_POLICY"], "balanced")
         self.assertEqual(env["REPIN"], "64")
         explicit = environment_for_plan(plan, {"REPIN": "0"})
         self.assertEqual(explicit["REPIN"], "0")
