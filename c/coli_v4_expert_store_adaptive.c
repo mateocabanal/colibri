@@ -413,12 +413,14 @@ int coli_v4_coli_expert_store_open(const ColiV4ColiExpertStoreOptions *options,
                 "fallback=base-residency\n");
     }
 
-    /* The shared policy already gives currently-resident candidates percentage
-     * hysteresis. Disable the base store's old absolute request-count margin so
-     * it does not double-apply a V4-specific threshold. Byte geometry and the
-     * explicit legacy layout remain unchanged. */
+    /* Shared resident hysteresis already lives in the projected high bits. In
+     * planner-managed mode reserve the low 8 bits as a hard admission guard:
+     * the base store increments usage before choosing a slot, so rank-0
+     * unselected experts must not beat a zero-value sentinel after one request. */
     pthread_mutex_lock(&base->mutex);
-    if (!base->legacy_layout) base->hot_hysteresis = 0;
+    if (!base->legacy_layout)
+        base->hot_hysteresis = state->resource_planner.enabled
+            ? UINT64_C(255) : 0;
     pthread_mutex_unlock(&base->mutex);
 
     outer->ops = v4_adaptive_ops();
