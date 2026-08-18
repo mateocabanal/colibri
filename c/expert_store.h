@@ -70,6 +70,13 @@ typedef struct {
     uint64_t evictions;
     uint64_t slot_waits;
     uint64_t peak_inflight;
+
+    /* Logical routing/adaptive-policy diagnostics. These count pre-union route
+     * selections, not physical expert-store requests. */
+    uint64_t logical_activations;
+    uint64_t activation_observations;
+    uint64_t activation_keys;
+    uint64_t activation_dropped_new_keys;
 } ColiExpertStoreStats;
 
 /*
