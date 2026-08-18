@@ -23,7 +23,7 @@ static int fake_describe(void *opaque, uint64_t position,
                          ColiSequenceStateInfo *info,
                          ColiSequenceSegmentDesc *segments, size_t cap) {
     FakeSequenceState *state = (FakeSequenceState *)opaque;
-    if (!state || !info) return -1;
+    if (!state || !info || position != state->position) return -1;
     memset(info, 0, sizeof(*info));
     info->state_abi = 7;
     info->absolute_position = position;
@@ -134,11 +134,9 @@ static int test_sequence_state(void) {
         memcmp(source.recurrent, restored.recurrent, sizeof(source.recurrent)))
         return 3;
 
-    /* State ABI/segment metadata is fail-closed before bytes move. */
-    segments[1].segment_id = 1;
-    layout.info.segment_count = 2;
-    if (coli_sequence_segment_valid(&segments[0]) == 0 ||
-        coli_sequence_snapshot_layout(&src, 4, &layout) == 0)
+    /* A boundary beyond the live state is rejected by the adapter before any
+     * state bytes are read. */
+    if (coli_sequence_snapshot_layout(&src, 4, &layout) == 0)
         return 4;
     return 0;
 }
