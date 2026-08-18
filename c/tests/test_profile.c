@@ -3,6 +3,7 @@
 #endif
 #include "../profile.h"
 #include "../metal_policy.h"
+#include "../metal_runtime.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,8 +18,20 @@ static const ColiProfileCounterDef counters[] = {
     {"bytes"}, {"hits"},
 };
 
+static int fake_metal_init_result;
+static int fake_metal_init_calls;
+static int fake_metal_shutdown_calls;
+static int fake_metal_init(void) {
+    fake_metal_init_calls++;
+    return fake_metal_init_result;
+}
+static void fake_metal_shutdown(void) {
+    fake_metal_shutdown_calls++;
+}
+
 static int test_metal_policy(void) {
     ColiMetalPolicyResolution r;
+    ColiMetalRuntime runtime;
     char error[160];
 
     if (coli_metal_policy_resolve_values(
@@ -76,6 +89,39 @@ static int test_metal_policy(void) {
         !coli_metal_policy_is_strict(COLI_METAL_POLICY_STRICT))
         return 27;
 
+    fake_metal_init_result = 1;
+    fake_metal_init_calls = fake_metal_shutdown_calls = 0;
+    if (coli_metal_runtime_open_values(
+            &runtime, 1, "auto", NULL, NULL, COLI_METAL_POLICY_OFF,
+            fake_metal_init, error, sizeof(error)) != 0 ||
+        !coli_metal_runtime_enabled(&runtime) || fake_metal_init_calls != 1)
+        return 28;
+    coli_metal_runtime_close(&runtime, fake_metal_shutdown);
+    if (fake_metal_shutdown_calls != 1 || coli_metal_runtime_enabled(&runtime))
+        return 29;
+
+    fake_metal_init_result = 0;
+    fake_metal_init_calls = 0;
+    if (coli_metal_runtime_open_values(
+            &runtime, 1, "auto", NULL, NULL, COLI_METAL_POLICY_OFF,
+            fake_metal_init, error, sizeof(error)) != 0 ||
+        coli_metal_runtime_enabled(&runtime) || fake_metal_init_calls != 1)
+        return 30;
+
+    memset(error, 0, sizeof(error));
+    if (coli_metal_runtime_open_values(
+            &runtime, 1, "strict", NULL, NULL, COLI_METAL_POLICY_OFF,
+            fake_metal_init, error, sizeof(error)) == 0 ||
+        !strstr(error, "backend is unavailable"))
+        return 31;
+
+    fake_metal_init_calls = 0;
+    if (coli_metal_runtime_open_values(
+            &runtime, 1, "0", NULL, NULL, COLI_METAL_POLICY_AUTO,
+            fake_metal_init, error, sizeof(error)) != 0 ||
+        fake_metal_init_calls != 0 || coli_metal_runtime_enabled(&runtime))
+        return 32;
+
     return 0;
 }
 
@@ -131,6 +177,6 @@ int main(void) {
 #endif
     coli_profile_reset(&p, &config);
     if (coli_profile_enabled(&p)) return 5;
-    puts("PASS generic profile + metal policy");
+    puts("PASS generic profile + metal policy/runtime");
     return 0;
 }
