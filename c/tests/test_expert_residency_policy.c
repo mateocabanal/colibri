@@ -60,6 +60,20 @@ static void test_store_observer_contract(void) {
     coli_expert_observe_activations(&no_observer, samples, 2);
 }
 
+static void test_shared_miss_cost_stats(void) {
+    ColiExpertStoreStats stats;
+    memset(&stats, 0, sizeof(stats));
+    assert(coli_expert_store_stats_exposed_ns_per_miss(&stats) == 0);
+    assert(coli_expert_store_stats_physical_load_ns_average(&stats) == 0);
+
+    stats.physical_load_samples = 4;
+    stats.physical_load_ns = 400;
+    stats.exposed_wait_samples = 3;
+    stats.exposed_wait_ns = 750;
+    assert(coli_expert_store_stats_physical_load_ns_average(&stats) == 100);
+    assert(coli_expert_store_stats_exposed_ns_per_miss(&stats) == 250);
+}
+
 static void test_frequency_beats_pure_recency(void) {
     ColiExpertActivationEntry entries[16];
     ColiExpertActivationTracker tracker;
@@ -211,6 +225,7 @@ static void test_deterministic_tie_break(void) {
 
 int main(void) {
     test_store_observer_contract();
+    test_shared_miss_cost_stats();
     test_frequency_beats_pure_recency();
     test_stale_frequency_decays();
     test_decode_weight_and_hysteresis();
