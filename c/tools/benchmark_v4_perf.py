@@ -40,6 +40,11 @@ TOKENS_RE = re.compile(
     r"expert_requests=(\d+) hits=(\d+) misses=(\d+) "
     r"hit_rate=([0-9.]+) bytes=(\d+) target_only=(\d+)"
 )
+PREFIX_CACHE_RE = re.compile(
+    r"v4_prefix_cache hit=(\d+) matched_tokens=(\d+) restore_bytes=(\d+) "
+    r"restore_ms=([0-9.eE+-]+) stores=(\d+) evictions=(\d+) "
+    r"entries=(\d+) resident_bytes=(\d+) budget_bytes=(\d+)"
+)
 # v4_phases scope=startup tokens=0 wall_ms=.. accounted_ms=.. unaccounted_ms=..
 # cpu_compute_ms=.. io_wait_ms=.. dense_read_ms=.. ... emitted by the engine
 # when V4_PROFILE=1.
@@ -131,6 +136,15 @@ class Result:
     expert_bytes: Optional[int] = None
     expert_bytes_per_total_token: Optional[float] = None
     target_only: Optional[int] = None
+    prefix_cache_hit: Optional[int] = None
+    prefix_cache_matched_tokens: Optional[int] = None
+    prefix_cache_restore_bytes: Optional[int] = None
+    prefix_cache_restore_ms: Optional[float] = None
+    prefix_cache_stores: Optional[int] = None
+    prefix_cache_evictions: Optional[int] = None
+    prefix_cache_entries: Optional[int] = None
+    prefix_cache_resident_bytes: Optional[int] = None
+    prefix_cache_budget_bytes: Optional[int] = None
     # v4_phases rows (V4_PROFILE=1): scope name -> dict of phase ms/bytes.
     phases: Optional[dict] = None
     # Reconciliation flags computed after parsing.
@@ -237,6 +251,19 @@ def parse_output(stderr: str, stdout: str, result: Result) -> None:    # noqa: C
         result.expert_hit_rate_pct = float(match.group(7))
         result.expert_bytes = int(match.group(8))
         result.target_only = int(match.group(9))
+
+    prefix_matches = list(PREFIX_CACHE_RE.finditer(stderr))
+    if prefix_matches:
+        match = prefix_matches[-1]
+        result.prefix_cache_hit = int(match.group(1))
+        result.prefix_cache_matched_tokens = int(match.group(2))
+        result.prefix_cache_restore_bytes = int(match.group(3))
+        result.prefix_cache_restore_ms = float(match.group(4))
+        result.prefix_cache_stores = int(match.group(5))
+        result.prefix_cache_evictions = int(match.group(6))
+        result.prefix_cache_entries = int(match.group(7))
+        result.prefix_cache_resident_bytes = int(match.group(8))
+        result.prefix_cache_budget_bytes = int(match.group(9))
 
     result.phases = parse_phases(stderr)
 
@@ -434,6 +461,9 @@ def selftest() -> None:
         "v4_tokens prompt=512 generated=8 total=520 expert_requests=99 "
         "hits=80 misses=19 hit_rate=80.808 bytes=123456 target_only=1\n"
         "timing time_to_first_token=2.500s after_first=1.400s\n"
+        "v4_prefix_cache hit=1 matched_tokens=384 restore_bytes=1048576 "
+        "restore_ms=1.250 stores=1 evictions=0 entries=2 "
+        "resident_bytes=2097152 budget_bytes=67108864\n"
         "v4_phases scope=startup tokens=0 wall_ms=123.000 accounted_ms=100.000 "
         "unaccounted_ms=23.000 cpu_compute_ms=90.000 io_wait_ms=10.000 "
         "dense_read_ms=20.000 dense_read_bytes=6710886400 "
@@ -471,6 +501,15 @@ def selftest() -> None:
     assert abs(result.ttft_sec - 2.5) < 1e-9
     assert abs(result.after_first_tok_s - 5.0) < 1e-9
     assert abs(result.tune_tok_s - (8 / 3.9)) < 1e-9
+    assert result.prefix_cache_hit == 1
+    assert result.prefix_cache_matched_tokens == 384
+    assert result.prefix_cache_restore_bytes == 1048576
+    assert abs(result.prefix_cache_restore_ms - 1.25) < 1e-9
+    assert result.prefix_cache_stores == 1
+    assert result.prefix_cache_evictions == 0
+    assert result.prefix_cache_entries == 2
+    assert result.prefix_cache_resident_bytes == 2097152
+    assert result.prefix_cache_budget_bytes == 67108864
     assert make_prompt(512, 4.0) == make_prompt(512, 4.0)
     assert PROFILES["quick"] == ("decode8",)
     assert PROFILE_TIMEOUT_SEC["quick"] == 120.0

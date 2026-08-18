@@ -181,6 +181,24 @@ jobs:
         run: |
           python3 c/tests/test_v4_exact_coli_trace_tiny.py \
             --binary c/deepseek_v4 --package c/deepseek_v4_tiny.coli
+      - name: Validate exact COLI prefix-cache A/B on Apple Silicon
+        run: |
+          make -C c -f Makefile.deepseek-v4 V4_TRACE_EXEC=1 deepseek-v4-prefix-cache-test
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          package = Path('c/deepseek_v4_tiny.coli')
+          case = json.loads((package / 'ref.json').read_text(encoding='utf-8'))['cases']['short']
+          prompt = ''.join(f'<t{token:03d}>' for token in case['prompt_ids'])
+          Path('/tmp/v4-prefix-coli.txt').write_text(prompt, encoding='utf-8')
+          PY
+          python3 c/tools/benchmark_v4_prefix_cache.py \
+            --binary c/benchmark_v4_prefix_cache_sessions \
+            --model c/deepseek_v4_tiny.coli \
+            --prefix-file /tmp/v4-prefix-coli.txt \
+            --cache-mb 64 --min-prefix-tokens 1 \
+            --memory-gb 3 --context 128 --max-new 1 \
+            --trials 1 --timeout-sec 180 --repo .
 
   macos:
     # clang; libomp for the threaded path (Makefile falls back to
