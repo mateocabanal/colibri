@@ -1,0 +1,17 @@
+CC ?= cc
+CFLAGS ?= -O2 -std=c11 -Wall -Wextra -Werror
+EXE :=
+ifeq ($(OS),Windows_NT)
+EXE := .exe
+endif
+
+.PHONY: check clean
+
+check: test_record_io$(EXE)
+	./test_record_io$(EXE)
+
+test_record_io$(EXE): tests/test_record_io.c record_io.h
+	$(CC) $(CFLAGS) tests/test_record_io.c -o $@
+
+clean:
+	rm -f test_record_io test_record_io.exe
