@@ -5,6 +5,7 @@
 #include "../metal_policy.h"
 #include "../metal_runtime.h"
 #include "../metal_region.h"
+#include "../expert_residency.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -189,11 +190,89 @@ static int test_metal_region(void) {
     return 0;
 }
 
+static int test_expert_residency(void) {
+    ColiExpertResidencyBudget budget;
+    ColiExpertResidencyEntry a, b;
+    ColiExpertResidencyLease lease;
+    ColiExpertKey ka = {3, 11}, kb = {3, 12};
+
+    coli_expert_residency_budget_init(&budget, 100);
+    if (coli_expert_residency_entry_init(&a, ka) != 0 ||
+        coli_expert_residency_entry_init(&b, kb) != 0)
+        return 60;
+
+    if (coli_expert_residency_request(&a, &budget, 60, &lease) !=
+            COLI_EXPERT_REQUEST_LOAD_OWNER ||
+        coli_expert_residency_budget_committed(&budget) != 60 ||
+        atomic_load(&budget.reserved_bytes) != 60 ||
+        coli_expert_residency_state(&a) != COLI_EXPERT_RESIDENCY_RESERVED)
+        return 61;
+
+    if (coli_expert_residency_request(&a, &budget, 60, &lease) !=
+            COLI_EXPERT_REQUEST_JOIN_INFLIGHT ||
+        coli_expert_residency_budget_committed(&budget) != 60)
+        return 62;
+
+    if (coli_expert_residency_request(&b, &budget, 50, &lease) !=
+            COLI_EXPERT_REQUEST_NO_BUDGET ||
+        coli_expert_residency_state(&b) != COLI_EXPERT_RESIDENCY_COLD ||
+        coli_expert_residency_budget_committed(&budget) != 60)
+        return 63;
+
+    if (coli_expert_residency_mark_loading(&a) != 0 ||
+        coli_expert_residency_mark_preparing(&a) != 0 ||
+        coli_expert_residency_publish(&a, &budget, 1, COLI_EXPERT_TIER_UMA) != 0 ||
+        atomic_load(&budget.reserved_bytes) != 0 ||
+        atomic_load(&budget.resident_bytes) != 60 ||
+        coli_expert_residency_budget_committed(&budget) != 60)
+        return 64;
+
+    if (coli_expert_residency_request(&a, &budget, 60, &lease) !=
+            COLI_EXPERT_REQUEST_HIT ||
+        lease.generation != 1 || lease.tier_mask != COLI_EXPERT_TIER_UMA ||
+        !coli_expert_key_equal(lease.key, ka) || atomic_load(&a.refs) != 1)
+        return 65;
+
+    if (coli_expert_residency_begin_evict(&a) != 0 ||
+        coli_expert_residency_release(&lease) != 0 ||
+        atomic_load(&a.refs) != 0 ||
+        coli_expert_residency_begin_evict(&a) != 1 ||
+        coli_expert_residency_finish_evict(&a, &budget) != 0 ||
+        coli_expert_residency_state(&a) != COLI_EXPERT_RESIDENCY_COLD ||
+        coli_expert_residency_budget_committed(&budget) != 0)
+        return 66;
+
+    if (coli_expert_residency_request(&a, &budget, 60, &lease) !=
+            COLI_EXPERT_REQUEST_LOAD_OWNER ||
+        coli_expert_residency_mark_loading(&a) != 0 ||
+        coli_expert_residency_fail_load(&a, &budget) != 0 ||
+        coli_expert_residency_state(&a) != COLI_EXPERT_RESIDENCY_COLD ||
+        coli_expert_residency_budget_committed(&budget) != 0)
+        return 67;
+
+    if (coli_expert_residency_request(&b, &budget, 50, &lease) !=
+            COLI_EXPERT_REQUEST_LOAD_OWNER ||
+        coli_expert_residency_publish(&b, &budget, 9,
+            COLI_EXPERT_TIER_PINNED_HOST | COLI_EXPERT_TIER_DEVICE) != 0 ||
+        coli_expert_residency_request(&b, &budget, 50, &lease) !=
+            COLI_EXPERT_REQUEST_HIT || lease.generation != 9 ||
+        (lease.tier_mask & COLI_EXPERT_TIER_DEVICE) == 0)
+        return 68;
+    if (coli_expert_residency_release(&lease) != 0 ||
+        atomic_load(&budget.peak_committed_bytes) > budget.capacity_bytes ||
+        atomic_load(&budget.peak_committed_bytes) != 60)
+        return 69;
+
+    return 0;
+}
+
 int main(void) {
-    int metal_rc = test_metal_policy();
-    if (metal_rc) return metal_rc;
-    metal_rc = test_metal_region();
-    if (metal_rc) return metal_rc;
+    int rc = test_metal_policy();
+    if (rc) return rc;
+    rc = test_metal_region();
+    if (rc) return rc;
+    rc = test_expert_residency();
+    if (rc) return rc;
 
 #ifdef _WIN32
     _putenv_s("COLI_PROFILE", "1");
@@ -243,6 +322,6 @@ int main(void) {
 #endif
     coli_profile_reset(&p, &config);
     if (coli_profile_enabled(&p)) return 5;
-    puts("PASS generic profile + metal policy/runtime/regions");
+    puts("PASS shared runtime policy/regions/residency/profile");
     return 0;
 }
