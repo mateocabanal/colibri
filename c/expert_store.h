@@ -12,6 +12,7 @@ extern "C" {
 #endif
 
 typedef struct ColiExpertStore ColiExpertStore;
+struct ColiExpertActivationSample;
 
 typedef struct {
     int layer;
@@ -80,6 +81,10 @@ typedef struct {
  *   lookup().
  * - lookup_context(), when implemented, has exactly the same lease semantics;
  *   its context is observational metadata and must never change model output.
+ * - Logical activation observation is also non-failing/observational. Engines
+ *   may report routing multiplicity before batching/union; a store/runtime that
+ *   does not consume adaptive residency signals simply ignores it. Policy
+ *   accounting must never become a model-correctness dependency.
  * - On lookup failure the view is cleared; the caller must not use it and
  *   must not call release().
  * - release() clears the entire view. release() on an already-cleared or
@@ -110,6 +115,13 @@ typedef struct {
     int (*lookup_context)(ColiExpertStore *store, ColiExpertKey key,
                           const ColiExpertRequestContext *context,
                           ColiExpertView *view);
+    /* Optional shared adaptive-residency signal. The sample type is forward
+     * declared to keep expert_store.h independent from the tracker/policy
+     * implementation and avoid a header cycle. */
+    void (*observe_activations)(
+        ColiExpertStore *store,
+        const struct ColiExpertActivationSample *samples,
+        size_t count);
 } ColiExpertStoreOps;
 
 struct ColiExpertStore {
@@ -147,6 +159,15 @@ static inline int coli_expert_lookup_context(
     }
     if (result != 0 && view) memset(view, 0, sizeof(*view));
     return result;
+}
+
+static inline void coli_expert_observe_activations(
+        ColiExpertStore *store,
+        const struct ColiExpertActivationSample *samples,
+        size_t count) {
+    if (store && store->ops && store->ops->observe_activations &&
+        samples && count)
+        store->ops->observe_activations(store, samples, count);
 }
 
 static inline void coli_expert_release(ColiExpertStore *store,
