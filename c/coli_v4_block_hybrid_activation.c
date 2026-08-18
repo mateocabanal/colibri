@@ -76,7 +76,7 @@ typedef struct {
 
 static _Thread_local ColiV4ActivationRequest g_v4_activation_request;
 static _Thread_local ColiV4ActivationCall g_v4_activation_call;
-static atomic_uint_fast64_t g_v4_activation_epoch = ATOMIC_VAR_INIT(1);
+static atomic_uint_fast64_t g_v4_activation_epoch = 1;
 static ColiV4ActivationPending g_v4_activation_pending = {
     .mutex = PTHREAD_MUTEX_INITIALIZER,
     .layer = -1,
