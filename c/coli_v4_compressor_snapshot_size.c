@@ -33,6 +33,90 @@ size_t coli_v4_compressor_state_snapshot_bytes(
     return compressor_count_bytes(rows * projection);
 }
 
+/* Persistent payload: u64 count, then kv_state[count], score_state[count]. */
+size_t coli_v4_compressor_snapshot_wire_bytes(
+    const ColiV4CompressorSnapshot *snapshot) {
+    if (!snapshot) return 0;
+    if (snapshot->count > (SIZE_MAX - sizeof(uint64_t)) /
+                              (2 * sizeof(float)))
+        return SIZE_MAX;
+    return sizeof(uint64_t) + snapshot->count * 2 * sizeof(float);
+}
+
+int coli_v4_compressor_snapshot_wire_emit(
+    const ColiV4CompressorSnapshot *snapshot,
+    ColiV4PrefixWireSink sink, void *user_data) {
+    if (!snapshot || !sink ||
+        (snapshot->count && (!snapshot->kv_state || !snapshot->score_state)))
+        return -1;
+    if (coli_v4_compressor_snapshot_wire_bytes(snapshot) == SIZE_MAX)
+        return -1;
+    uint64_t count = (uint64_t)snapshot->count;
+    if ((size_t)count != snapshot->count) return -1;
+    if (sink(user_data, &count, sizeof(count))) return -1;
+    size_t values = snapshot->count * sizeof(float);
+    if (values && sink(user_data, snapshot->kv_state, values)) return -1;
+    if (values && sink(user_data, snapshot->score_state, values)) return -1;
+    return 0;
+}
+
+int coli_v4_compressor_snapshot_wire_write(
+    const ColiV4CompressorSnapshot *snapshot,
+    unsigned char *output, size_t output_size, size_t *written) {
+    if (written) *written = 0;
+    if (!snapshot || !output || !written ||
+        (snapshot->count && (!snapshot->kv_state || !snapshot->score_state)))
+        return -1;
+    size_t need = coli_v4_compressor_snapshot_wire_bytes(snapshot);
+    if (need == SIZE_MAX || need > output_size) return -1;
+    uint64_t count = (uint64_t)snapshot->count;
+    if ((size_t)count != snapshot->count) return -1;
+    memcpy(output, &count, sizeof(count));
+    size_t values = snapshot->count * sizeof(float);
+    if (values) {
+        memcpy(output + sizeof(count), snapshot->kv_state, values);
+        memcpy(output + sizeof(count) + values, snapshot->score_state, values);
+    }
+    *written = need;
+    return 0;
+}
+
+int coli_v4_compressor_snapshot_wire_read(
+    ColiV4CompressorSnapshot **output,
+    const unsigned char *input, size_t input_size, size_t *consumed) {
+    if (consumed) *consumed = 0;
+    if (!output || !input || !consumed || input_size < sizeof(uint64_t))
+        return -1;
+    *output = NULL;
+    uint64_t raw_count = 0;
+    memcpy(&raw_count, input, sizeof(raw_count));
+    size_t count = (size_t)raw_count;
+    if ((uint64_t)count != raw_count) return -1;
+    if (count > (SIZE_MAX - sizeof(uint64_t)) / (2 * sizeof(float)))
+        return -1;
+    size_t need = sizeof(uint64_t) + count * 2 * sizeof(float);
+    if (need > input_size) return -1;
+
+    ColiV4CompressorSnapshot *snapshot = calloc(1, sizeof(*snapshot));
+    if (!snapshot) return -1;
+    snapshot->count = count;
+    if (count) {
+        size_t values = count * sizeof(float);
+        snapshot->kv_state = malloc(values);
+        snapshot->score_state = malloc(values);
+        if (!snapshot->kv_state || !snapshot->score_state) {
+            coli_v4_compressor_snapshot_destroy(snapshot);
+            return -1;
+        }
+        memcpy(snapshot->kv_state, input + sizeof(uint64_t), values);
+        memcpy(snapshot->score_state,
+               input + sizeof(uint64_t) + values, values);
+    }
+    *output = snapshot;
+    *consumed = need;
+    return 0;
+}
+
 static int compressor_hydrate_error(char *error, size_t error_size,
                                     const char *format, ...) {
     if (error && error_size) {

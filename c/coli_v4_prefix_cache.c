@@ -18,6 +18,7 @@ int coli_v4_attention_snapshot_restore_fresh(
 
 #define COLI_V4_PREFIX_CACHE_MAX_ENTRIES 64
 #define COLI_V4_PREFIX_CACHE_DEFAULT_MIN_TOKENS 256
+#define COLI_V4_PREFIX_CACHE_DEFAULT_SERVE_MB 256u
 
 typedef struct {
     ColiV4Engine *engine;
@@ -64,23 +65,59 @@ static size_t safe_add_size(size_t a, size_t b) {
     return a > SIZE_MAX - b ? SIZE_MAX : a + b;
 }
 
-static size_t cache_budget_from_env(void) {
-    const char *value = getenv("V4_PREFIX_CACHE_MB");
-    if (!value || !*value) return 0;
+static int ascii_ieq(const char *a, const char *b) {
+    if (!a || !b) return 0;
+    while (*a && *b) {
+        unsigned char ca = (unsigned char)*a++, cb = (unsigned char)*b++;
+        if (ca >= 'A' && ca <= 'Z') ca = (unsigned char)(ca - 'A' + 'a');
+        if (cb >= 'A' && cb <= 'Z') cb = (unsigned char)(cb - 'A' + 'a');
+        if (ca != cb) return 0;
+    }
+    return *a == 0 && *b == 0;
+}
+
+static size_t parse_mib(const char *value, size_t fallback) {
+    if (!value || !*value) return fallback;
+    if (ascii_ieq(value, "off")) return 0;
     char *end = NULL;
-    double mib = strtod(value, &end);
-    if (end == value || mib <= 0.0) return 0;
-    long double bytes = (long double)mib * 1024.0L * 1024.0L;
+    long double mib = strtold(value, &end);
+    if (end == value || !(mib > 0.0L)) return 0;
+    while (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n') end++;
+    if (*end) return 0;
+    long double bytes = mib * 1024.0L * 1024.0L;
     if (bytes >= (long double)SIZE_MAX) return SIZE_MAX;
     return (size_t)bytes;
 }
 
+static int common_mode_allows_ram(void) {
+    const char *mode = getenv("COLI_PREFIX_CACHE");
+    if (!mode || !*mode || ascii_ieq(mode, "auto") || ascii_ieq(mode, "ram"))
+        return 1;
+    if (ascii_ieq(mode, "off") || ascii_ieq(mode, "ssd")) return 0;
+    /* Unknown policy is fail-closed rather than silently allocating RAM. */
+    return 0;
+}
+
+static size_t cache_budget_from_env(void) {
+    if (!common_mode_allows_ram()) return 0;
+    const char *compat = getenv("V4_PREFIX_CACHE_MB");
+    if (compat) return parse_mib(compat, 0);
+    const char *common = getenv("COLI_PREFIX_CACHE_RAM_MB");
+    if (common) return parse_mib(common, 0);
+    const char *serve = getenv("SERVE");
+    if (!serve || serve[0] != '1') return 0;
+    return (size_t)COLI_V4_PREFIX_CACHE_DEFAULT_SERVE_MB * 1024u * 1024u;
+}
+
 static int cache_min_tokens_from_env(void) {
     const char *value = getenv("V4_PREFIX_CACHE_MIN_TOKENS");
+    if (!value || !*value) value = getenv("COLI_PREFIX_CACHE_MIN_TOKENS");
     if (!value || !*value) return COLI_V4_PREFIX_CACHE_DEFAULT_MIN_TOKENS;
     char *end = NULL;
     long parsed = strtol(value, &end, 10);
     if (end == value || parsed < 1) return COLI_V4_PREFIX_CACHE_DEFAULT_MIN_TOKENS;
+    while (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n') end++;
+    if (*end) return COLI_V4_PREFIX_CACHE_DEFAULT_MIN_TOKENS;
     if (parsed > INT_MAX) return INT_MAX;
     return (int)parsed;
 }
@@ -90,9 +127,11 @@ static void prefix_cache_init_once(void) {
     g_prefix_cache.min_tokens = cache_min_tokens_from_env();
     if (getenv("V4_PREFIX_LOG")) {
         fprintf(stderr,
-                "[PREFIX-CACHE] budget=%.2fMiB min_tokens=%d mode=process-local-exact\n",
+                "[PREFIX-CACHE] budget=%.2fMiB min_tokens=%d mode=process-local-exact%s\n",
                 (double)g_prefix_cache.budget_bytes / (1024.0 * 1024.0),
-                g_prefix_cache.min_tokens);
+                g_prefix_cache.min_tokens,
+                (!getenv("V4_PREFIX_CACHE_MB") && getenv("SERVE") &&
+                 getenv("SERVE")[0] == '1') ? " default-on" : "");
     }
 }
 
@@ -190,6 +229,29 @@ static int cache_already_has(ColiV4Engine *engine,
     }
     pthread_mutex_unlock(&g_prefix_cache.mutex);
     return found;
+}
+
+int coli_v4_prefix_cache_visit_exact(ColiV4Session *session,
+                                     ColiV4PrefixCacheVisitFn visitor,
+                                     void *user_data) {
+    prefix_cache_init();
+    if (!session || !visitor || !session->engine || !session->prompt_ids ||
+        session->prompt_count <= 0)
+        return 0;
+    ColiV4PrefixCacheEntry *entry = NULL;
+    pthread_mutex_lock(&g_prefix_cache.mutex);
+    entry = find_exact_locked(session->engine, session->prompt_ids,
+                              session->prompt_count);
+    if (entry) {
+        entry->refs++;
+        entry->last_used = ++g_prefix_cache.clock;
+    }
+    pthread_mutex_unlock(&g_prefix_cache.mutex);
+    if (!entry) return 0;
+    int result = visitor(entry->tokens, entry->token_count,
+                         entry->attention, entry->layer_count, user_data);
+    release_entry(entry);
+    return result;
 }
 
 /* Allocation-free exact preflight. These bytes mirror capture_entry(): entry
@@ -323,10 +385,6 @@ void coli_v4_prefix_cache_store(ColiV4Session *session) {
 
     ColiV4PrefixCacheEntry *entry = capture_entry(session);
     if (!entry || !entry->bytes || entry->bytes > reserved) {
-        /* Keep the reservation charged until every byte cloned under it is
-         * physically gone. Otherwise a concurrent admission can reuse this
-         * budget between reservation release and entry_free(), transiently
-         * exceeding the hard UMA/RAM cap. */
         entry_free(entry);
         release_snapshot_reservation(reserved);
         return;
@@ -338,18 +396,11 @@ void coli_v4_prefix_cache_store(ColiV4Session *session) {
     size_t resident = 0, entries = 0;
 
     pthread_mutex_lock(&g_prefix_cache.mutex);
-    /* Another thread may have admitted the same exact prefix while this clone
-     * was being built. Recheck under the insertion lock instead of installing
-     * duplicates and wasting the byte budget. */
     ColiV4PrefixCacheEntry *duplicate = find_exact_locked(
         entry->engine, entry->tokens, entry->token_count);
     if (duplicate) {
         duplicate->last_used = ++g_prefix_cache.clock;
     } else {
-        /* Evaluate the post-insert geometry while excluding only this clone's
-         * own reservation. If accepted, reservation -> resident is one atomic
-         * accounting transition under the mutex. Other concurrent clone
-         * reservations remain charged throughout. */
         int own_reservation_valid =
             reserved <= g_prefix_cache.reserved_bytes &&
             g_prefix_cache.reserved_entries > 0;
@@ -383,9 +434,6 @@ void coli_v4_prefix_cache_store(ColiV4Session *session) {
     pthread_mutex_unlock(&g_prefix_cache.mutex);
 
     if (!inserted) {
-        /* Duplicate/rejected clones are still covered by their reservation at
-         * this point. Free first, then make those bytes available to another
-         * admission. */
         entry_free(entry);
         release_snapshot_reservation(reserved);
         return;
