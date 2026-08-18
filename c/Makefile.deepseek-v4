@@ -174,8 +174,8 @@ deepseek-v4-prefix-cache-test: $(V4_PREFIX_TEST_BINARY) $(V4_PREFIX_BENCH_BINARY
 
 deepseek-v4-prefix-cache-bench: $(V4_PREFIX_BENCH_BINARY)
 
-coli_v4_expert_store.o: coli_v4_expert_store.c coli_v4_expert_store.h coli_v4_residency.h coli_executor.h coli_format.h expert_store.h tensor.h compat.h
-	$(CC) $(CFLAGS) -c coli_v4_expert_store.c -o $@
+coli_v4_expert_store.o: coli_v4_expert_store_adaptive.c coli_v4_expert_store.c coli_v4_expert_store.h coli_v4_residency.h coli_executor.h coli_format.h expert_store.h expert_activation.h expert_residency_policy.h tensor.h compat.h
+	$(CC) $(CFLAGS) -c coli_v4_expert_store_adaptive.c -o $@
 coli_v4_static.o: coli_v4_static.c coli_v4_static.h coli_v4_residency.h coli_executor.h coli_format.h deepseek_v4_internal.h
 	$(CC) $(CFLAGS) -c coli_v4_static.c -o $@
 coli_executor.o: coli_executor.c coli_executor.h coli_format.h
@@ -193,7 +193,7 @@ coli_v4_expert_execute_trace.o: coli_v4_expert_execute_trace.c deepseek_v4_inter
 
 COLI_V4_UNIT_RESOURCE_PLAN.o: coli_v4_resource_plan.c deepseek_v4_internal.h coli_v4_residency.h
 	$(CC) $(CFLAGS) -c coli_v4_resource_plan.c -o $@
-COLI_V4_UNIT_EXPERT_STORE_AUTO.o: coli_v4_expert_store_auto_prefix.c coli_v4_expert_store_auto.c coli_v4_prefix_cache.h deepseek_v4_internal.h coli_v4_expert_store.h coli_v4_residency.h coli_executor.h st.h
+COLI_V4_UNIT_EXPERT_STORE_AUTO.o: coli_v4_expert_store_auto_prefix.c coli_v4_expert_store_auto.c coli_v4_prefix_cache.h expert_activation_store.h deepseek_v4_internal.h coli_v4_expert_store.h coli_v4_residency.h coli_executor.h st.h
 	$(CC) $(CFLAGS) -c coli_v4_expert_store_auto_prefix.c -o $@
 COLI_V4_UNIT_COMPRESSOR_SNAPSHOT.o: coli_v4_compressor_snapshot_size.c deepseek_v4.c deepseek_v4_internal.h coli_v4_prefix_cache.h
 	$(CC) $(CFLAGS) -DCOLI_V4_UNIT_COMPRESSOR_SNAPSHOT -c coli_v4_compressor_snapshot_size.c -o $@
