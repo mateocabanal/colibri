@@ -50,6 +50,8 @@ CFLAGS = -D_GNU_SOURCE -D_FILE_OFFSET_BITS=64 -O3 -march=$(ARCH) -fopenmp \
 	-DCOLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
 LDFLAGS = -lm -fopenmp -static -pthread
 V4_BINARY := deepseek_v4.exe
+V4_PREFIX_TEST_BINARY := test_v4_prefix_cache_sessions.exe
+V4_PREFIX_BENCH_BINARY := benchmark_v4_prefix_cache_sessions.exe
 else ifeq ($(UNAME_S),Darwin)
 CC = clang
 OMPDIR := $(shell brew --prefix libomp 2>/dev/null)
@@ -69,6 +71,8 @@ CFLAGS = -D_GNU_SOURCE -O3 $(OMPC) -pthread -include pthread.h \
 	-DCOLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
 LDFLAGS = -lm $(OMPL) -pthread
 V4_BINARY := deepseek_v4
+V4_PREFIX_TEST_BINARY := test_v4_prefix_cache_sessions
+V4_PREFIX_BENCH_BINARY := benchmark_v4_prefix_cache_sessions
 METAL ?= 1
 V4_METAL_OBJS =
 ifeq ($(METAL),1)
@@ -90,6 +94,8 @@ CFLAGS = -D_GNU_SOURCE -O3 -march=$(ARCH) -fopenmp -pthread -include pthread.h \
 	-DCOLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
 LDFLAGS = -lm -fopenmp -pthread
 V4_BINARY := deepseek_v4
+V4_PREFIX_TEST_BINARY := test_v4_prefix_cache_sessions
+V4_PREFIX_BENCH_BINARY := benchmark_v4_prefix_cache_sessions
 endif
 
 V4_GIT_SHA := $(shell git rev-parse --short=12 HEAD 2>/dev/null || printf unknown)
@@ -102,9 +108,9 @@ LDFLAGS += -flto
 endif
 
 # #56 detailed instrumentation is compile-gated so the normal inference binary
-# compiles the original block and generation units directly. There is therefore
-# no route-wrapper, pthread_once, trace-state check, or expert-forward wrapper on
-# the default hot path. Aggregate store/profile counters remain available.
+# compiles the original block directly. There is therefore no route-wrapper or
+# expert-forward wrapper on the default block hot path. Aggregate store/profile
+# counters remain available.
 #
 # V4_TRACE_ROUTE=1 enables logical route + lookup correlation. V4_TRACE_EXEC=1
 # defaults route tracing on as well because execution validation needs the
@@ -123,30 +129,49 @@ COLI_V4_UNIT_LAYER_RESIDENT.o: CFLAGS += $(V4_LAYER_RESIDENT_CFLAGS)
 
 TARGET_OBJS = $(addsuffix .o,$(V4_TARGET_UNITS))
 TEST_UNIT_OBJS = $(addsuffix .o,$(V4_TEST_UNITS))
+V4_PREFIX_TEST_RUNTIME_OBJ = COLI_V4_UNIT_RUNTIME_PREFIX_TEST.o
+V4_PREFIX_TEST_GENERATE_OBJ = COLI_V4_UNIT_GENERATE_STATS_PREFIX_TEST.o
 V4_TRACE_SPLIT_OBJS =
 ifeq ($(V4_TRACE_ROUTE),1)
-V4_TRACE_SPLIT_OBJS = COLI_V4_UNIT_BLOCK_HYBRID.o COLI_V4_UNIT_GENERATE_STATS.o
+V4_TRACE_SPLIT_OBJS = COLI_V4_UNIT_BLOCK_HYBRID.o
+COLI_V4_UNIT_GENERATE_STATS.o $(V4_PREFIX_TEST_GENERATE_OBJ): CFLAGS += -DCOLI_V4_TRACE_ROUTE=1
 endif
-# Planner units are permanent standalone sources. The large block/generation
-# units only leave the amalgamation in a detailed-trace build.
+# Planner units remain standalone. #12 also splits the runtime/generation and
+# transaction snapshot units so the prefix-cache overlays can hook request and
+# engine lifetime without editing the large amalgamation, while snapshot byte
+# accounting stays next to each private snapshot layout.
 V4_SPLIT_OBJS = COLI_V4_UNIT_RESOURCE_PLAN.o \
 	COLI_V4_UNIT_EXPERT_STORE_AUTO.o \
+	COLI_V4_UNIT_COMPRESSOR_SNAPSHOT.o \
+	COLI_V4_UNIT_INDEXER_SNAPSHOT.o \
+	COLI_V4_UNIT_ATTENTION_TRANSACTION.o \
+	COLI_V4_UNIT_RUNTIME.o \
+	COLI_V4_UNIT_GENERATE_STATS.o \
 	$(V4_TRACE_SPLIT_OBJS)
 V4_AMALGAMATED_OBJS = $(filter-out $(V4_SPLIT_OBJS),$(sort $(TARGET_OBJS) $(TEST_UNIT_OBJS)))
-V4_COLI_OBJS = coli_v4_expert_store.o coli_v4_static.o coli_executor.o coli_format.o coli_profile_v4.o $(V4_TRACE_EXEC_OBJS)
+V4_COLI_OBJS = coli_v4_expert_store.o coli_v4_static.o coli_executor.o coli_format.o \
+	coli_profile_v4.o coli_v4_prefix_cache.o $(V4_TRACE_EXEC_OBJS)
 V4_OBJS = $(TARGET_OBJS) $(V4_COLI_OBJS) $(V4_METAL_OBJS)
+V4_PREFIX_TEST_OBJS = $(filter-out COLI_V4_UNIT_RUNTIME.o COLI_V4_UNIT_GENERATE_STATS.o,$(V4_OBJS)) \
+	$(V4_PREFIX_TEST_RUNTIME_OBJ) $(V4_PREFIX_TEST_GENERATE_OBJ)
 V4_BUILD_CONFIG = .deepseek-v4-build-config
 
-.PHONY: deepseek-v4 deepseek-v4-clean deepseek-v4-test-objs FORCE
+.PHONY: deepseek-v4 deepseek-v4-clean deepseek-v4-test-objs \
+	deepseek-v4-prefix-cache-test deepseek-v4-prefix-cache-bench FORCE
 FORCE:
 
 $(V4_BUILD_CONFIG): FORCE
 	@printf '%s\n' 'CC=$(CC)' 'CFLAGS=$(CFLAGS)' 'LDFLAGS=$(LDFLAGS)' 'METAL=$(METAL)' 'LTO=$(LTO)' 'V4_TRACE_ROUTE=$(V4_TRACE_ROUTE)' 'V4_TRACE_EXEC=$(V4_TRACE_EXEC)' 'V4_LAYER_RESIDENT_CFLAGS=$(V4_LAYER_RESIDENT_CFLAGS)' > $@.tmp
 	@if test -f $@ && cmp -s $@.tmp $@; then rm -f $@.tmp; else mv -f $@.tmp $@; fi
 
-$(V4_OBJS) $(TEST_UNIT_OBJS): $(V4_BUILD_CONFIG)
+$(V4_OBJS) $(TEST_UNIT_OBJS) $(V4_PREFIX_TEST_RUNTIME_OBJ) \
+	$(V4_PREFIX_TEST_GENERATE_OBJ): $(V4_BUILD_CONFIG)
 
 deepseek-v4: $(V4_BINARY)
+
+deepseek-v4-prefix-cache-test: $(V4_PREFIX_TEST_BINARY) $(V4_PREFIX_BENCH_BINARY)
+
+deepseek-v4-prefix-cache-bench: $(V4_PREFIX_BENCH_BINARY)
 
 coli_v4_expert_store.o: coli_v4_expert_store.c coli_v4_expert_store.h coli_v4_residency.h coli_executor.h coli_format.h expert_store.h tensor.h compat.h
 	$(CC) $(CFLAGS) -c coli_v4_expert_store.c -o $@
@@ -160,13 +185,33 @@ coli_profile_v4.o: profile.c profile.h
 	$(CC) $(CFLAGS) -c profile.c -o $@
 COLI_V4_UNIT_PROFILE.o: coli_v4_profile.c profile.h deepseek_v4_internal.h expert_store.h
 	$(CC) $(CFLAGS) -c coli_v4_profile.c -o $@
+coli_v4_prefix_cache.o: coli_v4_prefix_cache.c coli_v4_prefix_cache.h deepseek_v4_internal.h kv_prefix.h
+	$(CC) $(CFLAGS) -c coli_v4_prefix_cache.c -o $@
 coli_v4_expert_execute_trace.o: coli_v4_expert_execute_trace.c deepseek_v4_internal.h expert_store.h tensor.h
 	$(CC) $(CFLAGS) -c coli_v4_expert_execute_trace.c -o $@
 
 COLI_V4_UNIT_RESOURCE_PLAN.o: coli_v4_resource_plan.c deepseek_v4_internal.h coli_v4_residency.h
 	$(CC) $(CFLAGS) -c coli_v4_resource_plan.c -o $@
-COLI_V4_UNIT_EXPERT_STORE_AUTO.o: coli_v4_expert_store_auto.c deepseek_v4_internal.h coli_v4_expert_store.h coli_v4_residency.h coli_executor.h st.h
-	$(CC) $(CFLAGS) -c coli_v4_expert_store_auto.c -o $@
+COLI_V4_UNIT_EXPERT_STORE_AUTO.o: coli_v4_expert_store_auto_prefix.c coli_v4_expert_store_auto.c coli_v4_prefix_cache.h deepseek_v4_internal.h coli_v4_expert_store.h coli_v4_residency.h coli_executor.h st.h
+	$(CC) $(CFLAGS) -c coli_v4_expert_store_auto_prefix.c -o $@
+COLI_V4_UNIT_COMPRESSOR_SNAPSHOT.o: coli_v4_compressor_snapshot_size.c deepseek_v4.c deepseek_v4_internal.h coli_v4_prefix_cache.h
+	$(CC) $(CFLAGS) -DCOLI_V4_UNIT_COMPRESSOR_SNAPSHOT -c coli_v4_compressor_snapshot_size.c -o $@
+COLI_V4_UNIT_INDEXER_SNAPSHOT.o: coli_v4_indexer_snapshot_size.c coli_v4_compressor_snapshot_size.c deepseek_v4.c deepseek_v4_internal.h coli_v4_prefix_cache.h
+	$(CC) $(CFLAGS) -DCOLI_V4_UNIT_INDEXER_SNAPSHOT -c coli_v4_indexer_snapshot_size.c -o $@
+COLI_V4_UNIT_ATTENTION_TRANSACTION.o: coli_v4_attention_snapshot_size.c coli_v4_compressor_snapshot_size.c coli_v4_indexer_snapshot_size.c deepseek_v4.c deepseek_v4_internal.h coli_v4_prefix_cache.h
+	$(CC) $(CFLAGS) -DCOLI_V4_UNIT_ATTENTION_TRANSACTION -c coli_v4_attention_snapshot_size.c -o $@
+COLI_V4_UNIT_RUNTIME.o: coli_v4_runtime_prefix_cache.c deepseek_v4.c deepseek_v4.h deepseek_v4_internal.h coli_v4_prefix_cache.h
+	$(CC) $(CFLAGS) -DCOLI_V4_UNIT_RUNTIME -c coli_v4_runtime_prefix_cache.c -o $@
+# Test-only clones of the public runtime/generation APIs. The runtime clone
+# renames its CLI main. The generation overlay converts its test-only `main`
+# define into COLI_V4_SKIP_GENERATE_MAIN before including the amalgamated unit.
+# Production SERVE behavior remains unchanged while the oracle uses the real API.
+$(V4_PREFIX_TEST_RUNTIME_OBJ): coli_v4_runtime_prefix_cache.c deepseek_v4.c deepseek_v4.h deepseek_v4_internal.h coli_v4_prefix_cache.h
+	$(CC) $(CFLAGS) -Dmain=coli_v4_runtime_main_unused -DCOLI_V4_UNIT_RUNTIME -c coli_v4_runtime_prefix_cache.c -o $@
+COLI_V4_UNIT_GENERATE_STATS.o: coli_v4_generate_stats_cache.c deepseek_v4.c deepseek_v4.h deepseek_v4_internal.h coli_v4_prefix_cache.h kv_prefix.h
+	$(CC) $(CFLAGS) -DCOLI_V4_UNIT_GENERATE_STATS -c coli_v4_generate_stats_cache.c -o $@
+$(V4_PREFIX_TEST_GENERATE_OBJ): coli_v4_generate_stats_cache.c deepseek_v4.c deepseek_v4.h deepseek_v4_internal.h coli_v4_prefix_cache.h kv_prefix.h
+	$(CC) $(CFLAGS) -Dmain=coli_v4_generate_main_unused -DCOLI_V4_UNIT_GENERATE_STATS -c coli_v4_generate_stats_cache.c -o $@
 
 ifeq ($(V4_TRACE_ROUTE),1)
 # Detailed route tracing needs authoritative position before batch-union lookups
@@ -178,16 +223,16 @@ endif
 COLI_V4_UNIT_BLOCK_HYBRID.o: coli_v4_block_hybrid_trace.c deepseek_v4.c deepseek_v4.h \
 	deepseek_v4_internal.h expert_store.h tensor.h
 	$(CC) $(CFLAGS) -DCOLI_V4_UNIT_BLOCK_HYBRID -c coli_v4_block_hybrid_trace.c -o $@
-
-# coli_v4_session_generate() lives in GENERATE_STATS. The route build intercepts
-# its one kv-prefix decision to establish the request boundary and prompt length.
-COLI_V4_UNIT_GENERATE_STATS.o: coli_v4_generate_stats_trace.c deepseek_v4.c deepseek_v4.h \
-	deepseek_v4_internal.h kv_prefix.h
-	$(CC) $(CFLAGS) -DCOLI_V4_UNIT_GENERATE_STATS -c coli_v4_generate_stats_trace.c -o $@
 endif
 
 $(V4_BINARY): $(V4_OBJS)
 	$(CC) $(V4_OBJS) -o $@ $(LDFLAGS)
+
+$(V4_PREFIX_TEST_BINARY): tests/test_v4_prefix_cache_sessions.c $(V4_PREFIX_TEST_OBJS)
+	$(CC) $(CFLAGS) tests/test_v4_prefix_cache_sessions.c $(V4_PREFIX_TEST_OBJS) -o $@ $(LDFLAGS)
+
+$(V4_PREFIX_BENCH_BINARY): tools/benchmark_v4_prefix_cache.c $(V4_PREFIX_TEST_OBJS)
+	$(CC) $(CFLAGS) tools/benchmark_v4_prefix_cache.c $(V4_PREFIX_TEST_OBJS) -o $@ $(LDFLAGS)
 
 $(V4_AMALGAMATED_OBJS): %.o: deepseek_v4.c deepseek_v4.h \
 	deepseek_v4_internal.h deepseek_v4_dspark.inc st.h json.h compat.h tensor.h quant.h \
@@ -198,4 +243,7 @@ $(V4_AMALGAMATED_OBJS): %.o: deepseek_v4.c deepseek_v4.h \
 deepseek-v4-test-objs: $(TEST_UNIT_OBJS)
 
 deepseek-v4-clean:
-	rm -f $(V4_BINARY) $(V4_OBJS) $(TEST_UNIT_OBJS) coli_v4_expert_execute_trace.o $(V4_BUILD_CONFIG)
+	rm -f $(V4_BINARY) $(V4_OBJS) $(TEST_UNIT_OBJS) \
+		$(V4_PREFIX_TEST_RUNTIME_OBJ) $(V4_PREFIX_TEST_GENERATE_OBJ) \
+		$(V4_PREFIX_TEST_BINARY) $(V4_PREFIX_BENCH_BINARY) \
+		coli_v4_expert_execute_trace.o $(V4_BUILD_CONFIG)
