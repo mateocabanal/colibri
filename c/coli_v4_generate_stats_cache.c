@@ -3,47 +3,28 @@
 #endif
 
 /*
- * #12 process-local prefix-cache overlay for COLI_V4_UNIT_GENERATE_STATS.
+ * #12/#80 prefix-cache overlay for COLI_V4_UNIT_GENERATE_STATS.
  *
- * Keep the large generation implementation in deepseek_v4.c. We intercept its
- * existing single kv_prefix_reuse() decision: same-session continuation wins
- * first; otherwise the process-local cache may restore an exact V4 attention
- * snapshot and return the restored prefix length. The original caller then
- * executes only the fresh prompt tail exactly as it already does today.
- *
- * Admission happens at the generation unit's canonical end-of-prefill
- * `kv_prefix_record()` call, before decode mutates the state. This distinction
- * matters: a cache entry must represent the request prefix itself so unrelated
- * requests can share system/tool/project context. Capturing after generation
- * would instead key the snapshot by the previous answer and only help strict
- * conversation continuation.
+ * Reuse order is deliberate: same-session continuation first, process-local RAM
+ * second, persistent SSD third. Admission remains at the canonical
+ * end-of-prefill kv_prefix_record() boundary before decode mutates target state.
  */
 #define coli_v4_session_generate coli_v4_session_generate_uncached
 #include "deepseek_v4_internal.h"
 #undef coli_v4_session_generate
 
 #include "coli_v4_prefix_cache.h"
+#include "coli_v4_prefix_disk.h"
 
 #include <stddef.h>
 #include <stdio.h>
 
-/* The cross-session helper builds a test-only clone with -Dmain=... so its own
- * main can be linked. The embedded generation source has its own temporary
- * `main` macro for the legacy first-token helper, then undefines it before the
- * real CLI entry point; command-line renaming therefore cannot suppress that
- * final main reliably. Normalize the test signal into the source's dedicated
- * skip guard before including the unit, and remove the command-line macro so
- * the legacy helper's local rename remains warning-free. */
 #ifdef main
 #undef main
 #define COLI_V4_SKIP_GENERATE_MAIN 1
 #define COLI_V4_PREFIX_TEST_SKIP_GENERATE_MAIN 1
 #endif
 
-/* Defined by the DSpark implementation included by this generation unit. A
- * cross-session target-state restore must not inherit speculative-drafter
- * history from an unrelated request. Target outputs are verified either way,
- * but resetting keeps draft behavior tied to the restored context. */
 static void v4_ds_reset_history(void);
 
 #ifdef COLI_V4_TRACE_ROUTE
@@ -62,6 +43,8 @@ static int coli_v4_cached_kv_prefix_reuse(const kv_prefix *prefix,
     if (!reused) {
         ColiV4Session *session = session_from_prefix(prefix);
         reused = coli_v4_prefix_cache_restore(session, ids, count);
+        if (!reused)
+            reused = coli_v4_prefix_disk_restore(session, ids, count);
         if (reused && coli_v4_full_dspark_wanted)
             v4_ds_reset_history();
     }
@@ -85,12 +68,16 @@ static void coli_v4_cached_kv_prefix_record(kv_prefix *prefix,
      * state coverage equals prompt_count. Decode/speculative records point at
      * generated/input temporaries instead and therefore cannot admit here. */
     if (ids == session->prompt_ids + position &&
-        prefix->len == session->prompt_count && !prefix->tainted)
+        prefix->len == session->prompt_count && !prefix->tainted) {
         coli_v4_prefix_cache_store(session);
+        /* If the RAM tier captured the boundary this is a cheap exact-entry
+         * check and SSD publication stays post-generation. In SSD-only mode or
+         * when RAM admission cannot fit, persist the live state now while it
+         * still denotes the canonical pre-decode prompt boundary. */
+        coli_v4_prefix_disk_publish_live_prefix(session);
+    }
 }
 
-/* deepseek_v4_internal.h already included kv_prefix.h, so these macros rewrite
- * only call sites in the generation unit, not the inline helper definitions. */
 #define kv_prefix_reuse coli_v4_cached_kv_prefix_reuse
 #define kv_prefix_record coli_v4_cached_kv_prefix_record
 #define coli_v4_session_generate coli_v4_session_generate_uncached
@@ -121,6 +108,15 @@ int coli_v4_session_generate(ColiV4Session *session,
     int result = coli_v4_session_generate_uncached(
         session, prompt, prompt_length, options, on_token, user_data,
         stats, error, error_size);
+
+    /* The process-local entry was captured before decode, so after generation
+     * it remains the exact immutable request prefix even though live attention
+     * state has advanced. Stream that pinned entry now: SSD I/O is outside TTFT
+     * and token streaming, at the cost of delaying return/DONE in this first
+     * bounded implementation. If no RAM entry existed, the end-of-prefill hook
+     * already used the live one-layer-at-a-time publisher instead. */
+    if (!result)
+        coli_v4_prefix_disk_publish_session(session);
 
     coli_v4_prefix_cache_stats(&after);
     if (after.budget_bytes) {

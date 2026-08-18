@@ -46,6 +46,122 @@ size_t coli_v4_indexer_state_snapshot_bytes(
         coli_v4_compressor_state_snapshot_bytes(state->compressor));
 }
 
+/* Persistent payload: i32 count, i32 head_dim, compressed[count*head_dim],
+ * followed by one required compressor snapshot. */
+size_t coli_v4_indexer_snapshot_wire_bytes(
+    const ColiV4IndexerSnapshot *snapshot) {
+    if (!snapshot || !snapshot->compressor || snapshot->count < 0 ||
+        snapshot->head_dim <= 0)
+        return snapshot ? SIZE_MAX : 0;
+    size_t count = (size_t)snapshot->count;
+    size_t head = (size_t)snapshot->head_dim;
+    if (head && count > SIZE_MAX / head) return SIZE_MAX;
+    size_t values = count * head;
+    if (values > (SIZE_MAX - 2 * sizeof(int32_t)) / sizeof(float))
+        return SIZE_MAX;
+    size_t total = 2 * sizeof(int32_t) + values * sizeof(float);
+    size_t compressor = coli_v4_compressor_snapshot_wire_bytes(
+        snapshot->compressor);
+    if (compressor == SIZE_MAX || total > SIZE_MAX - compressor)
+        return SIZE_MAX;
+    return total + compressor;
+}
+
+int coli_v4_indexer_snapshot_wire_emit(
+    const ColiV4IndexerSnapshot *snapshot,
+    ColiV4PrefixWireSink sink, void *user_data) {
+    if (!snapshot || !sink || !snapshot->compressor || snapshot->count < 0 ||
+        snapshot->head_dim <= 0 ||
+        coli_v4_indexer_snapshot_wire_bytes(snapshot) == SIZE_MAX)
+        return -1;
+    int32_t fields[2] = { snapshot->count, snapshot->head_dim };
+    if (sink(user_data, fields, sizeof(fields))) return -1;
+    size_t value_bytes = (size_t)snapshot->count *
+                         (size_t)snapshot->head_dim * sizeof(float);
+    if (value_bytes && !snapshot->compressed) return -1;
+    if (value_bytes && sink(user_data, snapshot->compressed, value_bytes))
+        return -1;
+    return coli_v4_compressor_snapshot_wire_emit(
+        snapshot->compressor, sink, user_data);
+}
+
+int coli_v4_indexer_snapshot_wire_write(
+    const ColiV4IndexerSnapshot *snapshot,
+    unsigned char *output, size_t output_size, size_t *written) {
+    if (written) *written = 0;
+    if (!snapshot || !output || !written || !snapshot->compressor ||
+        snapshot->count < 0 || snapshot->head_dim <= 0)
+        return -1;
+    size_t need = coli_v4_indexer_snapshot_wire_bytes(snapshot);
+    if (need == SIZE_MAX || need > output_size) return -1;
+    int32_t count = snapshot->count;
+    int32_t head = snapshot->head_dim;
+    memcpy(output, &count, sizeof(count));
+    memcpy(output + sizeof(count), &head, sizeof(head));
+    size_t values = (size_t)snapshot->count * (size_t)snapshot->head_dim;
+    size_t value_bytes = values * sizeof(float);
+    if (value_bytes) {
+        if (!snapshot->compressed) return -1;
+        memcpy(output + 2 * sizeof(int32_t), snapshot->compressed, value_bytes);
+    }
+    size_t nested = 0;
+    if (coli_v4_compressor_snapshot_wire_write(
+            snapshot->compressor,
+            output + 2 * sizeof(int32_t) + value_bytes,
+            output_size - 2 * sizeof(int32_t) - value_bytes,
+            &nested))
+        return -1;
+    *written = 2 * sizeof(int32_t) + value_bytes + nested;
+    return *written == need ? 0 : -1;
+}
+
+int coli_v4_indexer_snapshot_wire_read(
+    ColiV4IndexerSnapshot **output,
+    const unsigned char *input, size_t input_size, size_t *consumed) {
+    if (consumed) *consumed = 0;
+    if (!output || !input || !consumed || input_size < 2 * sizeof(int32_t))
+        return -1;
+    *output = NULL;
+    int32_t count = 0, head = 0;
+    memcpy(&count, input, sizeof(count));
+    memcpy(&head, input + sizeof(count), sizeof(head));
+    if (count < 0 || head <= 0) return -1;
+    size_t scount = (size_t)count, shead = (size_t)head;
+    if (shead && scount > SIZE_MAX / shead) return -1;
+    size_t values = scount * shead;
+    if (values > (SIZE_MAX - 2 * sizeof(int32_t)) / sizeof(float)) return -1;
+    size_t value_bytes = values * sizeof(float);
+    size_t offset = 2 * sizeof(int32_t) + value_bytes;
+    if (offset > input_size) return -1;
+
+    ColiV4IndexerSnapshot *snapshot = calloc(1, sizeof(*snapshot));
+    if (!snapshot) return -1;
+    snapshot->count = count;
+    snapshot->head_dim = head;
+    if (value_bytes) {
+        snapshot->compressed = malloc(value_bytes);
+        if (!snapshot->compressed) {
+            coli_v4_indexer_snapshot_destroy(snapshot);
+            return -1;
+        }
+        memcpy(snapshot->compressed, input + 2 * sizeof(int32_t), value_bytes);
+    }
+    size_t nested = 0;
+    if (coli_v4_compressor_snapshot_wire_read(
+            &snapshot->compressor, input + offset, input_size - offset,
+            &nested)) {
+        coli_v4_indexer_snapshot_destroy(snapshot);
+        return -1;
+    }
+    if (nested > input_size - offset) {
+        coli_v4_indexer_snapshot_destroy(snapshot);
+        return -1;
+    }
+    *output = snapshot;
+    *consumed = offset + nested;
+    return 0;
+}
+
 static int indexer_hydrate_error(char *error, size_t error_size,
                                  const char *format, ...) {
     if (error && error_size) {

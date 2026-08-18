@@ -9,6 +9,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+int coli_v4_attention_snapshot_restore_fresh(
+    ColiDeepSeekV4WindowAttentionState *state,
+    const ColiV4AttentionSnapshot *snapshot,
+    const ColiDeepSeekV4Config *config, int layer);
+
 static int decode_token_string(const ColiV4Session *session,
                                const int *ids, int count,
                                char **output) {
@@ -108,6 +113,59 @@ static int run_generation(ColiV4Session *session, const char *prompt,
                                     NULL, NULL, &stats, error, error_size);
 }
 
+/* The persistent codec must preserve every byte that the existing native
+ * snapshot/restore API considers sequence state. Restore each serialized layer
+ * into a virgin session, snapshot it again, and require a byte-identical wire
+ * encoding. This catches omitted compressor/indexer/recurrent fields without
+ * relying on a production-size model. */
+static int check_wire_roundtrip(ColiV4Session *source,
+                                ColiV4Session *destination) {
+    if (!source || !destination || !source->attention || !destination->attention)
+        return -1;
+    for (int layer = 0; layer < source->config.num_hidden_layers; layer++) {
+        ColiV4AttentionSnapshot *before = NULL, *decoded = NULL, *after = NULL;
+        unsigned char *wire = NULL, *wire_after = NULL;
+        size_t need = 0, wrote = 0, consumed = 0, need_after = 0, wrote_after = 0;
+        int ok = 0;
+        if (coli_v4_attention_snapshot_create(source->attention[layer], &before))
+            goto layer_done;
+        need = coli_v4_attention_snapshot_wire_bytes(before);
+        if (!need || need == SIZE_MAX) goto layer_done;
+        wire = malloc(need);
+        if (!wire || coli_v4_attention_snapshot_wire_write(
+                before, wire, need, &wrote) || wrote != need)
+            goto layer_done;
+        if (coli_v4_attention_snapshot_wire_read(
+                &decoded, wire, need, &consumed) || consumed != need)
+            goto layer_done;
+        if (coli_v4_attention_snapshot_restore_fresh(
+                destination->attention[layer], decoded,
+                &destination->config, layer))
+            goto layer_done;
+        if (coli_v4_attention_snapshot_create(destination->attention[layer], &after))
+            goto layer_done;
+        need_after = coli_v4_attention_snapshot_wire_bytes(after);
+        if (need_after != need) goto layer_done;
+        wire_after = malloc(need_after);
+        if (!wire_after || coli_v4_attention_snapshot_wire_write(
+                after, wire_after, need_after, &wrote_after) ||
+            wrote_after != need_after || memcmp(wire, wire_after, need))
+            goto layer_done;
+        ok = 1;
+layer_done:
+        free(wire_after);
+        free(wire);
+        coli_v4_attention_snapshot_destroy(after);
+        coli_v4_attention_snapshot_destroy(decoded);
+        coli_v4_attention_snapshot_destroy(before);
+        if (!ok) {
+            fprintf(stderr, "V4 prefix wire round-trip failed at layer %d\n", layer);
+            return -1;
+        }
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc != 3) {
         fprintf(stderr, "usage: %s MODEL_DIR INITIAL_PROMPT\n", argv[0]);
@@ -117,7 +175,7 @@ int main(int argc, char **argv) {
     const char *initial_prompt = argv[2];
     char error[1024] = {0};
     ColiV4Engine *shared_engine = NULL, *cold_engine = NULL, *rejected_engine = NULL;
-    ColiV4Session *first = NULL, *equal = NULL, *extended = NULL;
+    ColiV4Session *first = NULL, *equal = NULL, *extended = NULL, *codec = NULL;
     ColiV4Session *longest = NULL, *cold = NULL;
     char *extension_token = NULL, *prompt_plus_one = NULL, *prompt_plus_two = NULL;
     char *longest_text = NULL, *cold_text = NULL;
@@ -134,6 +192,7 @@ int main(int argc, char **argv) {
         open_session(&first, shared_engine, error, sizeof(error)) ||
         open_session(&equal, shared_engine, error, sizeof(error)) ||
         open_session(&extended, shared_engine, error, sizeof(error)) ||
+        open_session(&codec, shared_engine, error, sizeof(error)) ||
         open_session(&longest, shared_engine, error, sizeof(error))) {
         fprintf(stderr, "shared engine/session open failed: %s\n", error);
         goto cleanup;
@@ -147,6 +206,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "first session did not retain tokenized prompt\n");
         goto cleanup;
     }
+    if (check_wire_roundtrip(first, codec)) goto cleanup;
     int base_tokens = first->prompt_count;
 
     ColiV4PrefixCacheStats after_first = {0};
@@ -302,7 +362,7 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
 
-    printf("PASS cross-session prefix cache: base=%d extended=%d longest=%d prompt tokens, %.3f MiB restored in %.3f ms, output identical to cold prefill; memory projected=%.3fGiB reserve=%.3fGiB limit=%.3fGiB\n",
+    printf("PASS cross-session prefix cache: base=%d extended=%d longest=%d prompt tokens, %.3f MiB restored in %.3f ms, output identical to cold prefill; persistent wire round-trip exact; memory projected=%.3fGiB reserve=%.3fGiB limit=%.3fGiB\n",
            base_tokens, extended_tokens, longest->prefix_reused,
            cache.restore_bytes / (1024.0 * 1024.0),
            cache.restore_ns / 1.0e6,
@@ -320,6 +380,7 @@ cleanup:
     if (first) coli_v4_session_destroy(first);
     if (equal) coli_v4_session_destroy(equal);
     if (extended) coli_v4_session_destroy(extended);
+    if (codec) coli_v4_session_destroy(codec);
     if (longest) coli_v4_session_destroy(longest);
     if (cold) coli_v4_session_destroy(cold);
     if (shared_engine) coli_v4_engine_destroy(shared_engine);

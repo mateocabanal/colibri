@@ -33,3 +33,23 @@ V4_TEST_UNITS = \
 	COLI_V4_UNIT_EXPERT \
 	COLI_V4_UNIT_EXPERT_STORE \
 	COLI_V4_UNIT_LAYER
+
+# #104 composes the RAM and SSD adapters inside the already-linked
+# coli_v4_prefix_cache.o. Keep make's incremental dependency graph aware of the
+# preserved RAM implementation and the shared SSD composition includes.
+coli_v4_prefix_cache.o: coli_v4_prefix_cache_impl.inc \
+	coli_v4_prefix_disk_shared.inc coli_v4_prefix_disk.c coli_v4_prefix_disk.h \
+	prefix_cache_disk.h
+
+# The SSD restart oracle is part of the existing prefix-cache build target. It
+# depends on the ordinary prefix test binary so V4_PREFIX_TEST_OBJS are already
+# materialized before this recipe expands and links them.
+V4_PREFIX_DISK_TEST_BINARY := $(if $(IS_WIN),test_v4_prefix_disk_sessions.exe,test_v4_prefix_disk_sessions)
+deepseek-v4-prefix-cache-test: $(V4_PREFIX_DISK_TEST_BINARY)
+$(V4_PREFIX_DISK_TEST_BINARY): tests/test_v4_prefix_disk_sessions.c $(V4_PREFIX_TEST_BINARY)
+	$(CC) $(CFLAGS) tests/test_v4_prefix_disk_sessions.c $(V4_PREFIX_TEST_OBJS) -o $@ $(LDFLAGS)
+
+.PHONY: deepseek-v4-prefix-disk-clean
+deepseek-v4-clean: deepseek-v4-prefix-disk-clean
+deepseek-v4-prefix-disk-clean:
+	rm -f $(V4_PREFIX_DISK_TEST_BINARY)
