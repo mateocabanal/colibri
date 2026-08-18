@@ -1,0 +1,64 @@
+name: global-prefix-cache-materialize-windows
+
+on:
+  pull_request:
+    branches: [cache-materialize-base]
+    types: [opened, reopened, synchronize]
+
+permissions:
+  contents: write
+
+jobs:
+  materialize-windows:
+    if: github.head_ref == 'feat/global-prefix-cache-ssd'
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          install: make mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-python
+      - name: Configure Git identity
+        shell: msys2 {0}
+        run: |
+          git config user.name 'colibri-ci'
+          git config user.email 'actions@users.noreply.github.com'
+      - name: Sync current main
+        shell: msys2 {0}
+        run: |
+          git fetch origin main
+          git merge --no-edit origin/main
+      - name: Apply integration
+        shell: msys2 {0}
+        run: |
+          python3 .github/scripts/apply_global_prefix_cache.py
+          python3 .github/scripts/fix_global_prefix_cache.py
+          python3 .github/scripts/fingerprint_global_prefix_cache.py
+          python3 .github/scripts/harden_global_prefix_cache.py
+          python3 .github/scripts/finalize_global_prefix_cache.py
+      - name: Validate persistent store and Qwen adapter
+        shell: msys2 {0}
+        run: |
+          make -C c tests/test_prefix_cache_disk ARCH=x86-64-v3
+          ./c/tests/test_prefix_cache_disk.exe
+          make -C c tests/test_qwen_prefix_disk ARCH=x86-64-v3
+          ./c/tests/test_qwen_prefix_disk.exe
+          make -C c qwen_moe ARCH=x86-64-v3
+      - name: Publish source-only implementation
+        shell: msys2 {0}
+        run: |
+          git rm .github/workflows/global-prefix-cache-apply.yml
+          git rm .github/scripts/apply_global_prefix_cache.py
+          git rm .github/scripts/fix_global_prefix_cache.py
+          git rm .github/scripts/fingerprint_global_prefix_cache.py
+          git rm .github/scripts/harden_global_prefix_cache.py
+          git rm .github/scripts/finalize_global_prefix_cache.py
+          git add c/Makefile c/prefix_cache_disk.c c/prefix_cache_disk.h \
+                  c/qwen_prefix_cache.h c/qwen_prefix_disk.h c/qwen_moe.c \
+                  c/tests/test_prefix_cache_disk.c c/tests/test_qwen_prefix_disk.c
+          git commit -m 'feat(cache): add global persistent SSD prompt cache for Qwen'
+          git push origin HEAD:${{ github.head_ref }}
