@@ -6,6 +6,7 @@
 #include "../metal_runtime.h"
 #include "../metal_region.h"
 #include "../expert_residency.h"
+#include "../resource_planner.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -266,12 +267,80 @@ static int test_expert_residency(void) {
     return 0;
 }
 
+static int test_resource_planner(void) {
+    ColiResourceCandidate candidates[] = {
+        {COLI_RESOURCE_DENSE_TENSOR, 2, 40, 80, 0},
+        {COLI_RESOURCE_PERSISTENT_EXPERT, 9, 30, 30, 0},
+        {COLI_RESOURCE_HEAD, 1, 50, 150, 0},
+        {COLI_RESOURCE_PREFIX_HOT, 4, 20, 20, 0},
+    };
+    unsigned char selected[4];
+    ColiResourceSelection selection;
+    ColiResourcePlan plan;
+
+    if (coli_resource_select(candidates, 4, 70, COLI_RESOURCE_VALUE_BYTES,
+                             selected, &selection) != 0)
+        return 70;
+    /* head scores 3/byte and wins first; of the remaining 20 bytes only prefix
+     * fits. This pins deterministic benefit-per-byte + fit semantics. */
+    if (!selected[2] || !selected[3] || selected[0] || selected[1] ||
+        selection.selected_resident_bytes != 70 || selection.selected_count != 2 ||
+        selection.expected_bytes_avoided != 170)
+        return 71;
+
+    coli_resource_plan_init(&plan);
+    if (coli_resource_plan_set_budget(&plan, COLI_RESOURCE_TIER_UMA, 100) != 0 ||
+        coli_resource_plan_reserve_mandatory(
+            &plan, COLI_RESOURCE_TIER_UMA, 35) != 0 ||
+        plan.tier[COLI_RESOURCE_TIER_UMA].optional_budget_bytes != 65 ||
+        plan.tier[COLI_RESOURCE_TIER_UMA].free_bytes != 65)
+        return 72;
+    if (coli_resource_plan_commit_optional(
+            &plan, COLI_RESOURCE_TIER_UMA, 60) != 0 ||
+        coli_resource_plan_committed(&plan, COLI_RESOURCE_TIER_UMA) != 95 ||
+        plan.tier[COLI_RESOURCE_TIER_UMA].free_bytes != 5)
+        return 73;
+    if (coli_resource_plan_commit_optional(
+            &plan, COLI_RESOURCE_TIER_UMA, 6) == 0 ||
+        coli_resource_plan_reserve_mandatory(
+            &plan, COLI_RESOURCE_TIER_UMA, 6) == 0)
+        return 74;
+    if (coli_resource_plan_release_optional(
+            &plan, COLI_RESOURCE_TIER_UMA, 20) != 0 ||
+        coli_resource_plan_committed(&plan, COLI_RESOURCE_TIER_UMA) != 75 ||
+        plan.tier[COLI_RESOURCE_TIER_UMA].free_bytes != 25)
+        return 75;
+
+    /* Explicit host/device are independent budgets (CUDA-style); UMA users
+     * would instead commit shared bytes only to the UMA tier above. */
+    if (coli_resource_plan_set_budget(&plan, COLI_RESOURCE_TIER_HOST, 80) != 0 ||
+        coli_resource_plan_set_budget(&plan, COLI_RESOURCE_TIER_DEVICE, 50) != 0 ||
+        coli_resource_plan_reserve_mandatory(
+            &plan, COLI_RESOURCE_TIER_HOST, 20) != 0 ||
+        coli_resource_plan_reserve_mandatory(
+            &plan, COLI_RESOURCE_TIER_DEVICE, 10) != 0 ||
+        coli_resource_plan_commit_optional(
+            &plan, COLI_RESOURCE_TIER_HOST, 60) != 0 ||
+        coli_resource_plan_commit_optional(
+            &plan, COLI_RESOURCE_TIER_DEVICE, 40) != 0 ||
+        coli_resource_plan_committed(&plan, COLI_RESOURCE_TIER_HOST) != 80 ||
+        coli_resource_plan_committed(&plan, COLI_RESOURCE_TIER_DEVICE) != 50)
+        return 76;
+
+    if (coli_resource_ratio_compare(UINT64_MAX, UINT64_MAX - 1,
+                                    UINT64_MAX - 1, UINT64_MAX) <= 0)
+        return 77;
+    return 0;
+}
+
 int main(void) {
     int rc = test_metal_policy();
     if (rc) return rc;
     rc = test_metal_region();
     if (rc) return rc;
     rc = test_expert_residency();
+    if (rc) return rc;
+    rc = test_resource_planner();
     if (rc) return rc;
 
 #ifdef _WIN32
@@ -322,6 +391,6 @@ int main(void) {
 #endif
     coli_profile_reset(&p, &config);
     if (coli_profile_enabled(&p)) return 5;
-    puts("PASS shared runtime policy/regions/residency/profile");
+    puts("PASS shared runtime policy/regions/residency/resources/profile");
     return 0;
 }
