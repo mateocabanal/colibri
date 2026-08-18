@@ -35,6 +35,10 @@ typedef enum {
 
 typedef struct {
     uint64_t capacity_bytes;
+    /* committed is the hard invariant. Reservation->resident publication only
+     * changes classification; it never opens a transient hole another loader
+     * can steal. */
+    atomic_uint_fast64_t committed_bytes;
     atomic_uint_fast64_t reserved_bytes;
     atomic_uint_fast64_t resident_bytes;
     atomic_uint_fast64_t peak_committed_bytes;
@@ -64,6 +68,7 @@ static inline void coli_expert_residency_budget_init(
     ColiExpertResidencyBudget *budget, uint64_t capacity_bytes) {
     if (!budget) return;
     budget->capacity_bytes = capacity_bytes;
+    atomic_init(&budget->committed_bytes, 0);
     atomic_init(&budget->reserved_bytes, 0);
     atomic_init(&budget->resident_bytes, 0);
     atomic_init(&budget->peak_committed_bytes, 0);
@@ -71,81 +76,82 @@ static inline void coli_expert_residency_budget_init(
 
 static inline uint64_t coli_expert_residency_budget_committed(
     const ColiExpertResidencyBudget *budget) {
-    if (!budget) return 0;
-    return atomic_load_explicit(&budget->reserved_bytes, memory_order_acquire) +
-           atomic_load_explicit(&budget->resident_bytes, memory_order_acquire);
+    return budget ? atomic_load_explicit(
+        &budget->committed_bytes, memory_order_acquire) : 0;
+}
+
+static inline void coli_expert_residency_update_peak(
+    ColiExpertResidencyBudget *budget, uint64_t committed) {
+    uint64_t peak = atomic_load_explicit(
+        &budget->peak_committed_bytes, memory_order_acquire);
+    while (committed > peak &&
+           !atomic_compare_exchange_weak_explicit(
+               &budget->peak_committed_bytes, &peak, committed,
+               memory_order_acq_rel, memory_order_acquire)) {}
 }
 
 static inline int coli_expert_residency_budget_try_reserve(
     ColiExpertResidencyBudget *budget, uint64_t bytes) {
     if (!budget || !bytes || bytes > budget->capacity_bytes) return -1;
+    uint64_t committed = atomic_load_explicit(
+        &budget->committed_bytes, memory_order_acquire);
     for (;;) {
-        uint64_t reserved = atomic_load_explicit(
-            &budget->reserved_bytes, memory_order_acquire);
-        uint64_t resident = atomic_load_explicit(
-            &budget->resident_bytes, memory_order_acquire);
-        if (resident > budget->capacity_bytes ||
-            reserved > budget->capacity_bytes - resident ||
-            bytes > budget->capacity_bytes - resident - reserved)
+        if (committed > budget->capacity_bytes ||
+            bytes > budget->capacity_bytes - committed)
             return 0;
-        uint64_t desired = reserved + bytes;
+        uint64_t desired = committed + bytes;
         if (atomic_compare_exchange_weak_explicit(
-                &budget->reserved_bytes, &reserved, desired,
+                &budget->committed_bytes, &committed, desired,
                 memory_order_acq_rel, memory_order_acquire)) {
-            uint64_t committed = resident + desired;
-            uint64_t peak = atomic_load_explicit(
-                &budget->peak_committed_bytes, memory_order_acquire);
-            while (committed > peak &&
-                   !atomic_compare_exchange_weak_explicit(
-                       &budget->peak_committed_bytes, &peak, committed,
-                       memory_order_acq_rel, memory_order_acquire)) {}
+            atomic_fetch_add_explicit(&budget->reserved_bytes, bytes,
+                                      memory_order_acq_rel);
+            coli_expert_residency_update_peak(budget, desired);
             return 1;
         }
     }
 }
 
+static inline int coli_expert_residency_atomic_sub_checked(
+    atomic_uint_fast64_t *value, uint64_t bytes) {
+    uint64_t current = atomic_load_explicit(value, memory_order_acquire);
+    for (;;) {
+        if (current < bytes) return -1;
+        if (atomic_compare_exchange_weak_explicit(
+                value, &current, current - bytes,
+                memory_order_acq_rel, memory_order_acquire))
+            return 0;
+    }
+}
+
 static inline int coli_expert_residency_budget_publish(
     ColiExpertResidencyBudget *budget, uint64_t bytes) {
-    if (!budget || !bytes) return -1;
-    uint64_t reserved = atomic_load_explicit(
-        &budget->reserved_bytes, memory_order_acquire);
-    for (;;) {
-        if (reserved < bytes) return -1;
-        if (atomic_compare_exchange_weak_explicit(
-                &budget->reserved_bytes, &reserved, reserved - bytes,
-                memory_order_acq_rel, memory_order_acquire))
-            break;
-    }
-    atomic_fetch_add_explicit(&budget->resident_bytes, bytes, memory_order_acq_rel);
+    if (!budget || !bytes ||
+        coli_expert_residency_atomic_sub_checked(
+            &budget->reserved_bytes, bytes) != 0)
+        return -1;
+    atomic_fetch_add_explicit(&budget->resident_bytes, bytes,
+                              memory_order_acq_rel);
     return 0;
 }
 
 static inline int coli_expert_residency_budget_cancel(
     ColiExpertResidencyBudget *budget, uint64_t bytes) {
-    if (!budget || !bytes) return -1;
-    uint64_t reserved = atomic_load_explicit(
-        &budget->reserved_bytes, memory_order_acquire);
-    for (;;) {
-        if (reserved < bytes) return -1;
-        if (atomic_compare_exchange_weak_explicit(
-                &budget->reserved_bytes, &reserved, reserved - bytes,
-                memory_order_acq_rel, memory_order_acquire))
-            return 0;
-    }
+    if (!budget || !bytes ||
+        coli_expert_residency_atomic_sub_checked(
+            &budget->reserved_bytes, bytes) != 0)
+        return -1;
+    return coli_expert_residency_atomic_sub_checked(
+        &budget->committed_bytes, bytes);
 }
 
 static inline int coli_expert_residency_budget_evict(
     ColiExpertResidencyBudget *budget, uint64_t bytes) {
-    if (!budget || !bytes) return -1;
-    uint64_t resident = atomic_load_explicit(
-        &budget->resident_bytes, memory_order_acquire);
-    for (;;) {
-        if (resident < bytes) return -1;
-        if (atomic_compare_exchange_weak_explicit(
-                &budget->resident_bytes, &resident, resident - bytes,
-                memory_order_acq_rel, memory_order_acquire))
-            return 0;
-    }
+    if (!budget || !bytes ||
+        coli_expert_residency_atomic_sub_checked(
+            &budget->resident_bytes, bytes) != 0)
+        return -1;
+    return coli_expert_residency_atomic_sub_checked(
+        &budget->committed_bytes, bytes);
 }
 
 static inline int coli_expert_residency_entry_init(
@@ -193,9 +199,8 @@ static inline int coli_expert_residency_acquire(
     return 1;
 }
 
-/* Request one logical expert. Exactly one contender can claim a cold entry as
- * LOAD_OWNER. Other callers observe RESERVED/LOADING/PREPARING and JOIN the
- * same in-flight operation rather than issuing duplicate I/O. */
+/* Exactly one contender can claim COLD as LOAD_OWNER. Everyone observing the
+ * intermediate states joins the same physical load/prepare operation. */
 static inline ColiExpertRequestResult coli_expert_residency_request(
     ColiExpertResidencyEntry *entry,
     ColiExpertResidencyBudget *budget,
@@ -214,9 +219,8 @@ static inline ColiExpertRequestResult coli_expert_residency_request(
         }
         if (state == COLI_EXPERT_RESIDENCY_RESERVED ||
             state == COLI_EXPERT_RESIDENCY_LOADING ||
-            state == COLI_EXPERT_RESIDENCY_PREPARING)
-            return COLI_EXPERT_REQUEST_JOIN_INFLIGHT;
-        if (state == COLI_EXPERT_RESIDENCY_EVICTING)
+            state == COLI_EXPERT_RESIDENCY_PREPARING ||
+            state == COLI_EXPERT_RESIDENCY_EVICTING)
             return COLI_EXPERT_REQUEST_JOIN_INFLIGHT;
         if (state != COLI_EXPERT_RESIDENCY_COLD)
             return COLI_EXPERT_REQUEST_INVALID;
