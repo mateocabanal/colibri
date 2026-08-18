@@ -141,14 +141,11 @@ static void test_restore(int kv_f16) {
     qwen_prefix_cache_store(&c, &f.view, p3, 3);
     assert(c.count == 1 && c.stores == 1);
 
-    /* Restore must replace only used KV positions, while restoring the whole
-     * recurrent GDN state that represents the same three-token prefix. */
     fill_state(&f, 9);
     assert(qwen_prefix_cache_restore(&c, &f.view, p5, 5) == 3);
     assert_prefix_seed(&f, 1, 3);
     assert_tail_seed(&f, 9, 3);
 
-    /* A later/longer exact snapshot wins over the shorter matching entry. */
     fill_state(&f, 2);
     qwen_prefix_cache_store(&c, &f.view, p4, 4);
     fill_state(&f, 8);
@@ -156,8 +153,6 @@ static void test_restore(int kv_f16) {
     assert_prefix_seed(&f, 2, 4);
     assert_tail_seed(&f, 8, 4);
 
-    /* Equal prompts are not reusable: step() still needs at least one new token
-     * to produce the final logits. Divergent prefixes also miss exactly. */
     assert(qwen_prefix_cache_restore(&c, &f.view, p4, 4) == 3);
     {
         int diverged[] = {10, 11, 99, 13, 14};
@@ -208,11 +203,26 @@ static void test_hard_budget(void) {
     fixture_free(&f);
 }
 
+static void test_default_serve_policy(void) {
+    const char *v;
+    assert(qwen_prefix_cache_policy_value(NULL, 0) == NULL);
+    assert(qwen_prefix_cache_policy_value("", 0) == NULL);
+    v = qwen_prefix_cache_policy_value(NULL, 1);
+    assert(v && !strcmp(v, "256"));
+    v = qwen_prefix_cache_policy_value("0", 1);
+    assert(v && !strcmp(v, "0"));
+    v = qwen_prefix_cache_policy_value("off", 1);
+    assert(v && !strcmp(v, "off"));
+    v = qwen_prefix_cache_policy_value("384", 1);
+    assert(v && !strcmp(v, "384"));
+}
+
 int main(void) {
     test_restore(1);
     test_restore(0);
     test_ram_cap_reservation();
     test_hard_budget();
+    test_default_serve_policy();
     puts("qwen prefix cache: ok");
     return 0;
 }
