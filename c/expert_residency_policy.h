@@ -2,6 +2,7 @@
 #define COLIBRI_EXPERT_RESIDENCY_POLICY_H
 
 #include "expert_activation.h"
+#include "resource_planner.h"
 
 #include <stdint.h>
 
@@ -194,6 +195,28 @@ coli_expert_residency_policy_candidate(
     candidate.score = coli_expert_residency_sat_mul(
         candidate.hotness, expected_miss_cost_us) / quanta;
     return candidate;
+}
+
+/* Convert the model-neutral expert policy output directly into the generic
+ * planner bridge. Local hotness/hysteresis remains a WHICH-expert signal;
+ * only the bounded common-horizon reuse weight crosses this boundary. */
+static inline int coli_expert_residency_policy_resource_estimate(
+    const ColiExpertResidencyCandidate *expert,
+    uint32_t resource_id,
+    uint64_t bytes_per_miss,
+    uint64_t exposed_ns_per_miss,
+    ColiResourceBenefitEstimate *out) {
+    if (!expert || !out || !expert->resident_bytes || !bytes_per_miss)
+        return -1;
+    *out = (ColiResourceBenefitEstimate){
+        .kind = COLI_RESOURCE_PERSISTENT_EXPERT,
+        .id = resource_id,
+        .resident_bytes = expert->resident_bytes,
+        .reuse_weight = expert->reuse_weight,
+        .bytes_per_miss = bytes_per_miss,
+        .exposed_ns_per_miss = exposed_ns_per_miss,
+    };
+    return 0;
 }
 
 /* Positive means a is preferred, negative means b is preferred. Deterministic
