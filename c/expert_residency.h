@@ -47,6 +47,9 @@ typedef struct {
 typedef struct {
     ColiExpertKey key;
     atomic_int state;
+    /* Monotonic successful publication identity. Keep the last value while COLD
+     * so a reused physical slot cannot accidentally republish an old backend
+     * generation and alias stale descriptors. */
     atomic_uint_fast64_t generation;
     atomic_uint refs;
     atomic_uint tier_mask;
@@ -280,6 +283,15 @@ static inline int coli_expert_residency_publish(
         state != COLI_EXPERT_RESIDENCY_LOADING &&
         state != COLI_EXPERT_RESIDENCY_PREPARING)
         return -1;
+
+    /* Successful publication identity must advance across physical-slot reuse.
+     * Retaining the last value while COLD prevents a caller from reusing an old
+     * generation and making stale backend handles valid again. Failed loads do
+     * not advance the generation because they never publish bytes. */
+    uint64_t previous = atomic_load_explicit(
+        &entry->generation, memory_order_acquire);
+    if (generation <= previous) return -1;
+
     if (coli_expert_residency_budget_publish(
             budget, entry->allocation_bytes) != 0)
         return -1;
