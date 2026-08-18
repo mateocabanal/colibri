@@ -1,0 +1,65 @@
+name: v4-prefix-ssd
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'c/coli_v4_prefix_cache.c'
+      - 'c/coli_v4_prefix_cache_impl.inc'
+      - 'c/coli_v4_prefix_disk.c'
+      - 'c/coli_v4_prefix_disk.h'
+      - 'c/coli_v4_prefix_disk_shared.inc'
+      - 'c/coli_v4_generate_stats_cache.c'
+      - 'c/coli_v4_*snapshot_size.c'
+      - 'c/tests/test_v4_prefix_disk_sessions.c'
+      - 'c/Makefile.deepseek-v4.units'
+      - 'c/tools/make_deepseek_v4_tiny.py'
+      - 'colic/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: v4-prefix-ssd-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux-ssd-only-restart:
+    name: Linux SSD-only exact-COLI restart oracle
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: c/tools/requirements-deepseek-v4-tiny.txt
+      - name: Install pinned tiny-fixture dependencies
+        run: python -m pip install -r c/tools/requirements-deepseek-v4-tiny.txt
+      - name: Generate tiny V4 source fixture
+        run: python c/tools/make_deepseek_v4_tiny.py --output c/deepseek_v4_tiny --force
+      - name: Compile exact native COLI package
+        run: |
+          cargo run --manifest-path colic/Cargo.toml -- \
+            compile c/deepseek_v4_tiny \
+            --target native --quant exact --codec none --opt default \
+            -o c/deepseek_v4_tiny.coli --verify
+      - name: Build V4 prefix-cache helpers
+        run: make -C c -f Makefile.deepseek-v4 LTO=0 deepseek-v4-prefix-cache-test
+      - name: Validate SSD-only writer, restart restore, and cold output
+        run: |
+          python - <<'PY'
+          import json
+          import subprocess
+          from pathlib import Path
+
+          package = Path('c/deepseek_v4_tiny.coli')
+          case = json.loads((package / 'ref.json').read_text(encoding='utf-8'))['cases']['short']
+          prompt = ''.join(f'<t{token:03d}>' for token in case['prompt_ids'])
+          subprocess.run([
+              'c/test_v4_prefix_disk_sessions',
+              str(package),
+              prompt,
+          ], check=True)
+          PY

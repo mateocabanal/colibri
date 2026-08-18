@@ -1,6 +1,9 @@
 #ifndef COLIBRI_V4_PREFIX_DISK_H
 #define COLIBRI_V4_PREFIX_DISK_H
 
+#include <limits.h>
+#include <stdint.h>
+
 #include "deepseek_v4.h"
 
 /* One process-wide V4 adapter owns persistent-cache namespaces. Engine open and
