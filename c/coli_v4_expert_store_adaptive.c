@@ -3,29 +3,90 @@
  *
  * The physical store remains the owner of slots, loader concurrency, lease
  * generations, Metal registration and byte accounting. This translation unit
- * only adds the shared logical activation tracker/scorer at its policy seam.
- * The base store still uses its existing `usage[]` array for persistent
- * admission; before physical lookups begin for a routed layer we project the
- * shared deterministic policy rank into that array. This lets us change policy
- * without duplicating the store state machine while #95 becomes the common
- * physical residency owner.
- *
- * V4 package experts are uniform-size records with the same storage path, so
- * benefit/byte ordering is equivalent to policy hotness ordering. We choose an
- * artificial miss-cost equal to the record's 4 KiB allocation quanta; the
- * shared score therefore equals hotness exactly while still exercising the
- * common benefit/byte scorer. The projection reserves low bits so the base
- * store's legacy per-physical-lookup counter increment cannot perturb policy
- * ordering between routing observations.
+ * adds the shared logical activation tracker/scorer at its policy seam and
+ * lightweight miss-cost telemetry at the blocking operations already present in
+ * the store. The base state machine itself remains unchanged while #95 becomes
+ * the common physical residency owner.
  */
 #include "expert_activation.h"
 #include "expert_residency_policy.h"
+#include "coli_executor.h"
 
+#include <pthread.h>
+#include <stdint.h>
+#include <time.h>
+
+typedef struct ColiV4AdaptiveExpertStoreState ColiV4AdaptiveExpertStoreState;
+
+typedef struct {
+    ColiV4AdaptiveExpertStoreState *state;
+    uint64_t wait_started_ns;
+    uint64_t physical_load_samples;
+    uint64_t physical_load_ns;
+} ColiV4AdaptiveLookupTiming;
+
+static _Thread_local ColiV4AdaptiveLookupTiming g_v4_adaptive_lookup_timing;
+
+/* C11 wall elapsed fallback for this migration overlay. Timing is advisory and
+ * is discarded if the clock moves backwards. Once V4 uses #95 record-I/O, the
+ * shared backend/request timestamps become authoritative without changing the
+ * ExpertStore stats contract. Immediate resident hits never call this helper. */
+static uint64_t v4_adaptive_now_ns(void) {
+    struct timespec ts;
+    if (timespec_get(&ts, TIME_UTC) != TIME_UTC || ts.tv_sec < 0 ||
+        (uint64_t)ts.tv_sec > UINT64_MAX / UINT64_C(1000000000))
+        return 0;
+    return (uint64_t)ts.tv_sec * UINT64_C(1000000000) +
+           (uint64_t)ts.tv_nsec;
+}
+
+static uint64_t v4_adaptive_sat_add(uint64_t a, uint64_t b) {
+    return UINT64_MAX - a < b ? UINT64_MAX : a + b;
+}
+
+static void v4_adaptive_mark_exposed_wait(void) {
+    ColiV4AdaptiveLookupTiming *timing = &g_v4_adaptive_lookup_timing;
+    if (!timing->state || timing->wait_started_ns) return;
+    timing->wait_started_ns = v4_adaptive_now_ns();
+}
+
+/* Only the two operations that can expose expert-miss latency are intercepted:
+ * waiting for another generation/slot and owning the physical record load.
+ * This avoids a timing syscall on immediate resident hits. */
+static int v4_adaptive_cond_wait(pthread_cond_t *cond, pthread_mutex_t *mutex) {
+    v4_adaptive_mark_exposed_wait();
+    return pthread_cond_wait(cond, mutex);
+}
+
+static int v4_adaptive_executor_load_expert(
+    const ColiExecutor *executor, int32_t layer, int32_t expert,
+    void *resident_slot, size_t resident_bytes,
+    char *error, size_t error_size) {
+    ColiV4AdaptiveLookupTiming *timing = &g_v4_adaptive_lookup_timing;
+    v4_adaptive_mark_exposed_wait();
+    uint64_t began = v4_adaptive_now_ns();
+    int result = coli_executor_load_expert(
+        executor, layer, expert, resident_slot, resident_bytes,
+        error, error_size);
+    uint64_t ended = v4_adaptive_now_ns();
+    if (!result && timing->state && began && ended > began) {
+        timing->physical_load_samples = v4_adaptive_sat_add(
+            timing->physical_load_samples, UINT64_C(1));
+        timing->physical_load_ns = v4_adaptive_sat_add(
+            timing->physical_load_ns, ended - began);
+    }
+    return result;
+}
+
+#define pthread_cond_wait v4_adaptive_cond_wait
+#define coli_executor_load_expert v4_adaptive_executor_load_expert
 #define coli_v4_coli_expert_store_open coli_v4_coli_expert_store_open_base
 #include "coli_v4_expert_store.c"
 #undef coli_v4_coli_expert_store_open
+#undef coli_executor_load_expert
+#undef pthread_cond_wait
 
-typedef struct {
+struct ColiV4AdaptiveExpertStoreState {
     ColiExpertStore *inner;
     ColiExpertActivationTracker tracker;
     ColiExpertActivationEntry *entries;
@@ -33,7 +94,7 @@ typedef struct {
     size_t key_count;
     uint64_t current_epoch;
     ColiExpertResidencyPolicyConfig policy;
-} ColiV4AdaptiveExpertStoreState;
+};
 
 static size_t v4_adaptive_tracker_capacity(size_t keys) {
     if (!keys || keys > SIZE_MAX / 2) return 0;
@@ -120,6 +181,34 @@ static void v4_adaptive_project_layer_locked(
     }
 }
 
+static void v4_adaptive_commit_lookup_timing(
+    State *inner, const ColiV4AdaptiveLookupTiming *timing,
+    int lookup_succeeded) {
+    if (!inner || !timing) return;
+
+    uint64_t ended = 0;
+    uint64_t exposed_ns = 0;
+    if (lookup_succeeded && timing->wait_started_ns) {
+        ended = v4_adaptive_now_ns();
+        if (ended > timing->wait_started_ns)
+            exposed_ns = ended - timing->wait_started_ns;
+    }
+
+    if (!timing->physical_load_samples && !exposed_ns) return;
+    pthread_mutex_lock(&inner->mutex);
+    inner->stats.physical_load_samples = v4_adaptive_sat_add(
+        inner->stats.physical_load_samples, timing->physical_load_samples);
+    inner->stats.physical_load_ns = v4_adaptive_sat_add(
+        inner->stats.physical_load_ns, timing->physical_load_ns);
+    if (exposed_ns) {
+        inner->stats.exposed_wait_samples = v4_adaptive_sat_add(
+            inner->stats.exposed_wait_samples, UINT64_C(1));
+        inner->stats.exposed_wait_ns = v4_adaptive_sat_add(
+            inner->stats.exposed_wait_ns, exposed_ns);
+    }
+    pthread_mutex_unlock(&inner->mutex);
+}
+
 static int v4_adaptive_lookup(ColiExpertStore *store, ColiExpertKey key,
                               ColiExpertView *view) {
     ColiV4AdaptiveExpertStoreState *state = store ? store->state : NULL;
@@ -136,7 +225,16 @@ static int v4_adaptive_lookup(ColiExpertStore *store, ColiExpertKey key,
             state->physical_usage[index]++;
         pthread_mutex_unlock(&inner->mutex);
     }
-    return coli_expert_lookup(state->inner, key, view);
+
+    ColiV4AdaptiveLookupTiming previous = g_v4_adaptive_lookup_timing;
+    g_v4_adaptive_lookup_timing = (ColiV4AdaptiveLookupTiming){
+        .state = state,
+    };
+    int result = coli_expert_lookup(state->inner, key, view);
+    ColiV4AdaptiveLookupTiming completed = g_v4_adaptive_lookup_timing;
+    g_v4_adaptive_lookup_timing = previous;
+    v4_adaptive_commit_lookup_timing(inner, &completed, result == 0);
+    return result;
 }
 
 static int v4_adaptive_lookup_context(
@@ -186,16 +284,15 @@ static void v4_adaptive_observe(
     if (!state || !inner || !samples || !count) return;
 
     pthread_mutex_lock(&inner->mutex);
-    (void)coli_expert_activation_observe_many(&state->tracker, samples, count);
+    coli_expert_activation_observe_many(&state->tracker, samples, count);
     for (size_t i = 0; i < count; i++)
         if (samples[i].epoch > state->current_epoch)
             state->current_epoch = samples[i].epoch;
 
     /* One route batch can contain UNKNOWN/PREFILL/DECODE samples for the same
      * layer. Reproject each distinct layer once after the complete batch has
-     * entered the tracker. Counts are small (<= routed experts * phases), so a
-     * dependency-free O(n^2) distinct check is cheaper than extra hot-path
-     * allocation and deterministic across platforms. */
+     * entered the tracker. Counts are small, so a dependency-free O(n^2)
+     * distinct check is cheaper than extra hot-path allocation. */
     for (size_t i = 0; i < count; i++) {
         int layer = samples[i].key.layer;
         int seen = 0;
@@ -304,10 +401,13 @@ int coli_v4_coli_expert_store_open(const ColiV4ColiExpertStoreOptions *options,
     fprintf(stderr,
             "v4_residency adaptive_policy=frequency-decay "
             "prefill_weight=%u decode_weight=%u resident_hysteresis=%u%% "
-            "recency_quantum=%llu persistent_slots_per_layer=%d\n",
+            "recency_quantum=%llu planner_horizon=%llu confidence_mass=%llu "
+            "persistent_slots_per_layer=%d\n",
             state->policy.prefill_weight, state->policy.decode_weight,
             state->policy.resident_hysteresis_percent,
             (unsigned long long)state->policy.recency_quantum_epochs,
+            (unsigned long long)state->policy.planning_horizon_epochs,
+            (unsigned long long)state->policy.planner_confidence_mass,
             base->persistent_slots_per_layer);
     return 0;
 }
