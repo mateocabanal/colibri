@@ -77,7 +77,35 @@ typedef struct {
     uint64_t activation_observations;
     uint64_t activation_keys;
     uint64_t activation_dropped_new_keys;
+
+    /* Shared miss-cost telemetry for the resource planner.
+     *
+     * physical_load_* measures successful storage/decode attempts owned by this
+     * store. exposed_wait_* measures successful blocking lookup calls that did
+     * not find a resident expert immediately. That includes load owners,
+     * in-flight joiners and slot-pressure waits. A prefetched read that finishes
+     * before lookup therefore adds physical service time but zero exposed time,
+     * which is exactly the distinction the planner needs.
+     *
+     * All values are observational and saturating implementations are preferred;
+     * inability to measure time must never affect inference correctness. */
+    uint64_t physical_load_samples;
+    uint64_t physical_load_ns;
+    uint64_t exposed_wait_samples;
+    uint64_t exposed_wait_ns;
 } ColiExpertStoreStats;
+
+static inline uint64_t coli_expert_store_stats_exposed_ns_per_miss(
+        const ColiExpertStoreStats *stats) {
+    return stats && stats->exposed_wait_samples
+        ? stats->exposed_wait_ns / stats->exposed_wait_samples : 0;
+}
+
+static inline uint64_t coli_expert_store_stats_physical_load_ns_average(
+        const ColiExpertStoreStats *stats) {
+    return stats && stats->physical_load_samples
+        ? stats->physical_load_ns / stats->physical_load_samples : 0;
+}
 
 /*
  * ExpertStore lease contract:
@@ -92,6 +120,9 @@ typedef struct {
  *   may report routing multiplicity before batching/union; a store/runtime that
  *   does not consume adaptive residency signals simply ignores it. Policy
  *   accounting must never become a model-correctness dependency.
+ * - Timing/statistics are likewise observational. In particular a store must
+ *   never turn a successful lookup into an error because a timing source is
+ *   unavailable or a counter saturates.
  * - On lookup failure the view is cleared; the caller must not use it and
  *   must not call release().
  * - release() clears the entire view. release() on an already-cleared or
