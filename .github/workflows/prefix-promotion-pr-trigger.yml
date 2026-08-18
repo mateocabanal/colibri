@@ -1,0 +1,50 @@
+name: one-shot-prefix-promotion-pr-trigger
+
+on:
+  pull_request:
+    branches: [feat/sequence-state-core]
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-verify:
+    if: github.head_ref == 'ci/prefix-promotion-trigger' && github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/global-prefix-cache-core
+          fetch-depth: 0
+
+      - name: Execute guarded patch embedded in target branch
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import textwrap
+
+          source = Path('.github/workflows/prefix-promotion-one-shot.yml').read_text()
+          marker = "          python3 - <<'PY'\n"
+          start = source.index(marker) + len(marker)
+          end = source.index("\n          PY\n", start)
+          script = textwrap.dedent(source[start:end])
+          exec(compile(script, 'prefix-promotion-guarded-patch', 'exec'))
+          PY
+
+      - name: Verify focused runtime core
+        working-directory: c
+        run: |
+          git diff --check
+          make -f Makefile.runtime-core check
+
+      - name: Commit verified target-branch fix
+        shell: bash
+        run: |
+          rm .github/workflows/prefix-promotion-one-shot.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add c/prefix_cache.h c/Makefile.runtime-core c/tests/test_prefix_cache_promotion.c .github/workflows/prefix-promotion-one-shot.yml
+          git diff --cached --check
+          git commit -m "fix(runtime): keep SSD metadata through cold restore"
+          git push origin HEAD:feat/global-prefix-cache-core
