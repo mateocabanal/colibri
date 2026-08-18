@@ -57,6 +57,9 @@ typedef struct {
     /* OWNER/JOIN participate in the in-flight waiter count and must release.
      * READY hits do not, so releasing a hit is a harmless handle clear. */
     int retained;
+    /* Exactly one retained handle owns the physical read attempt. JOIN handles
+     * may wait/release only; they must never start or publish backend I/O. */
+    int owner;
 } ColiRecordIoHandle;
 
 /* UINT_MAX is never a real blocker count. Cancellation temporarily owns this
@@ -100,13 +103,15 @@ static inline void coli_record_io_fill_handle(ColiRecordIoHandle *handle,
                                                ColiRecordIoEntry *entry,
                                                uint64_t generation,
                                                ColiRecordIoPriority priority,
-                                               int retained) {
+                                               int retained,
+                                               int owner) {
     memset(handle, 0, sizeof(*handle));
     handle->entry = entry;
     handle->key = entry->key;
     handle->generation = generation;
     handle->priority = priority;
     handle->retained = retained;
+    handle->owner = owner;
 }
 
 static inline int coli_record_io_blocker_retain(ColiRecordIoEntry *entry) {
@@ -155,7 +160,7 @@ static inline ColiRecordIoRequestResult coli_record_io_request(
             uint64_t generation = atomic_load_explicit(
                 &entry->generation, memory_order_acquire);
             if (!generation) return COLI_RECORD_IO_INVALID;
-            coli_record_io_fill_handle(handle, entry, generation, priority, 0);
+            coli_record_io_fill_handle(handle, entry, generation, priority, 0, 0);
             return COLI_RECORD_IO_HIT;
         }
         if (state == COLI_RECORD_IO_STARTING)
@@ -184,7 +189,7 @@ static inline ColiRecordIoRequestResult coli_record_io_request(
                     (void)coli_record_io_blocker_release(entry);
                 continue;
             }
-            coli_record_io_fill_handle(handle, entry, generation, priority, 1);
+            coli_record_io_fill_handle(handle, entry, generation, priority, 1, 0);
             return COLI_RECORD_IO_JOIN;
         }
         if (state != COLI_RECORD_IO_IDLE && state != COLI_RECORD_IO_FAILED &&
@@ -227,13 +232,14 @@ static inline ColiRecordIoRequestResult coli_record_io_request(
         atomic_store_explicit(&entry->error_code, 0, memory_order_relaxed);
         atomic_store_explicit(&entry->state, COLI_RECORD_IO_QUEUED,
                               memory_order_release);
-        coli_record_io_fill_handle(handle, entry, generation, priority, 1);
+        coli_record_io_fill_handle(handle, entry, generation, priority, 1, 1);
         return COLI_RECORD_IO_OWNER;
     }
 }
 
 static inline int coli_record_io_begin_read(ColiRecordIoHandle *handle) {
     if (!handle || !handle->entry || !handle->generation || !handle->retained ||
+        !handle->owner ||
         atomic_load_explicit(&handle->entry->generation, memory_order_acquire) !=
             handle->generation)
         return -1;
@@ -249,7 +255,7 @@ static inline int coli_record_io_begin_read(ColiRecordIoHandle *handle) {
 static inline int coli_record_io_complete(ColiRecordIoHandle *handle,
                                           uint64_t stored_bytes) {
     if (!handle || !handle->entry || !handle->generation || !handle->retained ||
-        !stored_bytes ||
+        !handle->owner || !stored_bytes ||
         atomic_load_explicit(&handle->entry->generation, memory_order_acquire) !=
             handle->generation)
         return -1;
@@ -269,6 +275,7 @@ static inline int coli_record_io_complete(ColiRecordIoHandle *handle,
 static inline int coli_record_io_fail(ColiRecordIoHandle *handle,
                                       int error_code) {
     if (!handle || !handle->entry || !handle->generation || !handle->retained ||
+        !handle->owner ||
         atomic_load_explicit(&handle->entry->generation, memory_order_acquire) !=
             handle->generation)
         return -1;
@@ -290,11 +297,11 @@ static inline int coli_record_io_fail(ColiRecordIoHandle *handle,
     return 0;
 }
 
-/* Speculative work may be cancelled only while still queued and only if no
- * blocking waiter has joined/escalated it. The temporary UINT_MAX blocker lock
- * makes the zero-blocker decision atomic with respect to new blocking joins. */
+/* Speculative work may be cancelled only by the OWNER while still queued and
+ * only if no blocking waiter has joined/escalated it. The temporary UINT_MAX
+ * blocker lock makes the zero-blocker decision atomic with new blocking joins. */
 static inline int coli_record_io_cancel_prefetch(ColiRecordIoHandle *handle) {
-    if (!handle || !handle->entry || !handle->retained ||
+    if (!handle || !handle->entry || !handle->retained || !handle->owner ||
         handle->priority != COLI_RECORD_IO_PREFETCH ||
         atomic_load_explicit(&handle->entry->generation, memory_order_acquire) !=
             handle->generation)
