@@ -4,6 +4,13 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef _WIN32
+#include <direct.h>
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
+
 #include "../qwen_prefix_cache.h"
 
 #define LAYERS 4
@@ -132,38 +139,27 @@ static void test_restore(int kv_f16) {
     fixture_init(&f, kv_f16);
     QwenPrefixCache c = {0};
     qwen_prefix_cache_init(&c, 1024 * 1024, 1, 0);
-
     int p3[] = {10, 11, 12};
     int p4[] = {10, 11, 12, 13};
     int p5[] = {10, 11, 12, 13, 14};
-
     fill_state(&f, 1);
     qwen_prefix_cache_store(&c, &f.view, p3, 3);
     assert(c.count == 1 && c.stores == 1);
-
-    /* Restore must replace only used KV positions, while restoring the whole
-     * recurrent GDN state that represents the same three-token prefix. */
     fill_state(&f, 9);
     assert(qwen_prefix_cache_restore(&c, &f.view, p5, 5) == 3);
     assert_prefix_seed(&f, 1, 3);
     assert_tail_seed(&f, 9, 3);
-
-    /* A later/longer exact snapshot wins over the shorter matching entry. */
     fill_state(&f, 2);
     qwen_prefix_cache_store(&c, &f.view, p4, 4);
     fill_state(&f, 8);
     assert(qwen_prefix_cache_restore(&c, &f.view, p5, 5) == 4);
     assert_prefix_seed(&f, 2, 4);
     assert_tail_seed(&f, 8, 4);
-
-    /* Equal prompts are not reusable: step() still needs at least one new token
-     * to produce the final logits. Divergent prefixes also miss exactly. */
     assert(qwen_prefix_cache_restore(&c, &f.view, p4, 4) == 3);
     {
         int diverged[] = {10, 11, 99, 13, 14};
         assert(qwen_prefix_cache_restore(&c, &f.view, diverged, 5) == 0);
     }
-
     QwenPrefixCacheStats s;
     qwen_prefix_cache_stats(&c, &s);
     assert(s.hits == 3);
@@ -203,7 +199,6 @@ static void test_hard_budget(void) {
     int b[] = {4, 5, 6};
     size_t one, kvb, gde;
     assert(qwen_prefix_cache_entry_bytes(&f.view, 3, &one, &kvb, &gde));
-
     QwenPrefixCache c = {0};
     qwen_prefix_cache_init(&c, one, 1, 0);
     fill_state(&f, 3);
@@ -211,14 +206,87 @@ static void test_hard_budget(void) {
     assert(c.count == 1 && c.resident_bytes == one);
     fill_state(&f, 4);
     qwen_prefix_cache_store(&c, &f.view, b, 3);
-    assert(c.count == 1);
-    assert(c.resident_bytes == one);
-    assert(c.evictions == 1);
+    assert(c.count == 1 && c.resident_bytes == one && c.evictions == 1);
     assert(qwen_prefix_cache_restore(&c, &f.view, (int[]){1,2,3,9}, 4) == 0);
     assert(qwen_prefix_cache_restore(&c, &f.view, (int[]){4,5,6,9}, 4) == 3);
-
     qwen_prefix_cache_clear(&c);
     fixture_free(&f);
+}
+
+static void env_set(const char *name, const char *value) {
+#ifdef _WIN32
+    assert(_putenv_s(name, value ? value : "") == 0);
+#else
+    if (value) assert(setenv(name, value, 1) == 0);
+    else assert(unsetenv(name) == 0);
+#endif
+}
+
+static void env_unset(const char *name) { env_set(name, NULL); }
+
+static void test_ssd_restart_restore(void) {
+#ifdef _WIN32
+    int pid = _getpid();
+#else
+    int pid = (int)getpid();
+#endif
+    char dir[256], model[320];
+    snprintf(dir, sizeof(dir), "./.qwen-prefix-disk-test-%d", pid);
+    assert(cpd_mkdirs(dir));
+    snprintf(model, sizeof(model), "%s/model.coli", dir);
+    FILE *mf = fopen(model, "wb");
+    assert(mf && fwrite("fake-coli-model-v1", 1, 18, mf) == 18 && fclose(mf) == 0);
+
+    env_set("SERVE", "1");
+    env_set("SNAP", model);
+    env_set("COLI_PREFIX_CACHE", "ssd");
+    env_set("COLI_PREFIX_CACHE_DIR", dir);
+    env_set("COLI_PREFIX_CACHE_RAM_MB", "1");
+    env_set("COLI_PREFIX_CACHE_MIN_TOKENS", "1");
+    env_set("COLI_PREFIX_CACHE_DISK_GB", "0.01");
+    env_set("COLI_PREFIX_CACHE_MIN_FREE_GB", "0");
+    env_unset("QWEN_PREFIX_CACHE_MB");
+    env_unset("QWEN_PREFIX_CACHE_MIN_TOKENS");
+
+    Fixture f;
+    fixture_init(&f, 1);
+    int p3[] = {21, 22, 23};
+    int p5[] = {21, 22, 23, 24, 25};
+    QwenPrefixCache first = {0};
+    fill_state(&f, 7);
+    qwen_prefix_cache_store(&first, &f.view, p3, 3);
+    assert(qwen_prefix_cache_disk_stats().writes >= 1);
+    qwen_prefix_cache_clear(&first);
+
+    QwenPrefixCache second = {0};
+    fill_state(&f, 9);
+    assert(qwen_prefix_cache_restore(&second, &f.view, p5, 5) == 3);
+    assert_prefix_seed(&f, 7, 3);
+    assert_tail_seed(&f, 9, 3);
+    ColiPrefixDiskStats ds = qwen_prefix_cache_disk_stats();
+    assert(ds.hits >= 1 && ds.read_bytes > 0);
+    assert(second.count == 1); /* SSD -> bounded RAM promotion */
+    qwen_prefix_cache_clear(&second);
+    fixture_free(&f);
+
+    DIR *d = opendir(dir);
+    if (d) {
+        struct dirent *de;
+        while ((de = readdir(d)) != NULL) {
+            if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+            char p[512]; snprintf(p, sizeof(p), "%s/%s", dir, de->d_name); remove(p);
+        }
+        closedir(d);
+    }
+#ifdef _WIN32
+    _rmdir(dir);
+#else
+    rmdir(dir);
+#endif
+    env_unset("SERVE"); env_unset("SNAP"); env_unset("COLI_PREFIX_CACHE");
+    env_unset("COLI_PREFIX_CACHE_DIR"); env_unset("COLI_PREFIX_CACHE_RAM_MB");
+    env_unset("COLI_PREFIX_CACHE_MIN_TOKENS"); env_unset("COLI_PREFIX_CACHE_DISK_GB");
+    env_unset("COLI_PREFIX_CACHE_MIN_FREE_GB");
 }
 
 int main(void) {
@@ -227,6 +295,7 @@ int main(void) {
     test_ram_cap_reservation();
     test_budget_policy();
     test_hard_budget();
+    test_ssd_restart_restore();
     puts("qwen prefix cache: ok");
     return 0;
 }

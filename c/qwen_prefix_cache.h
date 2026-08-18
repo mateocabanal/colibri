@@ -1,467 +1,173 @@
-/* qwen_prefix_cache.h — bounded exact-prefix snapshots for Qwen hybrid state.
+/* qwen_prefix_cache.h — common policy + SSD tier around the proven Qwen RAM cache.
  *
- * Qwen3.5/3.6/3.7 mixes full GQA layers with Gated DeltaNet layers. Reusing a
- * prompt therefore requires more than the attention KV cache: the GDN
- * recurrence matrix and causal-convolution history are part of the sequence
- * state too. This helper snapshots both representations at the end of prefill.
- *
- * The cache is deliberately model-instance local. Callers provide a state view
- * over one already-loaded Model, so entries cannot accidentally cross model,
- * tokenizer, quantization, or runtime-layout boundaries. Matching is exact on
- * token IDs and only strict prefixes are restorable (the unmatched tail must
- * contain at least one token so the caller receives fresh logits from step()).
- *
- * Admission is hard-budgeted: entries are evicted before allocation, and the
- * byte estimate includes metadata, token IDs, packed KV rows, and all GDN
- * recurrent/conv state. Allocation failure simply disables that admission;
- * prompt caching is an optimization and must never make inference fail.
+ * qwen_prefix_cache_impl.h is the byte-for-byte implementation currently in
+ * main.  This wrapper only owns common policy and persistence, so the validated
+ * hybrid snapshot/copy geometry is not forked.
  */
-#ifndef QWEN_PREFIX_CACHE_H
-#define QWEN_PREFIX_CACHE_H
+#ifndef QWEN_PREFIX_CACHE_GLOBAL_WRAPPER_H
+#define QWEN_PREFIX_CACHE_GLOBAL_WRAPPER_H
 
-#include <limits.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+#include "prefix_cache_disk.h"
 
-#define QWEN_PREFIX_CACHE_MAX_ENTRIES 64
-#define QWEN_PREFIX_CACHE_DEFAULT_MIN_TOKENS 256
-#define QWEN_PREFIX_CACHE_DEFAULT_SERVE_MB 256u
+/* Rename only the public policy/store/restore entry points while compiling the
+ * mainline implementation. Internal capture/restore helpers remain available
+ * for the persistent adapter and therefore share the exact same geometry. */
+#define qwen_prefix_cache_budget_from_env qpc_ram_budget_from_env
+#define qwen_prefix_cache_budget_for_serve qpc_ram_budget_for_serve
+#define qwen_prefix_cache_min_tokens_from_env qpc_ram_min_tokens_from_env
+#define qwen_prefix_cache_store qpc_ram_store
+#define qwen_prefix_cache_restore qpc_ram_restore
+#include "qwen_prefix_cache_impl.h"
+#undef qwen_prefix_cache_restore
+#undef qwen_prefix_cache_store
+#undef qwen_prefix_cache_min_tokens_from_env
+#undef qwen_prefix_cache_budget_for_serve
+#undef qwen_prefix_cache_budget_from_env
 
-typedef struct {
-    int layer_count;
-    const int8_t *layer_is_gdn; /* [layer_count], 1=GDN, 0=full attention */
-    int n_kv_heads;
-    int head_dim;
-    int max_t;
-    int kv_f16;
-    float **K, **V;
-    uint16_t **K16, **V16;
-    float **gdn_S, **gdn_conv;
-    size_t gdn_state_elems;     /* elements per GDN layer */
-    size_t gdn_conv_elems;      /* elements per GDN layer */
-} QwenPrefixStateView;
+#define QWEN_PREFIX_DISK_STATE_ABI 1u
 
-typedef struct QwenPrefixCacheEntry {
-    int *tokens;
-    int token_count;
-    unsigned char *kv;          /* packed used-prefix rows, K then V */
-    size_t kv_bytes;
-    float *gdn;                 /* each GDN layer: recurrence then conv */
-    size_t gdn_elems;
-    size_t bytes;
-    uint64_t last_used;
-} QwenPrefixCacheEntry;
-
-typedef struct {
-    QwenPrefixCacheEntry *entries[QWEN_PREFIX_CACHE_MAX_ENTRIES];
-    size_t count;
-    size_t resident_bytes;
-    size_t budget_bytes;
-    int min_tokens;
-    int log;
-    int initialized;
-    uint64_t clock;
-    uint64_t lookups;
-    uint64_t hits;
-    uint64_t stores;
-    uint64_t evictions;
-    uint64_t matched_tokens;
-    uint64_t restore_bytes;
-} QwenPrefixCache;
-
-typedef struct {
-    uint64_t lookups, hits, stores, evictions, matched_tokens, restore_bytes;
-    size_t entries, resident_bytes, budget_bytes;
-} QwenPrefixCacheStats;
-
-static inline int qpc_size_add(size_t a, size_t b, size_t *out) {
-    if (b > SIZE_MAX - a) return 0;
-    *out = a + b;
-    return 1;
-}
-
-static inline int qpc_size_mul(size_t a, size_t b, size_t *out) {
-    if (a && b > SIZE_MAX / a) return 0;
-    *out = a * b;
-    return 1;
-}
-
-static inline void qwen_prefix_cache_entry_free(QwenPrefixCacheEntry *e) {
-    if (!e) return;
-    free(e->tokens);
-    free(e->kv);
-    free(e->gdn);
-    free(e);
-}
-
-static inline void qwen_prefix_cache_clear(QwenPrefixCache *c) {
-    if (!c) return;
-    for (size_t i = 0; i < c->count; i++)
-        qwen_prefix_cache_entry_free(c->entries[i]);
-    memset(c->entries, 0, sizeof(c->entries));
-    c->count = 0;
-    c->resident_bytes = 0;
-}
-
-static inline void qwen_prefix_cache_init(QwenPrefixCache *c,
-                                           size_t budget_bytes,
-                                           int min_tokens, int log) {
-    if (!c) return;
-    if (c->initialized) qwen_prefix_cache_clear(c);
-    memset(c, 0, sizeof(*c));
-    c->budget_bytes = budget_bytes;
-    c->min_tokens = min_tokens > 0 ? min_tokens
-                                    : QWEN_PREFIX_CACHE_DEFAULT_MIN_TOKENS;
-    c->log = !!log;
-    c->initialized = 1;
-}
-
-/* Qwen's legacy RAM_GB policy treats one expert slot per sparse layer as
- * roughly 2 decimal GB. Reserve the prompt-cache bytes before applying
- * that same heuristic so an implicit RAM budget remains a total budget.
- * Explicit CACHE/positional caps are intentionally outside this helper. */
-static inline int qwen_prefix_cache_ram_cap(const char *value,
-                                            size_t prefix_budget_bytes,
-                                            int *valid) {
-    if (valid) *valid = 0;
-    if (!value || !*value) return 0;
-    char *end = NULL;
-    long double gib = strtold(value, &end);
-    /* Keep RAM_GB's historical permissive trailing-text behavior while
-     * rejecting NaN/inf/negative values before any integer conversion. */
-    if (end == value || !(gib > 0.0L) || gib > 1000000.0L) return 0;
-    if (valid) *valid = 1;
-    const long double gb = 1000000000.0L;
-    long double bytes = gib * gb;
-    if (bytes <= (long double)prefix_budget_bytes) return 0;
-    long double slots = (bytes - (long double)prefix_budget_bytes) / (2.0L * gb);
-    if (slots >= (long double)INT_MAX) return INT_MAX;
-    return slots > 0.0L ? (int)slots : 0;
-}
-
-static inline int qpc_ascii_ieq(const char *a, const char *b) {
-    if (!a || !b) return 0;
-    while (*a && *b) {
-        unsigned char ca = (unsigned char)*a++, cb = (unsigned char)*b++;
-        if (ca >= 'A' && ca <= 'Z') ca = (unsigned char)(ca - 'A' + 'a');
-        if (cb >= 'A' && cb <= 'Z') cb = (unsigned char)(cb - 'A' + 'a');
-        if (ca != cb) return 0;
-    }
-    return *a == 0 && *b == 0;
-}
-
-static inline size_t qwen_prefix_cache_budget_parse(const char *value,
-                                                     size_t fallback_bytes) {
-    if (!value || !*value) return fallback_bytes;
-    if (qpc_ascii_ieq(value, "off")) return 0;
-    char *end = NULL;
-    long double mib = strtold(value, &end);
-    if (end == value || !(mib > 0.0L)) return 0;
-    while (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n') end++;
-    if (*end) return 0;
-    long double bytes = mib * 1024.0L * 1024.0L;
-    if (bytes >= (long double)SIZE_MAX) return SIZE_MAX;
-    return (size_t)bytes;
+static inline int qpc_common_mode_allows_ram(void) {
+    int mode = coli_prefix_cache_mode();
+    return mode != 0;
 }
 
 static inline size_t qwen_prefix_cache_budget_from_env(void) {
-    return qwen_prefix_cache_budget_parse(getenv("QWEN_PREFIX_CACHE_MB"), 0);
+    if (!qpc_common_mode_allows_ram()) return 0;
+    const char *legacy = getenv("QWEN_PREFIX_CACHE_MB");
+    if (legacy && *legacy) return qwen_prefix_cache_budget_parse(legacy, 0);
+    const char *common = getenv("COLI_PREFIX_CACHE_RAM_MB");
+    return qwen_prefix_cache_budget_parse(common, 0);
 }
 
 static inline size_t qwen_prefix_cache_budget_for_serve(void) {
+    if (!qpc_common_mode_allows_ram()) return 0;
     const size_t fallback = (size_t)QWEN_PREFIX_CACHE_DEFAULT_SERVE_MB * 1024u * 1024u;
-    return qwen_prefix_cache_budget_parse(getenv("QWEN_PREFIX_CACHE_MB"), fallback);
+    const char *legacy = getenv("QWEN_PREFIX_CACHE_MB");
+    if (legacy && *legacy) return qwen_prefix_cache_budget_parse(legacy, fallback);
+    return qwen_prefix_cache_budget_parse(getenv("COLI_PREFIX_CACHE_RAM_MB"), fallback);
 }
 
 static inline int qwen_prefix_cache_min_tokens_from_env(void) {
     const char *value = getenv("QWEN_PREFIX_CACHE_MIN_TOKENS");
+    if (!value || !*value) value = getenv("COLI_PREFIX_CACHE_MIN_TOKENS");
     if (!value || !*value) return QWEN_PREFIX_CACHE_DEFAULT_MIN_TOKENS;
     char *end = NULL;
     long parsed = strtol(value, &end, 10);
-    if (end == value || parsed < 1)
-        return QWEN_PREFIX_CACHE_DEFAULT_MIN_TOKENS;
+    if (end == value || parsed < 1) return QWEN_PREFIX_CACHE_DEFAULT_MIN_TOKENS;
     if (parsed > INT_MAX) return INT_MAX;
     return (int)parsed;
 }
 
-static inline void qwen_prefix_cache_init_env(QwenPrefixCache *c) {
+static inline void qpc_global_init_if_needed(QwenPrefixCache *c) {
     if (!c || c->initialized) return;
-    qwen_prefix_cache_init(c, qwen_prefix_cache_budget_from_env(),
-                           qwen_prefix_cache_min_tokens_from_env(),
+    const char *serve = getenv("SERVE");
+    size_t budget = serve && serve[0] == '1'
+        ? qwen_prefix_cache_budget_for_serve()
+        : qwen_prefix_cache_budget_from_env();
+    qwen_prefix_cache_init(c, budget, qwen_prefix_cache_min_tokens_from_env(),
                            getenv("QWEN_PREFIX_LOG") != NULL);
-    if (c->log)
-        fprintf(stderr,
-                "[QWEN-PREFIX] budget=%.2fMiB min_tokens=%d mode=process-local-exact-hybrid\n",
-                (double)c->budget_bytes / (1024.0 * 1024.0), c->min_tokens);
 }
 
-static inline int qpc_view_valid(const QwenPrefixStateView *v, int prefix_tokens) {
-    if (!v || !v->layer_is_gdn || v->layer_count <= 0 ||
-        v->n_kv_heads <= 0 || v->head_dim <= 0 || v->max_t <= 0 ||
-        prefix_tokens <= 0 || prefix_tokens > v->max_t)
+typedef struct {
+    uint32_t layer_count;
+    uint32_t n_kv_heads;
+    uint32_t head_dim;
+    uint32_t kv_f16;
+    uint64_t gdn_state_elems;
+    uint64_t gdn_conv_elems;
+} QwenPrefixDiskGeometry;
+
+static inline int qwen_prefix_disk_enabled(void) {
+    const char *serve = getenv("SERVE");
+    if (!serve || serve[0] != '1') return 0;
+    /* Preserve the historical Qwen explicit-off override as a master switch;
+     * benchmark cache-off must never silently fall through to SSD. */
+    const char *legacy = getenv("QWEN_PREFIX_CACHE_MB");
+    if (legacy && *legacy && qwen_prefix_cache_budget_parse(legacy, 0) == 0)
         return 0;
-    for (int l = 0; l < v->layer_count; l++) {
-        if (v->layer_is_gdn[l]) {
-            if (!v->gdn_S || !v->gdn_conv || !v->gdn_S[l] || !v->gdn_conv[l])
-                return 0;
-        } else if (v->kv_f16) {
-            if (!v->K16 || !v->V16 || !v->K16[l] || !v->V16[l]) return 0;
-        } else {
-            if (!v->K || !v->V || !v->K[l] || !v->V[l]) return 0;
-        }
-    }
-    return 1;
+    return coli_prefix_disk_enabled();
 }
 
-/* Exact allocation geometry for one snapshot. */
-static inline int qwen_prefix_cache_entry_bytes(const QwenPrefixStateView *v,
-                                                 int token_count,
-                                                 size_t *bytes_out,
-                                                 size_t *kv_bytes_out,
-                                                 size_t *gdn_elems_out) {
-    if (!bytes_out || !kv_bytes_out || !gdn_elems_out ||
-        !qpc_view_valid(v, token_count)) return 0;
-
-    size_t full_layers = 0, gdn_layers = 0;
-    for (int l = 0; l < v->layer_count; l++) {
-        if (v->layer_is_gdn[l]) gdn_layers++;
-        else full_layers++;
-    }
-
-    size_t row_elems, kv_elems, kv_bytes, gdn_per, gdn_elems, gdn_bytes;
-    if (!qpc_size_mul((size_t)token_count, (size_t)v->head_dim, &row_elems) ||
-        !qpc_size_mul(row_elems, (size_t)v->n_kv_heads, &kv_elems) ||
-        !qpc_size_mul(kv_elems, 2, &kv_elems) ||
-        !qpc_size_mul(kv_elems, full_layers, &kv_elems) ||
-        !qpc_size_mul(kv_elems, v->kv_f16 ? sizeof(uint16_t) : sizeof(float),
-                      &kv_bytes) ||
-        !qpc_size_add(v->gdn_state_elems, v->gdn_conv_elems, &gdn_per) ||
-        !qpc_size_mul(gdn_per, gdn_layers, &gdn_elems) ||
-        !qpc_size_mul(gdn_elems, sizeof(float), &gdn_bytes))
-        return 0;
-
-    size_t token_bytes, bytes = sizeof(QwenPrefixCacheEntry);
-    if (!qpc_size_mul((size_t)token_count, sizeof(int), &token_bytes) ||
-        !qpc_size_add(bytes, token_bytes, &bytes) ||
-        !qpc_size_add(bytes, kv_bytes, &bytes) ||
-        !qpc_size_add(bytes, gdn_bytes, &bytes))
-        return 0;
-    *bytes_out = bytes;
-    *kv_bytes_out = kv_bytes;
-    *gdn_elems_out = gdn_elems;
-    return 1;
-}
-
-static inline size_t qpc_oldest_index(const QwenPrefixCache *c) {
-    size_t victim = 0;
-    uint64_t oldest = UINT64_MAX;
-    for (size_t i = 0; i < c->count; i++) {
-        if (c->entries[i]->last_used < oldest) {
-            oldest = c->entries[i]->last_used;
-            victim = i;
-        }
-    }
-    return victim;
-}
-
-static inline void qpc_remove_index(QwenPrefixCache *c, size_t idx, int eviction) {
-    QwenPrefixCacheEntry *e = c->entries[idx];
-    if (e->bytes <= c->resident_bytes) c->resident_bytes -= e->bytes;
-    else c->resident_bytes = 0;
-    for (size_t i = idx + 1; i < c->count; i++) c->entries[i - 1] = c->entries[i];
-    c->entries[--c->count] = NULL;
-    if (eviction) c->evictions++;
-    qwen_prefix_cache_entry_free(e);
-}
-
-static inline QwenPrefixCacheEntry *qpc_find_exact(QwenPrefixCache *c,
-                                                    const int *tokens,
-                                                    int token_count) {
-    for (size_t i = 0; i < c->count; i++) {
-        QwenPrefixCacheEntry *e = c->entries[i];
-        if (e->token_count == token_count &&
-            !memcmp(e->tokens, tokens, (size_t)token_count * sizeof(int)))
-            return e;
-    }
-    return NULL;
-}
-
-static inline QwenPrefixCacheEntry *qpc_capture(const QwenPrefixStateView *v,
-                                                 const int *tokens,
-                                                 int token_count,
-                                                 size_t bytes,
-                                                 size_t kv_bytes,
-                                                 size_t gdn_elems) {
-    QwenPrefixCacheEntry *e = (QwenPrefixCacheEntry *)calloc(1, sizeof(*e));
-    if (!e) return NULL;
-    e->tokens = (int *)malloc((size_t)token_count * sizeof(int));
-    e->kv = kv_bytes ? (unsigned char *)malloc(kv_bytes) : NULL;
-    e->gdn = gdn_elems ? (float *)malloc(gdn_elems * sizeof(float)) : NULL;
-    if (!e->tokens || (kv_bytes && !e->kv) || (gdn_elems && !e->gdn)) {
-        qwen_prefix_cache_entry_free(e);
-        return NULL;
-    }
-    memcpy(e->tokens, tokens, (size_t)token_count * sizeof(int));
-    e->token_count = token_count;
-    e->kv_bytes = kv_bytes;
-    e->gdn_elems = gdn_elems;
-    e->bytes = bytes;
-
-    size_t kv_off = 0;
-    size_t row_elems = (size_t)token_count * (size_t)v->head_dim;
-    size_t row_bytes = row_elems * (v->kv_f16 ? sizeof(uint16_t) : sizeof(float));
-    for (int l = 0; l < v->layer_count; l++) {
-        if (v->layer_is_gdn[l]) continue;
-        for (int g = 0; g < v->n_kv_heads; g++) {
-            size_t src_off = (size_t)g * (size_t)v->max_t * (size_t)v->head_dim;
-            const void *ksrc = v->kv_f16 ? (const void *)(v->K16[l] + src_off)
-                                         : (const void *)(v->K[l] + src_off);
-            const void *vsrc = v->kv_f16 ? (const void *)(v->V16[l] + src_off)
-                                         : (const void *)(v->V[l] + src_off);
-            memcpy(e->kv + kv_off, ksrc, row_bytes); kv_off += row_bytes;
-            memcpy(e->kv + kv_off, vsrc, row_bytes); kv_off += row_bytes;
-        }
-    }
-
-    size_t gd_off = 0;
-    for (int l = 0; l < v->layer_count; l++) {
-        if (!v->layer_is_gdn[l]) continue;
-        memcpy(e->gdn + gd_off, v->gdn_S[l], v->gdn_state_elems * sizeof(float));
-        gd_off += v->gdn_state_elems;
-        memcpy(e->gdn + gd_off, v->gdn_conv[l], v->gdn_conv_elems * sizeof(float));
-        gd_off += v->gdn_conv_elems;
-    }
-    return e;
+static inline uint64_t qwen_prefix_disk_namespace(const QwenPrefixStateView *v) {
+    if (!v || !qwen_prefix_disk_enabled()) return 0;
+    QwenPrefixDiskGeometry g = {
+        (uint32_t)v->layer_count, (uint32_t)v->n_kv_heads,
+        (uint32_t)v->head_dim, (uint32_t)!!v->kv_f16,
+        (uint64_t)v->gdn_state_elems, (uint64_t)v->gdn_conv_elems
+    };
+    return coli_prefix_disk_namespace("qwen-hybrid", QWEN_PREFIX_DISK_STATE_ABI,
+                                      getenv("SNAP"), getenv("COLI_CONFIG"),
+                                      &g, sizeof(g));
 }
 
 static inline void qwen_prefix_cache_store(QwenPrefixCache *c,
                                             const QwenPrefixStateView *v,
                                             const int *tokens, int token_count) {
     if (!c || !tokens) return;
-    qwen_prefix_cache_init_env(c);
-    if (!c->budget_bytes || token_count < c->min_tokens ||
-        !qpc_view_valid(v, token_count)) return;
+    qpc_global_init_if_needed(c);
+    qpc_ram_store(c, v, tokens, token_count);
+    if (token_count < c->min_tokens || !qwen_prefix_disk_enabled()) return;
+    uint64_t ns = qwen_prefix_disk_namespace(v);
+    if (!ns) return;
 
-    QwenPrefixCacheEntry *duplicate = qpc_find_exact(c, tokens, token_count);
-    if (duplicate) {
-        duplicate->last_used = ++c->clock;
-        return;
+    QwenPrefixCacheEntry *e = qpc_find_exact(c, tokens, token_count);
+    QwenPrefixCacheEntry *owned = NULL;
+    if (!e) {
+        size_t bytes, kv_bytes, gdn_elems;
+        if (!qwen_prefix_cache_entry_bytes(v, token_count, &bytes, &kv_bytes,
+                                           &gdn_elems)) return;
+        owned = qpc_capture(v, tokens, token_count, bytes, kv_bytes, gdn_elems);
+        e = owned;
     }
-
-    size_t bytes, kv_bytes, gdn_elems;
-    if (!qwen_prefix_cache_entry_bytes(v, token_count, &bytes, &kv_bytes,
-                                       &gdn_elems) ||
-        !bytes || bytes > c->budget_bytes) return;
-
-    while (c->count &&
-           (c->count >= QWEN_PREFIX_CACHE_MAX_ENTRIES ||
-            c->resident_bytes > c->budget_bytes - bytes))
-        qpc_remove_index(c, qpc_oldest_index(c), 1);
-    if (c->count >= QWEN_PREFIX_CACHE_MAX_ENTRIES ||
-        c->resident_bytes > c->budget_bytes - bytes) return;
-
-    QwenPrefixCacheEntry *e = qpc_capture(v, tokens, token_count, bytes,
-                                          kv_bytes, gdn_elems);
-    if (!e) return;
-    e->last_used = ++c->clock;
-    c->entries[c->count++] = e;
-    c->resident_bytes += e->bytes;
-    c->stores++;
-    if (c->log)
-        fprintf(stderr,
-                "[QWEN-PREFIX] store tokens=%d bytes=%.2fMiB entries=%zu resident=%.2fMiB\n",
-                token_count, (double)e->bytes / (1024.0 * 1024.0), c->count,
-                (double)c->resident_bytes / (1024.0 * 1024.0));
-}
-
-static inline QwenPrefixCacheEntry *qpc_find_longest(QwenPrefixCache *c,
-                                                      const int *tokens,
-                                                      int token_count) {
-    QwenPrefixCacheEntry *best = NULL;
-    for (size_t i = 0; i < c->count; i++) {
-        QwenPrefixCacheEntry *e = c->entries[i];
-        if (e->token_count <= 0 || e->token_count >= token_count ||
-            (best && e->token_count <= best->token_count)) continue;
-        if (!memcmp(e->tokens, tokens, (size_t)e->token_count * sizeof(int)))
-            best = e;
-    }
-    return best;
-}
-
-static inline int qpc_restore_entry(const QwenPrefixCacheEntry *e,
-                                    const QwenPrefixStateView *v) {
-    if (!e || !qpc_view_valid(v, e->token_count)) return 0;
-    size_t expected, kv_bytes, gdn_elems;
-    if (!qwen_prefix_cache_entry_bytes(v, e->token_count, &expected,
-                                       &kv_bytes, &gdn_elems) ||
-        expected != e->bytes || kv_bytes != e->kv_bytes ||
-        gdn_elems != e->gdn_elems) return 0;
-
-    size_t kv_off = 0;
-    size_t row_elems = (size_t)e->token_count * (size_t)v->head_dim;
-    size_t row_bytes = row_elems * (v->kv_f16 ? sizeof(uint16_t) : sizeof(float));
-    for (int l = 0; l < v->layer_count; l++) {
-        if (v->layer_is_gdn[l]) continue;
-        for (int g = 0; g < v->n_kv_heads; g++) {
-            size_t dst_off = (size_t)g * (size_t)v->max_t * (size_t)v->head_dim;
-            void *kdst = v->kv_f16 ? (void *)(v->K16[l] + dst_off)
-                                   : (void *)(v->K[l] + dst_off);
-            void *vdst = v->kv_f16 ? (void *)(v->V16[l] + dst_off)
-                                   : (void *)(v->V[l] + dst_off);
-            memcpy(kdst, e->kv + kv_off, row_bytes); kv_off += row_bytes;
-            memcpy(vdst, e->kv + kv_off, row_bytes); kv_off += row_bytes;
-        }
-    }
-
-    size_t gd_off = 0;
-    for (int l = 0; l < v->layer_count; l++) {
-        if (!v->layer_is_gdn[l]) continue;
-        memcpy(v->gdn_S[l], e->gdn + gd_off, v->gdn_state_elems * sizeof(float));
-        gd_off += v->gdn_state_elems;
-        memcpy(v->gdn_conv[l], e->gdn + gd_off, v->gdn_conv_elems * sizeof(float));
-        gd_off += v->gdn_conv_elems;
-    }
-    return 1;
+    if (e)
+        (void)coli_prefix_disk_store(ns, QWEN_PREFIX_DISK_STATE_ABI,
+                                     e->tokens, e->token_count,
+                                     e->kv, e->kv_bytes,
+                                     e->gdn, e->gdn_elems * sizeof(float), c->log);
+    qwen_prefix_cache_entry_free(owned);
 }
 
 static inline int qwen_prefix_cache_restore(QwenPrefixCache *c,
                                              const QwenPrefixStateView *v,
-                                             const int *tokens,
-                                             int token_count) {
+                                             const int *tokens, int token_count) {
     if (!c || !tokens || token_count <= 1) return 0;
-    qwen_prefix_cache_init_env(c);
-    if (!c->budget_bytes) return 0;
-    c->lookups++;
-    QwenPrefixCacheEntry *e = qpc_find_longest(c, tokens, token_count);
-    if (!e || !qpc_restore_entry(e, v)) return 0;
-    e->last_used = ++c->clock;
-    c->hits++;
-    c->matched_tokens += (uint64_t)e->token_count;
-    c->restore_bytes += (uint64_t)e->bytes;
-    if (c->log)
-        fprintf(stderr,
-                "[QWEN-PREFIX] hit matched=%d prompt=%d restore=%.2fMiB\n",
-                e->token_count, token_count,
-                (double)e->bytes / (1024.0 * 1024.0));
-    return e->token_count;
+    qpc_global_init_if_needed(c);
+    int matched = qpc_ram_restore(c, v, tokens, token_count);
+    if (matched || !qwen_prefix_disk_enabled()) return matched;
+    uint64_t ns = qwen_prefix_disk_namespace(v);
+    if (!ns) return 0;
+
+    ColiPrefixDiskObject d;
+    matched = coli_prefix_disk_load_longest(ns, QWEN_PREFIX_DISK_STATE_ABI,
+                                             tokens, token_count, &d, c->log);
+    if (!matched) return 0;
+
+    size_t expected = 0, kv_bytes = 0, gdn_elems = 0;
+    int ok = qwen_prefix_cache_entry_bytes(v, matched, &expected, &kv_bytes,
+                                            &gdn_elems) &&
+             kv_bytes == d.kv_bytes && gdn_elems * sizeof(float) == d.aux_bytes;
+    QwenPrefixCacheEntry e;
+    memset(&e, 0, sizeof(e));
+    if (ok) {
+        e.tokens = d.tokens; e.token_count = d.token_count;
+        e.kv = d.kv; e.kv_bytes = d.kv_bytes;
+        e.gdn = (float *)d.aux; e.gdn_elems = gdn_elems; e.bytes = expected;
+        ok = qpc_restore_entry(&e, v);
+    }
+    if (!ok) {
+        coli_prefix_disk_object_free(&d);
+        return 0;
+    }
+
+    /* Promote the decoded native boundary into the existing bounded RAM LRU. */
+    qpc_ram_store(c, v, d.tokens, d.token_count);
+    matched = d.token_count;
+    coli_prefix_disk_object_free(&d);
+    return matched;
 }
 
-static inline void qwen_prefix_cache_stats(const QwenPrefixCache *c,
-                                            QwenPrefixCacheStats *s) {
-    if (!s) return;
-    memset(s, 0, sizeof(*s));
-    if (!c) return;
-    s->lookups = c->lookups;
-    s->hits = c->hits;
-    s->stores = c->stores;
-    s->evictions = c->evictions;
-    s->matched_tokens = c->matched_tokens;
-    s->restore_bytes = c->restore_bytes;
-    s->entries = c->count;
-    s->resident_bytes = c->resident_bytes;
-    s->budget_bytes = c->budget_bytes;
+static inline ColiPrefixDiskStats qwen_prefix_cache_disk_stats(void) {
+    return coli_prefix_disk_stats();
 }
 
-#endif /* QWEN_PREFIX_CACHE_H */
+#endif
