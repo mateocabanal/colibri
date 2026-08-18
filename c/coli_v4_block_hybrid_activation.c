@@ -8,7 +8,15 @@
  * The router knows logical token->expert multiplicity before
  * v4_moe_batch_union collapses those selections into one physical expert
  * lookup. Capture that multiplicity here and publish it through the shared
- * ExpertStore observer contract on the first physical lookup for the layer.
+ * ExpertStore observer contract before the loader pool begins consuming the
+ * physical expert records.
+ *
+ * Routing runs on the block thread while package-mode expert lookups can run on
+ * several loader threads. The completed logical batch is therefore handed off
+ * through one small mutex-protected pending buffer. The first physical lookup
+ * for that layer publishes the entire batch while the other lanes wait on this
+ * short metadata critical section; disk I/O starts only after publication and
+ * remains fully parallel.
  *
  * This adapter owns no residency policy and no cache. Stores/runtimes that do
  * not implement observe_activations simply ignore the signal. Allocation or
@@ -17,6 +25,7 @@
 #include "deepseek_v4_internal.h"
 #include "expert_activation.h"
 
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -38,7 +47,6 @@ typedef struct {
 
 typedef struct {
     int valid;
-    int ready;
     int layer;
     int64_t start_position;
     int next_item;
@@ -56,9 +64,23 @@ typedef struct {
     int disabled;
 } ColiV4ActivationCall;
 
+typedef struct {
+    pthread_mutex_t mutex;
+    ColiExpertActivationSample *samples;
+    size_t capacity;
+    size_t count;
+    int layer;
+    int active;
+    uint64_t dropped_batches;
+} ColiV4ActivationPending;
+
 static _Thread_local ColiV4ActivationRequest g_v4_activation_request;
 static _Thread_local ColiV4ActivationCall g_v4_activation_call;
 static atomic_uint_fast64_t g_v4_activation_epoch = ATOMIC_VAR_INIT(1);
+static ColiV4ActivationPending g_v4_activation_pending = {
+    .mutex = PTHREAD_MUTEX_INITIALIZER,
+    .layer = -1,
+};
 
 void coli_v4_activation_begin_request(int prompt_tokens, int reused_tokens) {
     g_v4_activation_request.prompt_tokens = prompt_tokens;
@@ -120,12 +142,80 @@ static ColiExpertPhase v4_activation_phase(
                            : COLI_EXPERT_PHASE_UNKNOWN;
 }
 
+static int v4_activation_pending_reserve_locked(
+    ColiV4ActivationPending *pending, size_t wanted) {
+    if (!pending || !wanted) return 0;
+    if (wanted <= pending->capacity) return 1;
+    if (wanted > SIZE_MAX / sizeof(*pending->samples)) return 0;
+    ColiExpertActivationSample *samples = realloc(
+        pending->samples, wanted * sizeof(*pending->samples));
+    if (!samples) return 0;
+    pending->samples = samples;
+    pending->capacity = wanted;
+    return 1;
+}
+
+static void v4_activation_publish_pending(ColiV4ActivationCall *call) {
+    if (!call || !call->touched_count) return;
+
+    size_t wanted = call->touched_count;
+    if (wanted > SIZE_MAX / 3) {
+        v4_activation_clear_touched(call);
+        return;
+    }
+    wanted *= 3;
+
+    ColiV4ActivationPending *pending = &g_v4_activation_pending;
+    pthread_mutex_lock(&pending->mutex);
+
+    /* Normal V4 block execution consumes every expert lookup for a layer before
+     * routing the next layer. If that ordering is ever violated, preserve the
+     * older batch rather than attaching new multiplicity to the wrong physical
+     * lookups. The signal is advisory, so dropping the newer batch is safer. */
+    if (pending->active) {
+        pending->dropped_batches++;
+        pthread_mutex_unlock(&pending->mutex);
+        v4_activation_clear_touched(call);
+        return;
+    }
+
+    if (!v4_activation_pending_reserve_locked(pending, wanted)) {
+        pending->dropped_batches++;
+        pthread_mutex_unlock(&pending->mutex);
+        v4_activation_clear_touched(call);
+        return;
+    }
+
+    size_t count = 0;
+    for (size_t i = 0; i < call->touched_count; i++) {
+        int expert = call->touched[i];
+        if (expert < 0 || (size_t)expert >= call->capacity) continue;
+        for (int phase = COLI_EXPERT_PHASE_UNKNOWN;
+             phase <= COLI_EXPERT_PHASE_DECODE; phase++) {
+            uint64_t multiplicity = call->counts[
+                (size_t)phase * call->capacity + (size_t)expert];
+            if (!multiplicity) continue;
+            pending->samples[count++] = (ColiExpertActivationSample){
+                .key = {call->layer, expert},
+                .phase = (ColiExpertPhase)phase,
+                .multiplicity = multiplicity,
+                .epoch = call->epoch,
+            };
+        }
+    }
+
+    pending->count = count;
+    pending->layer = call->layer;
+    pending->active = count > 0;
+    pthread_mutex_unlock(&pending->mutex);
+    v4_activation_clear_touched(call);
+}
+
 static void v4_activation_context(
     const ColiDeepSeekV4LayerWeights *weights,
     int start_position, int batch, ColiExpertPhase phase) {
     ColiV4ActivationCall *call = &g_v4_activation_call;
     v4_activation_clear_touched(call);
-    call->ready = 0;
     call->valid = weights && start_position >= 0 && batch > 0 && !call->disabled;
     call->layer = weights ? weights->plan.layer : -1;
     call->start_position = start_position;
@@ -166,41 +256,28 @@ static void v4_activation_selected(const int *indices, int topk, int experts) {
     }
 
     if (call->next_item >= call->batch) {
-        call->ready = call->touched_count > 0;
         call->valid = 0;
+        v4_activation_publish_pending(call);
     }
 }
 
 static void v4_activation_flush(ColiExpertStore *store, int layer) {
-    ColiV4ActivationCall *call = &g_v4_activation_call;
-    if (!call->ready || call->layer != layer) return;
-    call->ready = 0;
-
-    /* Avoid even building samples when the current shared store/residency
-     * implementation has not adopted adaptive signals yet. */
-    if (!store || !store->ops || !store->ops->observe_activations) {
-        v4_activation_clear_touched(call);
-        return;
+    ColiV4ActivationPending *pending = &g_v4_activation_pending;
+    pthread_mutex_lock(&pending->mutex);
+    if (pending->active && pending->layer == layer) {
+        /* Keep the pending lock while the store consumes this compact batch.
+         * This guarantees every loader lane reaches its physical lookup only
+         * after the complete pre-union signal has been published. Observer
+         * callbacks are required to be non-failing and must not recurse into
+         * V4 routing. */
+        if (store && store->ops && store->ops->observe_activations)
+            coli_expert_observe_activations(
+                store, pending->samples, pending->count);
+        pending->count = 0;
+        pending->layer = -1;
+        pending->active = 0;
     }
-
-    for (size_t i = 0; i < call->touched_count; i++) {
-        int expert = call->touched[i];
-        if (expert < 0 || (size_t)expert >= call->capacity) continue;
-        for (int phase = COLI_EXPERT_PHASE_UNKNOWN;
-             phase <= COLI_EXPERT_PHASE_DECODE; phase++) {
-            uint64_t multiplicity = call->counts[
-                (size_t)phase * call->capacity + (size_t)expert];
-            if (!multiplicity) continue;
-            ColiExpertActivationSample sample = {
-                .key = {layer, expert},
-                .phase = (ColiExpertPhase)phase,
-                .multiplicity = multiplicity,
-                .epoch = call->epoch,
-            };
-            coli_expert_observe_activations(store, &sample, 1);
-        }
-    }
-    v4_activation_clear_touched(call);
+    pthread_mutex_unlock(&pending->mutex);
 }
 
 int coli_v4_activation_attention_token_ref(
