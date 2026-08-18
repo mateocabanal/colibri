@@ -1,0 +1,146 @@
+name: qwen-default-cache-impl
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: qwen-default-cache-impl
+  cancel-in-progress: true
+
+jobs:
+  implement:
+    if: github.head_ref == 'feat/qwen-prefix-cache-default-on'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+      - name: Implement default-on serve policy
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          h = Path('c/qwen_prefix_cache.h')
+          s = h.read_text()
+          s = s.replace('#define QWEN_PREFIX_CACHE_DEFAULT_MIN_TOKENS 256\n',
+                        '#define QWEN_PREFIX_CACHE_DEFAULT_MIN_TOKENS 256\n#define QWEN_PREFIX_CACHE_DEFAULT_SERVE_MB 256u\n')
+          old = '''static inline size_t qwen_prefix_cache_budget_from_env(void) {
+    const char *value = getenv("QWEN_PREFIX_CACHE_MB");
+    if (!value || !*value) return 0;
+    char *end = NULL;
+    double mib = strtod(value, &end);
+    if (end == value || mib <= 0.0) return 0;
+    long double bytes = (long double)mib * 1024.0L * 1024.0L;
+    if (bytes >= (long double)SIZE_MAX) return SIZE_MAX;
+    return (size_t)bytes;
+}
+'''
+          new = '''static inline int qpc_ascii_ieq(const char *a, const char *b) {
+    if (!a || !b) return 0;
+    while (*a && *b) {
+        unsigned char ca = (unsigned char)*a++, cb = (unsigned char)*b++;
+        if (ca >= 'A' && ca <= 'Z') ca = (unsigned char)(ca - 'A' + 'a');
+        if (cb >= 'A' && cb <= 'Z') cb = (unsigned char)(cb - 'A' + 'a');
+        if (ca != cb) return 0;
+    }
+    return *a == 0 && *b == 0;
+}
+
+/* Parse a MiB budget. The fallback applies only when VALUE is absent/empty;
+ * an explicit invalid/zero/off value disables the cache rather than silently
+ * spending memory the operator did not request. */
+static inline size_t qwen_prefix_cache_budget_parse(const char *value,
+                                                     size_t fallback_bytes) {
+    if (!value || !*value) return fallback_bytes;
+    if (qpc_ascii_ieq(value, "off")) return 0;
+    char *end = NULL;
+    long double mib = strtold(value, &end);
+    if (end == value || !(mib > 0.0L)) return 0;
+    while (*end == ' ' || *end == '\\t' || *end == '\\r' || *end == '\\n') end++;
+    if (*end) return 0;
+    long double bytes = mib * 1024.0L * 1024.0L;
+    if (bytes >= (long double)SIZE_MAX) return SIZE_MAX;
+    return (size_t)bytes;
+}
+
+static inline size_t qwen_prefix_cache_budget_from_env(void) {
+    return qwen_prefix_cache_budget_parse(getenv("QWEN_PREFIX_CACHE_MB"), 0);
+}
+
+static inline size_t qwen_prefix_cache_budget_for_serve(void) {
+    const size_t fallback =
+        (size_t)QWEN_PREFIX_CACHE_DEFAULT_SERVE_MB * 1024u * 1024u;
+    return qwen_prefix_cache_budget_parse(getenv("QWEN_PREFIX_CACHE_MB"), fallback);
+}
+'''
+          assert old in s, 'budget parser block not found'
+          s = s.replace(old, new)
+          h.write_text(s)
+
+          q = Path('c/qwen_moe.c')
+          s = q.read_text()
+          old = 'size_t prefix_budget = serving ? qwen_prefix_cache_budget_from_env() : 0;'
+          new = 'size_t prefix_budget = serving ? qwen_prefix_cache_budget_for_serve() : 0;'
+          assert old in s, 'serve budget line not found'
+          s = s.replace(old, new, 1)
+          old = '    Model m; model_init(&m, snap, cap);\n    Tok T;'
+          new = '''    Model m; model_init(&m, snap, cap);
+    if (serving) {
+        qwen_prefix_cache_init(&m.prefix_cache, prefix_budget,
+                               qwen_prefix_cache_min_tokens_from_env(),
+                               getenv("QWEN_PREFIX_LOG") != NULL);
+        if (m.prefix_cache.log)
+            fprintf(stderr,
+                    "[QWEN-PREFIX] budget=%.2fMiB min_tokens=%d mode=process-local-exact-hybrid%s\\n",
+                    (double)m.prefix_cache.budget_bytes / (1024.0 * 1024.0),
+                    m.prefix_cache.min_tokens,
+                    getenv("QWEN_PREFIX_CACHE_MB") ? " explicit" : " default-on");
+    }
+    Tok T;'''
+          assert old in s, 'model init insertion point not found'
+          s = s.replace(old, new, 1)
+          s = s.replace('One request is in flight at a time. With QWEN_PREFIX_CACHE_MB>0, exact',
+                        'One request is in flight at a time. In serve mode the exact prefix cache is')
+          s = s.replace(' * end-of-prefill snapshots can reuse the longest strict token prefix across\n',
+                        ' * default-on (256 MiB unless overridden); end-of-prefill snapshots reuse the\n * longest strict token prefix across\n')
+          q.write_text(s)
+
+          t = Path('c/tests/test_qwen_prefix_cache.c')
+          s = t.read_text()
+          insert = '''\nstatic void test_budget_policy(void) {
+    const size_t mib = 1024u * 1024u;
+    const size_t fallback = 256u * mib;
+    assert(qwen_prefix_cache_budget_parse(NULL, fallback) == fallback);
+    assert(qwen_prefix_cache_budget_parse("", fallback) == fallback);
+    assert(qwen_prefix_cache_budget_parse("0", fallback) == 0);
+    assert(qwen_prefix_cache_budget_parse("off", fallback) == 0);
+    assert(qwen_prefix_cache_budget_parse("OFF", fallback) == 0);
+    assert(qwen_prefix_cache_budget_parse("64", fallback) == 64u * mib);
+    assert(qwen_prefix_cache_budget_parse("64.5", fallback) == (size_t)(64.5 * 1024.0 * 1024.0));
+    assert(qwen_prefix_cache_budget_parse("garbage", fallback) == 0);
+    assert(qwen_prefix_cache_budget_parse("64garbage", fallback) == 0);
+}\n'''
+          marker = '\nstatic void test_hard_budget(void) {'
+          assert marker in s
+          s = s.replace(marker, insert + marker, 1)
+          s = s.replace('    test_ram_cap_reservation();\n    test_hard_budget();',
+                        '    test_ram_cap_reservation();\n    test_budget_policy();\n    test_hard_budget();')
+          t.write_text(s)
+          PY
+      - name: Validate policy and build
+        run: |
+          make -C c test-qwen-prefix-cache
+          make -C c qwen_moe ARCH=x86-64-v3
+      - name: Commit implementation and remove helper workflow
+        run: |
+          git rm .github/workflows/qwen-default-cache-impl.yml
+          git add c/qwen_prefix_cache.h c/qwen_moe.c c/tests/test_qwen_prefix_cache.c
+          git config user.name 'colibri-ci'
+          git config user.email 'actions@users.noreply.github.com'
+          git commit -m 'feat(qwen): enable prompt cache by default in serve mode'
+          git push origin HEAD:${{ github.head_ref }}
