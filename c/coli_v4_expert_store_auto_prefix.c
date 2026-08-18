@@ -123,13 +123,13 @@ int coli_v4_expert_store_open_planned(
     coli_v4_prefix_active_plan = NULL;
     coli_v4_prefix_final_plan_valid = 0;
 
-    /* Bridge current V4 stores into the shared logical activation contract
-     * while #95 becomes the physical residency owner. This is deliberately
-     * best-effort: metadata allocation failure leaves the original store and
-     * inference behavior untouched. No V4-specific replacement policy lives in
-     * the adapter. */
-    if (!result && output && *output && options && options->layers > 0 &&
-        options->experts_per_layer > 0 &&
+    /* Package-mode COLI stores already own the shared tracker/scorer through
+     * coli_v4_expert_store_adaptive.c. Keep the generic best-effort wrapper only
+     * for the legacy safetensors store until that path migrates into #95. This
+     * avoids double tracking and keeps package admission decisions at the same
+     * physical residency boundary that owns the slots. */
+    if (!result && !engine->coli_static && output && *output && options &&
+        options->layers > 0 && options->experts_per_layer > 0 &&
         (size_t)options->layers <= SIZE_MAX / (size_t)options->experts_per_layer) {
         size_t key_hint = (size_t)options->layers *
                           (size_t)options->experts_per_layer;
