@@ -1,0 +1,289 @@
+name: one-shot-prefix-promotion-accounting
+
+on:
+  pull_request:
+    branches: [feat/sequence-state-core]
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-verify:
+    if: github.event.pull_request.number == 98 && github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/global-prefix-cache-core
+          fetch-depth: 0
+
+      - name: Apply guarded promotion fix and regression
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('c/prefix_cache.h')
+          text = p.read_text()
+          old = '''static inline int coli_prefix_cache_promote_blob(ColiPrefixCache *cache,
+                                                            ColiPrefixCacheEntry *entry,
+                                                            unsigned char *blob) {
+              if (!cache || !entry || !blob) return -1;
+              if (!(cache->policy & COLI_PREFIX_CACHE_RAM) ||
+                  entry->metadata_bytes > cache->ram_budget_bytes ||
+                  entry->snapshot_bytes > cache->ram_budget_bytes - entry->metadata_bytes)
+                  return 0;
+              entry->snapshot = blob;
+              cache->ram_resident_bytes += entry->snapshot_bytes;
+              coli_prefix_enforce_ram_budget(cache, entry);
+              return entry->snapshot == blob ? 1 : 0;
+          }
+          '''
+          new = '''/* Promotion is optional. Make room by demoting other hot persisted payloads
+           * or evicting RAM-only entries, but never discard SSD-cold metadata merely
+           * to make one hit hot. Otherwise the in-memory index can diverge from the
+           * physical file and a supposedly evicted persisted entry can reappear after
+           * restart. */
+          static inline int coli_prefix_cache_make_promotion_room(
+                  ColiPrefixCache *cache, ColiPrefixCacheEntry *protect,
+                  size_t snapshot_bytes) {
+              if (!cache || !protect || snapshot_bytes > cache->ram_budget_bytes)
+                  return 0;
+              size_t target = cache->ram_budget_bytes - snapshot_bytes;
+              while (cache->ram_resident_bytes > target) {
+                  size_t victim = coli_prefix_oldest_index(cache, protect, 1, 0);
+                  if (victim == cache->count) return 0;
+                  ColiPrefixCacheEntry *e = cache->entries[victim];
+                  if (e->disk_record_bytes && e->disk_snapshot_offset) {
+                      free(e->snapshot);
+                      e->snapshot = NULL;
+                      cache->ram_resident_bytes -= e->snapshot_bytes;
+                      cache->stats.evictions_ram++;
+                  } else {
+                      /* RAM-only state has no persistent identity to reconcile. */
+                      coli_prefix_remove_index(cache, victim, 1, 0);
+                  }
+              }
+              return 1;
+          }
+
+          static inline int coli_prefix_cache_promote_blob(ColiPrefixCache *cache,
+                                                            ColiPrefixCacheEntry *entry,
+                                                            unsigned char *blob) {
+              if (!cache || !entry || !blob) return -1;
+              if (!(cache->policy & COLI_PREFIX_CACHE_RAM) ||
+                  entry->metadata_bytes > cache->ram_budget_bytes ||
+                  entry->snapshot_bytes > cache->ram_budget_bytes - entry->metadata_bytes)
+                  return 0;
+              if (!coli_prefix_cache_make_promotion_room(
+                      cache, entry, entry->snapshot_bytes))
+                  return 0;
+              entry->snapshot = blob;
+              cache->ram_resident_bytes += entry->snapshot_bytes;
+              return 1;
+          }
+          '''
+          if text.count(old) != 1:
+              raise SystemExit(f'promotion function match count={text.count(old)}')
+          p.write_text(text.replace(old, new))
+
+          test = r'''#include "../prefix_cache.h"
+
+#include <stdio.h>
+#include <string.h>
+
+          typedef struct {
+              unsigned char bytes[16];
+              uint64_t position;
+          } State;
+
+          static int describe(void *opaque, uint64_t position,
+                              ColiSequenceStateInfo *info,
+                              ColiSequenceSegmentDesc *segments, size_t cap) {
+              State *s = (State *)opaque;
+              if (!s || !info || position != s->position) return -1;
+              memset(info, 0, sizeof(*info));
+              info->state_abi = 77;
+              info->absolute_position = position;
+              info->logical_bytes = sizeof(s->bytes);
+              info->resident_bytes = sizeof(*s);
+              info->segment_count = 1;
+              if (!segments) return 0;
+              if (cap < 1) return -1;
+              segments[0] = (ColiSequenceSegmentDesc){
+                  .segment_id = 1,
+                  .kind = COLI_SEQUENCE_SEGMENT_ENGINE_NATIVE,
+                  .element_bytes = 1,
+                  .visibility = COLI_SEQUENCE_VIS_CPU,
+                  .logical_rows = 1,
+                  .row_bytes = sizeof(s->bytes),
+                  .snapshot_bytes = sizeof(s->bytes),
+                  .layout_abi = 1,
+              };
+              return 0;
+          }
+
+          static int read_segment(void *opaque, uint64_t position, uint32_t id,
+                                  uint64_t offset, void *dst, size_t bytes) {
+              State *s = (State *)opaque;
+              if (!s || !dst || id != 1 || position != s->position ||
+                  offset > sizeof(s->bytes) || bytes > sizeof(s->bytes) - (size_t)offset)
+                  return -1;
+              memcpy(dst, s->bytes + offset, bytes);
+              return 0;
+          }
+
+          static int write_segment(void *opaque, uint64_t position, uint32_t id,
+                                   uint64_t offset, const void *src, size_t bytes) {
+              State *s = (State *)opaque;
+              if (!s || !src || id != 1 || offset > sizeof(s->bytes) ||
+                  bytes > sizeof(s->bytes) - (size_t)offset)
+                  return -1;
+              memcpy(s->bytes + offset, src, bytes);
+              s->position = position;
+              return 0;
+          }
+
+          static int reset_state(void *opaque) {
+              State *s = (State *)opaque;
+              if (!s) return -1;
+              memset(s->bytes, 0, sizeof(s->bytes));
+              s->position = 0;
+              return 0;
+          }
+
+          static int finish(void *opaque, uint64_t position) {
+              State *s = (State *)opaque;
+              if (!s) return -1;
+              s->position = position;
+              return 0;
+          }
+
+          static const ColiSequenceStateOps ops = {
+              describe, read_segment, write_segment, reset_state, finish
+          };
+
+          int main(void) {
+              char path[256];
+              snprintf(path, sizeof(path), ".test_prefix_promote_%ld.bin", (long)getpid());
+              remove(path);
+
+              ColiPrefixNamespace ns = {0};
+              ns.state_abi = 77;
+              for (size_t i = 0; i < sizeof(ns.fingerprint); ++i)
+                  ns.fingerprint[i] = (unsigned char)(i + 1);
+              const int a[] = {1, 2, 3};
+              const int b[] = {1, 2, 3, 4};
+              const int query[] = {1, 2, 3, 4, 5};
+              State source = {0}, restored = {0};
+              ColiSequenceStateAdapter src = {&source, &ops};
+              ColiSequenceStateAdapter dst = {&restored, &ops};
+              ColiPrefixCache cache;
+
+              if (coli_prefix_cache_init(&cache, COLI_PREFIX_CACHE_AUTO,
+                                         4096, 4096, path) != 0)
+                  return 1;
+              source.position = 3; memset(source.bytes, 0x31, sizeof(source.bytes));
+              if (coli_prefix_cache_store(&cache, &ns, a, 3, 3, &src) != 1) return 2;
+              source.position = 4; memset(source.bytes, 0x42, sizeof(source.bytes));
+              if (coli_prefix_cache_store(&cache, &ns, b, 4, 4, &src) != 1) return 3;
+              size_t ia = coli_prefix_find_exact_index(&cache, &ns, a, 3);
+              size_t ib = coli_prefix_find_exact_index(&cache, &ns, b, 4);
+              if (ia >= cache.count || ib >= cache.count) return 4;
+              size_t metadata_budget = cache.entries[ia]->metadata_bytes +
+                                       cache.entries[ib]->metadata_bytes;
+              size_t snapshot_bytes = cache.entries[ib]->snapshot_bytes;
+              uint64_t physical_before = cache.disk_live_bytes;
+              coli_prefix_cache_close(&cache);
+
+              /* Both metadata records fit, but one payload misses by exactly one
+               * byte. The SSD hit must restore successfully and remain cold rather
+               * than deleting the other persisted prefix merely to promote. */
+              if (coli_prefix_cache_init(&cache, COLI_PREFIX_CACHE_AUTO,
+                      metadata_budget + snapshot_bytes - 1, 4096, path) != 0)
+                  return 5;
+              if (cache.count != 2 || cache.entries[0]->snapshot || cache.entries[1]->snapshot)
+                  return 6;
+              int matched = 0;
+              if (coli_prefix_cache_restore(&cache, &ns, query, 5, &dst, &matched) != 1 ||
+                  matched != 4 || restored.position != 4)
+                  return 7;
+              ib = coli_prefix_find_exact_index(&cache, &ns, b, 4);
+              if (cache.count != 2 || ib >= cache.count || cache.entries[ib]->snapshot != NULL ||
+                  cache.disk_live_bytes != physical_before)
+                  return 8;
+              ColiPrefixCacheStats stats;
+              coli_prefix_cache_get_stats(&cache, &stats);
+              if (stats.hits_ssd != 1 || stats.evictions_ssd != 0 ||
+                  stats.ram_resident_bytes > stats.ram_budget_bytes)
+                  return 9;
+              coli_prefix_cache_close(&cache);
+
+              /* Restart proves the non-promoted hit did not mutate the persisted
+               * index/file: both exact boundaries are still discoverable. */
+              if (coli_prefix_cache_init(&cache, COLI_PREFIX_CACHE_SSD,
+                                         4096, 4096, path) != 0 || cache.count != 2 ||
+                  coli_prefix_find_exact_index(&cache, &ns, a, 3) >= cache.count ||
+                  coli_prefix_find_exact_index(&cache, &ns, b, 4) >= cache.count)
+                  return 10;
+              coli_prefix_cache_close(&cache);
+              remove(path);
+              puts("PASS prefix SSD restore stays cold when promotion lacks payload room");
+              return 0;
+          }
+          '''
+          Path('c/tests/test_prefix_cache_promotion.c').write_text(test)
+
+          m = Path('c/Makefile.runtime-core')
+          make = m.read_text()
+          old_make = '''check: test_record_io$(EXE) test_expert_residency$(EXE)
+          \t./test_record_io$(EXE)
+          \t./test_expert_residency$(EXE)
+
+          test_record_io$(EXE): tests/test_record_io.c record_io.h
+          \t$(CC) $(CFLAGS) tests/test_record_io.c -o $@
+
+          test_expert_residency$(EXE): tests/test_expert_residency.c expert_residency.h expert_store.h
+          \t$(CC) $(CFLAGS) tests/test_expert_residency.c -o $@
+
+          clean:
+          \trm -f test_record_io test_record_io.exe test_expert_residency test_expert_residency.exe
+          '''
+          new_make = '''check: test_record_io$(EXE) test_expert_residency$(EXE) test_prefix_cache_promotion$(EXE)
+          \t./test_record_io$(EXE)
+          \t./test_expert_residency$(EXE)
+          \t./test_prefix_cache_promotion$(EXE)
+
+          test_record_io$(EXE): tests/test_record_io.c record_io.h
+          \t$(CC) $(CFLAGS) tests/test_record_io.c -o $@
+
+          test_expert_residency$(EXE): tests/test_expert_residency.c expert_residency.h expert_store.h
+          \t$(CC) $(CFLAGS) tests/test_expert_residency.c -o $@
+
+          test_prefix_cache_promotion$(EXE): tests/test_prefix_cache_promotion.c prefix_cache.h sequence_state.h compat.h
+          \t$(CC) $(CFLAGS) tests/test_prefix_cache_promotion.c -o $@
+
+          clean:
+          \trm -f test_record_io test_record_io.exe test_expert_residency test_expert_residency.exe test_prefix_cache_promotion test_prefix_cache_promotion.exe
+          '''
+          if make.count(old_make) != 1:
+              raise SystemExit(f'Makefile block match count={make.count(old_make)}')
+          m.write_text(make.replace(old_make, new_make))
+          PY
+
+      - name: Verify and run focused runtime core
+        working-directory: c
+        run: |
+          git diff --check
+          make -f Makefile.runtime-core check
+
+      - name: Commit verified fix
+        shell: bash
+        run: |
+          rm .github/workflows/prefix-promotion-one-shot.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add c/prefix_cache.h c/Makefile.runtime-core c/tests/test_prefix_cache_promotion.c .github/workflows/prefix-promotion-one-shot.yml
+          git diff --cached --check
+          git commit -m "fix(runtime): keep SSD metadata through cold restore"
+          git push origin HEAD:feat/global-prefix-cache-core
