@@ -47,6 +47,15 @@ typedef struct {
     atomic_uint_fast64_t generation;
     atomic_uint_fast64_t stored_bytes;
     atomic_int error_code;
+
+    /* Optional backend-supplied timestamps for this physical generation. The
+     * generic state machine deliberately owns no platform clock. Values are ns
+     * in one caller-chosen monotonic domain; zero means unavailable. They are
+     * initialized before QUEUED publication and terminal_ns is published before
+     * READY/FAILED, so acquire-reading terminal state makes the metadata visible. */
+    atomic_uint_fast64_t queued_ns;
+    atomic_uint_fast64_t read_started_ns;
+    atomic_uint_fast64_t terminal_ns;
 } ColiRecordIoEntry;
 
 typedef struct {
@@ -54,6 +63,9 @@ typedef struct {
     ColiRecordIoKey key;
     uint64_t generation;
     ColiRecordIoPriority priority;
+    /* Per-caller blocking-arrival time, in the same optional clock domain as
+     * entry timestamps. Prefetch owners and READY hits leave this zero. */
+    uint64_t request_started_ns;
     /* OWNER/JOIN participate in the in-flight waiter count and must release.
      * READY hits do not, so releasing a hit is a harmless handle clear. */
     int retained;
@@ -86,6 +98,9 @@ static inline int coli_record_io_entry_init(ColiRecordIoEntry *entry,
     atomic_init(&entry->generation, 0);
     atomic_init(&entry->stored_bytes, 0);
     atomic_init(&entry->error_code, 0);
+    atomic_init(&entry->queued_ns, 0);
+    atomic_init(&entry->read_started_ns, 0);
+    atomic_init(&entry->terminal_ns, 0);
     return 0;
 }
 
@@ -103,6 +118,7 @@ static inline void coli_record_io_fill_handle(ColiRecordIoHandle *handle,
                                                ColiRecordIoEntry *entry,
                                                uint64_t generation,
                                                ColiRecordIoPriority priority,
+                                               uint64_t request_started_ns,
                                                int retained,
                                                int owner) {
     memset(handle, 0, sizeof(*handle));
@@ -110,6 +126,8 @@ static inline void coli_record_io_fill_handle(ColiRecordIoHandle *handle,
     handle->key = entry->key;
     handle->generation = generation;
     handle->priority = priority;
+    handle->request_started_ns = priority == COLI_RECORD_IO_BLOCKING
+        ? request_started_ns : 0;
     handle->retained = retained;
     handle->owner = owner;
 }
@@ -141,14 +159,14 @@ static inline int coli_record_io_blocker_release(ColiRecordIoEntry *entry) {
     }
 }
 
-/* The generation identifies one physical read/prepare attempt. One contender
- * owns IDLE/FAILED/CANCELLED -> STARTING, initializes the complete attempt, then
- * release-publishes QUEUED. Joiners never observe half-initialized generation or
- * waiter fields. Failed/cancelled attempts cannot advance until all retained
- * handles from the previous generation have been reaped. */
-static inline ColiRecordIoRequestResult coli_record_io_request(
+/* Timestamp-aware form. `now_ns` is optional: zero preserves the exact original
+ * behavior and simply leaves timing telemetry unavailable. The generation
+ * identifies one physical read/prepare attempt. One contender owns
+ * IDLE/FAILED/CANCELLED -> STARTING, initializes the complete attempt, then
+ * release-publishes QUEUED. */
+static inline ColiRecordIoRequestResult coli_record_io_request_at(
         ColiRecordIoEntry *entry, ColiRecordIoPriority priority,
-        ColiRecordIoHandle *handle) {
+        uint64_t now_ns, ColiRecordIoHandle *handle) {
     if (!entry || !handle ||
         (priority != COLI_RECORD_IO_PREFETCH &&
          priority != COLI_RECORD_IO_BLOCKING))
@@ -160,7 +178,10 @@ static inline ColiRecordIoRequestResult coli_record_io_request(
             uint64_t generation = atomic_load_explicit(
                 &entry->generation, memory_order_acquire);
             if (!generation) return COLI_RECORD_IO_INVALID;
-            coli_record_io_fill_handle(handle, entry, generation, priority, 0, 0);
+            /* READY means no exposed wait for this request, even if it is
+             * logically blocking. Do not retain the caller's timestamp. */
+            coli_record_io_fill_handle(
+                handle, entry, generation, priority, 0, 0, 0);
             return COLI_RECORD_IO_HIT;
         }
         if (state == COLI_RECORD_IO_STARTING)
@@ -189,7 +210,8 @@ static inline ColiRecordIoRequestResult coli_record_io_request(
                     (void)coli_record_io_blocker_release(entry);
                 continue;
             }
-            coli_record_io_fill_handle(handle, entry, generation, priority, 1, 0);
+            coli_record_io_fill_handle(
+                handle, entry, generation, priority, now_ns, 1, 0);
             return COLI_RECORD_IO_JOIN;
         }
         if (state != COLI_RECORD_IO_IDLE && state != COLI_RECORD_IO_FAILED &&
@@ -230,30 +252,50 @@ static inline ColiRecordIoRequestResult coli_record_io_request(
                               memory_order_relaxed);
         atomic_store_explicit(&entry->stored_bytes, 0, memory_order_relaxed);
         atomic_store_explicit(&entry->error_code, 0, memory_order_relaxed);
+        atomic_store_explicit(&entry->queued_ns, now_ns, memory_order_relaxed);
+        atomic_store_explicit(&entry->read_started_ns, 0, memory_order_relaxed);
+        atomic_store_explicit(&entry->terminal_ns, 0, memory_order_relaxed);
         atomic_store_explicit(&entry->state, COLI_RECORD_IO_QUEUED,
                               memory_order_release);
-        coli_record_io_fill_handle(handle, entry, generation, priority, 1, 1);
+        coli_record_io_fill_handle(
+            handle, entry, generation, priority, now_ns, 1, 1);
         return COLI_RECORD_IO_OWNER;
     }
 }
 
-static inline int coli_record_io_begin_read(ColiRecordIoHandle *handle) {
+static inline ColiRecordIoRequestResult coli_record_io_request(
+        ColiRecordIoEntry *entry, ColiRecordIoPriority priority,
+        ColiRecordIoHandle *handle) {
+    return coli_record_io_request_at(entry, priority, 0, handle);
+}
+
+static inline int coli_record_io_begin_read_at(ColiRecordIoHandle *handle,
+                                                uint64_t now_ns) {
     if (!handle || !handle->entry || !handle->generation || !handle->retained ||
         !handle->owner ||
         atomic_load_explicit(&handle->entry->generation, memory_order_acquire) !=
             handle->generation)
         return -1;
     int expected = COLI_RECORD_IO_QUEUED;
-    return atomic_compare_exchange_strong_explicit(
-        &handle->entry->state, &expected, COLI_RECORD_IO_READING,
-        memory_order_acq_rel, memory_order_acquire) ? 0 : -1;
+    if (!atomic_compare_exchange_strong_explicit(
+            &handle->entry->state, &expected, COLI_RECORD_IO_READING,
+            memory_order_acq_rel, memory_order_acquire))
+        return -1;
+    atomic_store_explicit(&handle->entry->read_started_ns, now_ns,
+                          memory_order_relaxed);
+    return 0;
+}
+
+static inline int coli_record_io_begin_read(ColiRecordIoHandle *handle) {
+    return coli_record_io_begin_read_at(handle, 0);
 }
 
 /* Claim FINISHING before publishing terminal metadata. Exactly one completion
  * callback for the generation can win, so READY and FAILED cannot overwrite one
  * another after check-then-store races. */
-static inline int coli_record_io_complete(ColiRecordIoHandle *handle,
-                                          uint64_t stored_bytes) {
+static inline int coli_record_io_complete_at(ColiRecordIoHandle *handle,
+                                             uint64_t stored_bytes,
+                                             uint64_t now_ns) {
     if (!handle || !handle->entry || !handle->generation || !handle->retained ||
         !handle->owner || !stored_bytes ||
         atomic_load_explicit(&handle->entry->generation, memory_order_acquire) !=
@@ -267,13 +309,21 @@ static inline int coli_record_io_complete(ColiRecordIoHandle *handle,
     atomic_store_explicit(&handle->entry->stored_bytes, stored_bytes,
                           memory_order_relaxed);
     atomic_store_explicit(&handle->entry->error_code, 0, memory_order_relaxed);
+    atomic_store_explicit(&handle->entry->terminal_ns, now_ns,
+                          memory_order_relaxed);
     atomic_store_explicit(&handle->entry->state, COLI_RECORD_IO_READY,
                           memory_order_release);
     return 0;
 }
 
-static inline int coli_record_io_fail(ColiRecordIoHandle *handle,
-                                      int error_code) {
+static inline int coli_record_io_complete(ColiRecordIoHandle *handle,
+                                          uint64_t stored_bytes) {
+    return coli_record_io_complete_at(handle, stored_bytes, 0);
+}
+
+static inline int coli_record_io_fail_at(ColiRecordIoHandle *handle,
+                                         int error_code,
+                                         uint64_t now_ns) {
     if (!handle || !handle->entry || !handle->generation || !handle->retained ||
         !handle->owner ||
         atomic_load_explicit(&handle->entry->generation, memory_order_acquire) !=
@@ -292,9 +342,53 @@ static inline int coli_record_io_fail(ColiRecordIoHandle *handle,
     atomic_store_explicit(&handle->entry->stored_bytes, 0, memory_order_relaxed);
     atomic_store_explicit(&handle->entry->error_code, error_code,
                           memory_order_relaxed);
+    atomic_store_explicit(&handle->entry->terminal_ns, now_ns,
+                          memory_order_relaxed);
     atomic_store_explicit(&handle->entry->state, COLI_RECORD_IO_FAILED,
                           memory_order_release);
     return 0;
+}
+
+static inline int coli_record_io_fail(ColiRecordIoHandle *handle,
+                                      int error_code) {
+    return coli_record_io_fail_at(handle, error_code, 0);
+}
+
+/* Return physical service time for a successfully completed owner generation.
+ * Zero means unavailable/invalid, not a zero-cost read. */
+static inline uint64_t coli_record_io_physical_load_ns(
+        const ColiRecordIoHandle *handle) {
+    if (!handle || !handle->entry || !handle->generation || !handle->owner ||
+        atomic_load_explicit(&handle->entry->generation, memory_order_acquire) !=
+            handle->generation ||
+        atomic_load_explicit(&handle->entry->state, memory_order_acquire) !=
+            COLI_RECORD_IO_READY)
+        return 0;
+    uint64_t began = atomic_load_explicit(
+        &handle->entry->read_started_ns, memory_order_acquire);
+    uint64_t ended = atomic_load_explicit(
+        &handle->entry->terminal_ns, memory_order_acquire);
+    return began && ended > began ? ended - began : 0;
+}
+
+/* Return user-visible blocking wait for one OWNER/JOIN after READY publication.
+ * A prefetch handle or READY hit returns zero. A blocking join onto an in-flight
+ * prefetch measures only from the join's own arrival, which makes hidden I/O
+ * naturally less valuable to residency than exposed I/O. */
+static inline uint64_t coli_record_io_exposed_wait_ns(
+        const ColiRecordIoHandle *handle) {
+    if (!handle || !handle->entry || !handle->generation ||
+        handle->priority != COLI_RECORD_IO_BLOCKING ||
+        !handle->request_started_ns ||
+        atomic_load_explicit(&handle->entry->generation, memory_order_acquire) !=
+            handle->generation ||
+        atomic_load_explicit(&handle->entry->state, memory_order_acquire) !=
+            COLI_RECORD_IO_READY)
+        return 0;
+    uint64_t ended = atomic_load_explicit(
+        &handle->entry->terminal_ns, memory_order_acquire);
+    return ended > handle->request_started_ns
+        ? ended - handle->request_started_ns : 0;
 }
 
 /* Speculative work may be cancelled only by the OWNER while still queued and
