@@ -1,15 +1,10 @@
 #!/usr/bin/env python3
-"""KV prefix reuse on the DeepSeek V4 serve path.
+"""KV/prompt prefix reuse on the DeepSeek V4 runtime.
 
-The property under test is not "it is faster" -- it is that reusing the
-attention state produces the bytes a cold prefill would have produced. So each
-case runs the same second turn twice: once as the continuation of a warm
-session, once against a freshly started engine, and requires the two to agree
-token for token.
-
-Speaking the SUBMIT/DATA/DONE protocol directly rather than through
-openai_server.Engine keeps the test on the engine's own contract, including the
-trailing reuse field of the DONE frame.
+Same-session cases speak the existing single-session SERVE protocol directly.
+The #12 cross-session case deliberately does not extend that protocol: it builds
+and runs a tiny C integration binary that creates two real ColiV4Session
+instances sharing one ColiV4Engine, plus a second engine as the cold oracle.
 """
 from __future__ import annotations
 
@@ -19,6 +14,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 
@@ -32,11 +28,12 @@ def parse_tokens(text: str) -> list[int]:
 
 
 class Serve:
-    """One persistent `SERVE=1` engine process."""
+    """One persistent `SERVE=1` engine process (the protocol owns one session)."""
 
     def __init__(self, binary: Path, model: Path, ctx: str = "128") -> None:
-        env = dict(os.environ, SERVE="1", SNAP=str(model), CTX=ctx,
-                   V4_PREFIX_LOG="1")
+        env = dict(os.environ, SERVE="1", SNAP=str(model), CTX=ctx)
+        env.pop("V4_PREFIX_CACHE_MB", None)
+        env.pop("V4_PREFIX_CACHE_MIN_TOKENS", None)
         self.process = subprocess.Popen(
             [str(binary)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, env=env,
@@ -44,10 +41,11 @@ class Serve:
         self.counter = 0
 
     def submit(self, prompt: str, max_tokens: int) -> tuple[str, int]:
-        """Returns the generated text and the DONE frame's reuse count."""
+        """Returns generated text and the DONE frame's reused-prefix count."""
         self.counter += 1
         request_id = f"r{self.counter}"
         payload = prompt.encode("utf-8")
+        # The second field is currently a reserved protocol value and must be 0.
         header = (f"SUBMIT {request_id} 0 {len(payload)} {max_tokens} "
                   f"0.0 1.0 0\n").encode("ascii")
         assert self.process.stdin is not None
@@ -97,9 +95,21 @@ class Serve:
             self.process.kill()
 
 
+def extended_prompt(first_ids: list[int], first_text: str) -> list[int]:
+    """Build a strict extension of exactly the target state left by a turn."""
+    reply = parse_tokens(first_text)
+    if len(reply) < 2:
+        raise AssertionError(f"first turn produced too little: {first_text!r}")
+    # The final emitted token has not yet been fed through the target. The state
+    # therefore represents prompt + reply[:-1]. This mirrors a continuation at
+    # the exact reusable boundary rather than pretending an unseen token exists
+    # in KV/recurrent state.
+    return first_ids + reply[:-1] + [first_ids[0]]
+
+
 def check_growing_conversation(binary: Path, model: Path,
                                case: dict[str, object]) -> None:
-    """Turn 2 extends turn 1: the state is reused, the output does not change."""
+    """Turn 2 extends turn 1: same-session reuse stays token-exact."""
     first_ids = list(case["prompt_ids"])            # type: ignore[arg-type]
     max_new = 4
 
@@ -111,15 +121,7 @@ def check_growing_conversation(binary: Path, model: Path,
                 f"first turn of a fresh session reused {first_reuse} tokens; "
                 "there was nothing to reuse"
             )
-        # What the engine feeds is the prompt plus every generated token except
-        # the last, which is emitted but never fed back. Turn 2 has to be a
-        # STRICT extension of that, which is what a chat produces: the previous
-        # prompt, the reply, then the new user text.
-        reply = parse_tokens(first_text)
-        if len(reply) < 2:
-            raise AssertionError(f"first turn produced too little: {first_text!r}")
-        fed = first_ids + reply[:-1]
-        second_ids = fed + [first_ids[0]]
+        second_ids = extended_prompt(first_ids, first_text)
         second_text, second_reuse = warm.submit(token_prompt(second_ids), max_new)
     finally:
         warm.close()
@@ -147,8 +149,148 @@ def check_growing_conversation(binary: Path, model: Path,
             f"reused only {second_reuse} tokens, expected at least the "
             f"{len(first_ids)} prompt tokens of the previous turn"
         )
-    print(f"PASS prefix reuse: {second_reuse} tokens reused, "
+    print(f"PASS same-session prefix reuse: {second_reuse} tokens reused, "
           f"output identical to a cold prefill")
+
+
+def build_prefix_helpers(binary: Path) -> Path:
+    c_dir = binary.resolve().parent
+    make = os.environ.get("MAKE", "make")
+    build = subprocess.run(
+        [make, "-f", "Makefile.deepseek-v4", "deepseek-v4-prefix-cache-test"],
+        cwd=c_dir,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=180,
+    )
+    if build.returncode:
+        raise AssertionError(
+            "prefix-cache helper build failed:\n"
+            f"stdout:\n{build.stdout}\nstderr:\n{build.stderr}"
+        )
+    return c_dir
+
+
+def check_cross_session_cache(binary: Path, model: Path,
+                              case: dict[str, object]) -> None:
+    """Two actual sessions share one engine/cache; a second engine is cold."""
+    c_dir = build_prefix_helpers(binary)
+    helper = c_dir / (
+        "test_v4_prefix_cache_sessions.exe"
+        if os.name == "nt" else "test_v4_prefix_cache_sessions"
+    )
+    env = dict(os.environ,
+               V4_PREFIX_CACHE_MB="64",
+               V4_PREFIX_CACHE_MIN_TOKENS="1",
+               V4_PREFIX_LOG="1")
+    result = subprocess.run(
+        [helper.as_posix(), model.resolve().as_posix(),
+         token_prompt(list(case["prompt_ids"]))],  # type: ignore[arg-type]
+        cwd=c_dir,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=180,
+        env=env,
+    )
+    if result.returncode:
+        raise AssertionError(
+            "cross-session prefix-cache oracle failed:\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+    if "PASS cross-session prefix cache:" not in result.stdout:
+        raise AssertionError(
+            f"cross-session helper did not report success: {result.stdout!r}"
+        )
+    print(result.stdout.strip())
+
+
+def check_prefix_benchmark_ab(binary: Path, model: Path,
+                              case: dict[str, object]) -> None:
+    """The public A/B wrapper must compare matched second-request workloads."""
+    c_dir = binary.resolve().parent
+    helper = c_dir / (
+        "benchmark_v4_prefix_cache_sessions.exe"
+        if os.name == "nt" else "benchmark_v4_prefix_cache_sessions"
+    )
+    wrapper = c_dir / "tools" / "benchmark_v4_prefix_cache.py"
+    if not helper.exists():
+        c_dir = build_prefix_helpers(binary)
+    prompt = token_prompt(list(case["prompt_ids"]))  # type: ignore[arg-type]
+    handle = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", suffix=".txt", delete=False
+    )
+    try:
+        handle.write(prompt)
+        handle.close()
+        result = subprocess.run(
+            [sys.executable, wrapper.as_posix(),
+             "--binary", helper.as_posix(),
+             "--model", model.resolve().as_posix(),
+             "--prefix-file", handle.name,
+             "--cache-mb", "64",
+             "--min-prefix-tokens", "1",
+             "--memory-gb", "3",
+             "--context", "128",
+             "--max-new", "1",
+             "--trials", "1",
+             "--timeout-sec", "180",
+             "--repo", c_dir.parent.as_posix()],
+            cwd=c_dir,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=360,
+        )
+    finally:
+        try:
+            Path(handle.name).unlink()
+        except OSError:
+            pass
+    if result.returncode:
+        raise AssertionError(
+            "prefix-cache A/B wrapper failed:\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+
+    record = None
+    for line in result.stdout.splitlines():
+        try:
+            candidate = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if candidate.get("schema") == "colibri.v4.prefix_cache_ab.v1":
+            record = candidate
+    if not record or len(record.get("pairs", [])) != 1:
+        raise AssertionError(f"A/B wrapper produced invalid JSON: {result.stdout!r}")
+    pair = record["pairs"][0]
+    off = pair["cache_off"]
+    on = pair["cache_on"]
+    if (off["prefix_tokens"] != on["prefix_tokens"] or
+            off["second_prompt_tokens"] != on["second_prompt_tokens"]):
+        raise AssertionError(f"A/B token workloads differ: {pair}")
+    if int(off["second_prefix_reused"]) != 0 or int(off["cache_hits_delta"]) != 0:
+        raise AssertionError(f"cache-off A/B probe reused state: {off}")
+    if int(on["second_prefix_reused"]) != int(on["prefix_tokens"]) or \
+            int(on["cache_hits_delta"]) < 1 or int(on["restore_bytes"]) <= 0:
+        raise AssertionError(f"cache-on A/B probe failed to restore prefix: {on}")
+    if int(off["cache_budget_bytes"]) != 0 or int(on["cache_budget_bytes"]) <= 0:
+        raise AssertionError(f"A/B cache budgets are invalid: {pair}")
+    for probe in (off, on):
+        projected = int(probe["memory_projected_bytes"])
+        reserve = int(probe["cache_budget_bytes"])
+        limit = int(probe["memory_limit_bytes"])
+        if projected <= 0 or projected + reserve > limit:
+            raise AssertionError(f"A/B memory envelope invalid: {probe}")
+    print("PASS prefix-cache A/B benchmark: matched cache-off/cache-on "
+          "second-request workloads with hard memory envelopes")
 
 
 def check_divergent_prompt_resets(binary: Path, model: Path,
@@ -215,9 +357,11 @@ def main() -> int:
     case = reference["cases"]["short"]
 
     check_growing_conversation(arguments.binary, arguments.fixture, case)
+    check_cross_session_cache(arguments.binary, arguments.fixture, case)
+    check_prefix_benchmark_ab(arguments.binary, arguments.fixture, case)
     check_repeated_prompt(arguments.binary, arguments.fixture, case)
     check_divergent_prompt_resets(arguments.binary, arguments.fixture, case)
-    print("PASS DeepSeek V4 KV prefix reuse: all checks completed")
+    print("PASS DeepSeek V4 prefix reuse/cache: all checks completed")
     return 0
 
 
