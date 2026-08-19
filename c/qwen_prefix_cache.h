@@ -51,6 +51,7 @@ static inline int qwen_adaptive_bootstrap_ram_cap(
 #endif
 #include "qwen_adaptive_residency_adapter.h"
 #include "qwen_adaptive_resource_budget_adapter.h"
+#include "qwen_adaptive_backing_pool_adapter.h"
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic pop
 #endif
