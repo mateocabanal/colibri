@@ -292,13 +292,23 @@ static void v4_adaptive_observe(
 
     pthread_mutex_lock(&inner->mutex);
     coli_expert_activation_observe_many(&state->tracker, samples, count);
-    for (size_t i = 0; i < count; i++)
+    int final_layer_observed = 0;
+    for (size_t i = 0; i < count; i++) {
         if (samples[i].epoch > state->current_epoch)
             state->current_epoch = samples[i].epoch;
+        if (samples[i].key.layer == inner->layers - 1)
+            final_layer_observed = 1;
+    }
 
-    int replanned = coli_v4_adaptive_resource_replan_locked(
-        &state->resource_planner, inner, &state->tracker,
-        state->current_epoch, &state->policy);
+    /* V4 publishes one logical activation batch per layer and evaluates layers
+     * in order. A global UMA decision only needs to run after the final layer;
+     * the planner independently verifies that every layer reached this epoch,
+     * preserving correctness if callback ordering ever changes. */
+    int replanned = final_layer_observed
+        ? coli_v4_adaptive_resource_replan_locked(
+            &state->resource_planner, inner, &state->tracker,
+            state->current_epoch, &state->policy)
+        : 0;
     if (replanned > 0) {
         /* A global allocation can change any layer even when this route batch
          * touched only one of them, so refresh the complete local admission map. */
