@@ -36,6 +36,7 @@ typedef struct {
     unsigned char *expert_selected;
     uint64_t last_replan_epoch;
     uint64_t replan_count;
+    uint64_t bootstrap_expert_bytes;
     uint64_t selected_dense_bytes;
     uint64_t selected_expert_bytes;
 } ColiV4AdaptiveResourcePlanner;
@@ -157,6 +158,29 @@ static inline size_t coli_v4_adaptive_resource_append_dense(
     return count;
 }
 
+/* Before the activation tracker has enough evidence to rank experts, dense
+ * first-touch admissions must not consume the entire optional pool. Reserve a
+ * small fungible bootstrap window: roughly one expert record per layer, capped
+ * at 25% of optional memory. Nothing is allocated here; the bytes simply stay
+ * out of the dense admission ceiling until the first global replan can assign
+ * them using observed expert reuse. This avoids a permanent first-mover
+ * advantage for immutable dense borrows without imposing a fixed long-term
+ * dense/expert split. */
+static inline uint64_t coli_v4_adaptive_resource_bootstrap_bytes(
+    const State *inner, uint64_t optional_bytes) {
+    if (!inner || inner->layers < 1 || !inner->slot_bytes ||
+        optional_bytes < inner->slot_bytes)
+        return 0;
+    uint64_t layer_target = optional_bytes;
+    if ((uint64_t)inner->layers <= UINT64_MAX / inner->slot_bytes)
+        layer_target = (uint64_t)inner->layers * inner->slot_bytes;
+    uint64_t reserve = layer_target;
+    uint64_t cap = optional_bytes / 4;
+    if (reserve > cap) reserve = cap;
+    reserve -= reserve % inner->slot_bytes;
+    return reserve;
+}
+
 static inline int coli_v4_adaptive_resource_init(
     ColiV4AdaptiveResourcePlanner *planner, State *inner) {
     if (!planner) return -1;
@@ -241,8 +265,12 @@ static inline int coli_v4_adaptive_resource_init(
         free(candidates);
         return -1;
     }
-    inner->stats.capacity_bytes = transient_bytes;
-    inner->dense_cache_budget_bytes = inner->offered_cache_bytes - transient_bytes;
+    uint64_t optional_bytes = inner->offered_cache_bytes - transient_bytes;
+    uint64_t bootstrap_expert_bytes =
+        coli_v4_adaptive_resource_bootstrap_bytes(inner, optional_bytes);
+    inner->stats.capacity_bytes = coli_resource_saturating_add(
+        transient_bytes, bootstrap_expert_bytes);
+    inner->dense_cache_budget_bytes = optional_bytes - bootstrap_expert_bytes;
     (void)coli_v4_dense_cache_set_budget(inner->dense_cache_budget_bytes);
 
     planner->key_count = key_count;
@@ -250,6 +278,7 @@ static inline int coli_v4_adaptive_resource_init(
     planner->candidates = candidates;
     planner->candidate_selected = candidate_selected;
     planner->expert_selected = expert_selected;
+    planner->bootstrap_expert_bytes = bootstrap_expert_bytes;
     planner->selected_dense_bytes = inner->dense_cache_budget_bytes;
     planner->enabled = 1;
     return 0;
