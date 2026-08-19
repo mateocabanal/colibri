@@ -20,12 +20,11 @@
  * global planner selects that expert. Unselected experts continue through the
  * global transient pool.
  *
- * Dense package tensors are immutable borrowed allocations and currently have
- * no per-entry refcount, so already-resident dense bytes are a mandatory floor
- * for the current engine generation. The planner can reduce future dense
- * admissions without invalidating borrowed pointers. This preserves a hard
- * UMA/RAM envelope while still allowing hot experts to take bytes that dense
- * has not already materialized.
+ * Dense package tensors are immutable borrowed allocations with explicit borrow
+ * refs. Live borrows are a mandatory floor for the current replan; idle dense
+ * entries are reclaimable and compete with persistent experts in the same UMA
+ * budget. This preserves a hard RAM envelope without giving dense first-touch
+ * residency a permanent advantage over subsequently observed hot experts.
  */
 typedef struct {
     int enabled;
@@ -328,14 +327,15 @@ static inline int coli_v4_adaptive_resource_replan_locked(
     uint64_t transient_bytes = (uint64_t)inner->transient_slots *
                                inner->slot_bytes;
     if (transient_bytes > inner->offered_cache_bytes ||
-        dense.resident_bytes > inner->offered_cache_bytes - transient_bytes)
+        dense.resident_bytes > inner->offered_cache_bytes - transient_bytes ||
+        dense.pinned_bytes > dense.resident_bytes)
         return -1;
 
     memset(planner->expert_selected, 0, planner->key_count);
     uint64_t forced_expert_bytes =
         coli_v4_adaptive_resource_forced_bytes_locked(planner, inner);
     if (forced_expert_bytes > inner->offered_cache_bytes - transient_bytes -
-                              dense.resident_bytes)
+                              dense.pinned_bytes)
         return -1;
 
     ColiResourcePlan plan;
@@ -346,7 +346,7 @@ static inline int coli_v4_adaptive_resource_replan_locked(
         coli_resource_plan_reserve_mandatory(
             &plan, tier, transient_bytes) != 0 ||
         coli_resource_plan_reserve_mandatory(
-            &plan, tier, dense.resident_bytes) != 0 ||
+            &plan, tier, dense.pinned_bytes) != 0 ||
         coli_resource_plan_reserve_mandatory(
             &plan, tier, forced_expert_bytes) != 0)
         return -1;
@@ -417,7 +417,7 @@ static inline int coli_v4_adaptive_resource_replan_locked(
 
     coli_v4_adaptive_resource_reclaim_locked(planner, inner);
     uint64_t dense_budget = coli_resource_saturating_add(
-        dense.resident_bytes, selected_dense);
+        dense.pinned_bytes, selected_dense);
     dense_budget = coli_v4_dense_cache_set_budget(dense_budget);
     inner->dense_cache_budget_bytes = dense_budget;
     planner->selected_dense_bytes = dense_budget;
