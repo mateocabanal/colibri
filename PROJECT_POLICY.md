@@ -15,6 +15,8 @@ Shared runtime owns reusable mechanism and policy: compiled-record I/O, expert a
 
 A model engine may be the first consumer of a new optimization, but reusable infrastructure must not be implemented as an engine-local subsystem merely because that engine motivated the work. Prefer a narrow shared contract plus an engine adapter.
 
+**Runtime-first rule:** when work changes routing telemetry, residency/admission, memory planning, I/O scheduling, caching, prefetch, or backend policy, implement the mechanism and policy in shared runtime code first. Model-family adapters should contribute only semantic observations/descriptors and physical acquire/release/reclaim hooks. Do not copy a policy from one MoE engine into another; adapt both engines to the shared policy instead.
+
 Do not introduce model-name dispatch into generic runtime policy. Dispatch by explicit descriptors, capabilities, geometry, quant/layout/kernel ABI, and engine-provided semantic hooks.
 
 ## Performance is the default
@@ -34,6 +36,7 @@ Prefer global/shared knobs (`COLI_*`) over engine-specific knobs (`V4_*`, `QWEN_
 - RAM, Apple UMA, pinned host memory, and device VRAM are globally planned resources, not independent per-engine budgets.
 - On Apple Silicon, shared UMA allocations count once. On discrete CUDA systems, host/pinned/device tiers are distinct resources.
 - Optional residency should compete on measured expected benefit per resident byte, preferably exposed time avoided per byte; do not permanently partition memory into arbitrary dense-vs-expert pools when the runtime can compare them.
+- Candidates that compete in one optional-resource plan must project reuse onto the same logical-token timebase, future horizon, and confidence scale. Never compare an empirically projected resource against an arbitrary fixed ratio baseline.
 - Logical expert activation frequency must be captured before batching/union destroys multiplicity. Physical I/O counts are not a substitute for routing hotness.
 - Persistent expert policy should be frequency/benefit-aware rather than blindly LRU when reuse distance exceeds cache capacity.
 - Keep transient execution concurrency separate from persistent locality/residency.

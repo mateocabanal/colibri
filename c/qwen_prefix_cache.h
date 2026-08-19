@@ -10,4 +10,9 @@
 #include "qwen_prefix_cache_global_5.inc"
 #include "qwen_prefix_cache_global_6.inc"
 #include "qwen_prefix_cache_global_7.inc"
+
+/* qwen_moe.c includes route_trace.h before this wrapper. The adapter therefore
+ * wraps the existing semantic route seam without changing the model engine's
+ * math or duplicating residency policy. */
+#include "qwen_adaptive_residency_adapter.h"
 #endif /* QWEN_PREFIX_CACHE_GLOBAL_WRAPPER_H */

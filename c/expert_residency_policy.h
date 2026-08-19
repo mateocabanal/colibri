@@ -3,6 +3,7 @@
 
 #include "expert_activation.h"
 #include "resource_planner.h"
+#include "reuse_projection.h"
 
 #include <stdint.h>
 
@@ -22,6 +23,9 @@ extern "C" {
  *   - reuse_weight: unweighted recent route rate projected onto one bounded
  *     common horizon for deciding HOW MANY expert bytes compete with dense,
  *     prefix and other optional resources in the global planner.
+ *
+ * The projection math lives in reuse_projection.h so non-expert resources use
+ * the exact same horizon/confidence scale instead of inventing local ratios.
  */
 typedef struct {
     uint32_t prefill_weight;
@@ -76,6 +80,18 @@ static inline int coli_expert_residency_policy_config_valid(
         config->max_reuse_weight;
 }
 
+static inline ColiReuseProjectionConfig
+coli_expert_residency_policy_projection_config(
+    const ColiExpertResidencyPolicyConfig *config) {
+    ColiReuseProjectionConfig projection = {0};
+    if (!config) return projection;
+    projection.decay_quantum_epochs = config->recency_quantum_epochs;
+    projection.planning_horizon_epochs = config->planning_horizon_epochs;
+    projection.confidence_mass = config->planner_confidence_mass;
+    projection.max_reuse_weight = config->max_reuse_weight;
+    return projection;
+}
+
 static inline uint64_t coli_expert_residency_policy_recent_mass(
     const ColiExpertActivationEntry *entry, uint64_t current_epoch,
     const ColiExpertResidencyPolicyConfig *config,
@@ -104,48 +120,19 @@ static inline uint64_t coli_expert_residency_policy_recent_mass(
     return coli_expert_activation_sat_add(mass, weighted_decode);
 }
 
-static inline uint64_t coli_expert_residency_scale_div(
-    uint64_t value, uint64_t numerator, uint64_t denominator) {
-    if (!value || !numerator || !denominator) return 0;
-    uint64_t quotient = value / denominator;
-    uint64_t remainder = value % denominator;
-    uint64_t scaled = coli_expert_residency_sat_mul(quotient, numerator);
-    uint64_t tail_product = coli_expert_residency_sat_mul(remainder, numerator);
-    uint64_t tail = tail_product / denominator;
-    return coli_expert_activation_sat_add(scaled, tail);
-}
-
-/* The lazy half-life accumulator has a steady-state effective window of roughly
- * 2 * decay_quantum epochs. Project that recent unweighted route mass onto a
- * fixed future horizon. The result is bounded and process-age independent.
- *
- * A small evidence ramp prevents a single cold-start observation from claiming
- * optional global memory immediately. This confidence affects only HOW MANY
- * bytes the planner gives experts; local expert ranking remains responsive. */
+/* Project recent unweighted route mass through the generic optional-resource
+ * projection. This keeps expert, dense, prefix and future cache classes on the
+ * same fixed future horizon and cold-start confidence scale. */
 static inline uint64_t coli_expert_residency_policy_reuse_weight(
     const ColiExpertActivationEntry *entry,
     uint64_t current_epoch,
     const ColiExpertResidencyPolicyConfig *config) {
-    if (!coli_expert_residency_policy_config_valid(config) ||
-        config->recency_quantum_epochs > UINT64_MAX / 2)
-        return 0;
-
+    if (!coli_expert_residency_policy_config_valid(config)) return 0;
     uint64_t mass = coli_expert_residency_policy_recent_mass(
         entry, current_epoch, config, 0);
-    if (!mass) return 0;
-
-    uint64_t denominator = config->recency_quantum_epochs * 2;
-    uint64_t projected = coli_expert_residency_scale_div(
-        mass, config->planning_horizon_epochs, denominator);
-
-    uint64_t confidence = mass < config->planner_confidence_mass
-        ? mass : config->planner_confidence_mass;
-    projected = coli_expert_residency_scale_div(
-        projected, confidence, config->planner_confidence_mass);
-
-    if (projected > config->max_reuse_weight)
-        projected = config->max_reuse_weight;
-    return projected;
+    ColiReuseProjectionConfig projection =
+        coli_expert_residency_policy_projection_config(config);
+    return coli_reuse_project_recent_mass(mass, &projection);
 }
 
 static inline uint64_t coli_expert_residency_policy_hotness(

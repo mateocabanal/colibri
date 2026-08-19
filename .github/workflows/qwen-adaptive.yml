@@ -1,0 +1,44 @@
+name: Qwen adaptive residency
+
+on:
+  pull_request:
+    branches: [main, dev]
+  push:
+    branches: [main, dev]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qwen-adaptive-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONUTF8: '1'
+
+jobs:
+  tiny-sanitized:
+    name: Linux tiny oracle (ASan + UBSan)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: c/tools/requirements-deepseek-v4-tiny.txt
+      - name: Install pinned tiny-fixture dependencies
+        run: python -m pip install -r c/tools/requirements-deepseek-v4-tiny.txt
+      - name: Generate hybrid Qwen fixture
+        run: python c/tools/make_qwen_moe_tiny.py --output c/qwen_moe_tiny --force
+      - name: Build sanitized Qwen engine
+        run: |
+          make -C c qwen_moe ARCH=x86-64-v3 \
+            EXTRA_CFLAGS='-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer' \
+            EXTRA_LDFLAGS='-fsanitize=address,undefined'
+      - name: Validate cold target oracle under sanitizers
+        env:
+          ASAN_OPTIONS: detect_leaks=0:halt_on_error=1:abort_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: c/qwen_moe c/qwen_moe_tiny 2
