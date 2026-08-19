@@ -86,9 +86,29 @@ static int v4_adaptive_executor_load_expert(
 #undef coli_executor_load_expert
 #undef pthread_cond_wait
 
+/* Dense and expert candidates must use the same expected-reuse scale. The
+ * generic V4 planner historically assigned dense a constant reuse_weight=1,
+ * which let a handful of early expert observations evict the entire dense cache.
+ * The routing thread sets this value from recent dense-cache reuse immediately
+ * before a complete-sweep replan. Thread-local storage keeps independent
+ * sessions/engines from racing through this temporary adapter value. */
+static _Thread_local uint64_t g_v4_adaptive_dense_reuse_weight = 1;
+
+static int v4_adaptive_candidate_from_benefit(
+    const ColiResourceBenefitEstimate *estimate,
+    ColiResourceCandidate *candidate) {
+    if (!estimate) return -1;
+    ColiResourceBenefitEstimate adjusted = *estimate;
+    if (adjusted.kind == COLI_RESOURCE_DENSE_TENSOR)
+        adjusted.reuse_weight = g_v4_adaptive_dense_reuse_weight;
+    return coli_resource_candidate_from_benefit(&adjusted, candidate);
+}
+
 /* This adapter intentionally comes after the base implementation include: it
  * consumes the base State/Slot helpers without duplicating physical ownership. */
+#define coli_resource_candidate_from_benefit v4_adaptive_candidate_from_benefit
 #include "coli_v4_adaptive_resource_planner.h"
+#undef coli_resource_candidate_from_benefit
 
 struct ColiV4AdaptiveExpertStoreState {
     ColiExpertStore *inner;
@@ -99,6 +119,14 @@ struct ColiV4AdaptiveExpertStoreState {
     uint64_t current_epoch;
     ColiExpertResidencyPolicyConfig policy;
     ColiV4AdaptiveResourcePlanner resource_planner;
+
+    /* Recent dense benefit is tracked in bytes avoided because dense tensors are
+     * heterogeneous in size. This is the dense analogue of the expert
+     * activation tracker's lazy half-life mass. */
+    uint64_t dense_last_bytes_avoided;
+    uint64_t dense_recent_bytes_avoided;
+    uint64_t dense_recent_decay_epoch;
+    uint64_t dense_reuse_weight;
 };
 
 static size_t v4_adaptive_tracker_capacity(size_t keys) {
@@ -110,6 +138,77 @@ static size_t v4_adaptive_tracker_capacity(size_t keys) {
         capacity <<= 1;
     }
     return capacity;
+}
+
+/* Convert recent dense bytes avoided into the same projected-use vocabulary as
+ * expert reuse_weight. The expert policy projects a half-life window of
+ * 2*recency_quantum onto planning_horizon; do the identical projection here,
+ * then divide by the resident dense bytes that produced those hits.
+ *
+ * Cold start gets a decaying confidence prior instead of the old ratio-1
+ * certainty. With the default confidence_mass=8 this is 4, 2, 1 across the
+ * first three complete replans. That lets the bootstrap expert window compete
+ * without allowing one prompt sweep to liquidate several GiB of proven dense
+ * storage before it has had a chance to record a decode hit. */
+static uint64_t v4_adaptive_dense_reuse_weight(
+    ColiV4AdaptiveExpertStoreState *state, State *inner,
+    uint64_t current_epoch) {
+    if (!state || !inner || !state->policy.recency_quantum_epochs)
+        return 1;
+
+    ColiV4DenseCacheStats dense = {0};
+    coli_v4_dense_cache_stats(&dense);
+
+    if (!state->dense_recent_decay_epoch)
+        state->dense_recent_decay_epoch = current_epoch;
+    if (current_epoch > state->dense_recent_decay_epoch) {
+        uint64_t delta_epoch = current_epoch - state->dense_recent_decay_epoch;
+        uint64_t buckets = delta_epoch / state->policy.recency_quantum_epochs;
+        if (buckets) {
+            state->dense_recent_bytes_avoided =
+                coli_expert_activation_decay_value(
+                    state->dense_recent_bytes_avoided, buckets);
+            state->dense_recent_decay_epoch +=
+                buckets * state->policy.recency_quantum_epochs;
+        }
+    }
+
+    uint64_t delta_avoided = dense.bytes_avoided >=
+        state->dense_last_bytes_avoided
+        ? dense.bytes_avoided - state->dense_last_bytes_avoided
+        : dense.bytes_avoided;
+    state->dense_last_bytes_avoided = dense.bytes_avoided;
+    state->dense_recent_bytes_avoided = v4_adaptive_sat_add(
+        state->dense_recent_bytes_avoided, delta_avoided);
+
+    uint64_t basis = dense.resident_bytes;
+    if (!basis) basis = state->resource_planner.selected_dense_bytes;
+
+    uint64_t observed = 0;
+    if (basis && state->policy.recency_quantum_epochs <= UINT64_MAX / 2) {
+        uint64_t effective_window = state->policy.recency_quantum_epochs * 2;
+        uint64_t projected_bytes = coli_expert_residency_scale_div(
+            state->dense_recent_bytes_avoided,
+            state->policy.planning_horizon_epochs,
+            effective_window);
+        if (projected_bytes) {
+            observed = projected_bytes / basis;
+            if (projected_bytes % basis) observed++;
+        }
+    }
+
+    uint64_t prior = state->policy.planner_confidence_mass / 2;
+    if (!prior) prior = 1;
+    uint64_t shifts = state->resource_planner.replan_count;
+    if (shifts > 2) shifts = 2;
+    prior >>= (unsigned)shifts;
+    if (!prior) prior = 1;
+
+    uint64_t weight = observed > prior ? observed : prior;
+    if (weight > state->policy.max_reuse_weight)
+        weight = state->policy.max_reuse_weight;
+    state->dense_reuse_weight = weight;
+    return weight;
 }
 
 static int v4_adaptive_key_index(const State *inner, ColiExpertKey key,
@@ -304,16 +403,32 @@ static void v4_adaptive_observe(
      * in order. A global UMA decision only needs to run after the final layer;
      * the planner independently verifies that every layer reached this epoch,
      * preserving correctness if callback ordering ever changes. */
-    int replanned = final_layer_observed
-        ? coli_v4_adaptive_resource_replan_locked(
+    int replanned = 0;
+    if (final_layer_observed) {
+        g_v4_adaptive_dense_reuse_weight = v4_adaptive_dense_reuse_weight(
+            state, inner, state->current_epoch);
+        replanned = coli_v4_adaptive_resource_replan_locked(
             &state->resource_planner, inner, &state->tracker,
-            state->current_epoch, &state->policy)
-        : 0;
+            state->current_epoch, &state->policy);
+    }
     if (replanned > 0) {
         /* A global allocation can change any layer even when this route batch
          * touched only one of them, so refresh the complete local admission map. */
         for (int layer = 0; layer < inner->layers; layer++)
             v4_adaptive_project_layer_locked(state, inner, layer);
+        const char *log = getenv("V4_RESIDENCY_LOG");
+        if (log && atoi(log) != 0) {
+            fprintf(stderr,
+                    "v4_residency_replan epoch=%llu dense_value=%llu "
+                    "dense_budget=%.2fGiB expert_capacity=%.2fGiB replans=%llu\n",
+                    (unsigned long long)state->current_epoch,
+                    (unsigned long long)state->dense_reuse_weight,
+                    inner->dense_cache_budget_bytes /
+                        (1024.0 * 1024.0 * 1024.0),
+                    inner->stats.capacity_bytes /
+                        (1024.0 * 1024.0 * 1024.0),
+                    (unsigned long long)state->resource_planner.replan_count);
+        }
     } else {
         /* One route batch can contain UNKNOWN/PREFILL/DECODE samples for the same
          * layer. Reproject each distinct layer once after the complete batch has
@@ -414,6 +529,7 @@ int coli_v4_coli_expert_store_open(const ColiV4ColiExpertStoreOptions *options,
     state->physical_usage = physical_usage;
     state->key_count = key_count;
     state->policy = coli_expert_residency_policy_default();
+    state->dense_reuse_weight = 1;
 
     int planner_result = coli_v4_adaptive_resource_init(
         &state->resource_planner, base);
