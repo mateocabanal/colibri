@@ -148,6 +148,40 @@ static void test_planner_confidence_ramp(void) {
     assert(coli_expert_residency_policy_reuse_weight(entry, 2, &config) > 0);
 }
 
+static void test_epoch_unit_is_logical_token_step(void) {
+    ColiExpertActivationEntry normalized_entries[16];
+    ColiExpertActivationEntry layer_serial_entries[16];
+    ColiExpertActivationTracker normalized;
+    ColiExpertActivationTracker layer_serial;
+    assert(coli_expert_activation_init(&normalized, normalized_entries, 16) == 0);
+    assert(coli_expert_activation_init(&layer_serial, layer_serial_entries, 16) == 0);
+
+    ColiExpertActivationEntry *good = NULL;
+    ColiExpertActivationEntry *bad = NULL;
+    const uint64_t routed_layers = 43;
+    for (uint64_t token = 1; token <= 16; token++) {
+        /* Correct adapter contract: every routed layer for one token shares the
+         * same epoch, so a hot expert ages once per token regardless of depth. */
+        good = observe(&normalized, 17, 9, COLI_EXPERT_PHASE_DECODE, 1, token);
+        /* Regression shape seen on V4: a request-global layer-call serial turns
+         * 64 policy epochs into ~1.5 tokens on a 43-layer model. */
+        uint64_t wrong_epoch = 1 + (token - 1) * routed_layers;
+        bad = observe(&layer_serial, 17, 9, COLI_EXPERT_PHASE_DECODE, 1,
+                      wrong_epoch);
+    }
+
+    ColiExpertResidencyPolicyConfig config =
+        coli_expert_residency_policy_default();
+    uint64_t good_reuse = coli_expert_residency_policy_reuse_weight(
+        good, 16, &config);
+    uint64_t bad_epoch = 1 + 15 * routed_layers;
+    uint64_t bad_reuse = coli_expert_residency_policy_reuse_weight(
+        bad, bad_epoch, &config);
+
+    assert(good_reuse >= 16);
+    assert(good_reuse > bad_reuse * 4);
+}
+
 static void test_bounded_common_horizon(void) {
     ColiExpertActivationEntry entries[16];
     ColiExpertActivationTracker tracker;
@@ -230,6 +264,7 @@ int main(void) {
     test_stale_frequency_decays();
     test_decode_weight_and_hysteresis();
     test_planner_confidence_ramp();
+    test_epoch_unit_is_logical_token_step();
     test_bounded_common_horizon();
     test_burst_fades_out();
     test_benefit_per_byte();
