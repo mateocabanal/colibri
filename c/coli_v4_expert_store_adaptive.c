@@ -87,8 +87,47 @@ static int v4_adaptive_executor_load_expert(
 #undef pthread_cond_wait
 
 /* This adapter intentionally comes after the base implementation include: it
- * consumes the base State/Slot helpers without duplicating physical ownership. */
+ * consumes the base State/Slot helpers without duplicating physical ownership.
+ * The planner sees only currently borrowed dense bytes as mandatory; inactive
+ * dense entries are reclaimable optional residency. Rename the base replan
+ * helper so this adapter can add a short token-epoch warmup cadence without
+ * changing the shared long-lived 64-epoch decay cadence. */
+#define coli_v4_dense_cache_stats coli_v4_dense_cache_planner_stats
+#define coli_v4_adaptive_resource_replan_locked \
+    coli_v4_adaptive_resource_replan_locked_base
 #include "coli_v4_adaptive_resource_planner.h"
+#undef coli_v4_adaptive_resource_replan_locked
+#undef coli_v4_dense_cache_stats
+
+static int coli_v4_adaptive_resource_replan_locked(
+    ColiV4AdaptiveResourcePlanner *planner, State *inner,
+    const ColiExpertActivationTracker *tracker,
+    uint64_t current_epoch,
+    const ColiExpertResidencyPolicyConfig *policy) {
+    if (planner && planner->enabled && tracker && policy &&
+        planner->replan_count &&
+        planner->replan_count <= policy->planner_confidence_mass &&
+        current_epoch > planner->last_replan_epoch &&
+        current_epoch - planner->last_replan_epoch <
+            policy->recency_quantum_epochs) {
+        /* The first global plan is intentionally allowed as soon as route mass
+         * reaches confidence. After that, replan once per new logical token for
+         * one small confidence window so decode-hot experts can emerge inside a
+         * short request. The base helper still owns the actual allocation and
+         * returns to its 64-epoch cadence after this bounded warmup. */
+        uint64_t saved_count = planner->replan_count;
+        planner->replan_count = 0;
+        int result = coli_v4_adaptive_resource_replan_locked_base(
+            planner, inner, tracker, current_epoch, policy);
+        if (result > 0)
+            planner->replan_count = saved_count + 1;
+        else
+            planner->replan_count = saved_count;
+        return result;
+    }
+    return coli_v4_adaptive_resource_replan_locked_base(
+        planner, inner, tracker, current_epoch, policy);
+}
 
 struct ColiV4AdaptiveExpertStoreState {
     ColiExpertStore *inner;
@@ -332,6 +371,18 @@ static void v4_adaptive_destroy(ColiExpertStore *store) {
             memcpy(inner->usage, state->physical_usage,
                    state->key_count * sizeof(*state->physical_usage));
             pthread_mutex_unlock(&inner->mutex);
+        }
+        if (state->resource_planner.enabled) {
+            fprintf(stderr,
+                    "v4_resource_planner status=done replans=%llu "
+                    "last_epoch=%llu dense_budget=%.2fGiB "
+                    "expert_budget=%.2fGiB\n",
+                    (unsigned long long)state->resource_planner.replan_count,
+                    (unsigned long long)state->resource_planner.last_replan_epoch,
+                    state->resource_planner.selected_dense_bytes /
+                        (1024.0 * 1024.0 * 1024.0),
+                    state->resource_planner.selected_expert_bytes /
+                        (1024.0 * 1024.0 * 1024.0));
         }
         coli_v4_adaptive_resource_destroy(&state->resource_planner);
         if (state->inner && state->inner->ops && state->inner->ops->destroy)

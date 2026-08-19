@@ -73,11 +73,19 @@ static inline int coli_v4_residency_select(
 }
 
 void coli_v4_dense_cache_configure(uint64_t budget_bytes);
-/* Change only the admission ceiling. Existing immutable borrowed entries are
- * never evicted; lowering below resident_bytes clamps to that mandatory floor. */
+/* Change the admission ceiling and reclaim inactive dense entries as necessary.
+ * Payloads currently borrowed by a layer are pinned until their matching
+ * coli_v4_layer_payload_free() release, so lowering the budget cannot invalidate
+ * a live execution pointer. The return value is the effective ceiling after any
+ * unavoidable active-borrow floor. */
 uint64_t coli_v4_dense_cache_set_budget(uint64_t budget_bytes);
 void coli_v4_dense_cache_reset(void);
 void coli_v4_dense_cache_stats(ColiV4DenseCacheStats *out);
+/* Planner-only view: resident_bytes is the currently borrowed/pinned subset.
+ * Reclaimable resident dense entries remain optional and therefore compete with
+ * persistent experts inside the shared resource plan. Other counters retain
+ * their ordinary diagnostic meanings. */
+void coli_v4_dense_cache_planner_stats(ColiV4DenseCacheStats *out);
 
 #ifdef __cplusplus
 }
