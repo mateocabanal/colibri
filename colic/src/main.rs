@@ -114,9 +114,11 @@ impl ProgressSink for ConsoleProgress {
         let started = self.discovery_started.get_or_insert_with(Instant::now);
         let elapsed = started.elapsed().as_secs_f64();
         let complete = update.completed_files >= update.total_files;
-        let percent = progress_percent(update.completed_files, update.total_files);
-        let bar = progress_bar(update.completed_files, update.total_files);
-        let eta = estimate_eta(update.completed_files, update.total_files, elapsed);
+        let completed = update.completed_files as u64;
+        let total = update.total_files as u64;
+        let percent = progress_percent(completed, total);
+        let bar = progress_bar(completed, total);
+        let eta = estimate_eta(completed, total, elapsed);
         self.progress_line(
             format!(
                 "colic: source   [{bar}] {percent:5.1}%  {}/{} files  {} ({})  ETA {eta}",
