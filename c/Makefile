@@ -141,6 +141,7 @@ LDFLAGS = -lm -fopenmp -pthread $(EXTRA_LDFLAGS)
 EXE     =
 else
 # --- Linux / *BSD x86-64 (percorso originale, invariato) ---
+CC      = gcc
 # ARCH=native -> ottimizzato per QUESTA macchina (default, piu' veloce).
 # ARCH=x86-64-v3 -> binario PORTABILE su qualsiasi x86-64 moderno con AVX2 (per distribuire).
 # ARCH=x86-64 -> massima compatibilita' (niente AVX2: usa il path scalare di fallback).
@@ -887,7 +888,7 @@ tests/bench_topp$(EXE): tests/bench_topp.c colibri.c st.h uring.h json.h tok.h t
 tests/test_sample_nan$(EXE): tests/test_sample_nan.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_temp_env$(EXE): tests/test_temp_env.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
+tests/test_temp_env$(EXE): tests/test_temp_env.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_kv_alloc$(EXE): tests/test_kv_alloc.c colibri.c st.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
