@@ -44,10 +44,11 @@ static inline int qwen_adaptive_bootstrap_ram_cap(
  * wrap the existing semantic/physical seams without changing model math or
  * duplicating residency/resource policy. Prefix-cache-only unit tests include
  * this wrapper without instantiating the engine, so keep their -Werror builds
- * from treating adapter-only static helpers as dead-code failures. */
+ * from treating adapter-only static helpers/state as dead-code failures. */
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-function"
+#pragma GCC diagnostic ignored "-Wunused-variable"
 #endif
 #include "qwen_adaptive_residency_adapter.h"
 #include "qwen_adaptive_resource_budget_adapter.h"
