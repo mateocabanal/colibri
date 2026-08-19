@@ -91,6 +91,21 @@ static void coli_v4_cached_kv_prefix_record(kv_prefix *prefix,
     }
 }
 
+/* The synthetic package tensor for head.weight keeps its real COLITENS data
+ * offset so ordinary named-range reads remain well-defined. The established
+ * V4 resident-head cache, however, uses synthetic shard -2 with cache-relative
+ * offset zero. Normalize only that synthetic shard at the cache lookup seam so
+ * multi-token verification can evaluate one resident head batch instead of
+ * falling back to one scalar package head pass per speculative position. */
+static const void *coli_v4_package_head_cache_data(
+        const ColiV4Engine *engine, int shard,
+        uint64_t offset, size_t length) {
+    if (shard == -2 && coli_v4_package_source_active(
+            engine ? engine->target_index : NULL))
+        offset = 0;
+    return coli_v4_head_cache_data(engine, shard, offset, length);
+}
+
 #define kv_prefix_reuse coli_v4_cached_kv_prefix_reuse
 #define kv_prefix_record coli_v4_cached_kv_prefix_record
 #define coli_v4_session_generate coli_v4_session_generate_uncached
@@ -101,7 +116,9 @@ static void coli_v4_cached_kv_prefix_record(kv_prefix *prefix,
 #define coli_st_read_at_streaming coli_v4_package_source_read_at_streaming
 #define st_read_scale_f32 coli_v4_package_read_scale_f32
 #define coli_tensor_load_f32 coli_v4_package_tensor_load_f32
+#define coli_v4_head_cache_data coli_v4_package_head_cache_data
 #include "deepseek_v4.c"
+#undef coli_v4_head_cache_data
 #undef coli_tensor_load_f32
 #undef st_read_scale_f32
 #undef coli_st_read_at_streaming
