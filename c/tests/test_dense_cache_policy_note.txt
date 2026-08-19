@@ -1,1 +1,0 @@
-dense cache reclaim validation is covered by V4 lifecycle/oracle CI; no standalone fixture yet.
