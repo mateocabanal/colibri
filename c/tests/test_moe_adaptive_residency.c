@@ -89,6 +89,33 @@ static void test_hotness_fills_common_budget(void) {
     coli_moe_adaptive_destroy(&state);
 }
 
+static void test_large_expert_hotness_does_not_underflow(void) {
+    ColiMoeAdaptiveResidency state;
+    assert(coli_moe_adaptive_init(&state, 1, 4) == 0);
+
+    for (uint64_t epoch = 1; epoch <= 8; epoch++) {
+        int decode[] = {3};
+        assert(coli_moe_adaptive_observe_routes(
+            &state, 0, decode, 1, COLI_EXPERT_PHASE_DECODE, epoch) == 0);
+    }
+
+    /* With no measured exposed-ns miss cost the policy fallback is 1 us. The
+     * historical integer score divided that by 4 KiB quanta and became zero
+     * for real multi-MiB experts, causing a nonzero byte envelope to select no
+     * experts at all. WHICH selection must depend on hotness, not that lossy
+     * scalar. */
+    const uint64_t expert_bytes = UINT64_C(32) * 1024 * 1024;
+    ColiResourceSelection selection;
+    assert(coli_moe_adaptive_select_experts(
+        &state, expert_bytes, expert_bytes, expert_bytes,
+        0, COLI_RESOURCE_VALUE_BYTES, never_resident, NULL, &selection) == 1);
+    assert(selection.selected_count == 1);
+    assert(selection.selected_resident_bytes == expert_bytes);
+    assert(coli_moe_adaptive_selected(&state, (ColiExpertKey){0, 3}));
+
+    coli_moe_adaptive_destroy(&state);
+}
+
 static void test_prefill_union_equivalence(void) {
     ColiMoeAdaptiveResidency per_token, unioned;
     assert(coli_moe_adaptive_init(&per_token, 1, 8) == 0);
@@ -162,6 +189,7 @@ static void test_mixed_global_plan_apply(void) {
 int main(void) {
     test_global_selection_and_warmup();
     test_hotness_fills_common_budget();
+    test_large_expert_hotness_does_not_underflow();
     test_prefill_union_equivalence();
     test_mixed_global_plan_apply();
     puts("generic MoE adaptive residency: ok");
