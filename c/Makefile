@@ -141,7 +141,6 @@ LDFLAGS = -lm -fopenmp -pthread $(EXTRA_LDFLAGS)
 EXE     =
 else
 # --- Linux / *BSD x86-64 (percorso originale, invariato) ---
-CC      = gcc
 # ARCH=native -> ottimizzato per QUESTA macchina (default, piu' veloce).
 # ARCH=x86-64-v3 -> binario PORTABILE su qualsiasi x86-64 moderno con AVX2 (per distribuire).
 # ARCH=x86-64 -> massima compatibilita' (niente AVX2: usa il path scalare di fallback).
@@ -466,14 +465,23 @@ endif
 endif
 endif
 
-# METAL=1 adds an opt-in Apple-GPU backend (macOS only). The shader is compiled at
-# runtime, so no Xcode / offline metal compiler is required. Default build unchanged.
+# METAL=1 keeps Apple-GPU compute opt-in. MetalIO is an independent generic
+# compiled-record I/O provider and is default-linked for Qwen on Apple Silicon
+# after the M2 correctness/performance gate passed; COLI_RECORD_IO=pread remains
+# the runtime force-disable/A-B control. Intel macOS keeps the previous behavior:
+# MetalIO is linked when METAL=1.
 METAL     ?= 0
 METAL_OBJ  =
 METALXX    = clang++ -x objective-c++ -std=gnu++17 -fobjc-arc -O3
 MIO_OBJ    =
 MIO_LDFLAGS =
 MIO_CFLAGS  =
+ifneq (,$(DARWIN))
+ifneq (,$(AARCH64))
+MIO_OBJ     = metalio.o
+MIO_LDFLAGS = -framework Metal -framework Foundation -lc++
+endif
+endif
 ifeq ($(METAL),1)
 ifeq (,$(DARWIN))
 $(error METAL=1 is supported only on macOS)
@@ -482,7 +490,7 @@ CFLAGS   += -DCOLI_METAL
 LDFLAGS  += -framework Metal -framework Foundation -lc++
 METAL_OBJ = backend_metal.o
 MIO_OBJ   = metalio.o
-MIO_LDFLAGS = -framework Metal -framework Foundation
+MIO_LDFLAGS = -framework Metal -framework Foundation -lc++
 MIO_CFLAGS  = -DCOLI_METALIO
 endif
 
@@ -738,9 +746,10 @@ olmoe$(EXE): olmoe.c st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unico
 
 # Qwen3.5/3.6/3.7 MoE (hybrid Gated DeltaNet + Gated Attention + fine-grained
 # MoE with shared expert). CPU-only engine, disk-streamed int8 experts; same
-# no-CUDA build class as olmoe (#783). On darwin, links the MTLIO subsystem
-# (QWEN_METAL_IO=1) for async expert streaming — CPU compute reads the
-# shared-storage buffers in place; MetalIO is never mandatory.
+# no-CUDA build class as olmoe (#783). On Apple Silicon, the generic compiled-
+# record I/O provider links MetalIO by default; COLI_RECORD_IO=pread forces the
+# portable path for A/B or emergency disable. The old QWEN_METAL_IO path stays
+# available only when explicitly compiling the legacy Metal integration.
 QMOE_COLI_OBJS = qwen_coli_executor.o qwen_coli_format.o mxfp4_expert.o mxfp4_runtime.o qwen_profile.o
 # Qwen's first CUDA/HIP slice is the streamed MXFP4 routed-expert path. Direct
 # Linux GPU builds link backend_cuda.o; CPU builds and Windows runtime-DLL builds
@@ -752,7 +761,7 @@ QMOE_LDFLAGS = $(if $(QMOE_GPU_ENABLED),$(LDFLAGS),$(NOCUDA_LDFLAGS))
 qwen_coli_executor.o: coli_executor.c coli_executor.h coli_format.h
 	$(CC) $(QMOE_CFLAGS) -c coli_executor.c -o $@
 
-qwen_coli_format.o: coli_format.c coli_format.h compat.h
+qwen_coli_format.o: coli_format.c coli_format.h compat.h record_io_backend.h
 	$(CC) $(QMOE_CFLAGS) -c coli_format.c -o $@
 
 qwen_profile.o: profile.c profile.h
@@ -878,7 +887,7 @@ tests/bench_topp$(EXE): tests/bench_topp.c colibri.c st.h uring.h json.h tok.h t
 tests/test_sample_nan$(EXE): tests/test_sample_nan.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_temp_env$(EXE): tests/test_temp_env.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
+tests/test_temp_env$(EXE): tests/test_temp_env.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_kv_alloc$(EXE): tests/test_kv_alloc.c colibri.c st.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
