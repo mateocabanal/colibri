@@ -7,35 +7,66 @@ endif
 
 .PHONY: check clean
 
-check: test_record_io$(EXE) test_expert_residency$(EXE) test_expert_activation$(EXE) test_expert_residency_policy$(EXE) test_expert_resource_bridge$(EXE) test_resource_planner$(EXE)
+check: test_record_io$(EXE) test_record_io_backend$(EXE) test_expert_residency$(EXE) test_expert_backing_pool$(EXE) test_qwen_adaptive_backing_pool$(EXE) test_expert_activation$(EXE) test_expert_residency_policy$(EXE) test_expert_resource_bridge$(EXE) test_resource_planner$(EXE) test_reuse_projection$(EXE) test_moe_adaptive_residency$(EXE) test_moe_resource_budget$(EXE)
 	./test_record_io$(EXE)
+	./test_record_io_backend$(EXE)
 	./test_expert_residency$(EXE)
+	./test_expert_backing_pool$(EXE)
+	./test_qwen_adaptive_backing_pool$(EXE)
 	./test_expert_activation$(EXE)
 	./test_expert_residency_policy$(EXE)
 	./test_expert_resource_bridge$(EXE)
 	./test_resource_planner$(EXE)
+	./test_reuse_projection$(EXE)
+	./test_moe_adaptive_residency$(EXE)
+	./test_moe_resource_budget$(EXE)
 
 test_record_io$(EXE): tests/test_record_io.c record_io.h
 	$(CC) $(CFLAGS) tests/test_record_io.c -o $@
 
+test_record_io_backend$(EXE): tests/test_record_io_backend.c record_io_backend.h
+	$(CC) $(CFLAGS) tests/test_record_io_backend.c -o $@
+
 test_expert_residency$(EXE): tests/test_expert_residency.c expert_residency.h expert_store.h
 	$(CC) $(CFLAGS) tests/test_expert_residency.c -o $@
+
+test_expert_backing_pool$(EXE): tests/test_expert_backing_pool.c expert_backing_pool.h
+	$(CC) $(CFLAGS) tests/test_expert_backing_pool.c -o $@
+
+test_qwen_adaptive_backing_pool$(EXE): tests/test_qwen_adaptive_backing_pool.c qwen_adaptive_backing_pool_adapter.h expert_backing_pool.h
+	$(CC) $(CFLAGS) tests/test_qwen_adaptive_backing_pool.c -o $@
 
 test_expert_activation$(EXE): tests/test_expert_activation.c expert_activation.h expert_store.h
 	$(CC) $(CFLAGS) tests/test_expert_activation.c -o $@
 
-test_expert_residency_policy$(EXE): tests/test_expert_residency_policy.c expert_residency_policy.h expert_activation.h expert_store.h resource_planner.h
+test_expert_residency_policy$(EXE): tests/test_expert_residency_policy.c expert_residency_policy.h expert_activation.h expert_store.h resource_planner.h reuse_projection.h
 	$(CC) $(CFLAGS) tests/test_expert_residency_policy.c -o $@
 
-test_expert_resource_bridge$(EXE): tests/test_expert_resource_bridge.c expert_residency_policy.h expert_activation.h expert_store.h resource_planner.h
+test_expert_resource_bridge$(EXE): tests/test_expert_resource_bridge.c expert_residency_policy.h expert_activation.h expert_store.h resource_planner.h reuse_projection.h
 	$(CC) $(CFLAGS) tests/test_expert_resource_bridge.c -o $@
 
 test_resource_planner$(EXE): tests/test_resource_planner.c resource_planner.h
 	$(CC) $(CFLAGS) tests/test_resource_planner.c -o $@
 
+test_reuse_projection$(EXE): tests/test_reuse_projection.c reuse_projection.h
+	$(CC) $(CFLAGS) tests/test_reuse_projection.c -o $@
+
+test_moe_adaptive_residency$(EXE): tests/test_moe_adaptive_residency.c moe_adaptive_residency.h expert_residency_policy.h expert_activation.h expert_store.h resource_planner.h reuse_projection.h
+	$(CC) $(CFLAGS) tests/test_moe_adaptive_residency.c -o $@
+
+test_moe_resource_budget$(EXE): tests/test_moe_resource_budget.c moe_resource_budget.h
+	$(CC) $(CFLAGS) tests/test_moe_resource_budget.c -o $@
+
 clean:
-	rm -f test_record_io test_record_io.exe test_expert_residency test_expert_residency.exe \
+	rm -f test_record_io test_record_io.exe \
+		test_record_io_backend test_record_io_backend.exe \
+		test_expert_residency test_expert_residency.exe \
+		test_expert_backing_pool test_expert_backing_pool.exe \
+		test_qwen_adaptive_backing_pool test_qwen_adaptive_backing_pool.exe \
 		test_expert_activation test_expert_activation.exe \
 		test_expert_residency_policy test_expert_residency_policy.exe \
 		test_expert_resource_bridge test_expert_resource_bridge.exe \
-		test_resource_planner test_resource_planner.exe
+		test_resource_planner test_resource_planner.exe \
+		test_reuse_projection test_reuse_projection.exe \
+		test_moe_adaptive_residency test_moe_adaptive_residency.exe \
+		test_moe_resource_budget test_moe_resource_budget.exe

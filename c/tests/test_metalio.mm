@@ -1,9 +1,10 @@
 /* test_metalio.mm — lifecycle test for the MTLIO expert-streaming subsystem.
  *
  * Exercises the real async path: init -> file wrap -> persistent slot ->
- * non-blocking load -> event wait -> byte-exact contents, plus multiple
- * outstanding loads, slot reuse, prefetch accounting, and clean shutdown
- * with outstanding IO. Skips (exit 0) when MetalIO is unavailable. */
+ * non-blocking load -> event wait -> byte-exact contents, plus direct-pointer
+ * compiled-record loads, multiple outstanding loads, slot reuse, prefetch
+ * accounting, and clean shutdown with outstanding IO. Skips (exit 0) when
+ * MetalIO is unavailable. */
 #import <Foundation/Foundation.h>
 #import <mach/mach_time.h>
 #include <stdio.h>
@@ -22,8 +23,6 @@ static int failures;
 
 static char g_path[512];
 
-/* position-seeded payload: byte(i) = splitmix64(i) & 0xFF — O(1) per byte,
- * so the loader check can verify any range without replaying the stream. */
 static uint64_t splitmix64(uint64_t x){
     x += 0x9E3779B97F4A7C15ull;
     x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
@@ -55,12 +54,13 @@ int main(void){
         }
         metalio_verbose(1);
 
-        /* --- file + one slot, load + wait, byte-exact -------------------- */
-        const size_t F = 1u << 20;         /* 1 MiB file */
+        const size_t F = 1u << 20;
         int fd = make_file(F);
         CHECK(fd >= 0, "make_file");
         int file = metalio_file_add(g_path);
         CHECK(file >= 0, "file_add");
+        CHECK(metalio_file_add(g_path) == file, "file_add is idempotent");
+
         int slot = metalio_slot_alloc(256u << 10);
         CHECK(slot >= 0, "slot_alloc");
         CHECK(metalio_slot_bytes(slot) >= (256u << 10), "slot size");
@@ -75,18 +75,15 @@ int main(void){
         }
         CHECK(!bad, "loaded bytes match file contents at offset 4096");
 
-        /* --- multiple outstanding loads ---------------------------------- */
         int64_t ev2 = metalio_load(slot, file, 0, 256u << 10);
         int64_t ev3 = metalio_load(slot, file, F - 1024, 1024);
         CHECK(ev2 > ev && ev3 > ev2, "event values increase");
         CHECK(metalio_wait(ev3) == 0, "wait covers earlier loads");
 
-        /* --- slot reuse: overwrite with a different range ---------------- */
         int64_t ev4 = metalio_load(slot, file, 65536, 4096);
         CHECK(metalio_wait(ev4) == 0, "reuse wait");
         CHECK(metalio_slot_ptr(slot) != NULL, "reuse ptr");
 
-        /* --- prefetch accounting ------------------------------------------ */
         metalio_slot_consumed(slot);
         metalio_prefetch_done(slot);
         ColiMetalioStats st;
@@ -97,7 +94,6 @@ int main(void){
         CHECK(st.latency_samples >= 3, "latency samples: %llu", (unsigned long long)st.latency_samples);
         CHECK(st.peak_outstanding >= 2, "peak outstanding: %llu", (unsigned long long)st.peak_outstanding);
 
-        /* --- multi-region vectored load: weights + scales, ONE event ------ */
         int64_t evr = metalio_loadv(slot, (ColiMetalioRegion[]){
             { file, 256u << 10, 4096, 0 },
             { file, 60000u, 512, 4096 },
@@ -110,14 +106,42 @@ int main(void){
         for (int i = 0; i < 512; i++) if (q[4096 + i] != payload_byte(60000u + i)) badv = 1;
         CHECK(!badv, "loadv regions byte-exact at both destinations");
 
-        /* --- invalid region set must enqueue NOTHING ---------------------- */
+        /* Generic compiled-record path: MetalIO loadBytes writes directly into
+         * caller-owned resident storage, so no MTLBuffer allocation/memcpy is
+         * required between storage and the expert backing. */
+        ColiRecordIoBackend *backend = coli_record_io_metal_default();
+        CHECK((coli_record_io_backend_capabilities(backend) &
+               COLI_RECORD_IO_CAP_DIRECT_POINTER) != 0,
+              "direct-pointer capability");
+        unsigned char *direct = (unsigned char *)malloc(8192);
+        CHECK(direct != NULL, "direct destination allocation");
+        if (direct) {
+            memset(direct, 0, 8192);
+            ColiRecordIoBackendRegion direct_regions[2] = {
+                { (ColiRecordIoBackendFile)file, 12345, 4096, 0 },
+                { (ColiRecordIoBackendFile)file, 54321, 1024, 4096 },
+            };
+            ColiRecordIoBackendEvent dev = coli_record_io_backend_submitv_ptr(
+                backend, direct, 8192, direct_regions, 2,
+                COLI_RECORD_IO_INTENT_DEMAND);
+            CHECK(dev > 0, "direct-pointer event");
+            CHECK(coli_record_io_backend_wait(backend, dev) == 0,
+                  "direct-pointer wait");
+            int direct_bad = 0;
+            for (int i = 0; i < 4096; i++)
+                if (direct[i] != payload_byte(12345u + (size_t)i)) direct_bad = 1;
+            for (int i = 0; i < 1024; i++)
+                if (direct[4096 + i] != payload_byte(54321u + (size_t)i)) direct_bad = 1;
+            CHECK(!direct_bad, "direct-pointer regions byte-exact");
+            free(direct);
+        }
+
         int64_t evbad = metalio_loadv(slot, (ColiMetalioRegion[]){
-            { file, 0, 1 << 20, 0 },                    /* exceeds slot capacity */
+            { file, 0, 1 << 20, 0 },
         }, 1, MIO_LOAD_DEMAND);
         CHECK(evbad == -1, "oversized region rejected");
         CHECK(q[0] == payload_byte((size_t)(256u << 10)), "rejected load left slot untouched");
 
-        /* --- slot id reuse: >256 lifetime allocs, bounded active set ------ */
         int first = metalio_slot_alloc(4096);
         CHECK(first >= 0, "alloc for reuse test");
         metalio_slot_free(first);
@@ -132,7 +156,6 @@ int main(void){
         }
         CHECK(active <= 256, "active set stays bounded: %d", active);
 
-        /* --- counter consistency: wait on the LAST event covers all ------- */
         int64_t eva = metalio_loadv(slot, (ColiMetalioRegion[]){ { file, 0, 1024, 0 } }, 1, MIO_LOAD_DEMAND);
         int64_t evb2 = metalio_loadv(slot, (ColiMetalioRegion[]){ { file, 1024, 1024, 0 } }, 1, MIO_LOAD_DEMAND);
         int64_t evc = metalio_loadv(slot, (ColiMetalioRegion[]){ { file, 2048, 1024, 0 } }, 1, MIO_LOAD_DEMAND);
@@ -144,21 +167,19 @@ int main(void){
                   "outstanding drained by high-water wait: %llu",
                   (unsigned long long)st2.outstanding);
         }
-        /* waiting on an ALREADY-covered event is a no-op (no double count) */
         CHECK(metalio_wait(eva) == 0, "covered wait no-op");
 
-        /* --- shutdown with outstanding IO -------------------------------- */
         int64_t ev5 = metalio_load(slot, file, 0, 1024);
         CHECK(ev5 > 0, "load before shutdown");
         metalio_shutdown();
         CHECK(!metalio_active(), "inactive after shutdown");
-        CHECK(metalio_init() == 1, "re-init after shutdown");   /* model reload path */
+        CHECK(metalio_init() == 1, "re-init after shutdown");
         metalio_shutdown();
 
         close(fd);
         unlink(g_path);
     }
     if (failures) { fprintf(stderr, "metalio: %d failure(s)\n", failures); return 1; }
-    printf("metalio: init, load, wait, reuse, prefetch accounting, shutdown ok\n");
+    printf("metalio: init, buffer/direct-pointer load, wait, reuse, prefetch accounting, shutdown ok\n");
     return 0;
 }

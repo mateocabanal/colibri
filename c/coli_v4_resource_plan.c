@@ -1,15 +1,10 @@
 #include "deepseek_v4_internal.h"
 #include "coli_v4_residency.h"
+#include "runtime_memory.h"
 
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
-
-#ifdef _WIN32
-#include <windows.h>
-#else
-#include <unistd.h>
-#endif
 
 #define MIB UINT64_C(1048576)
 
@@ -35,44 +30,10 @@ static int multiply_u64(uint64_t a, uint64_t b, uint64_t *output) {
     return 0;
 }
 
-#ifdef __APPLE__
-#include <mach/mach.h>
-#endif
-
+/* Compatibility symbol for the V4 engine. The platform mechanism now lives in
+ * runtime_memory.h and is shared by every MoE adapter. */
 uint64_t coli_v4_os_available_memory(void) {
-#ifdef _WIN32
-    MEMORYSTATUSEX status;
-    memset(&status, 0, sizeof(status));
-    status.dwLength = sizeof(status);
-    return GlobalMemoryStatusEx(&status) ? (uint64_t)status.ullAvailPhys : 0;
-#elif defined(__APPLE__)
-    /* No /proc and no _SC_AVPHYS_PAGES on macOS. "Available" is what the
-     * kernel could hand out without swapping: free + inactive pages -- the
-     * same approximation Activity Monitor reports, and the closest analogue
-     * of Linux's MemAvailable (which also counts reclaimable cache). */
-    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
-    vm_statistics64_data_t vm;
-    vm_size_t page = 0;
-    if (host_statistics64(mach_host_self(), HOST_VM_INFO64,
-                          (host_info64_t)&vm, &count) == KERN_SUCCESS &&
-        host_page_size(mach_host_self(), &page) == KERN_SUCCESS && page)
-        return ((uint64_t)vm.free_count + (uint64_t)vm.inactive_count) *
-               (uint64_t)page;
-    return 0;
-#else
-    FILE *stream = fopen("/proc/meminfo", "r");
-    if (stream) {
-        char line[256];
-        unsigned long long kib = 0;
-        while (fgets(line, sizeof(line), stream))
-            if (sscanf(line, "MemAvailable: %llu kB", &kib) == 1) break;
-        fclose(stream);
-        if (kib) return (uint64_t)kib * 1024;
-    }
-    long pages = sysconf(_SC_AVPHYS_PAGES), page_size = sysconf(_SC_PAGESIZE);
-    if (pages <= 0 || page_size <= 0) return 0;
-    return (uint64_t)pages * (uint64_t)page_size;
-#endif
+    return coli_runtime_available_memory_bytes();
 }
 
 int coli_v4_resource_plan_compute(
