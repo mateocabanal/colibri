@@ -10,8 +10,8 @@
  * end-of-prefill kv_prefix_record() boundary before decode mutates target state.
  *
  * The same split unit owns V4 speculative generation, so package-only DSpark
- * binds the named COLITENS compatibility source here.  Real safetensors runs
- * continue through the original functions unchanged.
+ * binds the named COLITENS compatibility source here. Target-only generation
+ * explicitly leaves that adapter unbound so speculation is behaviorally inert.
  */
 #define coli_v4_session_generate coli_v4_session_generate_uncached
 #include "deepseek_v4_internal.h"
@@ -47,17 +47,28 @@ static ColiV4Session *session_from_prefix(const kv_prefix *prefix) {
                             offsetof(ColiV4Session, fed));
 }
 
+/* This TU owns a separate static package-adapter instance from the runtime TU.
+ * Keep it bound only while the live engine actually has a speculative source.
+ * Full DSpark records its capability in coli_v4_full_dspark_wanted; the legacy
+ * Markov proposer records it in engine->dspark.enabled. */
+static int coli_v4_generation_package_bridge_sync(ColiV4Session *session) {
+    int wanted = session && session->engine &&
+        (coli_v4_full_dspark_wanted || session->engine->dspark.enabled);
+    if (!wanted)
+        return coli_v4_package_source_bind(NULL);
+    return coli_v4_package_source_bind(session->engine->coli_static);
+}
+
 static int coli_v4_cached_kv_prefix_reuse(const kv_prefix *prefix,
                                           const int *ids, int count) {
     /* The production CLI/serve entry points live inside the amalgamated
      * generation unit. Because that unit is macro-renamed to the uncached
      * implementation, those internal call sites bypass the public wrapper
-     * below. Bind here as well: kv_prefix_reuse is reached before prefill on
-     * every request, so package-only DSpark sees the executor even on those
-     * internal paths. The bind is idempotent for the already-wrapped API path. */
+     * below. Sync here as well: kv_prefix_reuse is reached before prefill on
+     * every request, so target-only calls drop the adapter before any target
+     * tensor work and package-only DSpark binds it before its first proposal. */
     ColiV4Session *session = session_from_prefix(prefix);
-    if (session && session->engine &&
-        coli_v4_package_source_bind(session->engine->coli_static)) {
+    if (coli_v4_generation_package_bridge_sync(session)) {
         fprintf(stderr,
                 "[MTP] package tensor source bind failed in generation path\n");
     }
@@ -310,11 +321,10 @@ int coli_v4_session_generate(ColiV4Session *session,
     ColiV4PrefixCacheStats after = {0};
     coli_v4_prefix_cache_stats(&before);
 
-    if (coli_v4_package_source_bind(
-            session && session->engine ? session->engine->coli_static : NULL)) {
+    if (coli_v4_generation_package_bridge_sync(session)) {
         if (error && error_size)
             snprintf(error, error_size,
-                     "cannot bind package named-tensor source");
+                     "cannot synchronize package named-tensor source");
         return -1;
     }
     g_coli_v4_package_head_cache_miss_reported = 0;
