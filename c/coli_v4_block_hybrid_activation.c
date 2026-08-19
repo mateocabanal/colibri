@@ -43,6 +43,14 @@ typedef struct {
     int prompt_tokens;
     int reused_tokens;
     int active;
+
+    /* Policy epochs are measured in logical token steps, not layer calls.
+     * Every layer evaluating the same token span must therefore reuse one epoch.
+     * A fresh request invalidates this cache even when token positions restart. */
+    int span_valid;
+    int span_start_position;
+    int span_batch;
+    uint64_t span_epoch;
 } ColiV4ActivationRequest;
 
 typedef struct {
@@ -76,6 +84,8 @@ typedef struct {
 
 static _Thread_local ColiV4ActivationRequest g_v4_activation_request;
 static _Thread_local ColiV4ActivationCall g_v4_activation_call;
+/* Global across routing threads/sessions so policy time never moves backwards.
+ * The counter advances by logical token count once per distinct routed span. */
 static atomic_uint_fast64_t g_v4_activation_epoch = 1;
 static ColiV4ActivationPending g_v4_activation_pending = {
     .mutex = PTHREAD_MUTEX_INITIALIZER,
@@ -86,6 +96,7 @@ void coli_v4_activation_begin_request(int prompt_tokens, int reused_tokens) {
     g_v4_activation_request.prompt_tokens = prompt_tokens;
     g_v4_activation_request.reused_tokens = reused_tokens;
     g_v4_activation_request.active = prompt_tokens >= 0;
+    g_v4_activation_request.span_valid = 0;
 }
 
 static void v4_activation_clear_touched(ColiV4ActivationCall *call) {
@@ -211,6 +222,28 @@ static void v4_activation_publish_pending(ColiV4ActivationCall *call) {
     v4_activation_clear_touched(call);
 }
 
+static uint64_t v4_activation_epoch_for_span(int start_position, int batch) {
+    ColiV4ActivationRequest *request = &g_v4_activation_request;
+    if (request->span_valid && request->span_start_position == start_position &&
+        request->span_batch == batch)
+        return request->span_epoch;
+
+    /* Reserve exactly one policy tick per logical token in this routed span.
+     * A 43-layer decode token therefore advances the clock once, not 43 times;
+     * a prefill batch of N tokens advances it by N while every layer in that
+     * batch shares the same end-of-span epoch. */
+    uint64_t width = (uint64_t)batch;
+    uint64_t first = atomic_fetch_add_explicit(
+        &g_v4_activation_epoch, width, memory_order_relaxed);
+    uint64_t epoch = first + width - UINT64_C(1);
+
+    request->span_valid = 1;
+    request->span_start_position = start_position;
+    request->span_batch = batch;
+    request->span_epoch = epoch;
+    return epoch;
+}
+
 static void v4_activation_context(
     const ColiDeepSeekV4LayerWeights *weights,
     int start_position, int batch, ColiExpertPhase phase) {
@@ -222,11 +255,8 @@ static void v4_activation_context(
     call->next_item = 0;
     call->batch = batch;
     call->phase = phase;
-    call->epoch = atomic_fetch_add_explicit(
-        &g_v4_activation_epoch, UINT64_C(1), memory_order_relaxed);
-    if (!call->epoch)
-        call->epoch = atomic_fetch_add_explicit(
-            &g_v4_activation_epoch, UINT64_C(1), memory_order_relaxed);
+    call->epoch = call->valid
+        ? v4_activation_epoch_for_span(start_position, batch) : 0;
 }
 
 static void v4_activation_selected(const int *indices, int topk, int experts) {

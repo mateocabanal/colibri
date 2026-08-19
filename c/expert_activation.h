@@ -38,9 +38,13 @@ typedef struct ColiExpertActivationSample {
      * For ordinary decode this is commonly 1. A batched/union prefill path may
      * report a larger value for one (layer, expert) before physical dedupe. */
     uint64_t multiplicity;
-    /* Monotonic policy epoch chosen by the runtime/engine adapter. This may be
-     * a token position, routing step, or request-global serial; generic policy
-     * only relies on ordering, not model-specific meaning. */
+    /* Monotonic logical-token epoch chosen by the runtime/engine adapter.
+     * One epoch unit is one logical token step: every routed layer evaluating
+     * the same token/span must use the same epoch, independent of model depth.
+     * A batched observation may use the end-of-span epoch and advance policy
+     * time by the number of logical tokens represented by that span. Do not use
+     * a per-layer routing-call serial here: decay and planner horizons are
+     * expressed in these epoch units and therefore require a stable timebase. */
     uint64_t epoch;
 } ColiExpertActivationSample;
 
