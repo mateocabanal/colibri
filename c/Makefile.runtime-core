@@ -7,9 +7,10 @@ endif
 
 .PHONY: check clean
 
-check: test_record_io$(EXE) test_expert_residency$(EXE) test_expert_activation$(EXE) test_expert_residency_policy$(EXE) test_expert_resource_bridge$(EXE) test_resource_planner$(EXE) test_reuse_projection$(EXE) test_moe_adaptive_residency$(EXE) test_moe_resource_budget$(EXE)
+check: test_record_io$(EXE) test_expert_residency$(EXE) test_expert_backing_pool$(EXE) test_expert_activation$(EXE) test_expert_residency_policy$(EXE) test_expert_resource_bridge$(EXE) test_resource_planner$(EXE) test_reuse_projection$(EXE) test_moe_adaptive_residency$(EXE) test_moe_resource_budget$(EXE)
 	./test_record_io$(EXE)
 	./test_expert_residency$(EXE)
+	./test_expert_backing_pool$(EXE)
 	./test_expert_activation$(EXE)
 	./test_expert_residency_policy$(EXE)
 	./test_expert_resource_bridge$(EXE)
@@ -23,6 +24,9 @@ test_record_io$(EXE): tests/test_record_io.c record_io.h
 
 test_expert_residency$(EXE): tests/test_expert_residency.c expert_residency.h expert_store.h
 	$(CC) $(CFLAGS) tests/test_expert_residency.c -o $@
+
+test_expert_backing_pool$(EXE): tests/test_expert_backing_pool.c expert_backing_pool.h
+	$(CC) $(CFLAGS) tests/test_expert_backing_pool.c -o $@
 
 test_expert_activation$(EXE): tests/test_expert_activation.c expert_activation.h expert_store.h
 	$(CC) $(CFLAGS) tests/test_expert_activation.c -o $@
@@ -47,6 +51,7 @@ test_moe_resource_budget$(EXE): tests/test_moe_resource_budget.c moe_resource_bu
 
 clean:
 	rm -f test_record_io test_record_io.exe test_expert_residency test_expert_residency.exe \
+		test_expert_backing_pool test_expert_backing_pool.exe \
 		test_expert_activation test_expert_activation.exe \
 		test_expert_residency_policy test_expert_residency_policy.exe \
 		test_expert_resource_bridge test_expert_resource_bridge.exe \
