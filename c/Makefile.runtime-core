@@ -7,8 +7,9 @@ endif
 
 .PHONY: check clean
 
-check: test_record_io$(EXE) test_expert_residency$(EXE) test_expert_backing_pool$(EXE) test_qwen_adaptive_backing_pool$(EXE) test_expert_activation$(EXE) test_expert_residency_policy$(EXE) test_expert_resource_bridge$(EXE) test_resource_planner$(EXE) test_reuse_projection$(EXE) test_moe_adaptive_residency$(EXE) test_moe_resource_budget$(EXE)
+check: test_record_io$(EXE) test_record_io_backend$(EXE) test_expert_residency$(EXE) test_expert_backing_pool$(EXE) test_qwen_adaptive_backing_pool$(EXE) test_expert_activation$(EXE) test_expert_residency_policy$(EXE) test_expert_resource_bridge$(EXE) test_resource_planner$(EXE) test_reuse_projection$(EXE) test_moe_adaptive_residency$(EXE) test_moe_resource_budget$(EXE)
 	./test_record_io$(EXE)
+	./test_record_io_backend$(EXE)
 	./test_expert_residency$(EXE)
 	./test_expert_backing_pool$(EXE)
 	./test_qwen_adaptive_backing_pool$(EXE)
@@ -22,6 +23,9 @@ check: test_record_io$(EXE) test_expert_residency$(EXE) test_expert_backing_pool
 
 test_record_io$(EXE): tests/test_record_io.c record_io.h
 	$(CC) $(CFLAGS) tests/test_record_io.c -o $@
+
+test_record_io_backend$(EXE): tests/test_record_io_backend.c record_io_backend.h
+	$(CC) $(CFLAGS) tests/test_record_io_backend.c -o $@
 
 test_expert_residency$(EXE): tests/test_expert_residency.c expert_residency.h expert_store.h
 	$(CC) $(CFLAGS) tests/test_expert_residency.c -o $@
@@ -54,7 +58,9 @@ test_moe_resource_budget$(EXE): tests/test_moe_resource_budget.c moe_resource_bu
 	$(CC) $(CFLAGS) tests/test_moe_resource_budget.c -o $@
 
 clean:
-	rm -f test_record_io test_record_io.exe test_expert_residency test_expert_residency.exe \
+	rm -f test_record_io test_record_io.exe \
+		test_record_io_backend test_record_io_backend.exe \
+		test_expert_residency test_expert_residency.exe \
 		test_expert_backing_pool test_expert_backing_pool.exe \
 		test_qwen_adaptive_backing_pool test_qwen_adaptive_backing_pool.exe \
 		test_expert_activation test_expert_activation.exe \
