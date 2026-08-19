@@ -227,20 +227,31 @@ static inline size_t coli_moe_adaptive_append_candidates(
     return count;
 }
 
+/* The byte envelope has already accounted for resident size and miss value.
+ * WHICH-expert ordering is therefore intentionally phase-hotness first, with
+ * resident hysteresis and recency as deterministic tie breakers. Do not reuse
+ * the policy's integer `score` here: for multi-MiB experts and an unknown
+ * exposed miss cost, score can legitimately quantize to zero even when the
+ * hotness signal is nonzero. */
 static inline int coli_moe_adaptive_hot_qsort_compare(
     const void *left, const void *right) {
     const ColiExpertResidencyCandidate *a =
         (const ColiExpertResidencyCandidate *)left;
     const ColiExpertResidencyCandidate *b =
         (const ColiExpertResidencyCandidate *)right;
-    int order = coli_expert_residency_policy_compare(a, b);
-    return order > 0 ? -1 : order < 0 ? 1 : 0;
+    if (a->hotness != b->hotness) return a->hotness > b->hotness ? -1 : 1;
+    if (a->currently_resident != b->currently_resident)
+        return a->currently_resident ? -1 : 1;
+    if (a->last_epoch != b->last_epoch) return a->last_epoch > b->last_epoch ? -1 : 1;
+    if (a->key.layer != b->key.layer) return a->key.layer < b->key.layer ? -1 : 1;
+    if (a->key.expert != b->key.expert) return a->key.expert < b->key.expert ? -1 : 1;
+    return 0;
 }
 
 /* Apply an already-decided expert byte envelope to the phase-aware expert
  * policy. This is the generic HOW-MANY -> WHICH bridge for both expert-only and
- * mixed-resource plans. Only experts with positive common-horizon reuse are
- * eligible, so hotness cannot bypass cold-start confidence. */
+ * mixed-resource plans. Only experts with positive common-horizon reuse and
+ * phase hotness are eligible, so hotness cannot bypass cold-start confidence. */
 static inline size_t coli_moe_adaptive_apply_expert_budget(
     ColiMoeAdaptiveResidency *state, uint64_t expert_budget_bytes,
     uint64_t resident_bytes, uint64_t exposed_ns_per_miss,
@@ -262,7 +273,7 @@ static inline size_t coli_moe_adaptive_apply_expert_budget(
             coli_expert_residency_policy_candidate(
                 entry, state->current_epoch, resident_bytes, miss_cost_us,
                 resident, &state->policy);
-        if (!candidate.reuse_weight || !candidate.score) continue;
+        if (!candidate.reuse_weight || !candidate.hotness) continue;
         state->scratch_experts[count++] = candidate;
     }
 
