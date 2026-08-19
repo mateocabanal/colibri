@@ -11,15 +11,27 @@
 #include "qwen_prefix_cache_global_6.inc"
 #include "qwen_prefix_cache_global_7.inc"
 
+static inline int qwen_adaptive_legacy_placement_requested(void) {
+    const char *adaptive = getenv("COLI_ADAPTIVE_RESIDENCY");
+    if (adaptive && adaptive[0] && strcmp(adaptive, "0") == 0) return 1;
+    const char *hot = getenv("HOT");
+    if (hot && hot[0] && atoi(hot) > 0) return 1;
+    const char *pin = getenv("PIN");
+    if (pin && pin[0] && strcmp(pin, "auto") != 0) return 1;
+    return 0;
+}
+
 /* The generated/process-local prefix implementation still contains Qwen's
  * historical 2-decimal-GB-per-slot RAM_GB helper for source compatibility.
- * Normal engine startup must not consume that heuristic anymore: fall back to
- * the safe top-k bootstrap and let the adaptive resource adapter interpret
- * RAM_GB as a TOTAL byte budget once actual expert resident bytes are known.
- * Define this redirect only after all generated .inc chunks have completed so
- * their split function bodies remain untouched. */
+ * Automatic execution must not consume that heuristic: fall back to the safe
+ * top-k bootstrap and let the adaptive resource adapter interpret RAM_GB as a
+ * TOTAL byte budget once actual expert resident bytes are known. Explicit
+ * legacy/benchmark mode still calls the original helper so A/B controls remain
+ * byte-for-byte useful. */
 static inline int qwen_adaptive_bootstrap_ram_cap(
     const char *value, size_t prefix_budget_bytes, int *valid) {
+    if (qwen_adaptive_legacy_placement_requested())
+        return (qwen_prefix_cache_ram_cap)(value, prefix_budget_bytes, valid);
     (void)value;
     (void)prefix_budget_bytes;
     if (valid) *valid = 0;
