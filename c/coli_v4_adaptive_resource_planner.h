@@ -357,8 +357,8 @@ static inline int coli_v4_adaptive_resource_should_replan(
 
 /* Among the optional experts tentatively selected by the shared allocator,
  * identify the least valuable one using the inverse of the allocator's exact
- * deterministic ordering. This is used only when a concurrent dense borrower
- * raises the live pin floor after our snapshot and before budget commit. */
+ * deterministic ordering. This is used when a dense floor or transfer limit
+ * leaves less room for experts than the unconstrained global selection. */
 static inline size_t coli_v4_adaptive_resource_weakest_selected_expert(
     const ColiV4AdaptiveResourcePlanner *planner,
     size_t dense_count, size_t count) {
@@ -383,6 +383,68 @@ static inline size_t coli_v4_adaptive_resource_weakest_selected_expert(
             weakest = i;
     }
     return weakest;
+}
+
+/* If a dense-growth rate limit leaves spare UMA, keep it productive by filling
+ * with the strongest expert candidates that fit. Otherwise a controller meant
+ * to reduce churn would accidentally create an unallocated-memory trough on
+ * every move back toward dense residency. */
+static inline size_t coli_v4_adaptive_resource_strongest_unselected_expert(
+    const ColiV4AdaptiveResourcePlanner *planner,
+    size_t dense_count, size_t count, uint64_t available) {
+    size_t strongest = count;
+    if (!planner || !available) return strongest;
+    for (size_t i = dense_count; i < count; i++) {
+        if (planner->candidate_selected[i]) continue;
+        const ColiResourceCandidate *candidate = &planner->candidates[i];
+        if (candidate->kind != COLI_RESOURCE_PERSISTENT_EXPERT ||
+            !candidate->resident_bytes || candidate->resident_bytes > available)
+            continue;
+        if (strongest == count) {
+            strongest = i;
+            continue;
+        }
+        const ColiResourceCandidate *incumbent = &planner->candidates[strongest];
+        int ratio = coli_resource_ratio_compare(
+            candidate->expected_bytes_avoided, candidate->resident_bytes,
+            incumbent->expected_bytes_avoided, incumbent->resident_bytes);
+        if (ratio > 0 ||
+            (ratio == 0 &&
+             (candidate->id < incumbent->id ||
+              (candidate->id == incumbent->id && i < strongest))))
+            strongest = i;
+    }
+    return strongest;
+}
+
+/* A noisy one-token benefit estimate must not migrate the entire UMA pool from
+ * dense to experts (or back) in one replan. Use the topology-derived bootstrap
+ * reserve -- approximately one expert record per target layer -- as the maximum
+ * class transfer per complete logical-token sweep. Mandatory live dense pins or
+ * in-flight expert leases may still force a larger move; safety beats damping. */
+static inline uint64_t coli_v4_adaptive_resource_limit_dense_transfer(
+    const ColiV4AdaptiveResourcePlanner *planner,
+    uint64_t desired, uint64_t floor, uint64_t ceiling) {
+    if (floor > ceiling) return ceiling;
+    if (desired < floor) desired = floor;
+    if (desired > ceiling) desired = ceiling;
+    if (!planner || !planner->bootstrap_expert_bytes) return desired;
+
+    uint64_t previous = planner->selected_dense_bytes;
+    uint64_t quantum = planner->bootstrap_expert_bytes;
+
+    /* A changed mandatory envelope may put the previous budget outside the new
+     * legal range. In that case move directly to the nearest safe boundary. */
+    if (previous < floor) return floor;
+    if (previous > ceiling) return ceiling;
+
+    uint64_t low = previous > quantum ? previous - quantum : 0;
+    uint64_t high = coli_resource_saturating_add(previous, quantum);
+    if (low < floor) low = floor;
+    if (high > ceiling) high = ceiling;
+    if (desired < low) desired = low;
+    if (desired > high) desired = high;
+    return desired;
 }
 
 /* Called with the base expert-store mutex held. */
@@ -489,13 +551,16 @@ static inline int coli_v4_adaptive_resource_replan_locked(
         }
     }
 
-    /* Commit dense first. If another session acquired a borrow after the stats
-     * snapshot, set_budget() returns the newer (higher) live pin floor. Treat
-     * that returned ceiling as authoritative, then shed the weakest optional
-     * experts until the single UMA envelope fits. Only after this reconciliation
-     * do we project expert selections or reclaim physical persistent slots. */
+    /* Commit dense first. The unconstrained allocator supplies the desired class
+     * split; rate-limit that split to one topology-derived transfer quantum per
+     * complete token sweep. Live dense pins and forced expert bytes remain hard
+     * bounds. Then reconcile expert selections against the actual dense budget. */
     uint64_t requested_dense = coli_resource_saturating_add(
         dense.pinned_bytes, selected_dense);
+    uint64_t dense_ceiling = inner->offered_cache_bytes - transient_bytes -
+                             forced_expert_bytes;
+    requested_dense = coli_v4_adaptive_resource_limit_dense_transfer(
+        planner, requested_dense, dense.pinned_bytes, dense_ceiling);
     uint64_t dense_budget = coli_v4_dense_cache_set_budget(requested_dense);
     if (dense_budget > inner->offered_cache_bytes - transient_bytes ||
         forced_expert_bytes > inner->offered_cache_bytes - transient_bytes -
@@ -513,6 +578,16 @@ static inline int coli_v4_adaptive_resource_replan_locked(
             selected_optional_experts -= candidate->resident_bytes;
         else
             selected_optional_experts = 0;
+    }
+    while (selected_optional_experts < optional_expert_limit) {
+        uint64_t available = optional_expert_limit - selected_optional_experts;
+        size_t strongest = coli_v4_adaptive_resource_strongest_unselected_expert(
+            planner, dense_count, count, available);
+        if (strongest == count) break;
+        const ColiResourceCandidate *candidate = &planner->candidates[strongest];
+        planner->candidate_selected[strongest] = 1;
+        selected_optional_experts = coli_resource_saturating_add(
+            selected_optional_experts, candidate->resident_bytes);
     }
 
     for (size_t i = dense_count; i < count; i++) {
