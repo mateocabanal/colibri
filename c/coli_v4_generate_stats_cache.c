@@ -8,6 +8,10 @@
  * Reuse order is deliberate: same-session continuation first, process-local RAM
  * second, persistent SSD third. Admission remains at the canonical
  * end-of-prefill kv_prefix_record() boundary before decode mutates target state.
+ *
+ * The same split unit owns V4 speculative generation, so package-only DSpark
+ * binds the named COLITENS compatibility source here.  Real safetensors runs
+ * continue through the original functions unchanged.
  */
 #define coli_v4_session_generate coli_v4_session_generate_uncached
 #include "deepseek_v4_internal.h"
@@ -15,6 +19,7 @@
 
 #include "coli_v4_prefix_cache.h"
 #include "coli_v4_prefix_disk.h"
+#include "coli_v4_package_tensor_source.h"
 
 #include <stddef.h>
 #include <stdio.h>
@@ -89,7 +94,21 @@ static void coli_v4_cached_kv_prefix_record(kv_prefix *prefix,
 #define kv_prefix_reuse coli_v4_cached_kv_prefix_reuse
 #define kv_prefix_record coli_v4_cached_kv_prefix_record
 #define coli_v4_session_generate coli_v4_session_generate_uncached
+#define coli_st_find coli_v4_package_source_find
+#define coli_st_read_tensor coli_v4_package_source_read_tensor
+#define coli_st_tensor_shard coli_v4_package_source_tensor_shard
+#define coli_st_read_at coli_v4_package_source_read_at
+#define coli_st_read_at_streaming coli_v4_package_source_read_at_streaming
+#define st_read_scale_f32 coli_v4_package_read_scale_f32
+#define coli_tensor_load_f32 coli_v4_package_tensor_load_f32
 #include "deepseek_v4.c"
+#undef coli_tensor_load_f32
+#undef st_read_scale_f32
+#undef coli_st_read_at_streaming
+#undef coli_st_read_at
+#undef coli_st_tensor_shard
+#undef coli_st_read_tensor
+#undef coli_st_find
 #undef coli_v4_session_generate
 #undef kv_prefix_record
 #undef kv_prefix_reuse
@@ -112,6 +131,14 @@ int coli_v4_session_generate(ColiV4Session *session,
     ColiV4PrefixCacheStats before = {0};
     ColiV4PrefixCacheStats after = {0};
     coli_v4_prefix_cache_stats(&before);
+
+    if (coli_v4_package_source_bind(
+            session && session->engine ? session->engine->coli_static : NULL)) {
+        if (error && error_size)
+            snprintf(error, error_size,
+                     "cannot bind package named-tensor source");
+        return -1;
+    }
 
     int result = coli_v4_session_generate_uncached(
         session, prompt, prompt_length, options, on_token, user_data,
