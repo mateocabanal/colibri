@@ -6,8 +6,25 @@
 #include <stdint.h>
 
 /*
- * Model-neutral bridge from a resumable prefix-cache entry into the global
- * optional-residency planner.
+ * Model-neutral inventory for one process-resident resumable prefix boundary.
+ *
+ * The cache owns entry lifetime/state bytes. The global policy owns forecasting
+ * future reuse. Keeping these raw observations separate is important: a Qwen
+ * cache hit and a V4 cache hit must not silently use different planning
+ * horizons merely because their engine-local LRU clocks happen to differ.
+ */
+typedef struct {
+    uint32_t id;
+    uint64_t resident_bytes;
+    uint64_t token_count;
+    uint64_t hit_count;
+    uint64_t last_used;
+    uint32_t references;
+} ColiPrefixHotEntryInfo;
+
+/*
+ * Model-neutral bridge from a valued resumable prefix-cache entry into the
+ * global optional-residency planner.
  *
  * The cache/state adapter owns the semantics of a reusable boundary and the
  * policy that estimates reuse over its planning horizon. This helper only
