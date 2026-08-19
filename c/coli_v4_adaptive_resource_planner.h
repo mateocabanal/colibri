@@ -298,6 +298,49 @@ static inline int coli_v4_adaptive_resource_selected(
         (key_index < planner->key_count && planner->expert_selected[key_index]);
 }
 
+/* A resource decision must be based on one coherent logical-token span. The V4
+ * activation overlay publishes one layer at a time but assigns every layer in
+ * the same routed span the same epoch. Replanning before all layers have reached
+ * that epoch lets layer 0 make a global UMA decision with no evidence for the
+ * other 42 layers. Detect completion from the tracker itself so the planner
+ * remains independent of callback ordering and loader concurrency. */
+static inline int coli_v4_adaptive_resource_epoch_complete(
+    const ColiExpertActivationTracker *tracker, const State *inner,
+    uint64_t current_epoch) {
+    if (!tracker || !inner || inner->layers < 1 || !current_epoch) return 0;
+
+    if (inner->layers <= 64) {
+        uint64_t seen = 0;
+        for (size_t slot = 0; slot < tracker->capacity; slot++) {
+            const ColiExpertActivationEntry *entry = &tracker->entries[slot];
+            if (!entry->hash_tag || entry->last_epoch != current_epoch ||
+                entry->key.layer < 0 || entry->key.layer >= inner->layers)
+                continue;
+            seen |= UINT64_C(1) << (unsigned)entry->key.layer;
+        }
+        uint64_t expected = inner->layers == 64
+            ? UINT64_MAX
+            : (UINT64_C(1) << (unsigned)inner->layers) - UINT64_C(1);
+        return seen == expected;
+    }
+
+    /* V4 is currently 43 layers, so the mask path above is the hot path. Keep a
+     * portable fallback for future deeper variants without heap allocation. */
+    for (int layer = 0; layer < inner->layers; layer++) {
+        int found = 0;
+        for (size_t slot = 0; slot < tracker->capacity; slot++) {
+            const ColiExpertActivationEntry *entry = &tracker->entries[slot];
+            if (entry->hash_tag && entry->last_epoch == current_epoch &&
+                entry->key.layer == layer) {
+                found = 1;
+                break;
+            }
+        }
+        if (!found) return 0;
+    }
+    return 1;
+}
+
 static inline int coli_v4_adaptive_resource_should_replan(
     const ColiV4AdaptiveResourcePlanner *planner,
     const ColiExpertActivationTracker *tracker,
@@ -307,9 +350,9 @@ static inline int coli_v4_adaptive_resource_should_replan(
     if (!planner->replan_count)
         return tracker->total_logical_activations >=
                policy->planner_confidence_mass;
-    if (current_epoch <= planner->last_replan_epoch) return 0;
-    return current_epoch - planner->last_replan_epoch >=
-           policy->recency_quantum_epochs;
+    /* recency_quantum_epochs is the activity half-life quantum, not an allocator
+     * cadence. Once a complete new token span is available, use it immediately. */
+    return current_epoch > planner->last_replan_epoch;
 }
 
 /* Among the optional experts tentatively selected by the shared allocator,
@@ -348,7 +391,9 @@ static inline int coli_v4_adaptive_resource_replan_locked(
     const ColiExpertActivationTracker *tracker,
     uint64_t current_epoch,
     const ColiExpertResidencyPolicyConfig *policy) {
-    if (!coli_v4_adaptive_resource_should_replan(
+    if (!coli_v4_adaptive_resource_epoch_complete(
+            tracker, inner, current_epoch) ||
+        !coli_v4_adaptive_resource_should_replan(
             planner, tracker, current_epoch, policy))
         return 0;
 
