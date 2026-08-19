@@ -57,8 +57,6 @@ static int coli_v4_cached_kv_prefix_reuse(const kv_prefix *prefix,
             v4_ds_reset_history();
     }
 #ifdef COLI_V4_ADAPTIVE_ACTIVATION
-    /* The lightweight block overlay uses this only to distinguish fresh prompt
-     * positions from decode positions. It does not inspect token values. */
     coli_v4_activation_begin_request(count, reused);
 #endif
 #ifdef COLI_V4_TRACE_ROUTE
@@ -75,43 +73,37 @@ static void coli_v4_cached_kv_prefix_record(kv_prefix *prefix,
     if (!session || !ids || count <= 0 || !session->prompt_ids ||
         session->prompt_count <= 0)
         return;
-
-    /* The end-of-prefill record is uniquely the slice of session->prompt_ids
-     * beginning at the reused position, and after kv_prefix_record the exact
-     * state coverage equals prompt_count. Decode/speculative records point at
-     * generated/input temporaries instead and therefore cannot admit here. */
     if (ids == session->prompt_ids + position &&
         prefix->len == session->prompt_count && !prefix->tainted) {
         coli_v4_prefix_cache_store(session);
-        /* If the RAM tier captured the boundary this is a cheap exact-entry
-         * check and SSD publication stays post-generation. In SSD-only mode or
-         * when RAM admission cannot fit, persist the live state now while it
-         * still denotes the canonical pre-decode prompt boundary. */
         coli_v4_prefix_disk_publish_live_prefix(session);
     }
 }
 
-/* head.weight is target state, not an MTP ancillary tensor. Keep speculative
- * target verification independent from the generic package compatibility table:
- * the latter is intentionally bounded and optimized for mtp.* discovery, while
- * the target head already has a native COLI record plus a resident BF16 cache.
- *
- * Returning this tiny descriptor lets the existing batched-head implementation
- * reuse that resident allocation directly. No head bytes are read through this
- * descriptor; scalar package decode continues to use the native COLI path. */
+/* head.weight is target state, not an MTP ancillary tensor. Package generation
+ * has already bound its ColiExecutor before entering the amalgamated generation
+ * unit, so target-head lookup must depend on that binding rather than on the
+ * contents of the non-owning safetensors sentinel installed by the runtime TU.
+ * Keeping this contract executor-based also prevents future sentinel metadata
+ * changes from silently disabling package speculative verification. */
 static ColiSafetensorsTensor g_coli_v4_package_head_tensor;
+static int g_coli_v4_package_head_cache_miss_reported;
+
+static int coli_v4_generate_package_bound(void) {
+    return g_coli_v4_package_tensor_source.executor != NULL;
+}
 
 static const ColiSafetensorsTensor *coli_v4_generate_st_find(
         const ColiSafetensorsIndex *index, const char *name) {
-    if (!coli_v4_package_source_active(index) || !name ||
-        strcmp(name, "head.weight"))
+    if (!name || strcmp(name, "head.weight") ||
+        !coli_v4_generate_package_bound())
         return coli_v4_package_source_find(index, name);
 
     const ColiExecutor *executor = g_coli_v4_package_tensor_source.executor;
-    const ColiRecordInfo *record = executor
-        ? coli_executor_record_by_name(executor, "head.weight") : NULL;
+    const ColiRecordInfo *record =
+        coli_executor_record_by_name(executor, "head.weight");
     ColiTensorInfo info;
-    const ColiPackage *package = executor ? coli_executor_package(executor) : NULL;
+    const ColiPackage *package = coli_executor_package(executor);
     if (!record || !package || record->kind != COLI_CSF_REC_TENSOR ||
         record->math_format != COLI_CSF_MATH_BF16 ||
         coli_package_tensor_info(package, record, &info, NULL, 0) ||
@@ -138,24 +130,31 @@ static int coli_v4_generate_tensor_shard(
         const ColiSafetensorsIndex *index,
         const ColiSafetensorsTensor *tensor) {
     if (tensor == &g_coli_v4_package_head_tensor &&
-        coli_v4_package_source_active(index))
+        coli_v4_generate_package_bound())
         return -2;
     return coli_v4_package_source_tensor_shard(index, tensor);
 }
 
-/* The synthetic package tensor for head.weight keeps its real COLITENS data
- * offset so ordinary named-range reads remain well-defined. The established
- * V4 resident-head cache, however, uses synthetic shard -2 with cache-relative
- * offset zero. Normalize only that synthetic shard at the cache lookup seam so
- * multi-token verification can evaluate one resident head batch instead of
- * falling back to one scalar package head pass per speculative position. */
 static const void *coli_v4_package_head_cache_data(
         const ColiV4Engine *engine, int shard,
         uint64_t offset, size_t length) {
-    if (shard == -2 && coli_v4_package_source_active(
-            engine ? engine->target_index : NULL))
+    if (shard == -2 && coli_v4_generate_package_bound())
         offset = 0;
-    return coli_v4_head_cache_data(engine, shard, offset, length);
+    const void *data = coli_v4_head_cache_data(engine, shard, offset, length);
+    if (!data && shard == -2 && coli_v4_generate_package_bound() &&
+        !g_coli_v4_package_head_cache_miss_reported) {
+        g_coli_v4_package_head_cache_miss_reported = 1;
+        fprintf(stderr,
+                "v4_spec_head cache_miss requested_shard=%d requested_offset=%llu "
+                "requested_bytes=%zu cache_shard=%d cache_offset=%llu "
+                "cache_bytes=%zu cache_data=%d\n",
+                shard, (unsigned long long)offset, length,
+                engine ? engine->head_cache.shard : 0,
+                (unsigned long long)(engine ? engine->head_cache.offset : 0),
+                engine ? engine->head_cache.bytes : 0,
+                engine && engine->head_cache.data ? 1 : 0);
+    }
+    return data;
 }
 
 #define kv_prefix_reuse coli_v4_cached_kv_prefix_reuse
@@ -208,17 +207,12 @@ int coli_v4_session_generate(ColiV4Session *session,
                      "cannot bind package named-tensor source");
         return -1;
     }
+    g_coli_v4_package_head_cache_miss_reported = 0;
 
     int result = coli_v4_session_generate_uncached(
         session, prompt, prompt_length, options, on_token, user_data,
         stats, error, error_size);
 
-    /* The process-local entry was captured before decode, so after generation
-     * it remains the exact immutable request prefix even though live attention
-     * state has advanced. Stream that pinned entry now: SSD I/O is outside TTFT
-     * and token streaming, at the cost of delaying return/DONE in this first
-     * bounded implementation. If no RAM entry existed, the end-of-prefill hook
-     * already used the live one-layer-at-a-time publisher instead. */
     if (!result)
         coli_v4_prefix_disk_publish_session(session);
 
