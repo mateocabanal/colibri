@@ -3,6 +3,7 @@
  * Physical responsibility only:
  *   file path -> persistent MTLIOFileHandle
  *   reusable buffer -> shared-storage MTLBuffer
+ *   caller-owned storage -> MTLIO loadBytes
  *   region vector -> one async MTLIOCommandBuffer + completion event
  *
  * record_io.h owns logical request/join/cancel state. Residency policy, MoE
@@ -43,6 +44,7 @@ static int64_t g_consumed_high;
 static NSRecursiveLock *g_lock;
 
 static id<MTLIOFileHandle> g_files[METALIO_MAX_FILES];
+static NSString *g_file_paths[METALIO_MAX_FILES];
 static int g_nfiles;
 
 static struct {
@@ -87,6 +89,22 @@ static void stats_reset(void) {
     atomic_store_explicit(&m_lat_total_us, 0, memory_order_relaxed);
     for (int i = 0; i < 32; i++)
         atomic_store_explicit(&m_lat_hist[i], 0, memory_order_relaxed);
+}
+
+static void account_submit(const ColiMetalioRegion *regions, int count,
+                           ColiMetalioKind kind) {
+    atomic_fetch_add_explicit(&m_loads, 1, memory_order_relaxed);
+    if (kind == MIO_LOAD_SPEC)
+        atomic_fetch_add_explicit(&m_prefetch_loads, 1, memory_order_relaxed);
+    for (int i = 0; i < count; i++)
+        atomic_fetch_add_explicit(&m_bytes, regions[i].bytes, memory_order_relaxed);
+    uint64_t outstanding =
+        atomic_fetch_add_explicit(&m_outstanding, 1, memory_order_relaxed) + 1;
+    uint64_t peak = atomic_load_explicit(&m_peak_outstanding, memory_order_relaxed);
+    while (outstanding > peak &&
+           !atomic_compare_exchange_weak_explicit(
+               &m_peak_outstanding, &peak, outstanding,
+               memory_order_relaxed, memory_order_relaxed)) {}
 }
 
 int metalio_active(void) {
@@ -149,7 +167,10 @@ void metalio_shutdown(void) {
                 (unsigned long long)(g_ev_val - 1));
     }
 
-    for (int i = 0; i < g_nfiles; i++) g_files[i] = nil;
+    for (int i = 0; i < g_nfiles; i++) {
+        g_files[i] = nil;
+        g_file_paths[i] = nil;
+    }
     for (int i = 0; i < g_nslots; i++) {
         g_slots[i].buf = nil;
         g_slots[i].bytes = 0;
@@ -174,16 +195,24 @@ int metalio_file_add(const char *path) {
     [g_lock lock];
     int file = -1;
     if (@available(macOS 13.0, *)) {
-        if (g_nfiles < METALIO_MAX_FILES) {
-            NSString *string = [NSString stringWithUTF8String:path];
-            if (string) {
+        NSString *string = [NSString stringWithUTF8String:path];
+        if (string) {
+            for (int i = 0; i < g_nfiles; i++) {
+                if (g_file_paths[i] && [g_file_paths[i] isEqualToString:string]) {
+                    file = i;
+                    break;
+                }
+            }
+            if (file < 0 && g_nfiles < METALIO_MAX_FILES) {
                 NSURL *url = [NSURL fileURLWithPath:string];
                 NSError *error = nil;
                 id<MTLIOFileHandle> handle =
                     [g_dev newIOFileHandleWithURL:url error:&error];
                 if (handle) {
                     file = g_nfiles;
-                    g_files[g_nfiles++] = handle;
+                    g_files[g_nfiles] = handle;
+                    g_file_paths[g_nfiles] = [string copy];
+                    g_nfiles++;
                     verbose("file_add: path=%s id=%d", path, file);
                 } else if (error) {
                     fprintf(stderr, "[metalio] file handle failed for %s: %s\n",
@@ -266,11 +295,14 @@ size_t metalio_slot_bytes(int slot) {
     return g_slots[slot].bytes;
 }
 
-static int regions_ok(int slot, const ColiMetalioRegion *regions, int count) {
-    if (slot < 0 || slot >= g_nslots || !g_slots[slot].in_use ||
-        !regions || count < 1)
-        return 0;
-    size_t capacity = g_slots[slot].bytes;
+static int kind_ok(ColiMetalioKind kind) {
+    return kind == MIO_LOAD_DEMAND || kind == MIO_LOAD_ASYNC ||
+           kind == MIO_LOAD_SPEC;
+}
+
+static int regions_common_ok(const ColiMetalioRegion *regions, int count,
+                             size_t capacity) {
+    if (!regions || count < 1) return 0;
     for (int i = 0; i < count; i++) {
         const ColiMetalioRegion *region = &regions[i];
         if (region->file < 0 || region->file >= g_nfiles ||
@@ -284,11 +316,15 @@ static int regions_ok(int slot, const ColiMetalioRegion *regions, int count) {
     return 1;
 }
 
+static int regions_ok(int slot, const ColiMetalioRegion *regions, int count) {
+    if (slot < 0 || slot >= g_nslots || !g_slots[slot].in_use) return 0;
+    return regions_common_ok(regions, count, g_slots[slot].bytes);
+}
+
 int64_t metalio_loadv(int slot, const ColiMetalioRegion *regions, int count,
                       ColiMetalioKind kind) {
     if (!metalio_active()) return -1;
-    if (kind != MIO_LOAD_DEMAND && kind != MIO_LOAD_ASYNC &&
-        kind != MIO_LOAD_SPEC) {
+    if (!kind_ok(kind)) {
         atomic_fetch_add_explicit(&m_fails, 1, memory_order_relaxed);
         return -1;
     }
@@ -313,25 +349,50 @@ int64_t metalio_loadv(int slot, const ColiMetalioRegion *regions, int count,
                 atomic_store_explicit(&g_slots[slot].last_event,
                                       (int64_t)value, memory_order_release);
                 event = (int64_t)value;
-
-                atomic_fetch_add_explicit(&m_loads, 1, memory_order_relaxed);
-                if (kind == MIO_LOAD_SPEC)
-                    atomic_fetch_add_explicit(&m_prefetch_loads, 1,
-                                              memory_order_relaxed);
-                for (int i = 0; i < count; i++)
-                    atomic_fetch_add_explicit(&m_bytes, regions[i].bytes,
-                                              memory_order_relaxed);
-                uint64_t outstanding =
-                    atomic_fetch_add_explicit(&m_outstanding, 1,
-                                              memory_order_relaxed) + 1;
-                uint64_t peak = atomic_load_explicit(&m_peak_outstanding,
-                                                     memory_order_relaxed);
-                while (outstanding > peak &&
-                       !atomic_compare_exchange_weak_explicit(
-                           &m_peak_outstanding, &peak, outstanding,
-                           memory_order_relaxed, memory_order_relaxed)) {}
+                account_submit(regions, count, kind);
                 verbose("submit: buffer=%d regions=%d event=%llu intent=%d",
                         slot, count, (unsigned long long)value, (int)kind);
+            }
+        }
+    }
+    [g_lock unlock];
+
+    if (event <= 0)
+        atomic_fetch_add_explicit(&m_fails, 1, memory_order_relaxed);
+    return event;
+}
+
+static int64_t metalio_loadv_ptr(void *destination, size_t destination_bytes,
+                                 const ColiMetalioRegion *regions, int count,
+                                 ColiMetalioKind kind) {
+    if (!metalio_active() || !destination || !destination_bytes) return -1;
+    if (!kind_ok(kind)) {
+        atomic_fetch_add_explicit(&m_fails, 1, memory_order_relaxed);
+        return -1;
+    }
+
+    [g_lock lock];
+    int64_t event = -1;
+    if (@available(macOS 13.0, *)) {
+        if (regions_common_ok(regions, count, destination_bytes)) {
+            id<MTLIOCommandBuffer> command = [g_iq commandBuffer];
+            if (command) {
+                unsigned char *base = (unsigned char *)destination;
+                for (int i = 0; i < count; i++) {
+                    const ColiMetalioRegion *region = &regions[i];
+                    [command loadBytes:base + (size_t)region->dst_off
+                                 size:region->bytes
+                         sourceHandle:g_files[region->file]
+                    sourceHandleOffset:region->src_off];
+                }
+                uint64_t value = g_ev_val++;
+                [command signalEvent:g_ev value:value];
+                [command commit];
+                event = (int64_t)value;
+                account_submit(regions, count, kind);
+                verbose("submit_ptr: dst=%p bytes=%zu regions=%d event=%llu intent=%d",
+                        destination, destination_bytes, count,
+                        (unsigned long long)value, (int)kind);
             }
         }
     }
@@ -497,6 +558,22 @@ static ColiRecordIoBackendEvent metal_backend_submitv(
     return (ColiRecordIoBackendEvent)metalio_loadv(
         (int)buffer, (const ColiMetalioRegion *)regions, count, kind);
 }
+static ColiRecordIoBackendEvent metal_backend_submitv_ptr(
+        void *context, void *destination, size_t destination_bytes,
+        const ColiRecordIoBackendRegion *regions, int count,
+        ColiRecordIoBackendIntent intent) {
+    (void)context;
+    ColiMetalioKind kind;
+    switch (intent) {
+        case COLI_RECORD_IO_INTENT_DEMAND: kind = MIO_LOAD_DEMAND; break;
+        case COLI_RECORD_IO_INTENT_ASYNC: kind = MIO_LOAD_ASYNC; break;
+        case COLI_RECORD_IO_INTENT_SPECULATIVE: kind = MIO_LOAD_SPEC; break;
+        default: return COLI_RECORD_IO_BACKEND_INVALID_EVENT;
+    }
+    return (ColiRecordIoBackendEvent)metalio_loadv_ptr(
+        destination, destination_bytes,
+        (const ColiMetalioRegion *)regions, count, kind);
+}
 static int metal_backend_wait(void *context, ColiRecordIoBackendEvent event) {
     (void)context;
     return metalio_wait((int64_t)event);
@@ -541,7 +618,8 @@ static const ColiRecordIoBackendOps g_metal_backend_ops = {
     .capabilities = COLI_RECORD_IO_CAP_ASYNC |
                     COLI_RECORD_IO_CAP_VECTORED |
                     COLI_RECORD_IO_CAP_CPU_VISIBLE_BUFFER |
-                    COLI_RECORD_IO_CAP_DEVICE_VISIBLE_BUFFER,
+                    COLI_RECORD_IO_CAP_DEVICE_VISIBLE_BUFFER |
+                    COLI_RECORD_IO_CAP_DIRECT_POINTER,
     .init = metal_backend_init,
     .shutdown = metal_backend_shutdown,
     .active = metal_backend_active,
@@ -551,6 +629,7 @@ static const ColiRecordIoBackendOps g_metal_backend_ops = {
     .buffer_ptr = metal_backend_buffer_ptr,
     .buffer_bytes = metal_backend_buffer_bytes,
     .submitv = metal_backend_submitv,
+    .submitv_ptr = metal_backend_submitv_ptr,
     .wait = metal_backend_wait,
     .buffer_consumed = metal_backend_consumed,
     .buffer_discarded = metal_backend_discarded,
@@ -565,4 +644,22 @@ static ColiRecordIoBackend g_metal_backend = {
 
 ColiRecordIoBackend *coli_record_io_metal_default(void) {
     return &g_metal_backend;
+}
+
+/* Platform-default policy. Apple Silicon selects MetalIO automatically once
+ * the provider has passed its target validation gate. `COLI_RECORD_IO=pread`
+ * (or off/0) is the generic A/B and emergency-disable control. Intel macOS can
+ * still request MetalIO explicitly with COLI_RECORD_IO=metalio. */
+ColiRecordIoBackend *coli_record_io_platform_default(void) {
+    const char *policy = getenv("COLI_RECORD_IO");
+    if (policy && (!strcmp(policy, "pread") || !strcmp(policy, "off") ||
+                   !strcmp(policy, "0")))
+        return NULL;
+    if (policy && !strcmp(policy, "metalio")) return &g_metal_backend;
+    if (policy && strcmp(policy, "auto")) return NULL;
+#if defined(__aarch64__) || defined(__arm64__)
+    return &g_metal_backend;
+#else
+    return NULL;
+#endif
 }
