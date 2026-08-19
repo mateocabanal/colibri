@@ -5,7 +5,6 @@ session and model-native prompt renderers that back ``coli serve``.  The Engine
 class is stdin/stdout only; HTTP remains a separate transport owned exclusively
 by the serve/web commands.
 """
-import codecs
 import os
 import sys
 import threading
@@ -251,11 +250,19 @@ def install(core):
 
                 if hard_interrupt:
                     raise KeyboardInterrupt
-                # Give a cancelled turn a bounded chance to consume the engine's
-                # DONE/CANCEL frame before the next prompt.  Engine.close() remains
-                # the final cleanup if the child is unhealthy.
+                # A session is serialized by design. If a cancelled request does
+                # not reach DONE/CANCEL promptly, do not accept another prompt on
+                # the same pipe and risk overlapping generations; close the child.
                 if worker.is_alive():
                     worker.join(2.0)
+                    if worker.is_alive():
+                        thinking_spinner.stop()
+                        reasoning.close()
+                        if not raw_answer:
+                            md.close()
+                        messages.pop()
+                        print(f"\n  {C.yel}[engine did not acknowledge cancellation; closing this session]{C.r}")
+                        break
 
                 thinking_spinner.stop()
                 reasoning.close()
