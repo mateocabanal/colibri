@@ -11,9 +11,9 @@
 #include "qwen_prefix_cache_global_6.inc"
 #include "qwen_prefix_cache_global_7.inc"
 
-/* qwen_moe.c includes route_trace.h before this wrapper. The adapter therefore
- * wraps the existing semantic route seam without changing the model engine's
- * math or duplicating residency policy. Prefix-cache-only unit tests include
+/* qwen_moe.c includes route_trace.h before this wrapper. The adapters therefore
+ * wrap the existing semantic/physical seams without changing model math or
+ * duplicating residency/resource policy. Prefix-cache-only unit tests include
  * this wrapper without instantiating the engine, so keep their -Werror builds
  * from treating adapter-only static helpers as dead-code failures. */
 #if defined(__GNUC__) || defined(__clang__)
@@ -21,6 +21,7 @@
 #pragma GCC diagnostic ignored "-Wunused-function"
 #endif
 #include "qwen_adaptive_residency_adapter.h"
+#include "qwen_adaptive_resource_budget_adapter.h"
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic pop
 #endif
