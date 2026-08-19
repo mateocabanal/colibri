@@ -23,6 +23,8 @@
 
 #include <stddef.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 #ifdef main
 #undef main
@@ -89,16 +91,54 @@ static void coli_v4_cached_kv_prefix_record(kv_prefix *prefix,
 static ColiSafetensorsTensor g_coli_v4_package_head_tensor;
 static int g_coli_v4_package_head_cache_miss_reported;
 static int g_coli_v4_package_head_lookup_miss_reported;
+static unsigned g_coli_v4_mtp_trace_count;
 
 static int coli_v4_generate_package_bound(void) {
     return g_coli_v4_package_tensor_source.executor != NULL;
 }
 
+static int coli_v4_mtp_name(const char *name) {
+    return name && !strncmp(name, "mtp.", 4);
+}
+
+static int coli_v4_mtp_trace_enabled(void) {
+    const char *value = getenv("V4_MTP_TRACE");
+    return value && atoi(value) != 0;
+}
+
+static void coli_v4_mtp_trace_tensor(const ColiSafetensorsTensor *tensor,
+                                     const char *name) {
+    if (!coli_v4_mtp_trace_enabled() || g_coli_v4_mtp_trace_count >= 64) return;
+    g_coli_v4_mtp_trace_count++;
+    if (!tensor) {
+        fprintf(stderr, "[MTP] package tensor lookup failed: %s\n",
+                name ? name : "<null>");
+        return;
+    }
+    fprintf(stderr,
+            "[MTP] package tensor name=%s dtype=%d rank=%d numel=%lld bytes=%lld",
+            name, tensor->dtype, tensor->rank,
+            (long long)tensor->numel, (long long)tensor->nbytes);
+    for (int i = 0; i < tensor->rank && i < 4; i++)
+        fprintf(stderr, "%s%lld", i ? "x" : " shape=",
+                (long long)tensor->shape[i]);
+    fputc('\n', stderr);
+}
+
 static const ColiSafetensorsTensor *coli_v4_generate_st_find(
         const ColiSafetensorsIndex *index, const char *name) {
     if (!name || strcmp(name, "head.weight") ||
-        !coli_v4_generate_package_bound())
-        return coli_v4_package_source_find(index, name);
+        !coli_v4_generate_package_bound()) {
+        const ColiSafetensorsTensor *tensor =
+            coli_v4_package_source_find(index, name);
+        if (coli_v4_generate_package_bound() && coli_v4_mtp_name(name)) {
+            if (!tensor)
+                fprintf(stderr, "[MTP] package tensor lookup failed: %s\n", name);
+            else
+                coli_v4_mtp_trace_tensor(tensor, name);
+        }
+        return tensor;
+    }
 
     const ColiExecutor *executor = g_coli_v4_package_tensor_source.executor;
     const ColiRecordInfo *record =
@@ -152,6 +192,38 @@ static const ColiSafetensorsTensor *coli_v4_generate_st_find(
     return &g_coli_v4_package_head_tensor;
 }
 
+static int coli_v4_generate_read_tensor(
+        const ColiSafetensorsIndex *index,
+        const ColiSafetensorsTensor *tensor, void *destination) {
+    int result = coli_v4_package_source_read_tensor(index, tensor, destination);
+    if (result && tensor && coli_v4_mtp_name(tensor->name))
+        fprintf(stderr, "[MTP] package tensor read failed: %s bytes=%lld\n",
+                tensor->name, (long long)tensor->nbytes);
+    return result;
+}
+
+static int64_t coli_v4_generate_read_scale_f32(
+        ColiSafetensorsIndex *index, const char *name,
+        float *out, int64_t cap, int drop) {
+    int64_t result = coli_v4_package_read_scale_f32(index, name, out, cap, drop);
+    if (result != cap && coli_v4_mtp_name(name))
+        fprintf(stderr,
+                "[MTP] package scale read failed: %s got=%lld expected=%lld\n",
+                name, (long long)result, (long long)cap);
+    return result;
+}
+
+static int coli_v4_generate_tensor_load_f32(
+        ColiFloatTensor *output, const ColiSafetensorsIndex *index,
+        const char *name, char *error, size_t error_size) {
+    int result = coli_v4_package_tensor_load_f32(
+        output, index, name, error, error_size);
+    if (result && coli_v4_mtp_name(name))
+        fprintf(stderr, "[MTP] package float load failed: %s reason=%s\n",
+                name, error && error[0] ? error : "unknown");
+    return result;
+}
+
 static int coli_v4_generate_tensor_shard(
         const ColiSafetensorsIndex *index,
         const ColiSafetensorsTensor *tensor) {
@@ -187,12 +259,12 @@ static const void *coli_v4_package_head_cache_data(
 #define kv_prefix_record coli_v4_cached_kv_prefix_record
 #define coli_v4_session_generate coli_v4_session_generate_uncached
 #define coli_st_find coli_v4_generate_st_find
-#define coli_st_read_tensor coli_v4_package_source_read_tensor
+#define coli_st_read_tensor coli_v4_generate_read_tensor
 #define coli_st_tensor_shard coli_v4_generate_tensor_shard
 #define coli_st_read_at coli_v4_package_source_read_at
 #define coli_st_read_at_streaming coli_v4_package_source_read_at_streaming
-#define st_read_scale_f32 coli_v4_package_read_scale_f32
-#define coli_tensor_load_f32 coli_v4_package_tensor_load_f32
+#define st_read_scale_f32 coli_v4_generate_read_scale_f32
+#define coli_tensor_load_f32 coli_v4_generate_tensor_load_f32
 #define coli_v4_head_cache_data coli_v4_package_head_cache_data
 #include "deepseek_v4.c"
 #undef coli_v4_head_cache_data
@@ -235,6 +307,7 @@ int coli_v4_session_generate(ColiV4Session *session,
     }
     g_coli_v4_package_head_cache_miss_reported = 0;
     g_coli_v4_package_head_lookup_miss_reported = 0;
+    g_coli_v4_mtp_trace_count = 0;
 
     int result = coli_v4_session_generate_uncached(
         session, prompt, prompt_length, options, on_token, user_data,
