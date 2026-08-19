@@ -11,19 +11,46 @@
  * memory and an optional total budget. Qwen contributes the already-measured
  * physical expert size and its prefix-cache reserve. No Qwen model geometry or
  * guessed bytes-per-slot enters the budget decision.
+ *
+ * Qwen's legacy physical cache does not yet expose an exact global count of
+ * reclaimable resident expert bytes. Therefore compute the optional byte
+ * envelope once, when the first real expert size is known, and keep it stable
+ * for that model lifetime. Re-probing OS headroom every policy replan would
+ * charge already-resident experts twice. Future shared residency-manager leases
+ * can feed `current_optional_resident_bytes` and make the envelope dynamic.
  */
-static int qwen_adaptive_resource_budget_plan(
+typedef struct {
+    void *model;
+    uint64_t resident_bytes_per_expert;
+    uint64_t persistent_budget_bytes;
+    uint64_t system_reserve_bytes;
+    int used_explicit_total;
+    int valid;
+} ColiQwenAdaptiveBudgetCache;
+
+static ColiQwenAdaptiveBudgetCache g_qwen_adaptive_budget;
+
+static int qwen_adaptive_resource_budget_resolve(
     void *model, uint64_t resident_bytes_per_expert,
-    uint64_t transient_slots) {
-    if (!model || !resident_bytes_per_expert) return 0;
+    uint64_t transient_slots, ColiMoeResourceBudget *out) {
+    if (!model || !resident_bytes_per_expert || !out) return -1;
+    if (g_qwen_adaptive_budget.valid &&
+        g_qwen_adaptive_budget.model == model &&
+        g_qwen_adaptive_budget.resident_bytes_per_expert ==
+            resident_bytes_per_expert) {
+        *out = (ColiMoeResourceBudget){
+            .system_reserve_bytes = g_qwen_adaptive_budget.system_reserve_bytes,
+            .persistent_budget_bytes =
+                g_qwen_adaptive_budget.persistent_budget_bytes,
+            .persistent_slots = g_qwen_adaptive_budget.persistent_budget_bytes /
+                resident_bytes_per_expert,
+            .used_explicit_total = g_qwen_adaptive_budget.used_explicit_total,
+        };
+        return 0;
+    }
 
     uint64_t available = coli_runtime_available_memory_bytes();
-    if (!available) {
-        /* If the platform cannot report availability, retain the existing
-         * bounded adapter behavior rather than inventing a byte budget. */
-        return (qwen_adaptive_adapter_maybe_plan)(
-            model, resident_bytes_per_expert, transient_slots);
-    }
+    if (!available) return -1;
 
     uint64_t explicit_total = coli_runtime_parse_decimal_gb(getenv("RAM_GB"));
     uint64_t rss = coli_runtime_process_resident_bytes();
@@ -45,23 +72,46 @@ static int qwen_adaptive_resource_budget_plan(
 
     /* Reserve the normal serve-prefix allowance even before the first snapshot
      * materializes. On non-serve runs this is conservative by a small fixed
-     * amount and prevents experts from consuming memory the shared prefix tier
-     * may need later. */
+     * amount and prevents experts from consuming memory the prefix tier may
+     * need later. */
     uint64_t prefix_reserve = (uint64_t)qwen_prefix_cache_budget_for_serve();
 
     ColiMoeResourceBudgetInputs inputs = {
         .available_bytes = available,
         .process_resident_bytes = rss,
         .explicit_total_bytes = explicit_total,
+        .current_optional_resident_bytes = 0,
         .other_optional_reserve_bytes = prefix_reserve,
         .resident_bytes_per_expert = resident_bytes_per_expert,
         .transient_slots = transient_slots,
         .max_persistent_slots = max_slots,
     };
+    if (coli_moe_resource_budget_compute(out, &inputs) != 0) return -1;
+
+    g_qwen_adaptive_budget = (ColiQwenAdaptiveBudgetCache){
+        .model = model,
+        .resident_bytes_per_expert = resident_bytes_per_expert,
+        .persistent_budget_bytes = out->persistent_budget_bytes,
+        .system_reserve_bytes = out->system_reserve_bytes,
+        .used_explicit_total = out->used_explicit_total,
+        .valid = 1,
+    };
+    return 0;
+}
+
+static int qwen_adaptive_resource_budget_plan(
+    void *model, uint64_t resident_bytes_per_expert,
+    uint64_t transient_slots) {
+    if (!model || !resident_bytes_per_expert) return 0;
+
     ColiMoeResourceBudget budget;
-    if (coli_moe_resource_budget_compute(&budget, &inputs) != 0)
+    if (qwen_adaptive_resource_budget_resolve(
+            model, resident_bytes_per_expert, transient_slots, &budget) != 0) {
+        /* If the platform cannot report a safe byte envelope, retain Qwen's
+         * existing bounded physical behavior rather than inventing one. */
         return (qwen_adaptive_adapter_maybe_plan)(
             model, resident_bytes_per_expert, transient_slots);
+    }
 
     int changed = 0;
     pthread_mutex_lock(&g_qwen_adaptive.mutex);
