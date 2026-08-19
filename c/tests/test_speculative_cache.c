@@ -87,11 +87,10 @@ int main(void) {
         ColiSpecProposer proposer = {
             COLI_SPEC_SOURCE_OUTPUT_CACHE, &ctx, coli_spec_cache_proposer
         };
-        ColiSpecProposal proposal = coli_spec_propose(&proposer,
-                                                      history,
-                                                      sizeof(history) / sizeof(history[0]),
-                                                      out,
-                                                      2);
+        ColiSpecProposalRequest request = {
+            history, sizeof(history) / sizeof(history[0]), 1234
+        };
+        ColiSpecProposal proposal = coli_spec_propose(&proposer, &request, out, 2);
         check(proposal.source == COLI_SPEC_SOURCE_OUTPUT_CACHE,
               "proposal retains source identity");
         check(proposal.token_count == 2 && out[0] == 6 && out[1] == 7,
