@@ -91,6 +91,58 @@ static void coli_v4_cached_kv_prefix_record(kv_prefix *prefix,
     }
 }
 
+/* head.weight is target state, not an MTP ancillary tensor. Keep speculative
+ * target verification independent from the generic package compatibility table:
+ * the latter is intentionally bounded and optimized for mtp.* discovery, while
+ * the target head already has a native COLI record plus a resident BF16 cache.
+ *
+ * Returning this tiny descriptor lets the existing batched-head implementation
+ * reuse that resident allocation directly. No head bytes are read through this
+ * descriptor; scalar package decode continues to use the native COLI path. */
+static ColiSafetensorsTensor g_coli_v4_package_head_tensor;
+
+static const ColiSafetensorsTensor *coli_v4_generate_st_find(
+        const ColiSafetensorsIndex *index, const char *name) {
+    if (!coli_v4_package_source_active(index) || !name ||
+        strcmp(name, "head.weight"))
+        return coli_v4_package_source_find(index, name);
+
+    const ColiExecutor *executor = g_coli_v4_package_tensor_source.executor;
+    const ColiRecordInfo *record = executor
+        ? coli_executor_record_by_name(executor, "head.weight") : NULL;
+    ColiTensorInfo info;
+    const ColiPackage *package = executor ? coli_executor_package(executor) : NULL;
+    if (!record || !package || record->kind != COLI_CSF_REC_TENSOR ||
+        record->math_format != COLI_CSF_MATH_BF16 ||
+        coli_package_tensor_info(package, record, &info, NULL, 0) ||
+        info.rank != 2 || info.data_stored_bytes > INT64_MAX)
+        return NULL;
+
+    int64_t numel = 0;
+    if (coli_v4_package_tensor_numel(&info, &numel)) return NULL;
+    memset(&g_coli_v4_package_head_tensor, 0,
+           sizeof(g_coli_v4_package_head_tensor));
+    g_coli_v4_package_head_tensor.name = (char *)record->name;
+    g_coli_v4_package_head_tensor.fd = INT_MIN;
+    g_coli_v4_package_head_tensor.off = 0;
+    g_coli_v4_package_head_tensor.nbytes = (int64_t)info.data_stored_bytes;
+    g_coli_v4_package_head_tensor.dtype = COLI_ST_BF16;
+    g_coli_v4_package_head_tensor.numel = numel;
+    g_coli_v4_package_head_tensor.rank = 2;
+    g_coli_v4_package_head_tensor.shape[0] = (int64_t)info.dims[0];
+    g_coli_v4_package_head_tensor.shape[1] = (int64_t)info.dims[1];
+    return &g_coli_v4_package_head_tensor;
+}
+
+static int coli_v4_generate_tensor_shard(
+        const ColiSafetensorsIndex *index,
+        const ColiSafetensorsTensor *tensor) {
+    if (tensor == &g_coli_v4_package_head_tensor &&
+        coli_v4_package_source_active(index))
+        return -2;
+    return coli_v4_package_source_tensor_shard(index, tensor);
+}
+
 /* The synthetic package tensor for head.weight keeps its real COLITENS data
  * offset so ordinary named-range reads remain well-defined. The established
  * V4 resident-head cache, however, uses synthetic shard -2 with cache-relative
@@ -109,9 +161,9 @@ static const void *coli_v4_package_head_cache_data(
 #define kv_prefix_reuse coli_v4_cached_kv_prefix_reuse
 #define kv_prefix_record coli_v4_cached_kv_prefix_record
 #define coli_v4_session_generate coli_v4_session_generate_uncached
-#define coli_st_find coli_v4_package_source_find
+#define coli_st_find coli_v4_generate_st_find
 #define coli_st_read_tensor coli_v4_package_source_read_tensor
-#define coli_st_tensor_shard coli_v4_package_source_tensor_shard
+#define coli_st_tensor_shard coli_v4_generate_tensor_shard
 #define coli_st_read_at coli_v4_package_source_read_at
 #define coli_st_read_at_streaming coli_v4_package_source_read_at_streaming
 #define st_read_scale_f32 coli_v4_package_read_scale_f32
