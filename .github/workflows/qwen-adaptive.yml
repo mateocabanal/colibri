@@ -60,11 +60,19 @@ jobs:
           QWENMOE_MAX_NEW=8 \
           c/qwen_moe c/qwen_moe_tiny 2 >legacy.out 2>legacy.log
 
-          cmp adaptive.out legacy.out
-
           python - <<'PY'
           import re
           from pathlib import Path
+
+          def generated_ids(path: str) -> list[int]:
+              ids = []
+              for line in Path(path).read_text().splitlines():
+                  match = re.fullmatch(r'ID\s+(\d+)', line.strip())
+                  if match:
+                      ids.append(int(match.group(1)))
+              if not ids:
+                  raise SystemExit(f'{path}: missing generated ID rows')
+              return ids
 
           def request_counter(path: str, name: str) -> int:
               lines = [
@@ -78,11 +86,19 @@ jobs:
                   raise SystemExit(f'{path}: missing {name} in request profile row')
               return int(match.group(1))
 
+          adaptive_ids = generated_ids('adaptive.out')
+          legacy_ids = generated_ids('legacy.out')
+          if adaptive_ids != legacy_ids:
+              raise SystemExit(
+                  f'adaptive changed generated tokens: {adaptive_ids} != {legacy_ids}'
+              )
+
           adaptive_loads = request_counter('adaptive.log', 'expert_loads')
           legacy_loads = request_counter('legacy.log', 'expert_loads')
           adaptive_hits = request_counter('adaptive.log', 'cache_hits')
           legacy_hits = request_counter('legacy.log', 'cache_hits')
           print(
+              f'generated={adaptive_ids}; '
               f'adaptive expert_loads={adaptive_loads} cache_hits={adaptive_hits}; '
               f'legacy expert_loads={legacy_loads} cache_hits={legacy_hits}'
           )
