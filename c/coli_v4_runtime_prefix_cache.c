@@ -22,6 +22,30 @@
 #include "coli_v4_package_tensor_source.h"
 
 #include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+static int coli_v4_package_mtp_probe(const ColiExecutor *executor) {
+    static const char *required[] = {
+        "mtp.0.main_proj.weight",
+        "mtp.0.main_proj.scale",
+        "mtp.1.attn.wq_a.weight",
+        "mtp.1.attn.wq_a.scale",
+        "mtp.2.attn.wq_a.weight",
+        "mtp.2.attn.wq_a.scale",
+        "mtp.2.confidence_head.proj.weight",
+        "mtp.2.markov_head.markov_w1.weight",
+        "mtp.2.markov_head.markov_w2.weight",
+    };
+    if (!executor) return 0;
+    for (size_t i = 0; i < sizeof(required) / sizeof(required[0]); i++) {
+        const ColiRecordInfo *record =
+            coli_executor_record_by_name(executor, required[i]);
+        if (!record || record->kind != COLI_CSF_REC_TENSOR)
+            return 0;
+    }
+    return 1;
+}
 
 /* Intercept the executor acquire at the exact point engine->coli_static becomes
  * available.  For package-only opens, install a non-owning sentinel index so
@@ -45,8 +69,19 @@ static int coli_v4_package_executor_open_bridge(
     }
     ColiV4Engine *engine = (ColiV4Engine *)((char *)out -
         offsetof(ColiV4Engine, coli_static));
-    if (!engine->target_index)
+    if (!engine->target_index) {
         engine->target_index = coli_v4_package_source_sentinel();
+        const char *mtp = getenv("V4_MTP");
+        const char *draft = getenv("V4_DRAFT");
+        if (mtp && atoi(mtp) != 0 && draft && atoi(draft) > 0) {
+            int profile = coli_v4_package_mtp_probe(*out);
+            fprintf(stderr,
+                    "v4_coli dspark_source=package-named-tensors mtp_probe=%s "
+                    "validation=%s\n",
+                    profile ? "present" : "missing",
+                    profile ? "deferred-to-dspark-loader" : "target-only");
+        }
+    }
     return 0;
 }
 
