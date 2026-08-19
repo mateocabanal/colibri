@@ -312,6 +312,36 @@ static inline int coli_v4_adaptive_resource_should_replan(
            policy->recency_quantum_epochs;
 }
 
+/* Among the optional experts tentatively selected by the shared allocator,
+ * identify the least valuable one using the inverse of the allocator's exact
+ * deterministic ordering. This is used only when a concurrent dense borrower
+ * raises the live pin floor after our snapshot and before budget commit. */
+static inline size_t coli_v4_adaptive_resource_weakest_selected_expert(
+    const ColiV4AdaptiveResourcePlanner *planner,
+    size_t dense_count, size_t count) {
+    size_t weakest = count;
+    if (!planner) return weakest;
+    for (size_t i = dense_count; i < count; i++) {
+        if (!planner->candidate_selected[i]) continue;
+        const ColiResourceCandidate *candidate = &planner->candidates[i];
+        if (candidate->kind != COLI_RESOURCE_PERSISTENT_EXPERT) continue;
+        if (weakest == count) {
+            weakest = i;
+            continue;
+        }
+        const ColiResourceCandidate *incumbent = &planner->candidates[weakest];
+        int ratio = coli_resource_ratio_compare(
+            candidate->expected_bytes_avoided, candidate->resident_bytes,
+            incumbent->expected_bytes_avoided, incumbent->resident_bytes);
+        if (ratio < 0 ||
+            (ratio == 0 &&
+             (candidate->id > incumbent->id ||
+              (candidate->id == incumbent->id && i > weakest))))
+            weakest = i;
+    }
+    return weakest;
+}
+
 /* Called with the base expert-store mutex held. */
 static inline int coli_v4_adaptive_resource_replan_locked(
     ColiV4AdaptiveResourcePlanner *planner, State *inner,
@@ -409,16 +439,46 @@ static inline int coli_v4_adaptive_resource_replan_locked(
                 selected_dense, candidate->resident_bytes);
         } else if (candidate->kind == COLI_RESOURCE_PERSISTENT_EXPERT &&
                    candidate->id < planner->key_count) {
-            planner->expert_selected[candidate->id] = 1;
             selected_optional_experts = coli_resource_saturating_add(
                 selected_optional_experts, candidate->resident_bytes);
         }
     }
 
-    coli_v4_adaptive_resource_reclaim_locked(planner, inner);
-    uint64_t dense_budget = coli_resource_saturating_add(
+    /* Commit dense first. If another session acquired a borrow after the stats
+     * snapshot, set_budget() returns the newer (higher) live pin floor. Treat
+     * that returned ceiling as authoritative, then shed the weakest optional
+     * experts until the single UMA envelope fits. Only after this reconciliation
+     * do we project expert selections or reclaim physical persistent slots. */
+    uint64_t requested_dense = coli_resource_saturating_add(
         dense.pinned_bytes, selected_dense);
-    dense_budget = coli_v4_dense_cache_set_budget(dense_budget);
+    uint64_t dense_budget = coli_v4_dense_cache_set_budget(requested_dense);
+    if (dense_budget > inner->offered_cache_bytes - transient_bytes ||
+        forced_expert_bytes > inner->offered_cache_bytes - transient_bytes -
+                              dense_budget)
+        return -1;
+    uint64_t optional_expert_limit = inner->offered_cache_bytes -
+        transient_bytes - dense_budget - forced_expert_bytes;
+    while (selected_optional_experts > optional_expert_limit) {
+        size_t weakest = coli_v4_adaptive_resource_weakest_selected_expert(
+            planner, dense_count, count);
+        if (weakest == count) return -1;
+        const ColiResourceCandidate *candidate = &planner->candidates[weakest];
+        planner->candidate_selected[weakest] = 0;
+        if (selected_optional_experts >= candidate->resident_bytes)
+            selected_optional_experts -= candidate->resident_bytes;
+        else
+            selected_optional_experts = 0;
+    }
+
+    for (size_t i = dense_count; i < count; i++) {
+        if (!planner->candidate_selected[i]) continue;
+        const ColiResourceCandidate *candidate = &planner->candidates[i];
+        if (candidate->kind == COLI_RESOURCE_PERSISTENT_EXPERT &&
+            candidate->id < planner->key_count)
+            planner->expert_selected[candidate->id] = 1;
+    }
+    coli_v4_adaptive_resource_reclaim_locked(planner, inner);
+
     inner->dense_cache_budget_bytes = dense_budget;
     planner->selected_dense_bytes = dense_budget;
     planner->selected_expert_bytes = coli_resource_saturating_add(
