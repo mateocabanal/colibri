@@ -4,6 +4,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "prefix_hot_resource.h"
+
 typedef struct ColiV4Engine ColiV4Engine;
 typedef struct ColiV4Session ColiV4Session;
 typedef struct ColiV4AttentionSnapshot ColiV4AttentionSnapshot;
@@ -35,6 +37,18 @@ int coli_v4_prefix_cache_restore(ColiV4Session *session,
 void coli_v4_prefix_cache_store(ColiV4Session *session);
 void coli_v4_prefix_cache_forget_engine(ColiV4Engine *engine);
 void coli_v4_prefix_cache_stats(ColiV4PrefixCacheStats *stats);
+
+/* Planner-facing RAM-hot inventory. The return value is the total number of
+ * visible entries, even when CAPACITY is smaller, so callers can size/retry
+ * without exposing the V4-native snapshot representation. */
+size_t coli_v4_prefix_cache_hot_inventory(ColiPrefixHotEntryInfo *entries,
+                                          size_t capacity);
+
+/* Apply the optional RAM-hot bytes selected by the global planner. The V4
+ * compatibility/common cache policy remains an upper bound. Ref-pinned restore
+ * entries and in-flight snapshot reservations become a temporary mandatory
+ * floor rather than being invalidated. Returns the effective budget. */
+size_t coli_v4_prefix_cache_apply_planner_budget(size_t selected_bytes);
 
 /* Borrow the exact end-of-prefill RAM entry for SESSION's retained prompt.
  * The callback runs outside the cache mutex while the entry is ref-pinned, so
