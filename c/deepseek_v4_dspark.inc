@@ -997,7 +997,10 @@ static int v4_ds_heads(ColiV4Engine *engine,
     const ColiSafetensorsTensor *head = coli_st_find(index, "head.weight");
     if (!head || head->dtype != COLI_ST_BF16) return -1;
     int head_shard = coli_st_tensor_shard(index, head);
-    if (head_shard < 0 || head->off < 0) return -1;
+    /* Package-only COLI exposes the resident BF16 head as synthetic shard -2.
+     * The head-cache adapter understands that sentinel, so reject only other
+     * negative shard values here. */
+    if ((head_shard < 0 && head_shard != -2) || head->off < 0) return -1;
     uint64_t head_offset = (uint64_t)head->off;
     int hidden = config->hidden_size;
     int vocab = config->vocab_size;
