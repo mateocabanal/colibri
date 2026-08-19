@@ -27,12 +27,8 @@ typedef int64_t ColiRecordIoBackendEvent;
 #define COLI_RECORD_IO_BACKEND_INVALID_EVENT  ((ColiRecordIoBackendEvent)-1)
 
 typedef enum {
-    /* Required by the current execution point. The caller may still choose to
-     * submit early and wait later; intent describes value, not wait policy. */
     COLI_RECORD_IO_INTENT_DEMAND = 0,
-    /* Exact/non-speculative read issued ahead of its first consumer. */
     COLI_RECORD_IO_INTENT_ASYNC = 1,
-    /* Prediction/read-ahead that may never be consumed. */
     COLI_RECORD_IO_INTENT_SPECULATIVE = 2,
 } ColiRecordIoBackendIntent;
 
@@ -41,6 +37,9 @@ typedef enum {
     COLI_RECORD_IO_CAP_VECTORED = 1u << 1,
     COLI_RECORD_IO_CAP_CPU_VISIBLE_BUFFER = 1u << 2,
     COLI_RECORD_IO_CAP_DEVICE_VISIBLE_BUFFER = 1u << 3,
+    /* Backend can submit reads directly into caller-owned CPU-addressable
+     * storage. The caller keeps that storage alive until completion. */
+    COLI_RECORD_IO_CAP_DIRECT_POINTER = 1u << 4,
 } ColiRecordIoBackendCapability;
 
 typedef struct {
@@ -73,6 +72,7 @@ typedef struct ColiRecordIoBackendOps {
     void (*shutdown)(void *context);
     int (*active)(void *context);
 
+    /* Providers should make repeated file_add(path) calls idempotent. */
     ColiRecordIoBackendFile (*file_add)(void *context, const char *path);
 
     ColiRecordIoBackendBuffer (*buffer_alloc)(void *context, size_t max_bytes);
@@ -84,9 +84,16 @@ typedef struct ColiRecordIoBackendOps {
         void *context, ColiRecordIoBackendBuffer buffer,
         const ColiRecordIoBackendRegion *regions, int count,
         ColiRecordIoBackendIntent intent);
+
+    /* Optional direct-to-caller-storage form. dst_off is relative to
+     * destination and destination_bytes bounds every region. */
+    ColiRecordIoBackendEvent (*submitv_ptr)(
+        void *context, void *destination, size_t destination_bytes,
+        const ColiRecordIoBackendRegion *regions, int count,
+        ColiRecordIoBackendIntent intent);
+
     int (*wait)(void *context, ColiRecordIoBackendEvent event);
 
-    /* Optional semantic accounting hooks. They never control correctness. */
     void (*buffer_consumed)(void *context, ColiRecordIoBackendBuffer buffer);
     void (*buffer_discarded)(void *context, ColiRecordIoBackendBuffer buffer);
 
@@ -162,14 +169,19 @@ static inline size_t coli_record_io_backend_buffer_bytes(
         ? b->ops->buffer_bytes(b->context, buffer) : 0;
 }
 
+static inline int coli_record_io_backend_intent_valid(
+        ColiRecordIoBackendIntent intent) {
+    return intent >= COLI_RECORD_IO_INTENT_DEMAND &&
+           intent <= COLI_RECORD_IO_INTENT_SPECULATIVE;
+}
+
 static inline ColiRecordIoBackendEvent coli_record_io_backend_submitv(
         ColiRecordIoBackend *b, ColiRecordIoBackendBuffer buffer,
         const ColiRecordIoBackendRegion *regions, int count,
         ColiRecordIoBackendIntent intent) {
     if (!coli_record_io_backend_valid(b) ||
         buffer == COLI_RECORD_IO_BACKEND_INVALID_BUFFER || !regions || count < 1 ||
-        intent < COLI_RECORD_IO_INTENT_DEMAND ||
-        intent > COLI_RECORD_IO_INTENT_SPECULATIVE)
+        !coli_record_io_backend_intent_valid(intent))
         return COLI_RECORD_IO_BACKEND_INVALID_EVENT;
     return b->ops->submitv(b->context, buffer, regions, count, intent);
 }
@@ -180,6 +192,27 @@ static inline ColiRecordIoBackendEvent coli_record_io_backend_submit(
         uint64_t dst_off, ColiRecordIoBackendIntent intent) {
     ColiRecordIoBackendRegion region = {file, src_off, bytes, dst_off};
     return coli_record_io_backend_submitv(b, buffer, &region, 1, intent);
+}
+
+static inline ColiRecordIoBackendEvent coli_record_io_backend_submitv_ptr(
+        ColiRecordIoBackend *b, void *destination, size_t destination_bytes,
+        const ColiRecordIoBackendRegion *regions, int count,
+        ColiRecordIoBackendIntent intent) {
+    if (!coli_record_io_backend_valid(b) || !b->ops->submitv_ptr ||
+        !destination || !destination_bytes || !regions || count < 1 ||
+        !coli_record_io_backend_intent_valid(intent))
+        return COLI_RECORD_IO_BACKEND_INVALID_EVENT;
+    return b->ops->submitv_ptr(b->context, destination, destination_bytes,
+                               regions, count, intent);
+}
+
+static inline ColiRecordIoBackendEvent coli_record_io_backend_submit_ptr(
+        ColiRecordIoBackend *b, void *destination, size_t destination_bytes,
+        ColiRecordIoBackendFile file, uint64_t src_off, size_t bytes,
+        size_t dst_off, ColiRecordIoBackendIntent intent) {
+    ColiRecordIoBackendRegion region = {file, src_off, bytes, dst_off};
+    return coli_record_io_backend_submitv_ptr(
+        b, destination, destination_bytes, &region, 1, intent);
 }
 
 static inline int coli_record_io_backend_wait(
@@ -215,5 +248,16 @@ static inline void coli_record_io_backend_verbose(
     if (coli_record_io_backend_valid(b) && b->ops->verbose)
         b->ops->verbose(b->context, on);
 }
+
+/* Platform provider seam. Generic compiled-record code calls this and remains
+ * oblivious to MetalIO/io_uring/GDS names. A portable weak implementation may
+ * return NULL; a platform provider can supply the strong definition. */
+#ifdef __cplusplus
+extern "C" {
+#endif
+ColiRecordIoBackend *coli_record_io_platform_default(void);
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* COLIBRI_RECORD_IO_BACKEND_H */
