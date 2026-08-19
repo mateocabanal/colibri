@@ -211,7 +211,7 @@ def install(core):
                     (splitter.feed if splitter is not None else emit_answer)(text)
 
                 stop_filter = gateway.StopFilter(
-                    stop_sequences, routed_text, ignore_leading_stop)
+                    stop_sequences, routed_text, ignore_leading)
                 cancelled = threading.Event()
                 result = {}
 
