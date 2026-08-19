@@ -23,10 +23,16 @@ extern "C" {
  * table, common policy, replan cadence and selected-expert map. Physical slots,
  * leases, I/O and backend residency remain below the engine/store adapter.
  *
- * The controller deliberately exposes append/apply seams instead of owning a
- * whole resource plan. V4 can append its expert candidates beside dense/prefix
- * candidates; Qwen can use the expert-only convenience selector while its dense
- * weights are mandatory. Both paths therefore consume the same expert policy.
+ * Resource allocation and expert identity are intentionally separate:
+ *   - common-horizon reuse determines HOW MANY expert bytes are worthwhile
+ *     relative to other optional resource classes;
+ *   - phase-weighted hotness + residency hysteresis determines WHICH experts
+ *     occupy an expert byte envelope.
+ *
+ * The controller exposes both seams. V4 can append expert benefit candidates
+ * beside dense/prefix candidates and then apply the resulting expert byte
+ * envelope through the hot-expert selector. Qwen uses the expert-only
+ * convenience selector. Neither engine owns the policy math.
  */
 typedef int (*ColiMoeAdaptiveResidentFn)(void *context, ColiExpertKey key);
 
@@ -38,6 +44,7 @@ typedef struct {
     ColiExpertActivationEntry *entries;
     unsigned char *selected;
     ColiResourceCandidate *scratch_candidates;
+    ColiExpertResidencyCandidate *scratch_experts;
     unsigned char *scratch_selected;
     uint64_t current_epoch;
     uint64_t last_replan_epoch;
@@ -77,17 +84,21 @@ static inline int coli_moe_adaptive_init(
     size_t key_count = (size_t)layers * (size_t)experts;
     size_t capacity = coli_moe_adaptive_tracker_capacity(key_count);
     if (!capacity || capacity > SIZE_MAX / sizeof(*state->entries) ||
-        key_count > SIZE_MAX / sizeof(*state->scratch_candidates))
+        key_count > SIZE_MAX / sizeof(*state->scratch_candidates) ||
+        key_count > SIZE_MAX / sizeof(*state->scratch_experts))
         return -1;
 
     state->entries = calloc(capacity, sizeof(*state->entries));
     state->selected = calloc(key_count, 1);
     state->scratch_candidates = calloc(
         key_count, sizeof(*state->scratch_candidates));
+    state->scratch_experts = calloc(
+        key_count, sizeof(*state->scratch_experts));
     state->scratch_selected = calloc(key_count, 1);
     if (!state->entries || !state->selected || !state->scratch_candidates ||
-        !state->scratch_selected) {
+        !state->scratch_experts || !state->scratch_selected) {
         free(state->scratch_selected);
+        free(state->scratch_experts);
         free(state->scratch_candidates);
         free(state->selected);
         free(state->entries);
@@ -96,6 +107,7 @@ static inline int coli_moe_adaptive_init(
     }
     if (coli_expert_activation_init(&state->tracker, state->entries, capacity) != 0) {
         free(state->scratch_selected);
+        free(state->scratch_experts);
         free(state->scratch_candidates);
         free(state->selected);
         free(state->entries);
@@ -113,6 +125,7 @@ static inline int coli_moe_adaptive_init(
 static inline void coli_moe_adaptive_destroy(ColiMoeAdaptiveResidency *state) {
     if (!state) return;
     free(state->scratch_selected);
+    free(state->scratch_experts);
     free(state->scratch_candidates);
     free(state->selected);
     free(state->entries);
@@ -214,9 +227,67 @@ static inline size_t coli_moe_adaptive_append_candidates(
     return count;
 }
 
-/* Apply a mixed global-planner result to this controller. Non-expert resource
- * candidates are ignored. The caller owns physical reconciliation after this
- * point (load lazily, reclaim deselected unleased slots, etc.). */
+static inline int coli_moe_adaptive_hot_qsort_compare(
+    const void *left, const void *right) {
+    const ColiExpertResidencyCandidate *a =
+        (const ColiExpertResidencyCandidate *)left;
+    const ColiExpertResidencyCandidate *b =
+        (const ColiExpertResidencyCandidate *)right;
+    int order = coli_expert_residency_policy_compare(a, b);
+    return order > 0 ? -1 : order < 0 ? 1 : 0;
+}
+
+/* Apply an already-decided expert byte envelope to the phase-aware expert
+ * policy. This is the generic HOW-MANY -> WHICH bridge for both expert-only and
+ * mixed-resource plans. Only experts with positive common-horizon reuse are
+ * eligible, so hotness cannot bypass cold-start confidence. */
+static inline size_t coli_moe_adaptive_apply_expert_budget(
+    ColiMoeAdaptiveResidency *state, uint64_t expert_budget_bytes,
+    uint64_t resident_bytes, uint64_t exposed_ns_per_miss,
+    ColiMoeAdaptiveResidentFn is_resident, void *resident_context) {
+    if (!state || !resident_bytes) return 0;
+
+    uint64_t miss_cost_us = exposed_ns_per_miss / UINT64_C(1000);
+    if (!miss_cost_us) miss_cost_us = 1;
+    size_t count = 0;
+    for (size_t slot = 0; slot < state->tracker.capacity; slot++) {
+        const ColiExpertActivationEntry *entry = &state->tracker.entries[slot];
+        if (!entry->hash_tag) continue;
+        size_t key_index = 0;
+        if (!coli_moe_adaptive_key_index(state, entry->key, &key_index))
+            continue;
+        int resident = is_resident
+            ? is_resident(resident_context, entry->key) : 0;
+        ColiExpertResidencyCandidate candidate =
+            coli_expert_residency_policy_candidate(
+                entry, state->current_epoch, resident_bytes, miss_cost_us,
+                resident, &state->policy);
+        if (!candidate.reuse_weight || !candidate.score) continue;
+        state->scratch_experts[count++] = candidate;
+    }
+
+    if (count > 1)
+        qsort(state->scratch_experts, count, sizeof(*state->scratch_experts),
+              coli_moe_adaptive_hot_qsort_compare);
+
+    memset(state->selected, 0, state->key_count);
+    size_t limit = (size_t)(expert_budget_bytes / resident_bytes);
+    if (limit > count) limit = count;
+    for (size_t i = 0; i < limit; i++) {
+        size_t key_index = 0;
+        if (coli_moe_adaptive_key_index(
+                state, state->scratch_experts[i].key, &key_index))
+            state->selected[key_index] = 1;
+    }
+    state->last_replan_epoch = state->current_epoch;
+    state->replan_count++;
+    return limit;
+}
+
+/* Apply exact expert identities from an external planner. Use this only when
+ * that planner intentionally owns WHICH-expert ordering. Mixed resource plans
+ * that use common-horizon reuse solely to determine an expert byte envelope
+ * should instead call coli_moe_adaptive_apply_expert_budget(). */
 static inline void coli_moe_adaptive_apply_selection(
     ColiMoeAdaptiveResidency *state,
     const ColiResourceCandidate *candidates,
@@ -235,9 +306,11 @@ static inline void coli_moe_adaptive_apply_selection(
     state->replan_count++;
 }
 
-/* Convenience for engines whose non-expert memory is already mandatory. It
- * still uses the global planner candidate/value contract, so moving Qwen dense
- * or prefix resources into the optional set later does not change expert math. */
+/* Convenience for engines whose non-expert memory is already mandatory.
+ * Common-horizon reuse first decides how many expert bytes are justified; the
+ * phase-aware policy then fills exactly that envelope with the hottest experts.
+ * This prevents the global resource value scale from silently replacing the
+ * expert-local decode weighting/hysteresis policy. */
 static inline int coli_moe_adaptive_select_experts(
     ColiMoeAdaptiveResidency *state, uint64_t optional_budget_bytes,
     uint64_t resident_bytes, uint64_t bytes_per_miss,
@@ -251,12 +324,32 @@ static inline int coli_moe_adaptive_select_experts(
         state, state->scratch_candidates, 0, state->key_count,
         resident_bytes, bytes_per_miss, exposed_ns_per_miss,
         is_resident, resident_context);
+    ColiResourceSelection allocation = {0};
     if (coli_resource_select(
             state->scratch_candidates, count, optional_budget_bytes, mode,
-            state->scratch_selected, selection) != 0)
+            state->scratch_selected, &allocation) != 0)
         return -1;
-    coli_moe_adaptive_apply_selection(
-        state, state->scratch_candidates, state->scratch_selected, count);
+
+    size_t selected_count = coli_moe_adaptive_apply_expert_budget(
+        state, allocation.selected_resident_bytes, resident_bytes,
+        exposed_ns_per_miss, is_resident, resident_context);
+
+    *selection = allocation;
+    selection->selected_count = selected_count;
+    selection->selected_resident_bytes = coli_resource_saturating_mul(
+        (uint64_t)selected_count, resident_bytes);
+    selection->expected_bytes_avoided = 0;
+    selection->expected_exposed_ns_avoided = 0;
+    for (size_t i = 0; i < selected_count; i++) {
+        const ColiExpertResidencyCandidate *expert = &state->scratch_experts[i];
+        selection->expected_bytes_avoided = coli_resource_saturating_add(
+            selection->expected_bytes_avoided,
+            coli_resource_saturating_mul(expert->reuse_weight, bytes_per_miss));
+        selection->expected_exposed_ns_avoided = coli_resource_saturating_add(
+            selection->expected_exposed_ns_avoided,
+            coli_resource_saturating_mul(
+                expert->reuse_weight, exposed_ns_per_miss));
+    }
     return 1;
 }
 
