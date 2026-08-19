@@ -34,7 +34,14 @@ static int qwen_adaptive_resource_budget_resolve(
     void *model, uint64_t resident_bytes_per_expert,
     uint64_t transient_slots, ColiMoeResourceBudget *out) {
     if (!model || !resident_bytes_per_expert || !out) return -1;
+
+    /* A freshly initialized controller has replan_count==0. Do not reuse a
+     * process-global cached envelope in that state even if malloc happened to
+     * recycle the same Model address and the new model has the same expert
+     * format/size. Once this controller has made its first plan, the cached
+     * envelope is intentionally stable for the rest of that model lifetime. */
     if (g_qwen_adaptive_budget.valid &&
+        g_qwen_adaptive.adaptive.replan_count > 0 &&
         g_qwen_adaptive_budget.model == model &&
         g_qwen_adaptive_budget.resident_bytes_per_expert ==
             resident_bytes_per_expert) {
