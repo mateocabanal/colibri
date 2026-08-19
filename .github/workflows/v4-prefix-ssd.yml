@@ -10,6 +10,7 @@ on:
       - 'c/coli_v4_prefix_disk.h'
       - 'c/coli_v4_prefix_disk_shared.inc'
       - 'c/coli_v4_generate_stats_cache.c'
+      - 'c/coli_v4_package_tensor_source.h'
       - 'c/coli_v4_*snapshot_size.c'
       - 'c/tests/test_v4_prefix_disk_sessions.c'
       - 'c/Makefile.deepseek-v4.units'
@@ -39,11 +40,17 @@ jobs:
         run: python -m pip install -r c/tools/requirements-deepseek-v4-tiny.txt
       - name: Generate tiny V4 source fixture
         run: python c/tools/make_deepseek_v4_tiny.py --output c/deepseek_v4_tiny --force
-      - name: Compile exact native COLI package
+      - name: Compile exact COLI package for current V4 package ABI
         run: |
+          # The V4 runtime currently opens exact packages through the frozen
+          # macOS/Metal profile even when this portable correctness oracle runs
+          # on Linux. Exact tensor/expert payloads are still byte-preserving;
+          # use the profile the runtime actually negotiates so this job tests
+          # prefix/package behavior instead of failing at the profile gate.
           cargo run --manifest-path colic/Cargo.toml -- \
             compile c/deepseek_v4_tiny \
-            --target native --quant exact --codec none --opt default \
+            --target macos-arm64-metal-apple8-v1 \
+            --quant exact --codec none --opt default \
             -o c/deepseek_v4_tiny.coli --verify
       - name: Build V4 prefix-cache helpers
         run: make -C c -f Makefile.deepseek-v4 LTO=0 deepseek-v4-prefix-cache-test
