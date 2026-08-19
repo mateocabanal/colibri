@@ -4,6 +4,7 @@
 
 #include "coli_format.h"
 #include "compat.h"
+#include "record_io_backend.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -13,6 +14,15 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+/* Portable builds have no accelerated physical I/O provider. Platform objects
+ * (MetalIO today; io_uring/GDS later) override this weak seam when linked. */
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((weak))
+#endif
+ColiRecordIoBackend *coli_record_io_platform_default(void) {
+    return NULL;
+}
 
 #define CSF_MANIFEST_HEADER_BYTES 256u
 #define CSF_SHARD_DESC_BYTES 64u
@@ -357,7 +367,6 @@ static char *path_join(const char *root, const char *leaf) {
     memcpy(p + a, leaf, b + 1);
     return p;
 }
-
 static int pread_full(int fd, void *dst, size_t bytes, uint64_t offset,
                       char *error, size_t error_size) {
     unsigned char *p = (unsigned char *)dst;
@@ -1166,6 +1175,46 @@ const char *coli_package_compiler(const ColiPackage *p) { return p ? p->compiler
 const uint8_t *coli_package_source_fingerprint(const ColiPackage *p) { return p ? p->source_fingerprint : NULL; }
 uint32_t coli_package_record_alignment(const ColiPackage *p) { return p ? p->record_alignment : 0; }
 
+/* Returns 0 when the backend completed the read, 1 when no accelerated path
+ * accepted it (safe to fall back to pread), and -1 after an enqueued request
+ * failed to complete. Never issue a fallback read after enqueue: that would
+ * race two physical writers into the same residency backing. */
+static int try_platform_expert_read(const ColiCsfShard *shard,
+                                    void *destination, size_t bytes,
+                                    uint64_t source_offset,
+                                    char *error, size_t error_size) {
+    ColiRecordIoBackend *backend = coli_record_io_platform_default();
+    ColiRecordIoBackendFile file;
+    ColiRecordIoBackendEvent event;
+    const char *verbose_env;
+    if (!backend ||
+        !(coli_record_io_backend_capabilities(backend) &
+          COLI_RECORD_IO_CAP_DIRECT_POINTER) ||
+        !backend->ops || !backend->ops->submitv_ptr)
+        return 1;
+
+    verbose_env = getenv("COLI_RECORD_IO_VERBOSE");
+    if (verbose_env && verbose_env[0] && strcmp(verbose_env, "0"))
+        coli_record_io_backend_verbose(backend, 1);
+
+    if (!coli_record_io_backend_active(backend) &&
+        !coli_record_io_backend_init(backend))
+        return 1;
+    file = coli_record_io_backend_file_add(backend, shard->path);
+    if (file == COLI_RECORD_IO_BACKEND_INVALID_FILE) return 1;
+    event = coli_record_io_backend_submit_ptr(
+        backend, destination, bytes, file, source_offset, bytes, 0,
+        COLI_RECORD_IO_INTENT_DEMAND);
+    if (event == COLI_RECORD_IO_BACKEND_INVALID_EVENT) return 1;
+    if (coli_record_io_backend_wait(backend, event)) {
+        csf_error(error, error_size,
+                  "%s backend wait failed after expert read enqueue",
+                  coli_record_io_backend_name(backend));
+        return -1;
+    }
+    return 0;
+}
+
 int coli_package_read_range_ex(const ColiPackage *p, const ColiRecordInfo *r,
                                uint64_t record_offset, void *destination, size_t bytes,
                                uint32_t read_flags, char *error, size_t error_size) {
@@ -1184,6 +1233,17 @@ int coli_package_read_range_ex(const ColiPackage *p, const ColiRecordInfo *r,
     }
     if (!bytes) return 0;
     shard = &p->shards[r->shard_id];
+
+    /* Compiled routed experts are the hot path. The runtime owns their final
+     * resident backing already, so a capable platform backend can read the
+     * stored range directly into that pointer. Dense/static package parsing
+     * deliberately stays on the stable pread path for now. */
+    if (r->kind == COLI_CSF_REC_EXPERT) {
+        int backend_rc = try_platform_expert_read(
+            shard, destination, bytes, source_offset, error, error_size);
+        if (backend_rc <= 0) return backend_rc;
+    }
+
     fd = shard->fd;
 #ifdef __APPLE__
     /* F_NOCACHE has no alignment requirement, unlike Linux O_DIRECT, so the
