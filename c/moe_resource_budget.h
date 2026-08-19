@@ -53,16 +53,21 @@ static inline int coli_moe_resource_budget_compute(
         return -1;
     *out = (ColiMoeResourceBudget){0};
 
-    uint64_t reserve = in->available_bytes / 8;
+    /* Planner-owned optional residency is reclaimable headroom. Compute BOTH
+     * the OS reserve and the optional target from the same effective-available
+     * pool. If reserve were based only on raw MemAvailable, allocating our own
+     * cache would lower the reserve and could make repeated replans grow their
+     * budget simply because previous optional bytes became resident. */
+    uint64_t effective_available = coli_moe_budget_sat_add(
+        in->available_bytes, in->current_optional_resident_bytes);
+    uint64_t reserve = effective_available / 8;
     if (reserve < 512 * COLI_MOE_MIB) reserve = 512 * COLI_MOE_MIB;
     if (reserve > 4096 * COLI_MOE_MIB) reserve = 4096 * COLI_MOE_MIB;
-    if (reserve >= in->available_bytes) reserve = in->available_bytes;
+    if (reserve >= effective_available) reserve = effective_available;
     out->system_reserve_bytes = reserve;
 
-    uint64_t new_headroom = in->available_bytes > reserve
-        ? in->available_bytes - reserve : 0;
-    uint64_t allocatable = coli_moe_budget_sat_add(
-        new_headroom, in->current_optional_resident_bytes);
+    uint64_t allocatable = effective_available > reserve
+        ? effective_available - reserve : 0;
 
     /* RAM_GB-style controls are total process budgets, not expert budgets.
      * Convert the remaining process headroom into a TARGET optional pool by
