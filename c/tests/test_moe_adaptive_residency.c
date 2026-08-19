@@ -44,6 +44,51 @@ static void test_global_selection_and_warmup(void) {
     coli_moe_adaptive_destroy(&state);
 }
 
+static void test_hotness_fills_common_budget(void) {
+    ColiMoeAdaptiveResidency state;
+    assert(coli_moe_adaptive_init(&state, 1, 4) == 0);
+
+    /* Expert 1 has more unweighted reuse and therefore wins the common-value
+     * allocation ordering. Expert 2 has fewer observations but they are decode
+     * observations, so decode_weight=4 makes it the hotter WHICH-expert choice.
+     * The expert-only convenience path must use common reuse for HOW MANY bytes
+     * and hotness for WHICH expert fills those bytes. */
+    for (uint64_t epoch = 1; epoch <= 8; epoch++) {
+        int prefill[] = {1};
+        assert(coli_moe_adaptive_observe_routes(
+            &state, 0, prefill, 1, COLI_EXPERT_PHASE_PREFILL, epoch) == 0);
+    }
+    for (uint64_t epoch = 6; epoch <= 8; epoch++) {
+        int decode[] = {2};
+        assert(coli_moe_adaptive_observe_routes(
+            &state, 0, decode, 1, COLI_EXPERT_PHASE_DECODE, epoch) == 0);
+    }
+
+    const ColiExpertActivationEntry *prefill_entry =
+        coli_expert_activation_find_const(&state.tracker, (ColiExpertKey){0, 1});
+    const ColiExpertActivationEntry *decode_entry =
+        coli_expert_activation_find_const(&state.tracker, (ColiExpertKey){0, 2});
+    assert(prefill_entry && decode_entry);
+    assert(coli_expert_residency_policy_reuse_weight(
+               prefill_entry, 8, &state.policy) >
+           coli_expert_residency_policy_reuse_weight(
+               decode_entry, 8, &state.policy));
+    assert(coli_expert_residency_policy_hotness(
+               decode_entry, 8, 0, &state.policy) >
+           coli_expert_residency_policy_hotness(
+               prefill_entry, 8, 0, &state.policy));
+
+    ColiResourceSelection selection;
+    assert(coli_moe_adaptive_select_experts(
+        &state, UINT64_C(4096), UINT64_C(4096), UINT64_C(4096),
+        0, COLI_RESOURCE_VALUE_BYTES, never_resident, NULL, &selection) == 1);
+    assert(selection.selected_count == 1);
+    assert(!coli_moe_adaptive_selected(&state, (ColiExpertKey){0, 1}));
+    assert(coli_moe_adaptive_selected(&state, (ColiExpertKey){0, 2}));
+
+    coli_moe_adaptive_destroy(&state);
+}
+
 static void test_prefill_union_equivalence(void) {
     ColiMoeAdaptiveResidency per_token, unioned;
     assert(coli_moe_adaptive_init(&per_token, 1, 8) == 0);
@@ -107,8 +152,8 @@ static void test_mixed_global_plan_apply(void) {
 
     unsigned char selected[4] = {1, 1, 0, 0};
     coli_moe_adaptive_apply_selection(&state, candidates, selected, count);
-    /* Dense selection is ignored by the MoE controller; only the expert id is
-     * projected into the shared selected-expert map. */
+    /* Exact external-selection mode ignores dense candidates and projects only
+     * the explicitly selected expert id into the shared selected map. */
     assert(coli_moe_adaptive_selected(&state, (ColiExpertKey){0, 1}));
 
     coli_moe_adaptive_destroy(&state);
@@ -116,6 +161,7 @@ static void test_mixed_global_plan_apply(void) {
 
 int main(void) {
     test_global_selection_and_warmup();
+    test_hotness_fills_common_budget();
     test_prefill_union_equivalence();
     test_mixed_global_plan_apply();
     puts("generic MoE adaptive residency: ok");
