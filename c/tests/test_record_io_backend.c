@@ -47,19 +47,17 @@ static size_t fake_buffer_bytes(void *ctx, ColiRecordIoBackendBuffer buffer) {
     FakeIo *f = (FakeIo *)ctx;
     return f->buffer_in_use && buffer == 3 ? f->bytes : 0;
 }
-static ColiRecordIoBackendEvent fake_submitv(
-        void *ctx, ColiRecordIoBackendBuffer buffer,
+static int fake_regions(
+        FakeIo *f, unsigned char *destination, size_t destination_bytes,
         const ColiRecordIoBackendRegion *regions, int count,
         ColiRecordIoBackendIntent intent) {
-    FakeIo *f = (FakeIo *)ctx;
-    if (!f->active || !f->buffer_in_use || buffer != 3 || count < 1)
-        return -1;
+    if (!f->active || !destination || count < 1) return 0;
     for (int i = 0; i < count; i++) {
         const ColiRecordIoBackendRegion *r = &regions[i];
-        if (r->file != 7 || !r->bytes || r->dst_off > f->bytes ||
-            r->bytes > f->bytes - r->dst_off)
-            return -1;
-        memset(f->storage + r->dst_off,
+        if (r->file != 7 || !r->bytes || r->dst_off > destination_bytes ||
+            r->bytes > destination_bytes - r->dst_off)
+            return 0;
+        memset(destination + r->dst_off,
                (int)((r->src_off + (uint64_t)i) & 0xffu), r->bytes);
         f->stats.bytes += r->bytes;
     }
@@ -69,6 +67,26 @@ static ColiRecordIoBackendEvent fake_submitv(
     f->stats.outstanding++;
     if (f->stats.outstanding > f->stats.peak_outstanding)
         f->stats.peak_outstanding = f->stats.outstanding;
+    return 1;
+}
+static ColiRecordIoBackendEvent fake_submitv(
+        void *ctx, ColiRecordIoBackendBuffer buffer,
+        const ColiRecordIoBackendRegion *regions, int count,
+        ColiRecordIoBackendIntent intent) {
+    FakeIo *f = (FakeIo *)ctx;
+    if (!f->buffer_in_use || buffer != 3 ||
+        !fake_regions(f, f->storage, f->bytes, regions, count, intent))
+        return -1;
+    return f->next_event++;
+}
+static ColiRecordIoBackendEvent fake_submitv_ptr(
+        void *ctx, void *destination, size_t destination_bytes,
+        const ColiRecordIoBackendRegion *regions, int count,
+        ColiRecordIoBackendIntent intent) {
+    FakeIo *f = (FakeIo *)ctx;
+    if (!fake_regions(f, (unsigned char *)destination, destination_bytes,
+                      regions, count, intent))
+        return -1;
     return f->next_event++;
 }
 static int fake_wait(void *ctx, ColiRecordIoBackendEvent event) {
@@ -97,7 +115,8 @@ static const ColiRecordIoBackendOps fake_ops = {
     .name = "fake-async",
     .capabilities = COLI_RECORD_IO_CAP_ASYNC |
                     COLI_RECORD_IO_CAP_VECTORED |
-                    COLI_RECORD_IO_CAP_CPU_VISIBLE_BUFFER,
+                    COLI_RECORD_IO_CAP_CPU_VISIBLE_BUFFER |
+                    COLI_RECORD_IO_CAP_DIRECT_POINTER,
     .init = fake_init,
     .shutdown = fake_shutdown,
     .active = fake_active,
@@ -107,6 +126,7 @@ static const ColiRecordIoBackendOps fake_ops = {
     .buffer_ptr = fake_buffer_ptr,
     .buffer_bytes = fake_buffer_bytes,
     .submitv = fake_submitv,
+    .submitv_ptr = fake_submitv_ptr,
     .wait = fake_wait,
     .buffer_consumed = fake_consumed,
     .buffer_discarded = fake_discarded,
@@ -131,6 +151,8 @@ int main(void) {
     CHECK(strcmp(coli_record_io_backend_name(&backend), "fake-async") == 0);
     CHECK((coli_record_io_backend_capabilities(&backend) &
            COLI_RECORD_IO_CAP_VECTORED) != 0);
+    CHECK((coli_record_io_backend_capabilities(&backend) &
+           COLI_RECORD_IO_CAP_DIRECT_POINTER) != 0);
     CHECK(!coli_record_io_backend_active(&backend));
     CHECK(coli_record_io_backend_init(&backend) == 1);
     CHECK(coli_record_io_backend_active(&backend));
@@ -163,11 +185,25 @@ int main(void) {
     coli_record_io_backend_buffer_consumed(&backend, buffer);
     coli_record_io_backend_buffer_discarded(&backend, buffer);
 
+    unsigned char direct[128];
+    memset(direct, 0, sizeof(direct));
+    ColiRecordIoBackendRegion direct_regions[2] = {
+        {file, 0x44, 12, 8},
+        {file, 0x55, 7, 64},
+    };
+    ColiRecordIoBackendEvent e3 = coli_record_io_backend_submitv_ptr(
+        &backend, direct, sizeof(direct), direct_regions, 2,
+        COLI_RECORD_IO_INTENT_DEMAND);
+    CHECK(e3 == 3);
+    CHECK(direct[8] == 0x44);
+    CHECK(direct[64] == 0x56);
+    CHECK(coli_record_io_backend_wait(&backend, e3) == 0);
+
     ColiRecordIoBackendStats stats;
     coli_record_io_backend_stats(&backend, &stats);
-    CHECK(stats.submissions == 2);
-    CHECK(stats.bytes == 56);
-    CHECK(stats.waits == 1);
+    CHECK(stats.submissions == 3);
+    CHECK(stats.bytes == 75);
+    CHECK(stats.waits == 2);
     CHECK(stats.speculative_submissions == 1);
     CHECK(stats.speculative_consumed == 1);
     CHECK(stats.speculative_discarded == 1);
@@ -176,6 +212,10 @@ int main(void) {
 
     CHECK(coli_record_io_backend_submitv(
               &backend, buffer, NULL, 0,
+              COLI_RECORD_IO_INTENT_DEMAND) ==
+          COLI_RECORD_IO_BACKEND_INVALID_EVENT);
+    CHECK(coli_record_io_backend_submitv_ptr(
+              &backend, direct, sizeof(direct), NULL, 0,
               COLI_RECORD_IO_INTENT_DEMAND) ==
           COLI_RECORD_IO_BACKEND_INVALID_EVENT);
     CHECK(coli_record_io_backend_buffer_alloc(&backend, 0) ==
