@@ -38,6 +38,12 @@ if _tools not in sys.path:
 from local_chat import install as _install_local_chat
 _install_local_chat(globals())
 
+# Adaptive Qwen residency is still under its full-size post-backing-pool gate on
+# this draft branch.  Keep the public chat path on the proven legacy policy until
+# that gate passes; an explicit COLI_ADAPTIVE_RESIDENCY=1 remains the A/B override.
+if "chat" in sys.argv[1:]:
+    os.environ.setdefault("COLI_ADAPTIVE_RESIDENCY", "0")
+
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, signal.default_int_handler)
     main()
