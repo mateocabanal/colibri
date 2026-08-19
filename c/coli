@@ -32,6 +32,21 @@ exec(_code, globals(), globals())
 globals()["__name__"] = _name
 globals()["__file__"] = _PUBLIC_FILE
 
+# Compiled COLI packages are self-contained: config.json/tokenizer.json live
+# beside manifest.coli and the data shards.  The current Qwen C loader still has
+# a legacy internal COLI_CONFIG lookup from the first compiler prototype; make
+# that compatibility channel package-owned and non-user-configurable.  Every
+# public Qwen command therefore resolves metadata from --model itself, even if a
+# stale COLI_CONFIG is present in the caller's environment.
+_core_env_for_engine = env_for_engine
+def env_for_engine(a, arch):
+    env = _core_env_for_engine(a, arch)
+    model = getattr(a, "model", None)
+    if (arch == "qwen3_moe" and model and
+            os.path.isfile(os.path.join(model, "manifest.coli"))):
+        env["COLI_CONFIG"] = os.path.abspath(model)
+    return env
+
 _tools = os.path.dirname(_CORE)
 if _tools not in sys.path:
     sys.path.insert(0, _tools)
