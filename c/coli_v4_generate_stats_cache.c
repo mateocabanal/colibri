@@ -88,6 +88,7 @@ static void coli_v4_cached_kv_prefix_record(kv_prefix *prefix,
  * changes from silently disabling package speculative verification. */
 static ColiSafetensorsTensor g_coli_v4_package_head_tensor;
 static int g_coli_v4_package_head_cache_miss_reported;
+static int g_coli_v4_package_head_lookup_miss_reported;
 
 static int coli_v4_generate_package_bound(void) {
     return g_coli_v4_package_tensor_source.executor != NULL;
@@ -103,15 +104,40 @@ static const ColiSafetensorsTensor *coli_v4_generate_st_find(
     const ColiRecordInfo *record =
         coli_executor_record_by_name(executor, "head.weight");
     ColiTensorInfo info;
+    memset(&info, 0, sizeof(info));
     const ColiPackage *package = coli_executor_package(executor);
+    int info_failed = record && package
+        ? coli_package_tensor_info(package, record, &info, NULL, 0)
+        : 1;
     if (!record || !package || record->kind != COLI_CSF_REC_TENSOR ||
-        record->math_format != COLI_CSF_MATH_BF16 ||
-        coli_package_tensor_info(package, record, &info, NULL, 0) ||
-        info.rank != 2 || info.data_stored_bytes > INT64_MAX)
+        record->math_format != COLI_CSF_MATH_BF16 || info_failed ||
+        info.rank != 2 || info.data_stored_bytes > INT64_MAX) {
+        if (!g_coli_v4_package_head_lookup_miss_reported) {
+            g_coli_v4_package_head_lookup_miss_reported = 1;
+            fprintf(stderr,
+                    "v4_spec_head lookup_failed record=%d package=%d kind=%u math=%u "
+                    "tensor_info=%d rank=%u stored=%llu\n",
+                    record ? 1 : 0, package ? 1 : 0,
+                    record ? (unsigned)record->kind : 0u,
+                    record ? (unsigned)record->math_format : 0u,
+                    info_failed, (unsigned)info.rank,
+                    (unsigned long long)info.data_stored_bytes);
+        }
         return NULL;
+    }
 
     int64_t numel = 0;
-    if (coli_v4_package_tensor_numel(&info, &numel)) return NULL;
+    if (coli_v4_package_tensor_numel(&info, &numel)) {
+        if (!g_coli_v4_package_head_lookup_miss_reported) {
+            g_coli_v4_package_head_lookup_miss_reported = 1;
+            fprintf(stderr,
+                    "v4_spec_head lookup_failed reason=numel rank=%u dims0=%llu dims1=%llu\n",
+                    (unsigned)info.rank,
+                    (unsigned long long)info.dims[0],
+                    (unsigned long long)info.dims[1]);
+        }
+        return NULL;
+    }
     memset(&g_coli_v4_package_head_tensor, 0,
            sizeof(g_coli_v4_package_head_tensor));
     g_coli_v4_package_head_tensor.name = (char *)record->name;
@@ -208,6 +234,7 @@ int coli_v4_session_generate(ColiV4Session *session,
         return -1;
     }
     g_coli_v4_package_head_cache_miss_reported = 0;
+    g_coli_v4_package_head_lookup_miss_reported = 0;
 
     int result = coli_v4_session_generate_uncached(
         session, prompt, prompt_length, options, on_token, user_data,
