@@ -16,6 +16,10 @@ typedef struct {
     uint64_t process_resident_bytes;
     /* Optional total process/host budget. Zero means automatic. */
     uint64_t explicit_total_bytes;
+    /* Optional residency already owned by THIS planner and therefore
+     * reclaimable/reallocatable. It is present in RSS and absent from
+     * available_bytes, so add it back when computing a target pool. */
+    uint64_t current_optional_resident_bytes;
     /* Optional resources not yet necessarily materialized (e.g. prefix RAM). */
     uint64_t other_optional_reserve_bytes;
     /* Physical bytes one persistent expert consumes in this memory tier. */
@@ -34,6 +38,10 @@ typedef struct {
     int used_explicit_total;
 } ColiMoeResourceBudget;
 
+static inline uint64_t coli_moe_budget_sat_add(uint64_t a, uint64_t b) {
+    return UINT64_MAX - a < b ? UINT64_MAX : a + b;
+}
+
 static inline uint64_t coli_moe_budget_sat_mul(uint64_t a, uint64_t b) {
     return a && b > UINT64_MAX / a ? UINT64_MAX : a * b;
 }
@@ -51,17 +59,22 @@ static inline int coli_moe_resource_budget_compute(
     if (reserve >= in->available_bytes) reserve = in->available_bytes;
     out->system_reserve_bytes = reserve;
 
-    uint64_t allocatable = in->available_bytes > reserve
+    uint64_t new_headroom = in->available_bytes > reserve
         ? in->available_bytes - reserve : 0;
+    uint64_t allocatable = coli_moe_budget_sat_add(
+        new_headroom, in->current_optional_resident_bytes);
 
     /* RAM_GB-style controls are total process budgets, not expert budgets.
-     * Only convert them into additional bytes when current RSS is known. If an
-     * adapter cannot measure RSS it should preserve its explicit legacy cap via
-     * max_persistent_slots rather than guessing how much of the total is free. */
+     * Convert the remaining process headroom into a TARGET optional pool by
+     * adding back the planner's current reclaimable residency. Otherwise every
+     * replan would charge existing experts twice (once in RSS and again as the
+     * requested optional budget), causing artificial shrink/oscillation. */
     if (in->explicit_total_bytes && in->process_resident_bytes) {
         out->used_explicit_total = 1;
         uint64_t under_total = in->explicit_total_bytes > in->process_resident_bytes
             ? in->explicit_total_bytes - in->process_resident_bytes : 0;
+        under_total = coli_moe_budget_sat_add(
+            under_total, in->current_optional_resident_bytes);
         if (under_total < allocatable) allocatable = under_total;
     }
 
