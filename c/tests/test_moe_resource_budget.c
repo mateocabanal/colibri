@@ -58,8 +58,30 @@ static void test_replan_adds_back_current_optional_residency(void) {
     warm.current_optional_resident_bytes = UINT64_C(1073741824);
     ColiMoeResourceBudget second;
     assert(coli_moe_resource_budget_compute(&second, &warm) == 0);
-    assert(second.persistent_budget_bytes >=
-           first.persistent_budget_bytes - expert);
+    assert(second.persistent_budget_bytes == first.persistent_budget_bytes);
+}
+
+static void test_automatic_replan_keeps_system_reserve(void) {
+    const uint64_t expert = 16 * COLI_MOE_MIB;
+    ColiMoeResourceBudgetInputs cold = {
+        .available_bytes = 8 * UINT64_C(1073741824),
+        .resident_bytes_per_expert = expert,
+        .transient_slots = 4,
+    };
+    ColiMoeResourceBudget first;
+    assert(coli_moe_resource_budget_compute(&first, &cold) == 0);
+    assert(first.system_reserve_bytes == UINT64_C(1073741824));
+
+    /* Moving one GiB from OS-available into planner-owned optional residency
+     * does not change the effective memory pool, so neither the safety reserve
+     * nor the target persistent envelope may grow or shrink. */
+    ColiMoeResourceBudgetInputs warm = cold;
+    warm.available_bytes -= UINT64_C(1073741824);
+    warm.current_optional_resident_bytes = UINT64_C(1073741824);
+    ColiMoeResourceBudget second;
+    assert(coli_moe_resource_budget_compute(&second, &warm) == 0);
+    assert(second.system_reserve_bytes == first.system_reserve_bytes);
+    assert(second.persistent_budget_bytes == first.persistent_budget_bytes);
 }
 
 static void test_explicit_slot_ceiling(void) {
@@ -94,6 +116,7 @@ int main(void) {
     test_automatic_bytes_not_model_constants();
     test_explicit_total_is_total_not_expert_budget();
     test_replan_adds_back_current_optional_residency();
+    test_automatic_replan_keeps_system_reserve();
     test_explicit_slot_ceiling();
     test_no_rss_does_not_fake_total_conversion();
     puts("generic MoE resource budget: ok");
