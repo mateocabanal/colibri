@@ -17,9 +17,14 @@ typedef enum ColiSpecProposalSource {
     COLI_SPEC_SOURCE_EXTERNAL = 5,
 } ColiSpecProposalSource;
 
+typedef struct ColiSpecProposalRequest {
+    const int *history;
+    size_t history_count;
+    uint64_t next_position;
+} ColiSpecProposalRequest;
+
 typedef size_t (*ColiSpecProposeFn)(void *ctx,
-                                    const int *history,
-                                    size_t history_count,
+                                    const ColiSpecProposalRequest *request,
                                     int *out_tokens,
                                     size_t max_tokens);
 
@@ -35,17 +40,17 @@ typedef struct ColiSpecProposal {
 } ColiSpecProposal;
 
 static inline ColiSpecProposal coli_spec_propose(const ColiSpecProposer *proposer,
-                                                 const int *history,
-                                                 size_t history_count,
+                                                 const ColiSpecProposalRequest *request,
                                                  int *out_tokens,
                                                  size_t max_tokens) {
     ColiSpecProposal result;
     result.source = COLI_SPEC_SOURCE_NONE;
     result.token_count = 0;
-    if (proposer == NULL || proposer->propose == NULL || out_tokens == NULL || max_tokens == 0) {
+    if (proposer == NULL || proposer->propose == NULL || request == NULL ||
+        out_tokens == NULL || max_tokens == 0) {
         return result;
     }
-    result.token_count = proposer->propose(proposer->ctx, history, history_count, out_tokens, max_tokens);
+    result.token_count = proposer->propose(proposer->ctx, request, out_tokens, max_tokens);
     if (result.token_count > max_tokens) {
         result.token_count = 0;
         return result;
@@ -183,19 +188,18 @@ typedef struct ColiSpecCacheProposerCtx {
 } ColiSpecCacheProposerCtx;
 
 static inline size_t coli_spec_cache_proposer(void *opaque,
-                                              const int *history,
-                                              size_t history_count,
+                                              const ColiSpecProposalRequest *request,
                                               int *out_tokens,
                                               size_t max_tokens) {
     const ColiSpecCacheProposerCtx *ctx = (const ColiSpecCacheProposerCtx *)opaque;
-    if (ctx == NULL) {
+    if (ctx == NULL || request == NULL) {
         return 0;
     }
     return coli_spec_cache_propose(ctx->corpus,
                                    ctx->corpus_count,
                                    ctx->separator,
-                                   history,
-                                   history_count,
+                                   request->history,
+                                   request->history_count,
                                    out_tokens,
                                    max_tokens,
                                    ctx->min_match,
