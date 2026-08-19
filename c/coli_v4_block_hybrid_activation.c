@@ -249,7 +249,21 @@ static void v4_activation_context(
     int start_position, int batch, ColiExpertPhase phase) {
     ColiV4ActivationCall *call = &g_v4_activation_call;
     v4_activation_clear_touched(call);
-    call->valid = weights && start_position >= 0 && batch > 0 && !call->disabled;
+
+    /* The current V4 generation path uses a multi-row post-prompt batch only for
+     * speculative target verification. Those rows are provisional until the
+     * target accepts a prefix, and rejected suffix rows are rolled back/replayed.
+     * Do not let provisional work advance policy time or train long-lived expert
+     * residency. The retained exact path is replayed as ordinary single-token
+     * decode and is observed normally. When #17 introduces real multi-session
+     * decode batching this heuristic should become an explicit request-context
+     * provisional flag instead of inferring intent from batch geometry. */
+    int provisional_decode_batch =
+        g_v4_activation_request.active && batch > 1 &&
+        start_position >= g_v4_activation_request.prompt_tokens;
+
+    call->valid = weights && start_position >= 0 && batch > 0 &&
+                  !call->disabled && !provisional_decode_batch;
     call->layer = weights ? weights->plan.layer : -1;
     call->start_position = start_position;
     call->next_item = 0;
