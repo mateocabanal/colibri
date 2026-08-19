@@ -49,9 +49,21 @@ static ColiV4Session *session_from_prefix(const kv_prefix *prefix) {
 
 static int coli_v4_cached_kv_prefix_reuse(const kv_prefix *prefix,
                                           const int *ids, int count) {
+    /* The production CLI/serve entry points live inside the amalgamated
+     * generation unit. Because that unit is macro-renamed to the uncached
+     * implementation, those internal call sites bypass the public wrapper
+     * below. Bind here as well: kv_prefix_reuse is reached before prefill on
+     * every request, so package-only DSpark sees the executor even on those
+     * internal paths. The bind is idempotent for the already-wrapped API path. */
+    ColiV4Session *session = session_from_prefix(prefix);
+    if (session && session->engine &&
+        coli_v4_package_source_bind(session->engine->coli_static)) {
+        fprintf(stderr,
+                "[MTP] package tensor source bind failed in generation path\n");
+    }
+
     int reused = kv_prefix_reuse(prefix, ids, count);
     if (!reused) {
-        ColiV4Session *session = session_from_prefix(prefix);
         reused = coli_v4_prefix_cache_restore(session, ids, count);
         if (!reused)
             reused = coli_v4_prefix_disk_restore(session, ids, count);
