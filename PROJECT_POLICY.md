@@ -25,6 +25,8 @@ The ordinary engine invocation must select the best safe supported path automati
 
 Performance features should therefore be **default-on or auto-selected** when their correctness preconditions and platform capabilities are satisfied. Examples include GPU backends, fused quantized kernels, expert union/batching, async I/O, prefetch, prompt caching, adaptive residency, direct/uncached I/O, and sensible loader concurrency.
 
+A new performance path may remain opt-in while its correctness and target-performance gates are still being established. **Once it passes those gates on a supported target, promote it to the ordinary automatic/default path.** Do not leave a validated fast path permanently hidden behind an enable flag. Keep knobs only when they remain useful as force/disable controls, explicit resource caps, diagnostics, or reproducible A/B controls.
+
 Environment variables and command-line performance controls should primarily be diagnostics, benchmarking controls, explicit caps, or ways to force/disable behavior. Avoid adding a new enable flag for an optimization that should simply be normal execution.
 
 Do not replace automatic policy with a `performance=max` switch that hides required tuning flags. The runtime should make the decision itself and report what it chose.
