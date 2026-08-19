@@ -120,13 +120,18 @@ struct ColiV4AdaptiveExpertStoreState {
     ColiExpertResidencyPolicyConfig policy;
     ColiV4AdaptiveResourcePlanner resource_planner;
 
-    /* Recent dense benefit is tracked in bytes avoided because dense tensors are
-     * heterogeneous in size. This is the dense analogue of the expert
-     * activation tracker's lazy half-life mass. */
+    /* Recent dense benefit is tracked in bytes because dense tensors are
+     * heterogeneous in size. Successful hits describe proven reuse, while
+     * otherwise-admissible tensors rejected for lack of room describe marginal
+     * demand that the old hit-only estimate could not see. Both use the same
+     * lazy half-life window as expert activations. */
     uint64_t dense_last_bytes_avoided;
     uint64_t dense_recent_bytes_avoided;
+    uint64_t dense_last_rejected_bytes;
+    uint64_t dense_recent_rejected_bytes;
     uint64_t dense_recent_decay_epoch;
     uint64_t dense_reuse_weight;
+    uint64_t dense_pressure_weight;
 };
 
 static size_t v4_adaptive_tracker_capacity(size_t keys) {
@@ -140,10 +145,17 @@ static size_t v4_adaptive_tracker_capacity(size_t keys) {
     return capacity;
 }
 
-/* Convert recent dense bytes avoided into the same projected-use vocabulary as
- * expert reuse_weight. The expert policy projects a half-life window of
- * 2*recency_quantum onto planning_horizon; do the identical projection here,
- * then divide by the resident dense bytes that produced those hits.
+/* Convert recent dense hits and capacity misses into the same projected-use
+ * vocabulary as expert reuse_weight. The expert policy projects a half-life
+ * window of 2*recency_quantum onto planning_horizon; do the identical
+ * projection here, then divide by the resident dense bytes supplying the cache.
+ *
+ * rejected_bytes counts only tensors that passed the dense admission benefit
+ * threshold but could not fit. That is direct evidence that the marginal dense
+ * working set still has demand. Treat it as pressure, but cap its contribution
+ * to at most the proven-hit value (or the cold-start prior when hits are absent),
+ * so a burst of compulsory misses cannot instantly swing the UMA pool back to
+ * all-dense. The resource transfer damper remains the second line of defense.
  *
  * Cold start gets a decaying confidence prior instead of the old ratio-1
  * certainty. With the default confidence_mass=8 this is 4, 2, 1 across the
@@ -168,6 +180,9 @@ static uint64_t v4_adaptive_dense_reuse_weight(
             state->dense_recent_bytes_avoided =
                 coli_expert_activation_decay_value(
                     state->dense_recent_bytes_avoided, buckets);
+            state->dense_recent_rejected_bytes =
+                coli_expert_activation_decay_value(
+                    state->dense_recent_rejected_bytes, buckets);
             state->dense_recent_decay_epoch +=
                 buckets * state->policy.recency_quantum_epochs;
         }
@@ -181,10 +196,26 @@ static uint64_t v4_adaptive_dense_reuse_weight(
     state->dense_recent_bytes_avoided = v4_adaptive_sat_add(
         state->dense_recent_bytes_avoided, delta_avoided);
 
+    uint64_t delta_rejected = dense.rejected_bytes >=
+        state->dense_last_rejected_bytes
+        ? dense.rejected_bytes - state->dense_last_rejected_bytes
+        : dense.rejected_bytes;
+    state->dense_last_rejected_bytes = dense.rejected_bytes;
+    state->dense_recent_rejected_bytes = v4_adaptive_sat_add(
+        state->dense_recent_rejected_bytes, delta_rejected);
+
+    uint64_t prior = state->policy.planner_confidence_mass / 2;
+    if (!prior) prior = 1;
+    uint64_t shifts = state->resource_planner.replan_count;
+    if (shifts > 2) shifts = 2;
+    prior >>= (unsigned)shifts;
+    if (!prior) prior = 1;
+
     uint64_t basis = dense.resident_bytes;
     if (!basis) basis = state->resource_planner.selected_dense_bytes;
 
     uint64_t observed = 0;
+    uint64_t pressure = 0;
     if (basis && state->policy.recency_quantum_epochs <= UINT64_MAX / 2) {
         uint64_t effective_window = state->policy.recency_quantum_epochs * 2;
         uint64_t projected_bytes = coli_expert_residency_scale_div(
@@ -195,18 +226,29 @@ static uint64_t v4_adaptive_dense_reuse_weight(
             observed = projected_bytes / basis;
             if (projected_bytes % basis) observed++;
         }
+
+        uint64_t projected_rejected = coli_expert_residency_scale_div(
+            state->dense_recent_rejected_bytes,
+            state->policy.planning_horizon_epochs,
+            effective_window);
+        if (projected_rejected) {
+            pressure = projected_rejected / basis;
+            if (projected_rejected % basis) pressure++;
+        }
     }
 
-    uint64_t prior = state->policy.planner_confidence_mass / 2;
-    if (!prior) prior = 1;
-    uint64_t shifts = state->resource_planner.replan_count;
-    if (shifts > 2) shifts = 2;
-    prior >>= (unsigned)shifts;
-    if (!prior) prior = 1;
+    /* Marginal miss pressure is useful only as a bounded correction to proven
+     * reuse. This makes the maximum dense valuation at most 2x its measured-hit
+     * value after warmup, while still allowing a prior-sized signal from a cold
+     * cache whose useful tensors are immediately being rejected. */
+    uint64_t pressure_cap = observed > prior ? observed : prior;
+    if (pressure > pressure_cap) pressure = pressure_cap;
+    uint64_t measured = v4_adaptive_sat_add(observed, pressure);
 
-    uint64_t weight = observed > prior ? observed : prior;
+    uint64_t weight = measured > prior ? measured : prior;
     if (weight > state->policy.max_reuse_weight)
         weight = state->policy.max_reuse_weight;
+    state->dense_pressure_weight = pressure;
     state->dense_reuse_weight = weight;
     return weight;
 }
@@ -420,9 +462,11 @@ static void v4_adaptive_observe(
         if (log && atoi(log) != 0) {
             fprintf(stderr,
                     "v4_residency_replan epoch=%llu dense_value=%llu "
-                    "dense_budget=%.2fGiB expert_capacity=%.2fGiB replans=%llu\n",
+                    "dense_pressure=%llu dense_budget=%.2fGiB "
+                    "expert_capacity=%.2fGiB replans=%llu\n",
                     (unsigned long long)state->current_epoch,
                     (unsigned long long)state->dense_reuse_weight,
+                    (unsigned long long)state->dense_pressure_weight,
                     inner->dense_cache_budget_bytes /
                         (1024.0 * 1024.0 * 1024.0),
                     inner->stats.capacity_bytes /
