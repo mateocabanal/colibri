@@ -2,13 +2,15 @@ use std::{
     collections::BTreeMap,
     fs,
     path::PathBuf,
-    time::{SystemTime, UNIX_EPOCH},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use colic::{
     model::qwen_mtp,
     source::{SourceInventory, TensorRef},
 };
+
+static NEXT_FIXTURE_ID: AtomicU64 = AtomicU64::new(1);
 
 struct Fixture {
     root: PathBuf,
@@ -44,12 +46,9 @@ fn add_tensor(
 }
 
 fn fixture() -> Fixture {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
+    let fixture_id = NEXT_FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
     let root = std::env::temp_dir().join(format!(
-        "colic-qwen-mtp-{}-{nonce}",
+        "colic-qwen-mtp-{}-{fixture_id}",
         std::process::id()
     ));
     fs::create_dir_all(&root).unwrap();
