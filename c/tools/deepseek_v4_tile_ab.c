@@ -22,11 +22,11 @@ static int sink_token(void *opaque, int token, float logit,
                       int position, int ordinal) {
     (void)logit;
     (void)position;
+    (void)ordinal;
     TokenSink *sink = (TokenSink *)opaque;
     if (!sink) return 0;
     sink->count++;
     if (sink->trace) fprintf(sink->trace, "%d\n", token);
-    (void)ordinal;
     return 0;
 }
 
@@ -132,12 +132,15 @@ int main(int argc, char **argv) {
     ColiMetalTileStats tile_before, tile_after;
     row_stats(&row_before);
     coli_metal_tile_stats(&tile_before);
+    coli_metal_profile_reset();
+    coli_metal_profile_set_on(1);
 
     FILE *trace = NULL;
     if (trace_path) {
         trace = fopen(trace_path, "w");
         if (!trace) {
             fprintf(stderr, "WIRE_TILE cannot open trace: %s\n", trace_path);
+            coli_metal_profile_set_on(0);
             coli_v4_engine_destroy(engine);
             return 1;
         }
@@ -150,6 +153,13 @@ int main(int argc, char **argv) {
     if (trace) {
         if (fflush(trace) || fclose(trace)) rc = -1;
     }
+
+    uint64_t profile_encode_ns = 0, profile_submit_ns = 0;
+    uint64_t profile_wait_ns = 0, profile_kernel_ns = 0;
+    coli_metal_profile_get(&profile_encode_ns, &profile_submit_ns,
+                           &profile_wait_ns, &profile_kernel_ns);
+    coli_metal_profile_set_on(0);
+
     if (rc) {
         fprintf(stderr, "WIRE_TILE timed failed: %s\n", error[0] ? error : "trace write");
         coli_v4_engine_destroy(engine);
@@ -170,8 +180,14 @@ int main(int argc, char **argv) {
     uint64_t tile_wall_ns = du64(tile_after.wall_ns, tile_before.wall_ns);
     uint64_t tile_kernel_ns = du64(tile_after.kernel_ns, tile_before.kernel_ns);
     uint64_t tile_scatter_ns = du64(tile_after.scatter_ns, tile_before.scatter_ns);
-    double expert_seconds = row_setup + row_gpu + row_scatter +
-        (double)tile_repack_ns / 1.0e9 + (double)tile_wall_ns / 1.0e9;
+    uint64_t row_mxfp4_calls = du64(tile_after.row_mxfp4_calls,
+                                    tile_before.row_mxfp4_calls);
+    uint64_t row_mxfp4_wall_ns = du64(tile_after.row_mxfp4_wall_ns,
+                                      tile_before.row_mxfp4_wall_ns);
+    double expert_seconds =
+        (double)row_mxfp4_wall_ns / 1.0e9 +
+        (double)tile_repack_ns / 1.0e9 +
+        (double)tile_wall_ns / 1.0e9;
     double expert_pct = stats.decode_sec > 0.0
         ? 100.0 * expert_seconds / stats.decode_sec : 0.0;
 
@@ -186,6 +202,16 @@ int main(int argc, char **argv) {
         (unsigned long long)du64(row_after.experts, row_before.experts),
         row_setup * 1.0e3, row_gpu * 1.0e3, row_kernel * 1.0e3,
         row_scatter * 1.0e3);
+    fprintf(stdout,
+        "WIRE_TILE_ROW_MXFP4 calls=%llu wall_ms=%.3f\n",
+        (unsigned long long)row_mxfp4_calls,
+        (double)row_mxfp4_wall_ns / 1.0e6);
+    fprintf(stdout,
+        "WIRE_TILE_PROFILE encode_ms=%.3f submit_ms=%.3f wait_ms=%.3f kernel_ms=%.3f\n",
+        (double)profile_encode_ns / 1.0e6,
+        (double)profile_submit_ns / 1.0e6,
+        (double)profile_wait_ns / 1.0e6,
+        (double)profile_kernel_ns / 1.0e6);
     fprintf(stdout,
         "WIRE_TILE_APPLE8 repacks=%llu repack_mib=%.3f repack_ms=%.3f single=%llu blocks=%llu fallback=%llu experts=%llu wall_ms=%.3f kernel_ms=%.3f scatter_ms=%.3f\n",
         (unsigned long long)du64(tile_after.repack_count, tile_before.repack_count),

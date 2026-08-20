@@ -19,6 +19,8 @@ typedef struct {
     uint64_t wall_ns;
     uint64_t kernel_ns;
     uint64_t scatter_ns;
+    uint64_t row_mxfp4_calls;
+    uint64_t row_mxfp4_wall_ns;
 } ColiMetalTileStats;
 
 /* Milestone-1 opt-in gate. Unset/0 leaves the stock row-fmt7 path untouched. */

@@ -143,11 +143,10 @@ static bool tile_init(void) {
 }
 
 extern "C" int coli_metal_tile_enabled(void) {
-    static int enabled=-1;
-    if(enabled<0){
+    static const int enabled=[](){
         const char *v=getenv("V4_METAL_TILE");
-        enabled=(v&&*v&&atoi(v)!=0)?1:0;
-    }
+        return (v&&*v&&atoi(v)!=0)?1:0;
+    }();
     return enabled;
 }
 
@@ -182,6 +181,7 @@ static size_t tile_cache_capacity(void) {
 static std::atomic<uint64_t> st_repack_count{0},st_repack_bytes{0},st_repack_ns{0};
 static std::atomic<uint64_t> st_single_calls{0},st_moe_calls{0},st_fallback{0};
 static std::atomic<uint64_t> st_experts{0},st_wall_ns{0},st_kernel_ns{0},st_scatter_ns{0};
+static std::atomic<uint64_t> st_row_mxfp4_calls{0},st_row_mxfp4_wall_ns{0};
 
 extern "C" void coli_metal_tile_stats(ColiMetalTileStats *stats) {
     if(!stats) return;
@@ -195,6 +195,8 @@ extern "C" void coli_metal_tile_stats(ColiMetalTileStats *stats) {
     stats->wall_ns=st_wall_ns.load();
     stats->kernel_ns=st_kernel_ns.load();
     stats->scatter_ns=st_scatter_ns.load();
+    stats->row_mxfp4_calls=st_row_mxfp4_calls.load();
+    stats->row_mxfp4_wall_ns=st_row_mxfp4_wall_ns.load();
 }
 
 static id<MTLBuffer> tile_find(const void *weights,const void *scales,
@@ -310,7 +312,13 @@ extern "C" int coli_metal_matmul(ColiMetalTensor **tensor,
         if(rec&&tile_single_run(y,x,rec,S,I,O)) return 1;
         st_fallback.fetch_add(1);
     }
-    return coli_metal_matmul_row(tensor,y,x,weights,scales,fmt,S,I,O,gs);
+    uint64_t began=fmt==7?tile_now_ns():0;
+    int rc=coli_metal_matmul_row(tensor,y,x,weights,scales,fmt,S,I,O,gs);
+    if(began){
+        st_row_mxfp4_calls.fetch_add(1);
+        st_row_mxfp4_wall_ns.fetch_add(tile_now_ns()-began);
+    }
+    return rc;
 }
 
 static std::mutex g_exec_mutex;

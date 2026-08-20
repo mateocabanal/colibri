@@ -30,6 +30,7 @@ static int layout_plan(const ColiMxfp4Apple8SourceExpert *source,
                        ColiMxfp4Apple8TileMatrix entries[3]) {
     if (!source_descriptor_valid(source) || !resident_bytes || !entries)
         return -1;
+    memset(entries, 0, 3 * sizeof(*entries));
     uint64_t cursor = align64(sizeof(ColiMxfp4Apple8TileExpertHeader));
     if (!cursor) return -1;
     for (uint32_t i = 0; i < 3; ++i) {
@@ -38,18 +39,26 @@ static int layout_plan(const ColiMxfp4Apple8SourceExpert *source,
         if (!bytes) return -1;
         cursor = align64(cursor);
         if (!cursor || cursor > UINT64_MAX - (uint64_t)bytes) return -1;
-        entries[i] = (ColiMxfp4Apple8TileMatrix){
-            .role = src->role,
-            .reserved = 0,
-            .rows = src->rows,
-            .columns = src->columns,
-            .offset = cursor,
-            .bytes = (uint64_t)bytes,
-        };
+        entries[i].role = src->role;
+        entries[i].rows = src->rows;
+        entries[i].columns = src->columns;
+        entries[i].offset = cursor;
+        entries[i].bytes = (uint64_t)bytes;
         cursor += (uint64_t)bytes;
     }
     *resident_bytes = cursor;
     return 0;
+}
+
+static int entry_equal(const ColiMxfp4Apple8TileMatrix *a,
+                       const ColiMxfp4Apple8TileMatrix *b) {
+    return a && b &&
+        a->role == b->role &&
+        a->reserved == b->reserved &&
+        a->rows == b->rows &&
+        a->columns == b->columns &&
+        a->offset == b->offset &&
+        a->bytes == b->bytes;
 }
 
 static int apple8_estimate(void *context,
@@ -160,7 +169,7 @@ static int apple8_validate(void *context,
         const ColiMxfp4Apple8TileMatrix *actual = &header->matrices[i];
         const ColiMxfp4Apple8TileMatrix *wanted = &expected_entries[i];
         const ColiMxfp4Apple8RowMatrix *src = &source->matrices[i];
-        if (memcmp(actual, wanted, sizeof(*actual)) != 0 ||
+        if (!entry_equal(actual, wanted) ||
             actual->offset > resident_bytes ||
             actual->bytes > resident_bytes - actual->offset ||
             coli_mxfp4_apple8_tile_validate(
