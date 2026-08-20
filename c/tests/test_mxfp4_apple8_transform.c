@@ -55,7 +55,7 @@ int main(void) {
 
     ColiRepresentationTransformRegistry registry;
     coli_jit_transform_registry_init(&registry);
-    if (coli_mxfp4_apple8_register_transform(&registry) != 0) return 3;
+    if (coli_mxfp4_apple8_register_transform(&registry) != 1) return 3;
     ColiRepresentationTransformOps ops;
     if (coli_jit_transform_registry_find(
             &registry, &src_rep, &dst_rep,
