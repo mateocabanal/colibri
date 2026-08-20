@@ -185,17 +185,26 @@ static void coli_derived_telemetry_init(ColiDerivedCacheTelemetry *telemetry) {
     atomic_init(&telemetry->prepare_ns_avoided, 0);
 }
 
+static int coli_derived_directory_is_dir(const struct stat *st) {
+    if (!st) return 0;
+#ifdef _WIN32
+    return (st->st_mode & _S_IFDIR) != 0;
+#else
+    return S_ISDIR(st->st_mode) != 0;
+#endif
+}
+
 static int coli_derived_directory_ready(const char *path) {
     struct stat st;
     if (!path || !path[0]) return 0;
-    if (stat(path, &st) == 0) return S_ISDIR(st.st_mode) != 0;
+    if (stat(path, &st) == 0) return coli_derived_directory_is_dir(&st);
     if (errno != ENOENT) return 0;
 #ifdef _WIN32
     if (_mkdir(path) != 0 && errno != EEXIST) return 0;
 #else
     if (mkdir(path, 0700) != 0 && errno != EEXIST) return 0;
 #endif
-    return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+    return stat(path, &st) == 0 && coli_derived_directory_is_dir(&st);
 }
 
 int coli_derived_cache_init(
@@ -628,6 +637,7 @@ static int coli_derived_verify_file(
         return parsed;
     }
     if (info.payload_bytes > max_object_bytes ||
+        info.allocation_bytes > max_object_bytes ||
         !coli_derived_verify_payload(file, info.payload_bytes,
                                      info.payload_crc)) {
         fclose(file);
@@ -672,10 +682,12 @@ int coli_derived_cache_store(
     if (!cache || !cache->config.enabled ||
         !coli_derived_cache_identity_valid(identity) || !target_lease ||
         !coli_expert_residency_lease_valid(target_lease) ||
+        !coli_expert_key_equal(target_lease->key, identity->logical_expert) ||
         !coli_derived_alignment_valid(resident_alignment) ||
         coli_expert_residency_lease_view(target_lease, &view) != 0 ||
         !view.physical || !view.resident_bytes ||
         view.allocation_bytes < view.resident_bytes ||
+        view.allocation_bytes > cache->config.max_object_bytes ||
         !coli_representation_equal(&view.representation,
                                    &identity->target_representation) ||
         coli_expert_residency_preferred_variant(target_lease->entry) !=
@@ -802,6 +814,7 @@ int coli_derived_cache_load_variant(
     if (info) memset(info, 0, sizeof(*info));
     if (!cache || !cache->config.enabled ||
         !coli_derived_cache_identity_valid(expected_identity) || !entry ||
+        !coli_expert_key_equal(entry->key, expected_identity->logical_expert) ||
         !resident_budget || !target_tier_mask || !info)
         return 0;
 
@@ -817,7 +830,8 @@ int coli_derived_cache_load_variant(
         goto done;
     }
     parsed = coli_derived_parse_header(header, expected_identity, &header_info);
-    if (parsed != 1 || header_info.payload_bytes > cache->config.max_object_bytes) {
+    if (parsed != 1 || header_info.payload_bytes > cache->config.max_object_bytes ||
+        header_info.allocation_bytes > cache->config.max_object_bytes) {
         coli_derived_note_miss(cache, parsed == -1 ? -1 : -2);
         goto done;
     }
