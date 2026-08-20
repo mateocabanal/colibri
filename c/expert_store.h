@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "tensor.h"
+#include "expert_representation.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -48,6 +49,12 @@ typedef struct {
      * should validate it on release so an old view can never alias a newer
      * expert after slot reuse. */
     uint64_t lease_generation;
+    /* Exact resident execution representation held by this lease. This uses
+     * the shared .coli math/scale/layout vocabulary rather than ColiTensorFormat
+     * or a backend-private fmt ordinal. A zero value means a legacy store has
+     * not migrated its representation publication yet; representation-aware
+     * dispatch must fail closed rather than infer it from model name. */
+    ColiRepresentationId representation;
 } ColiExpertView;
 
 typedef struct {
@@ -130,6 +137,9 @@ static inline uint64_t coli_expert_store_stats_physical_load_ns_average(
  * - A streamed/reusable store should publish a monotonically changing
  *   lease_generation when a physical slot is repurposed. The lease pins that
  *   exact generation until release/backend completion.
+ * - representation describes the exact resident execution bytes held by that
+ *   same lease; generation changes and representation changes are independent
+ *   identities. A backend must not reinterpret a zero/unsupported representation.
  * - destroy() requires zero active leases (debug builds assert).
  * - Thread-safety is implementation-specific. Callers must not assume that
  *   lookup/release/prefetch/stats/destroy are safe to call concurrently on

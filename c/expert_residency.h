@@ -54,13 +54,39 @@ typedef struct {
     atomic_uint refs;
     atomic_uint tier_mask;
     uint64_t allocation_bytes;
+
+    /*
+     * Single-variant publication metadata for #133. It is immutable while the
+     * entry is RESIDENT and has refs. #134 will move these fields to per-variant
+     * state; this slice deliberately keeps the proven lifecycle unchanged.
+     */
+    uint64_t resident_bytes;
+    ColiRepresentationId representation;
+    const void *physical_handle;
 } ColiExpertResidencyEntry;
 
 typedef struct {
+    ColiExpertKey key;
+    ColiRepresentationId representation;
+    uint64_t generation;
+    unsigned tier_mask;
+    uint64_t resident_bytes;
+    uint64_t allocation_bytes;
+    /* Opaque publication/region identity. It is valid only together with the
+     * exact generation above; raw pointer identity alone is never sufficient. */
+    const void *physical_handle;
+} ColiExpertResidentView;
+
+typedef struct {
+    /* Preserve the original leading lease fields so existing callers that only
+     * consume generation/tier identity remain source-compatible. */
     ColiExpertResidencyEntry *entry;
     ColiExpertKey key;
     uint64_t generation;
     unsigned tier_mask;
+
+    /* Exact representation/publication pinned by this lease. */
+    ColiExpertResidentView resident;
 } ColiExpertResidencyLease;
 
 static inline int coli_expert_key_equal(ColiExpertKey a, ColiExpertKey b) {
@@ -199,6 +225,19 @@ static inline int coli_expert_residency_acquire(
     lease->key = entry->key;
     lease->generation = generation;
     lease->tier_mask = tier;
+
+    /*
+     * Publication metadata is immutable until refs return to zero, so once the
+     * generation check above succeeds these ordinary fields belong to this
+     * exact pinned publication.
+     */
+    lease->resident.key = entry->key;
+    lease->resident.representation = entry->representation;
+    lease->resident.generation = generation;
+    lease->resident.tier_mask = tier;
+    lease->resident.resident_bytes = entry->resident_bytes;
+    lease->resident.allocation_bytes = entry->allocation_bytes;
+    lease->resident.physical_handle = entry->physical_handle;
     return 1;
 }
 
@@ -243,6 +282,9 @@ static inline ColiExpertRequestResult coli_expert_residency_request(
                                 : COLI_EXPERT_REQUEST_NO_BUDGET;
         }
         entry->allocation_bytes = allocation_bytes;
+        entry->resident_bytes = 0;
+        memset(&entry->representation, 0, sizeof(entry->representation));
+        entry->physical_handle = NULL;
         memset(lease, 0, sizeof(*lease));
         return COLI_EXPERT_REQUEST_LOAD_OWNER;
     }
@@ -271,12 +313,23 @@ static inline int coli_expert_residency_mark_preparing(
         memory_order_acq_rel, memory_order_acquire) ? 0 : -1;
 }
 
-static inline int coli_expert_residency_publish(
+/*
+ * Representation-aware publication for #133. This is still one physical
+ * variant per entry: #134 will split logical and variant state. The generation
+ * and reference-count publication order is deliberately unchanged.
+ */
+static inline int coli_expert_residency_publish_representation(
     ColiExpertResidencyEntry *entry,
     ColiExpertResidencyBudget *budget,
     uint64_t generation,
-    unsigned tier_mask) {
-    if (!entry || !budget || !generation || !tier_mask || !entry->allocation_bytes)
+    unsigned tier_mask,
+    uint64_t resident_bytes,
+    const ColiRepresentationId *representation,
+    const void *physical_handle) {
+    if (!entry || !budget || !generation || !tier_mask ||
+        !entry->allocation_bytes || !resident_bytes ||
+        resident_bytes > entry->allocation_bytes ||
+        !coli_representation_valid(representation) || !physical_handle)
         return -1;
     int state = atomic_load_explicit(&entry->state, memory_order_acquire);
     if (state != COLI_EXPERT_RESIDENCY_RESERVED &&
@@ -295,10 +348,65 @@ static inline int coli_expert_residency_publish(
     if (coli_expert_residency_budget_publish(
             budget, entry->allocation_bytes) != 0)
         return -1;
+
+    entry->resident_bytes = resident_bytes;
+    entry->representation = *representation;
+    entry->physical_handle = physical_handle;
     atomic_store_explicit(&entry->generation, generation, memory_order_release);
     atomic_store_explicit(&entry->tier_mask, tier_mask, memory_order_release);
     atomic_store_explicit(&entry->state, COLI_EXPERT_RESIDENCY_RESIDENT,
                           memory_order_release);
+    return 0;
+}
+
+/*
+ * Compatibility publication for callers not yet migrated to representation
+ * identity. Lifetime/budget behavior remains byte-for-byte equivalent to the
+ * original API. New representation-aware dispatch must reject the zero
+ * representation rather than inventing one from model/backend context.
+ */
+static inline int coli_expert_residency_publish(
+    ColiExpertResidencyEntry *entry,
+    ColiExpertResidencyBudget *budget,
+    uint64_t generation,
+    unsigned tier_mask) {
+    if (!entry || !budget || !generation || !tier_mask || !entry->allocation_bytes)
+        return -1;
+    int state = atomic_load_explicit(&entry->state, memory_order_acquire);
+    if (state != COLI_EXPERT_RESIDENCY_RESERVED &&
+        state != COLI_EXPERT_RESIDENCY_LOADING &&
+        state != COLI_EXPERT_RESIDENCY_PREPARING)
+        return -1;
+
+    uint64_t previous = atomic_load_explicit(
+        &entry->generation, memory_order_acquire);
+    if (generation <= previous) return -1;
+
+    if (coli_expert_residency_budget_publish(
+            budget, entry->allocation_bytes) != 0)
+        return -1;
+    entry->resident_bytes = entry->allocation_bytes;
+    memset(&entry->representation, 0, sizeof(entry->representation));
+    entry->physical_handle = entry;
+    atomic_store_explicit(&entry->generation, generation, memory_order_release);
+    atomic_store_explicit(&entry->tier_mask, tier_mask, memory_order_release);
+    atomic_store_explicit(&entry->state, COLI_EXPERT_RESIDENCY_RESIDENT,
+                          memory_order_release);
+    return 0;
+}
+
+static inline int coli_expert_residency_lease_view(
+    const ColiExpertResidencyLease *lease, ColiExpertResidentView *view) {
+    if (!lease || !view || !lease->entry || !lease->generation ||
+        !coli_expert_key_equal(lease->key, lease->resident.key) ||
+        lease->generation != lease->resident.generation ||
+        lease->tier_mask != lease->resident.tier_mask ||
+        atomic_load_explicit(&lease->entry->state, memory_order_acquire) !=
+            COLI_EXPERT_RESIDENCY_RESIDENT ||
+        atomic_load_explicit(&lease->entry->generation, memory_order_acquire) !=
+            lease->generation)
+        return -1;
+    *view = lease->resident;
     return 0;
 }
 
@@ -314,6 +422,9 @@ static inline int coli_expert_residency_fail_load(
             budget, entry->allocation_bytes) != 0)
         return -1;
     entry->allocation_bytes = 0;
+    entry->resident_bytes = 0;
+    memset(&entry->representation, 0, sizeof(entry->representation));
+    entry->physical_handle = NULL;
     atomic_store_explicit(&entry->tier_mask, COLI_EXPERT_TIER_NONE,
                           memory_order_release);
     atomic_store_explicit(&entry->state, COLI_EXPERT_RESIDENCY_COLD,
@@ -370,6 +481,9 @@ static inline int coli_expert_residency_finish_evict(
             budget, entry->allocation_bytes) != 0)
         return -1;
     entry->allocation_bytes = 0;
+    entry->resident_bytes = 0;
+    memset(&entry->representation, 0, sizeof(entry->representation));
+    entry->physical_handle = NULL;
     atomic_store_explicit(&entry->tier_mask, COLI_EXPERT_TIER_NONE,
                           memory_order_release);
     atomic_store_explicit(&entry->state, COLI_EXPERT_RESIDENCY_COLD,
