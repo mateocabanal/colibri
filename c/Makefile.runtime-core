@@ -7,7 +7,7 @@ endif
 
 .PHONY: check clean
 
-check: test_record_io$(EXE) test_expert_representation$(EXE) test_expert_residency$(EXE) test_expert_multivariant$(EXE) test_expert_transform$(EXE) test_expert_dispatch$(EXE) test_expert_dispatch_output$(EXE) test_expert_activation$(EXE) test_expert_residency_policy$(EXE) test_expert_resource_bridge$(EXE) test_resource_planner$(EXE) test_speculative_cache$(EXE) test_speculative_cache_disk$(EXE)
+check: test_record_io$(EXE) test_expert_representation$(EXE) test_expert_residency$(EXE) test_expert_multivariant$(EXE) test_expert_transform$(EXE) test_expert_dispatch$(EXE) test_expert_dispatch_output$(EXE) test_expert_derived_cache$(EXE) test_expert_activation$(EXE) test_expert_residency_policy$(EXE) test_expert_resource_bridge$(EXE) test_resource_planner$(EXE) test_speculative_cache$(EXE) test_speculative_cache_disk$(EXE)
 	./test_record_io$(EXE)
 	./test_expert_representation$(EXE)
 	./test_expert_residency$(EXE)
@@ -15,6 +15,7 @@ check: test_record_io$(EXE) test_expert_representation$(EXE) test_expert_residen
 	./test_expert_transform$(EXE)
 	./test_expert_dispatch$(EXE)
 	./test_expert_dispatch_output$(EXE)
+	./test_expert_derived_cache$(EXE)
 	./test_expert_activation$(EXE)
 	./test_expert_residency_policy$(EXE)
 	./test_expert_resource_bridge$(EXE)
@@ -43,6 +44,9 @@ test_expert_dispatch$(EXE): tests/test_expert_dispatch.c expert_dispatch.h exper
 test_expert_dispatch_output$(EXE): tests/test_expert_dispatch_output.c expert_dispatch.h expert_transform.c expert_transform.h expert_residency.h expert_residency_policy.h expert_activation.h resource_planner.h expert_representation.h expert_store.h coli_format.h
 	$(CC) $(CFLAGS) tests/test_expert_dispatch_output.c expert_transform.c -o $@
 
+test_expert_derived_cache$(EXE): tests/test_expert_derived_cache.c expert_derived_cache.c expert_derived_cache.h cache_io.h expert_transform.c expert_transform.h expert_residency.h expert_representation.h expert_store.h coli_format.h
+	$(CC) $(CFLAGS) tests/test_expert_derived_cache.c expert_derived_cache.c expert_transform.c -o $@
+
 test_expert_activation$(EXE): tests/test_expert_activation.c expert_activation.h expert_store.h
 	$(CC) $(CFLAGS) tests/test_expert_activation.c -o $@
 
@@ -69,6 +73,7 @@ clean:
 		test_expert_transform test_expert_transform.exe \
 		test_expert_dispatch test_expert_dispatch.exe \
 		test_expert_dispatch_output test_expert_dispatch_output.exe \
+		test_expert_derived_cache test_expert_derived_cache.exe \
 		test_expert_activation test_expert_activation.exe \
 		test_expert_residency_policy test_expert_residency_policy.exe \
 		test_expert_resource_bridge test_expert_resource_bridge.exe \
