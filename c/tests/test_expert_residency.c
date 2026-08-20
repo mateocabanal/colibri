@@ -6,14 +6,15 @@
 static int expect_cold_clean(ColiExpertResidencyEntry *entry,
                              ColiExpertResidencyBudget *budget,
                              uint64_t generation) {
+    ColiExpertResidentVariant *variant = &entry->variants[0];
     return coli_expert_residency_state(entry) == COLI_EXPERT_RESIDENCY_COLD &&
-        atomic_load(&entry->generation) == generation &&
-        atomic_load(&entry->refs) == 0 &&
+        atomic_load(&variant->generation) == generation &&
+        atomic_load(&variant->refs) == 0 &&
         atomic_load(&budget->committed_bytes) == 0 &&
         atomic_load(&budget->reserved_bytes) == 0 &&
         atomic_load(&budget->resident_bytes) == 0 &&
-        entry->resident_bytes == 0 && entry->physical == NULL &&
-        !coli_representation_known(&entry->representation);
+        variant->resident_bytes == 0 && variant->physical == NULL &&
+        !coli_representation_known(&variant->representation);
 }
 
 int main(void) {
@@ -25,8 +26,6 @@ int main(void) {
     coli_expert_residency_budget_init(&budget, 100);
     if (coli_expert_residency_entry_init(&entry, key) != 0) return 1;
 
-    /* Existing callers keep identical lifetime/generation behavior. They now
-     * expose UNKNOWN representation instead of silently inferring one. */
     if (coli_expert_residency_request(&entry, &budget, 60, &lease) !=
             COLI_EXPERT_REQUEST_LOAD_OWNER ||
         coli_expert_residency_publish(&entry, &budget, 7,
@@ -34,9 +33,10 @@ int main(void) {
         return 2;
     if (coli_expert_residency_request(&entry, &budget, 60, &lease) !=
             COLI_EXPERT_REQUEST_HIT || lease.generation != 7 ||
+        lease.variant_id != 0 || lease.variant != &entry.variants[0] ||
         lease.resident_bytes != 60 || lease.allocation_bytes != 60 ||
         coli_representation_known(&lease.representation) ||
-        atomic_load(&entry.refs) != 1)
+        atomic_load(&entry.variants[0].refs) != 1)
         return 3;
     if (coli_expert_residency_release(&lease) != 0 ||
         coli_expert_residency_begin_evict(&entry) != 1 ||
@@ -44,9 +44,6 @@ int main(void) {
         !expect_cold_clean(&entry, &budget, 7))
         return 4;
 
-    /* Reusing the exact old generation after physical-slot reuse would make a
-     * stale backend descriptor valid again. Publication must fail without
-     * consuming or reclassifying the reservation. */
     if (coli_expert_residency_request(&entry, &budget, 60, &lease) !=
             COLI_EXPERT_REQUEST_LOAD_OWNER ||
         coli_expert_residency_publish(&entry, &budget, 7,
@@ -60,7 +57,6 @@ int main(void) {
         !expect_cold_clean(&entry, &budget, 7))
         return 6;
 
-    /* Older generations are equally invalid. */
     if (coli_expert_residency_request(&entry, &budget, 60, &lease) !=
             COLI_EXPERT_REQUEST_LOAD_OWNER ||
         coli_expert_residency_publish(&entry, &budget, 6,
@@ -82,8 +78,6 @@ int main(void) {
     };
     int physical_slot = 42;
 
-    /* A strictly newer generation is publishable and leases pin the exact
-     * representation/physical generation that was actually published. */
     if (coli_expert_residency_request(&entry, &budget, 60, &lease) !=
             COLI_EXPERT_REQUEST_LOAD_OWNER ||
         coli_expert_residency_publish_representation(
@@ -94,7 +88,8 @@ int main(void) {
             COLI_EXPERT_REQUEST_HIT || lease.generation != 8 ||
         !coli_representation_equal(&lease.representation, &rep) ||
         lease.resident_bytes != 56 || lease.allocation_bytes != 60 ||
-        lease.physical != &physical_slot || atomic_load(&entry.refs) != 1)
+        lease.physical != &physical_slot ||
+        atomic_load(&entry.variants[0].refs) != 1)
         return 8;
 
     ColiExpertResidentView view;
@@ -105,16 +100,16 @@ int main(void) {
         view.physical != &physical_slot)
         return 9;
 
-    /* Even if client code copied an old lease before releasing it, that stale
-     * identity must not be able to release the ref belonging to generation 8. */
     ColiExpertResidencyLease stale = {
         .entry = &entry,
+        .variant = &entry.variants[0],
+        .variant_id = 0,
         .key = key,
         .generation = 7,
         .tier_mask = COLI_EXPERT_TIER_HOST,
     };
     if (coli_expert_residency_release(&stale) == 0 ||
-        atomic_load(&entry.refs) != 1)
+        atomic_load(&entry.variants[0].refs) != 1)
         return 10;
 
     if (coli_expert_residency_release(&lease) != 0 ||
