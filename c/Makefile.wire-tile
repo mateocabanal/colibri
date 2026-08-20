@@ -1,0 +1,59 @@
+# Additive milestone-1 wire harness for #131's MXFP4 Apple8 tile layout.
+# The stock Makefile.deepseek-v4 targets/objects are not modified: this file
+# links an A/B binary whose public Metal fmt7 entrypoints are wrappers around a
+# macro-renamed copy of the exact stock backend.
+include Makefile.deepseek-v4
+
+ifneq ($(UNAME_S),Darwin)
+$(error Makefile.wire-tile is an Apple-Silicon Metal milestone harness)
+endif
+ifneq ($(METAL),1)
+$(error Makefile.wire-tile requires METAL=1)
+endif
+
+WIRE_TILE_BINARY := deepseek_v4_tile_ab
+WIRE_BASE_OBJS := $(filter-out coli_executor.o backend_metal.o,$(V4_PREFIX_TEST_OBJS))
+WIRE_TILE_OBJS := $(WIRE_BASE_OBJS) coli_executor_tile.o mxfp4_apple8_tile.o \
+	backend_metal_wire.o backend_metal_tile.o
+
+.PHONY: deepseek-v4-wire-tile test-mxfp4-apple8-transform wire-tile-clean
+
+deepseek-v4-wire-tile: $(WIRE_TILE_BINARY)
+
+backend_metal_wire.o: backend_metal.mm backend_metal.h $(V4_BUILD_CONFIG)
+	$(METALXX) \
+		-Dcoli_metal_matmul=coli_metal_matmul_row \
+		-Dcoli_metal_moe_block_mxfp4=coli_metal_moe_block_mxfp4_row \
+		-c backend_metal.mm -o $@
+
+backend_metal_tile.o: backend_metal_tile.mm backend_metal_tile.h \
+	mxfp4_apple8_tile.h backend_metal.h $(V4_BUILD_CONFIG)
+	$(METALXX) -c backend_metal_tile.mm -o $@
+
+mxfp4_apple8_tile.o: mxfp4_apple8_tile.c mxfp4_apple8_tile.h \
+	expert_transform.h expert_residency.h expert_representation.h coli_format.h
+	$(CC) $(CFLAGS) -c mxfp4_apple8_tile.c -o $@
+
+coli_executor_tile.o: coli_executor_tile.c coli_executor.c coli_executor.h \
+	coli_format.h backend_metal_tile.h $(V4_BUILD_CONFIG)
+	$(CC) $(CFLAGS) -c coli_executor_tile.c -o $@
+
+$(WIRE_TILE_BINARY): tools/deepseek_v4_tile_ab.c backend_metal_tile.h \
+	$(WIRE_TILE_OBJS)
+	$(CC) $(CFLAGS) tools/deepseek_v4_tile_ab.c $(WIRE_TILE_OBJS) -o $@ $(LDFLAGS)
+
+test-mxfp4-apple8-transform: test_mxfp4_apple8_transform
+	./test_mxfp4_apple8_transform
+
+test_mxfp4_apple8_transform: tests/test_mxfp4_apple8_transform.c \
+	mxfp4_apple8_tile.c mxfp4_apple8_tile_transform.c mxfp4_apple8_tile.h \
+	expert_transform.c expert_transform.h expert_residency.h \
+	expert_representation.h expert_store.h coli_format.h
+	$(CC) -O2 -std=c11 -Wall -Wextra -Werror \
+		tests/test_mxfp4_apple8_transform.c mxfp4_apple8_tile.c \
+		mxfp4_apple8_tile_transform.c expert_transform.c -o $@
+
+wire-tile-clean:
+	rm -f $(WIRE_TILE_BINARY) test_mxfp4_apple8_transform \
+		backend_metal_wire.o backend_metal_tile.o mxfp4_apple8_tile.o \
+		coli_executor_tile.o
