@@ -44,7 +44,7 @@ def env_for_engine(a, arch):
     model = getattr(a, "model", None)
     if (arch == "qwen3_moe" and model and
             os.path.isfile(os.path.join(model, "manifest.coli"))):
-        env["COLI_CONFIG"] = os.path.abspath(model)
+        env["COLI_CONFIG"] = os.path.realpath(model)
     return env
 
 if __name__ == "__main__":

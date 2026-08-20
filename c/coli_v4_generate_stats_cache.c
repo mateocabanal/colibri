@@ -8,6 +8,10 @@
  * Reuse order is deliberate: same-session continuation first, process-local RAM
  * second, persistent SSD third. Admission remains at the canonical
  * end-of-prefill kv_prefix_record() boundary before decode mutates target state.
+ *
+ * The same split unit owns V4 speculative generation, so package-only DSpark
+ * binds the named COLITENS compatibility source here. Target-only generation
+ * explicitly leaves that adapter unbound so speculation is behaviorally inert.
  */
 #define coli_v4_session_generate coli_v4_session_generate_uncached
 #include "deepseek_v4_internal.h"
@@ -15,9 +19,12 @@
 
 #include "coli_v4_prefix_cache.h"
 #include "coli_v4_prefix_disk.h"
+#include "coli_v4_package_tensor_source.h"
 
 #include <stddef.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 #ifdef main
 #undef main
@@ -40,11 +47,34 @@ static ColiV4Session *session_from_prefix(const kv_prefix *prefix) {
                             offsetof(ColiV4Session, fed));
 }
 
+/* This TU owns a separate static package-adapter instance from the runtime TU.
+ * Keep it bound only while the live engine actually has a speculative source.
+ * Full DSpark records its capability in coli_v4_full_dspark_wanted; the legacy
+ * Markov proposer records it in engine->dspark.enabled. */
+static int coli_v4_generation_package_bridge_sync(ColiV4Session *session) {
+    int wanted = session && session->engine &&
+        (coli_v4_full_dspark_wanted || session->engine->dspark.enabled);
+    if (!wanted)
+        return coli_v4_package_source_bind(NULL);
+    return coli_v4_package_source_bind(session->engine->coli_static);
+}
+
 static int coli_v4_cached_kv_prefix_reuse(const kv_prefix *prefix,
                                           const int *ids, int count) {
+    /* The production CLI/serve entry points live inside the amalgamated
+     * generation unit. Because that unit is macro-renamed to the uncached
+     * implementation, those internal call sites bypass the public wrapper
+     * below. Sync here as well: kv_prefix_reuse is reached before prefill on
+     * every request, so target-only calls drop the adapter before any target
+     * tensor work and package-only DSpark binds it before its first proposal. */
+    ColiV4Session *session = session_from_prefix(prefix);
+    if (coli_v4_generation_package_bridge_sync(session)) {
+        fprintf(stderr,
+                "[MTP] package tensor source bind failed in generation path\n");
+    }
+
     int reused = kv_prefix_reuse(prefix, ids, count);
     if (!reused) {
-        ColiV4Session *session = session_from_prefix(prefix);
         reused = coli_v4_prefix_cache_restore(session, ids, count);
         if (!reused)
             reused = coli_v4_prefix_disk_restore(session, ids, count);
@@ -52,8 +82,6 @@ static int coli_v4_cached_kv_prefix_reuse(const kv_prefix *prefix,
             v4_ds_reset_history();
     }
 #ifdef COLI_V4_ADAPTIVE_ACTIVATION
-    /* The lightweight block overlay uses this only to distinguish fresh prompt
-     * positions from decode positions. It does not inspect token values. */
     coli_v4_activation_begin_request(count, reused);
 #endif
 #ifdef COLI_V4_TRACE_ROUTE
@@ -70,26 +98,206 @@ static void coli_v4_cached_kv_prefix_record(kv_prefix *prefix,
     if (!session || !ids || count <= 0 || !session->prompt_ids ||
         session->prompt_count <= 0)
         return;
-
-    /* The end-of-prefill record is uniquely the slice of session->prompt_ids
-     * beginning at the reused position, and after kv_prefix_record the exact
-     * state coverage equals prompt_count. Decode/speculative records point at
-     * generated/input temporaries instead and therefore cannot admit here. */
     if (ids == session->prompt_ids + position &&
         prefix->len == session->prompt_count && !prefix->tainted) {
         coli_v4_prefix_cache_store(session);
-        /* If the RAM tier captured the boundary this is a cheap exact-entry
-         * check and SSD publication stays post-generation. In SSD-only mode or
-         * when RAM admission cannot fit, persist the live state now while it
-         * still denotes the canonical pre-decode prompt boundary. */
         coli_v4_prefix_disk_publish_live_prefix(session);
     }
+}
+
+/* head.weight is target state, not an MTP ancillary tensor. Package generation
+ * has already bound its ColiExecutor before entering the amalgamated generation
+ * unit, so target-head lookup must depend on that binding rather than on the
+ * contents of the non-owning safetensors sentinel installed by the runtime TU.
+ * Keeping this contract executor-based also prevents future sentinel metadata
+ * changes from silently disabling package speculative verification. */
+static ColiSafetensorsTensor g_coli_v4_package_head_tensor;
+static int g_coli_v4_package_head_cache_miss_reported;
+static int g_coli_v4_package_head_lookup_miss_reported;
+static unsigned g_coli_v4_mtp_trace_count;
+
+static int coli_v4_generate_package_bound(void) {
+    return g_coli_v4_package_tensor_source.executor != NULL;
+}
+
+static int coli_v4_mtp_name(const char *name) {
+    return name && !strncmp(name, "mtp.", 4);
+}
+
+static int coli_v4_mtp_trace_enabled(void) {
+    const char *value = getenv("V4_MTP_TRACE");
+    return value && atoi(value) != 0;
+}
+
+static void coli_v4_mtp_trace_tensor(const ColiSafetensorsTensor *tensor,
+                                     const char *name) {
+    if (!coli_v4_mtp_trace_enabled() || g_coli_v4_mtp_trace_count >= 64) return;
+    g_coli_v4_mtp_trace_count++;
+    if (!tensor) {
+        fprintf(stderr, "[MTP] package tensor lookup failed: %s\n",
+                name ? name : "<null>");
+        return;
+    }
+    fprintf(stderr,
+            "[MTP] package tensor name=%s dtype=%d rank=%d numel=%lld bytes=%lld",
+            name, tensor->dtype, tensor->rank,
+            (long long)tensor->numel, (long long)tensor->nbytes);
+    for (int i = 0; i < tensor->rank && i < 4; i++)
+        fprintf(stderr, "%s%lld", i ? "x" : " shape=",
+                (long long)tensor->shape[i]);
+    fputc('\n', stderr);
+}
+
+static const ColiSafetensorsTensor *coli_v4_generate_st_find(
+        const ColiSafetensorsIndex *index, const char *name) {
+    if (!name || strcmp(name, "head.weight") ||
+        !coli_v4_generate_package_bound()) {
+        const ColiSafetensorsTensor *tensor =
+            coli_v4_package_source_find(index, name);
+        if (coli_v4_generate_package_bound() && coli_v4_mtp_name(name)) {
+            if (!tensor)
+                fprintf(stderr, "[MTP] package tensor lookup failed: %s\n", name);
+            else
+                coli_v4_mtp_trace_tensor(tensor, name);
+        }
+        return tensor;
+    }
+
+    const ColiExecutor *executor = g_coli_v4_package_tensor_source.executor;
+    const ColiRecordInfo *record =
+        coli_executor_record_by_name(executor, "head.weight");
+    ColiTensorInfo info;
+    memset(&info, 0, sizeof(info));
+    const ColiPackage *package = coli_executor_package(executor);
+    int info_failed = record && package
+        ? coli_package_tensor_info(package, record, &info, NULL, 0)
+        : 1;
+    if (!record || !package || record->kind != COLI_CSF_REC_TENSOR ||
+        record->math_format != COLI_CSF_MATH_BF16 || info_failed ||
+        info.rank != 2 || info.data_stored_bytes > INT64_MAX) {
+        if (!g_coli_v4_package_head_lookup_miss_reported) {
+            g_coli_v4_package_head_lookup_miss_reported = 1;
+            fprintf(stderr,
+                    "v4_spec_head lookup_failed record=%d package=%d kind=%u math=%u "
+                    "tensor_info=%d rank=%u stored=%llu\n",
+                    record ? 1 : 0, package ? 1 : 0,
+                    record ? (unsigned)record->kind : 0u,
+                    record ? (unsigned)record->math_format : 0u,
+                    info_failed, (unsigned)info.rank,
+                    (unsigned long long)info.data_stored_bytes);
+        }
+        return NULL;
+    }
+
+    int64_t numel = 0;
+    if (coli_v4_package_tensor_numel(&info, &numel)) {
+        if (!g_coli_v4_package_head_lookup_miss_reported) {
+            g_coli_v4_package_head_lookup_miss_reported = 1;
+            fprintf(stderr,
+                    "v4_spec_head lookup_failed reason=numel rank=%u dims0=%llu dims1=%llu\n",
+                    (unsigned)info.rank,
+                    (unsigned long long)info.dims[0],
+                    (unsigned long long)info.dims[1]);
+        }
+        return NULL;
+    }
+    memset(&g_coli_v4_package_head_tensor, 0,
+           sizeof(g_coli_v4_package_head_tensor));
+    g_coli_v4_package_head_tensor.name = (char *)record->name;
+    g_coli_v4_package_head_tensor.fd = INT_MIN;
+    g_coli_v4_package_head_tensor.off = 0;
+    g_coli_v4_package_head_tensor.nbytes = (int64_t)info.data_stored_bytes;
+    g_coli_v4_package_head_tensor.dtype = COLI_ST_BF16;
+    g_coli_v4_package_head_tensor.numel = numel;
+    g_coli_v4_package_head_tensor.rank = 2;
+    g_coli_v4_package_head_tensor.shape[0] = (int64_t)info.dims[0];
+    g_coli_v4_package_head_tensor.shape[1] = (int64_t)info.dims[1];
+    return &g_coli_v4_package_head_tensor;
+}
+
+static int coli_v4_generate_read_tensor(
+        const ColiSafetensorsIndex *index,
+        const ColiSafetensorsTensor *tensor, void *destination) {
+    int result = coli_v4_package_source_read_tensor(index, tensor, destination);
+    if (result && tensor && coli_v4_mtp_name(tensor->name))
+        fprintf(stderr, "[MTP] package tensor read failed: %s bytes=%lld\n",
+                tensor->name, (long long)tensor->nbytes);
+    return result;
+}
+
+static int64_t coli_v4_generate_read_scale_f32(
+        ColiSafetensorsIndex *index, const char *name,
+        float *out, int64_t cap, int drop) {
+    int64_t result = coli_v4_package_read_scale_f32(index, name, out, cap, drop);
+    if (result != cap && coli_v4_mtp_name(name))
+        fprintf(stderr,
+                "[MTP] package scale read failed: %s got=%lld expected=%lld\n",
+                name, (long long)result, (long long)cap);
+    return result;
+}
+
+static int coli_v4_generate_tensor_load_f32(
+        ColiFloatTensor *output, const ColiSafetensorsIndex *index,
+        const char *name, char *error, size_t error_size) {
+    int result = coli_v4_package_tensor_load_f32(
+        output, index, name, error, error_size);
+    if (result && coli_v4_mtp_name(name))
+        fprintf(stderr, "[MTP] package float load failed: %s reason=%s\n",
+                name, error && error[0] ? error : "unknown");
+    return result;
+}
+
+static int coli_v4_generate_tensor_shard(
+        const ColiSafetensorsIndex *index,
+        const ColiSafetensorsTensor *tensor) {
+    if (tensor == &g_coli_v4_package_head_tensor &&
+        coli_v4_generate_package_bound())
+        return -2;
+    return coli_v4_package_source_tensor_shard(index, tensor);
+}
+
+static const void *coli_v4_package_head_cache_data(
+        const ColiV4Engine *engine, int shard,
+        uint64_t offset, size_t length) {
+    if (shard == -2 && coli_v4_generate_package_bound())
+        offset = 0;
+    const void *data = coli_v4_head_cache_data(engine, shard, offset, length);
+    if (!data && shard == -2 && coli_v4_generate_package_bound() &&
+        !g_coli_v4_package_head_cache_miss_reported) {
+        g_coli_v4_package_head_cache_miss_reported = 1;
+        fprintf(stderr,
+                "v4_spec_head cache_miss requested_shard=%d requested_offset=%llu "
+                "requested_bytes=%zu cache_shard=%d cache_offset=%llu "
+                "cache_bytes=%zu cache_data=%d\n",
+                shard, (unsigned long long)offset, length,
+                engine ? engine->head_cache.shard : 0,
+                (unsigned long long)(engine ? engine->head_cache.offset : 0),
+                engine ? engine->head_cache.bytes : 0,
+                engine && engine->head_cache.data ? 1 : 0);
+    }
+    return data;
 }
 
 #define kv_prefix_reuse coli_v4_cached_kv_prefix_reuse
 #define kv_prefix_record coli_v4_cached_kv_prefix_record
 #define coli_v4_session_generate coli_v4_session_generate_uncached
+#define coli_st_find coli_v4_generate_st_find
+#define coli_st_read_tensor coli_v4_generate_read_tensor
+#define coli_st_tensor_shard coli_v4_generate_tensor_shard
+#define coli_st_read_at coli_v4_package_source_read_at
+#define coli_st_read_at_streaming coli_v4_package_source_read_at_streaming
+#define st_read_scale_f32 coli_v4_generate_read_scale_f32
+#define coli_tensor_load_f32 coli_v4_generate_tensor_load_f32
+#define coli_v4_head_cache_data coli_v4_package_head_cache_data
 #include "deepseek_v4.c"
+#undef coli_v4_head_cache_data
+#undef coli_tensor_load_f32
+#undef st_read_scale_f32
+#undef coli_st_read_at_streaming
+#undef coli_st_read_at
+#undef coli_st_tensor_shard
+#undef coli_st_read_tensor
+#undef coli_st_find
 #undef coli_v4_session_generate
 #undef kv_prefix_record
 #undef kv_prefix_reuse
@@ -113,16 +321,20 @@ int coli_v4_session_generate(ColiV4Session *session,
     ColiV4PrefixCacheStats after = {0};
     coli_v4_prefix_cache_stats(&before);
 
+    if (coli_v4_generation_package_bridge_sync(session)) {
+        if (error && error_size)
+            snprintf(error, error_size,
+                     "cannot synchronize package named-tensor source");
+        return -1;
+    }
+    g_coli_v4_package_head_cache_miss_reported = 0;
+    g_coli_v4_package_head_lookup_miss_reported = 0;
+    g_coli_v4_mtp_trace_count = 0;
+
     int result = coli_v4_session_generate_uncached(
         session, prompt, prompt_length, options, on_token, user_data,
         stats, error, error_size);
 
-    /* The process-local entry was captured before decode, so after generation
-     * it remains the exact immutable request prefix even though live attention
-     * state has advanced. Stream that pinned entry now: SSD I/O is outside TTFT
-     * and token streaming, at the cost of delaying return/DONE in this first
-     * bounded implementation. If no RAM entry existed, the end-of-prefill hook
-     * already used the live one-layer-at-a-time publisher instead. */
     if (!result)
         coli_v4_prefix_disk_publish_session(session);
 

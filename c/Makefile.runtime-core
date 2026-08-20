@@ -7,13 +7,15 @@ endif
 
 .PHONY: check clean
 
-check: test_record_io$(EXE) test_expert_residency$(EXE) test_expert_activation$(EXE) test_expert_residency_policy$(EXE) test_expert_resource_bridge$(EXE) test_resource_planner$(EXE)
+check: test_record_io$(EXE) test_expert_residency$(EXE) test_expert_activation$(EXE) test_expert_residency_policy$(EXE) test_expert_resource_bridge$(EXE) test_resource_planner$(EXE) test_speculative_cache$(EXE) test_speculative_cache_disk$(EXE)
 	./test_record_io$(EXE)
 	./test_expert_residency$(EXE)
 	./test_expert_activation$(EXE)
 	./test_expert_residency_policy$(EXE)
 	./test_expert_resource_bridge$(EXE)
 	./test_resource_planner$(EXE)
+	./test_speculative_cache$(EXE)
+	./test_speculative_cache_disk$(EXE)
 
 test_record_io$(EXE): tests/test_record_io.c record_io.h
 	$(CC) $(CFLAGS) tests/test_record_io.c -o $@
@@ -33,9 +35,17 @@ test_expert_resource_bridge$(EXE): tests/test_expert_resource_bridge.c expert_re
 test_resource_planner$(EXE): tests/test_resource_planner.c resource_planner.h
 	$(CC) $(CFLAGS) tests/test_resource_planner.c -o $@
 
+test_speculative_cache$(EXE): tests/test_speculative_cache.c speculative_cache.h
+	$(CC) $(CFLAGS) tests/test_speculative_cache.c -o $@
+
+test_speculative_cache_disk$(EXE): tests/test_speculative_cache_disk.c speculative_cache_disk.h speculative_cache.h
+	$(CC) $(CFLAGS) tests/test_speculative_cache_disk.c -o $@
+
 clean:
 	rm -f test_record_io test_record_io.exe test_expert_residency test_expert_residency.exe \
 		test_expert_activation test_expert_activation.exe \
 		test_expert_residency_policy test_expert_residency_policy.exe \
 		test_expert_resource_bridge test_expert_resource_bridge.exe \
-		test_resource_planner test_resource_planner.exe
+		test_resource_planner test_resource_planner.exe \
+		test_speculative_cache test_speculative_cache.exe \
+		test_speculative_cache_disk test_speculative_cache_disk.exe

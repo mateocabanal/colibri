@@ -13,10 +13,13 @@ extern "C" {
 typedef struct {
     uint64_t budget_bytes;
     uint64_t resident_bytes;
+    uint64_t pinned_bytes;
     uint64_t entries;
     uint64_t hits;
     uint64_t misses;
     uint64_t admissions;
+    uint64_t evictions;
+    uint64_t evicted_bytes;
     uint64_t rejected_bytes;
     uint64_t bytes_avoided;
     uint64_t copy_bytes;
@@ -73,8 +76,9 @@ static inline int coli_v4_residency_select(
 }
 
 void coli_v4_dense_cache_configure(uint64_t budget_bytes);
-/* Change only the admission ceiling. Existing immutable borrowed entries are
- * never evicted; lowering below resident_bytes clamps to that mandatory floor. */
+/* Change the dense admission ceiling and reclaim idle entries immediately.
+ * Active borrowed entries are pinned until their layer/session releases them;
+ * lowering below pinned_bytes therefore clamps only to that live-borrow floor. */
 uint64_t coli_v4_dense_cache_set_budget(uint64_t budget_bytes);
 void coli_v4_dense_cache_reset(void);
 void coli_v4_dense_cache_stats(ColiV4DenseCacheStats *out);

@@ -10,12 +10,12 @@
 /*
  * Tensor-granular deterministic residency for package-only V4.
  *
- * Cache entries are immutable for a configured engine generation. Package-only
- * layer loads therefore borrow resident payload pointers directly instead of
- * materializing caller-owned memcpy copies on every token. The separately
- * compiled layer-resident unit routes payload free() through
- * coli_v4_layer_payload_free(), which leaves cache-owned pointers alone and
- * delegates ordinary streamed/safetensors allocations to libc free().
+ * Package-only layer loads borrow resident payload pointers directly instead of
+ * materializing caller-owned memcpy copies on every token. Borrow lifetimes are
+ * tracked per cache entry; an entry may be reclaimed only after its final live
+ * layer/session borrow releases it. The separately compiled layer-resident unit
+ * routes payload free() through coli_v4_layer_payload_free(), which is therefore
+ * the single ownership/release seam for both cached and ordinary allocations.
  *
  * This is deliberately an ownership bridge for the current layer API. A future
  * typed mixed-residency execution view can make borrowed ownership explicit in
@@ -27,6 +27,7 @@ typedef struct {
     uint64_t resident_bytes;
     uint64_t stored_bytes_avoided;
     uint64_t hits;
+    uint64_t refs;
 } DenseCacheEntry;
 
 typedef struct {
@@ -36,9 +37,12 @@ typedef struct {
     size_t capacity;
     uint64_t budget_bytes;
     uint64_t resident_bytes;
+    uint64_t pinned_bytes;
     uint64_t hits;
     uint64_t misses;
     uint64_t admissions;
+    uint64_t evictions;
+    uint64_t evicted_bytes;
     uint64_t rejected_bytes;
     uint64_t bytes_avoided;
     /* Retained in the stable diagnostics contract. Zero-copy borrowing keeps
@@ -77,10 +81,50 @@ static DenseCacheEntry *dense_cache_find_locked(const char *name) {
     return NULL;
 }
 
-static int dense_cache_owns_locked(const void *pointer) {
-    for (size_t i = 0; i < g_dense_cache.count; i++)
-        if (g_dense_cache.entries[i].data == pointer) return 1;
-    return 0;
+static DenseCacheEntry *dense_cache_find_pointer_locked(
+        const void *pointer, size_t *index_out) {
+    for (size_t i = 0; i < g_dense_cache.count; i++) {
+        if (g_dense_cache.entries[i].data != pointer) continue;
+        if (index_out) *index_out = i;
+        return &g_dense_cache.entries[i];
+    }
+    return NULL;
+}
+
+/* Reclaim only entries with no live borrowers. Hits are the stable reuse signal
+ * already collected by this cache, so evict the least-used idle tensor first;
+ * ties prefer the larger allocation to converge on the requested budget with
+ * fewer frees. Entry metadata may move, but payload addresses never move while
+ * borrowed and no caller keeps a pointer to DenseCacheEntry itself. */
+static void dense_cache_evict_unpinned_locked(void) {
+    while (g_dense_cache.resident_bytes > g_dense_cache.budget_bytes) {
+        size_t victim = SIZE_MAX;
+        for (size_t i = 0; i < g_dense_cache.count; i++) {
+            DenseCacheEntry *entry = &g_dense_cache.entries[i];
+            if (entry->refs) continue;
+            if (victim == SIZE_MAX ||
+                entry->hits < g_dense_cache.entries[victim].hits ||
+                (entry->hits == g_dense_cache.entries[victim].hits &&
+                 entry->resident_bytes >
+                     g_dense_cache.entries[victim].resident_bytes))
+                victim = i;
+        }
+        if (victim == SIZE_MAX) break;
+        DenseCacheEntry dead = g_dense_cache.entries[victim];
+        free(dead.data);
+        if (g_dense_cache.resident_bytes >= dead.resident_bytes)
+            g_dense_cache.resident_bytes -= dead.resident_bytes;
+        else
+            g_dense_cache.resident_bytes = 0;
+        g_dense_cache.evictions++;
+        g_dense_cache.evicted_bytes += dead.resident_bytes;
+        g_dense_cache.count--;
+        if (victim != g_dense_cache.count)
+            g_dense_cache.entries[victim] =
+                g_dense_cache.entries[g_dense_cache.count];
+        memset(&g_dense_cache.entries[g_dense_cache.count], 0,
+               sizeof(g_dense_cache.entries[g_dense_cache.count]));
+    }
 }
 
 /* Used only by the COLI_V4_UNIT_LAYER_RESIDENT object through a target-local
@@ -88,8 +132,22 @@ static int dense_cache_owns_locked(const void *pointer) {
  * package-only layer is borrowing immutable resident tensor storage. */
 void coli_v4_layer_payload_free(void *pointer) {
     if (!pointer) return;
+    int borrowed = 0;
     pthread_mutex_lock(&g_dense_cache.mutex);
-    int borrowed = dense_cache_owns_locked(pointer);
+    DenseCacheEntry *entry = dense_cache_find_pointer_locked(pointer, NULL);
+    if (entry) {
+        borrowed = 1;
+        if (entry->refs) {
+            entry->refs--;
+            if (!entry->refs) {
+                if (g_dense_cache.pinned_bytes >= entry->resident_bytes)
+                    g_dense_cache.pinned_bytes -= entry->resident_bytes;
+                else
+                    g_dense_cache.pinned_bytes = 0;
+            }
+        }
+        dense_cache_evict_unpinned_locked();
+    }
     pthread_mutex_unlock(&g_dense_cache.mutex);
     if (!borrowed) free(pointer);
 }
@@ -102,6 +160,7 @@ static void dense_cache_clear_locked(void) {
     g_dense_cache.count = 0;
     g_dense_cache.capacity = 0;
     g_dense_cache.resident_bytes = 0;
+    g_dense_cache.pinned_bytes = 0;
 }
 
 void coli_v4_dense_cache_configure(uint64_t budget_bytes) {
@@ -111,6 +170,8 @@ void coli_v4_dense_cache_configure(uint64_t budget_bytes) {
     g_dense_cache.hits = 0;
     g_dense_cache.misses = 0;
     g_dense_cache.admissions = 0;
+    g_dense_cache.evictions = 0;
+    g_dense_cache.evicted_bytes = 0;
     g_dense_cache.rejected_bytes = 0;
     g_dense_cache.bytes_avoided = 0;
     g_dense_cache.copy_bytes = 0;
@@ -138,9 +199,10 @@ void coli_v4_dense_cache_configure(uint64_t budget_bytes) {
 
 uint64_t coli_v4_dense_cache_set_budget(uint64_t budget_bytes) {
     pthread_mutex_lock(&g_dense_cache.mutex);
-    if (budget_bytes < g_dense_cache.resident_bytes)
-        budget_bytes = g_dense_cache.resident_bytes;
+    if (budget_bytes < g_dense_cache.pinned_bytes)
+        budget_bytes = g_dense_cache.pinned_bytes;
     g_dense_cache.budget_bytes = budget_bytes;
+    dense_cache_evict_unpinned_locked();
     pthread_mutex_unlock(&g_dense_cache.mutex);
     return budget_bytes;
 }
@@ -150,10 +212,13 @@ void coli_v4_dense_cache_reset(void) {
     pthread_mutex_lock(&g_dense_cache.mutex);
     snapshot.budget_bytes = g_dense_cache.budget_bytes;
     snapshot.resident_bytes = g_dense_cache.resident_bytes;
+    snapshot.pinned_bytes = g_dense_cache.pinned_bytes;
     snapshot.entries = g_dense_cache.count;
     snapshot.hits = g_dense_cache.hits;
     snapshot.misses = g_dense_cache.misses;
     snapshot.admissions = g_dense_cache.admissions;
+    snapshot.evictions = g_dense_cache.evictions;
+    snapshot.evicted_bytes = g_dense_cache.evicted_bytes;
     snapshot.rejected_bytes = g_dense_cache.rejected_bytes;
     snapshot.bytes_avoided = g_dense_cache.bytes_avoided;
     snapshot.copy_bytes = g_dense_cache.copy_bytes;
@@ -170,16 +235,20 @@ void coli_v4_dense_cache_reset(void) {
         double copy_gib_s = snapshot.copy_ns
             ? copy_gib / ((double)snapshot.copy_ns / 1000000000.0) : 0.0;
         fprintf(stderr,
-                "v4_dense_cache status=done resident=%.2fGiB budget=%.2fGiB "
-                "entries=%llu hits=%llu misses=%llu admissions=%llu "
+                "v4_dense_cache status=done resident=%.2fGiB pinned=%.2fGiB "
+                "budget=%.2fGiB entries=%llu hits=%llu misses=%llu "
+                "admissions=%llu evictions=%llu evicted=%.2fGiB "
                 "bytes_avoided=%.2fGiB rejected=%.2fGiB "
                 "copy=%.2fGiB copy_ms=%.3f copy_bw=%.2fGiB/s\n",
                 snapshot.resident_bytes / (1024.0 * 1024.0 * 1024.0),
+                snapshot.pinned_bytes / (1024.0 * 1024.0 * 1024.0),
                 snapshot.budget_bytes / (1024.0 * 1024.0 * 1024.0),
                 (unsigned long long)snapshot.entries,
                 (unsigned long long)snapshot.hits,
                 (unsigned long long)snapshot.misses,
                 (unsigned long long)snapshot.admissions,
+                (unsigned long long)snapshot.evictions,
+                snapshot.evicted_bytes / (1024.0 * 1024.0 * 1024.0),
                 snapshot.bytes_avoided / (1024.0 * 1024.0 * 1024.0),
                 snapshot.rejected_bytes / (1024.0 * 1024.0 * 1024.0),
                 copy_gib, copy_ms, copy_gib_s);
@@ -192,10 +261,13 @@ void coli_v4_dense_cache_stats(ColiV4DenseCacheStats *out) {
     *out = (ColiV4DenseCacheStats){
         .budget_bytes = g_dense_cache.budget_bytes,
         .resident_bytes = g_dense_cache.resident_bytes,
+        .pinned_bytes = g_dense_cache.pinned_bytes,
         .entries = g_dense_cache.count,
         .hits = g_dense_cache.hits,
         .misses = g_dense_cache.misses,
         .admissions = g_dense_cache.admissions,
+        .evictions = g_dense_cache.evictions,
+        .evicted_bytes = g_dense_cache.evicted_bytes,
         .rejected_bytes = g_dense_cache.rejected_bytes,
         .bytes_avoided = g_dense_cache.bytes_avoided,
         .copy_bytes = g_dense_cache.copy_bytes,
@@ -204,9 +276,8 @@ void coli_v4_dense_cache_stats(ColiV4DenseCacheStats *out) {
     pthread_mutex_unlock(&g_dense_cache.mutex);
 }
 
-/* Return 1 and an immutable borrowed pointer on hit, 0 on miss. Cache entries
- * are never evicted during a configured engine generation, so the pointer is
- * valid until cache reset after inference/session teardown. */
+/* Return 1 and an immutable borrowed pointer on hit, 0 on miss. A hit pins the
+ * entry until coli_v4_layer_payload_free releases that borrow. */
 static int dense_cache_borrow(const char *name, uint64_t resident_bytes,
                               void **output) {
     if (!name || !output || resident_bytes > SIZE_MAX) return 0;
@@ -219,6 +290,9 @@ static int dense_cache_borrow(const char *name, uint64_t resident_bytes,
         pthread_mutex_unlock(&g_dense_cache.mutex);
         return 0;
     }
+    if (!entry->refs)
+        g_dense_cache.pinned_bytes += entry->resident_bytes;
+    entry->refs++;
     entry->hits++;
     g_dense_cache.hits++;
     g_dense_cache.bytes_avoided += entry->stored_bytes_avoided;
@@ -228,9 +302,9 @@ static int dense_cache_borrow(const char *name, uint64_t resident_bytes,
 }
 
 /* Transfer ownership of an already-materialized immutable execution payload to
- * the cache. This avoids the old first-touch duplicate memcpy as well as all
- * subsequent hit copies. Returns 1 when the cache owns `data`; on 0 the caller
- * retains ownership and must release it normally. */
+ * the cache. The current layer immediately owns the first borrow, so a newly
+ * admitted entry starts with refs=1 and stays pinned until that layer releases
+ * it. Returns 1 when the cache owns `data`; on 0 the caller retains ownership. */
 static int dense_cache_admit_take(const char *name, unsigned char *data,
                                   uint64_t resident_bytes,
                                   uint64_t stored_bytes_avoided) {
@@ -276,7 +350,9 @@ static int dense_cache_admit_take(const char *name, unsigned char *data,
     entry->data = data;
     entry->resident_bytes = resident_bytes;
     entry->stored_bytes_avoided = stored_bytes_avoided;
+    entry->refs = 1;
     g_dense_cache.resident_bytes += resident_bytes;
+    g_dense_cache.pinned_bytes += resident_bytes;
     g_dense_cache.admissions++;
     pthread_mutex_unlock(&g_dense_cache.mutex);
     return 1;

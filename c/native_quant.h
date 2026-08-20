@@ -82,12 +82,25 @@ static inline int coli_v4_metal_mxfp4_matvec(
     float *output, const float *input, const void *weights, const void *scales,
     int rows, int columns) {
     static int enabled = -1;
+    static int trace = -1;
+    static int trace_success_reported;
+    static int trace_fallback_reported;
     if (enabled < 0) {
         const char *s = getenv("V4_METAL_EXPERTS");
         enabled = (!s || !*s) ? 1 : (atoi(s) != 0);   /* default ON */
     }
+    if (trace < 0) {
+        const char *s = getenv("V4_METAL_TRACE");
+        trace = s && *s && atoi(s) != 0;
+    }
     if (!enabled) return 0;
-    if (!coli_metal_init()) return 0;                /* lazy, idempotent */
+    if (!coli_metal_init()) {
+        if (trace && !trace_fallback_reported) {
+            trace_fallback_reported = 1;
+            fprintf(stderr, "v4_metal mxfp4=fallback reason=init-failed\n");
+        }
+        return 0;
+    }
     /* Coarse lock around the whole cache lifecycle + matmul: expert matvecs
      * are serial on the Metal queue anyway, so contention is negligible, and
      * it makes the arrays race-free for any future concurrent lanes. */
@@ -133,6 +146,17 @@ static inline int coli_v4_metal_mxfp4_matvec(
     int rc = coli_metal_matmul(&handles[slot], output, input, weights, scales, 7, 1,
                                columns, rows, 0);
     pthread_mutex_unlock(&lock);
+    if (trace && rc && !trace_success_reported) {
+        trace_success_reported = 1;
+        fprintf(stderr,
+                "v4_metal mxfp4=active rows=%d cols=%d registered=%d\n",
+                rows, columns, key_reg[slot] ? 1 : 0);
+    } else if (trace && !rc && !trace_fallback_reported) {
+        trace_fallback_reported = 1;
+        fprintf(stderr,
+                "v4_metal mxfp4=fallback reason=matmul-failed rows=%d cols=%d\n",
+                rows, columns);
+    }
 #ifdef COLI_METAL_DEBUG
     /* V4_METAL_DEBUG=1: run the CPU reference on the same inputs and compare
      * the first row of output. Prints a relative error; the GPU result is
