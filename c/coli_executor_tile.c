@@ -1,15 +1,18 @@
-/* Experimental milestone-1 executor overlay.
+/* Experimental milestone-1/2 executor overlay.
  *
  * The authoritative .coli load is unchanged. After a successful routed-expert
- * record read, V4_METAL_TILE=1 prepares lossless Apple8 tile copies for the
- * three MXFP4 matrices. Failure to prepare is advisory: canonical row bytes
- * remain intact and the Metal wrapper falls back to the stock fmt7 path.
+ * record read, V4_METAL_TILE=1 prepares lossless Apple8 tile copies. With
+ * V4_METAL_TILE_DERIVED_CACHE=1, #137 is consulted first and exact tile bytes
+ * are persisted/reused across processes. Any cache/install failure falls back
+ * to the milestone-1 in-process row->tile repack; canonical row bytes remain
+ * intact for exact CPU/row execution.
  */
 #define coli_executor_load_expert coli_executor_load_expert_row
 #include "coli_executor.c"
 #undef coli_executor_load_expert
 
 #include "backend_metal_tile.h"
+#include "mxfp4_apple8_tile_cache.h"
 
 #include <stdatomic.h>
 #include <stdint.h>
@@ -64,6 +67,12 @@ int coli_executor_load_expert(const ColiExecutor *executor,
     if (!generation)
         generation = atomic_fetch_add_explicit(
             &g_tile_load_generation, UINT64_C(1), memory_order_relaxed);
+
+    if (coli_mxfp4_apple8_derived_cache_enabled() &&
+        coli_mxfp4_apple8_derived_prepare_expert(
+            executor, layer, expert, resident_slot, resident_bytes,
+            generation))
+        return result;
 
     const uint8_t *base = (const uint8_t *)resident_slot;
     for (int i = 0; i < 3; ++i) {

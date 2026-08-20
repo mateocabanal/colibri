@@ -1,6 +1,7 @@
 #include "../deepseek_v4.h"
 #include "../backend_metal.h"
 #include "../backend_metal_tile.h"
+#include "../mxfp4_apple8_tile_cache.h"
 
 #include <errno.h>
 #include <stdint.h>
@@ -78,6 +79,36 @@ static int run_generation(ColiV4Engine *engine, const char *prompt, int tokens,
     return rc;
 }
 
+static void print_derived_delta(
+        const char *tag,
+        const ColiMxfp4Apple8DerivedCacheStats *before,
+        const ColiMxfp4Apple8DerivedCacheStats *after) {
+    fprintf(stdout,
+        "WIRE_TILE_DERIVED_%s enabled=%d lookup=%llu hit=%llu miss=%llu stale=%llu corrupt=%llu "
+        "read_mib=%.3f read_ms=%.3f write_mib=%.3f write_ms=%.3f write_dropped=%llu "
+        "prepare_avoided_ms=%.3f cold_prepares=%llu cold_prepare_ms=%.3f "
+        "installs=%llu install_failures=%llu\n",
+        tag,
+        coli_mxfp4_apple8_derived_cache_enabled(),
+        (unsigned long long)du64(after->lookup, before->lookup),
+        (unsigned long long)du64(after->hit, before->hit),
+        (unsigned long long)du64(after->miss, before->miss),
+        (unsigned long long)du64(after->stale, before->stale),
+        (unsigned long long)du64(after->corrupt, before->corrupt),
+        (double)du64(after->read_bytes, before->read_bytes) / (1024.0 * 1024.0),
+        (double)du64(after->read_ns, before->read_ns) / 1.0e6,
+        (double)du64(after->write_bytes, before->write_bytes) / (1024.0 * 1024.0),
+        (double)du64(after->write_ns, before->write_ns) / 1.0e6,
+        (unsigned long long)du64(after->write_dropped, before->write_dropped),
+        (double)du64(after->prepare_ns_avoided,
+                     before->prepare_ns_avoided) / 1.0e6,
+        (unsigned long long)du64(after->cold_prepares, before->cold_prepares),
+        (double)du64(after->cold_prepare_ns, before->cold_prepare_ns) / 1.0e6,
+        (unsigned long long)du64(after->installs, before->installs),
+        (unsigned long long)du64(after->install_failures,
+                                 before->install_failures));
+}
+
 int main(int argc, char **argv) {
     if (argc < 3) { usage(argv[0]); return 2; }
     const char *model = argv[1];
@@ -114,6 +145,11 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    ColiMxfp4Apple8DerivedCacheStats derived_before_warm;
+    ColiMxfp4Apple8DerivedCacheStats derived_after_warm;
+    ColiMxfp4Apple8DerivedCacheStats derived_after_timed;
+    coli_mxfp4_apple8_derived_cache_stats(&derived_before_warm);
+
     ColiV4SessionGenerateStats warm_stats;
     memset(&warm_stats, 0, sizeof(warm_stats));
     if (run_generation(engine, prompt, warm, NULL, &warm_stats,
@@ -122,10 +158,15 @@ int main(int argc, char **argv) {
         coli_v4_engine_destroy(engine);
         return 1;
     }
+    coli_mxfp4_apple8_derived_cache_stats(&derived_after_warm);
+    double cold_tok_s = warm_stats.decode_sec > 0.0
+        ? (double)warm_stats.generated_tokens / warm_stats.decode_sec : 0.0;
     fprintf(stdout,
-        "WIRE_TILE_WARM mode=%s generated=%d decode_sec=%.6f\n",
+        "WIRE_TILE_COLD_RESULT mode=%s generated=%d decode_sec=%.6f tok_s=%.6f ttft=%.6f eos=%d\n",
         coli_metal_tile_enabled() ? "tile" : "row",
-        warm_stats.generated_tokens, warm_stats.decode_sec);
+        warm_stats.generated_tokens, warm_stats.decode_sec, cold_tok_s,
+        warm_stats.time_to_first_token_sec, warm_stats.eos_stopped);
+    print_derived_delta("COLD", &derived_before_warm, &derived_after_warm);
     fflush(stdout);
 
     RowStats row_before, row_after;
@@ -168,6 +209,7 @@ int main(int argc, char **argv) {
 
     row_stats(&row_after);
     coli_metal_tile_stats(&tile_after);
+    coli_mxfp4_apple8_derived_cache_stats(&derived_after_timed);
     const char *mode = coli_metal_tile_enabled() ? "tile" : "row";
     double tok_s = stats.decode_sec > 0.0
         ? (double)stats.generated_tokens / stats.decode_sec : 0.0;
@@ -177,6 +219,8 @@ int main(int argc, char **argv) {
     double row_scatter = dd(row_after.scatter, row_before.scatter);
     double row_kernel = dd(row_after.kernel, row_before.kernel);
     uint64_t tile_repack_ns = du64(tile_after.repack_ns, tile_before.repack_ns);
+    uint64_t tile_cached_install_ns =
+        du64(tile_after.cached_install_ns, tile_before.cached_install_ns);
     uint64_t tile_wall_ns = du64(tile_after.wall_ns, tile_before.wall_ns);
     uint64_t tile_kernel_ns = du64(tile_after.kernel_ns, tile_before.kernel_ns);
     uint64_t tile_scatter_ns = du64(tile_after.scatter_ns, tile_before.scatter_ns);
@@ -187,6 +231,7 @@ int main(int argc, char **argv) {
     double expert_seconds =
         (double)row_mxfp4_wall_ns / 1.0e9 +
         (double)tile_repack_ns / 1.0e9 +
+        (double)tile_cached_install_ns / 1.0e9 +
         (double)tile_wall_ns / 1.0e9;
     double expert_pct = stats.decode_sec > 0.0
         ? 100.0 * expert_seconds / stats.decode_sec : 0.0;
@@ -213,10 +258,17 @@ int main(int argc, char **argv) {
         (double)profile_wait_ns / 1.0e6,
         (double)profile_kernel_ns / 1.0e6);
     fprintf(stdout,
-        "WIRE_TILE_APPLE8 repacks=%llu repack_mib=%.3f repack_ms=%.3f single=%llu blocks=%llu fallback=%llu experts=%llu wall_ms=%.3f kernel_ms=%.3f scatter_ms=%.3f\n",
+        "WIRE_TILE_APPLE8 repacks=%llu repack_mib=%.3f repack_ms=%.3f "
+        "cached_installs=%llu cached_install_mib=%.3f cached_install_ms=%.3f "
+        "single=%llu blocks=%llu fallback=%llu experts=%llu wall_ms=%.3f kernel_ms=%.3f scatter_ms=%.3f\n",
         (unsigned long long)du64(tile_after.repack_count, tile_before.repack_count),
         (double)du64(tile_after.repack_bytes, tile_before.repack_bytes) / (1024.0 * 1024.0),
         (double)tile_repack_ns / 1.0e6,
+        (unsigned long long)du64(tile_after.cached_install_count,
+                                tile_before.cached_install_count),
+        (double)du64(tile_after.cached_install_bytes,
+                     tile_before.cached_install_bytes) / (1024.0 * 1024.0),
+        (double)tile_cached_install_ns / 1.0e6,
         (unsigned long long)du64(tile_after.single_calls, tile_before.single_calls),
         (unsigned long long)du64(tile_after.moe_calls, tile_before.moe_calls),
         (unsigned long long)du64(tile_after.fallback_calls, tile_before.fallback_calls),
@@ -224,6 +276,7 @@ int main(int argc, char **argv) {
         (double)tile_wall_ns / 1.0e6,
         (double)tile_kernel_ns / 1.0e6,
         (double)tile_scatter_ns / 1.0e6);
+    print_derived_delta("TIMED", &derived_after_warm, &derived_after_timed);
     fprintf(stdout,
         "WIRE_TILE_EXPERT_SHARE mode=%s measured_expert_sec=%.6f decode_pct=%.3f trace=%s\n",
         mode, expert_seconds, expert_pct, trace_path ? trace_path : "none");

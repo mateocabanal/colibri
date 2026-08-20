@@ -12,6 +12,9 @@ typedef struct {
     uint64_t repack_count;
     uint64_t repack_bytes;
     uint64_t repack_ns;
+    uint64_t cached_install_count;
+    uint64_t cached_install_bytes;
+    uint64_t cached_install_ns;
     uint64_t single_calls;
     uint64_t moe_calls;
     uint64_t fallback_calls;
@@ -31,6 +34,13 @@ int coli_metal_tile_enabled(void);
 int coli_metal_tile_prepare_matrix(const void *weights, const void *scales,
                                    int rows, int columns,
                                    uint64_t source_generation);
+
+/* Milestone-2 cache-hit path: install already-repacked #131 tile bytes into the
+ * same bounded/pinned Metal slots without performing row->tile work again. */
+int coli_metal_tile_prepare_packed_matrix(
+    const void *weights, const void *scales,
+    int rows, int columns, uint64_t source_generation,
+    const void *tile_bytes, size_t tile_byte_count);
 
 void coli_metal_tile_stats(ColiMetalTileStats *stats);
 

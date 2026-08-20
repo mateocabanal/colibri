@@ -150,6 +150,8 @@ static size_t tile_cache_capacity(void) {
 }
 
 static std::atomic<uint64_t> st_repack_count{0},st_repack_bytes{0},st_repack_ns{0};
+static std::atomic<uint64_t> st_cached_install_count{0},st_cached_install_bytes{0};
+static std::atomic<uint64_t> st_cached_install_ns{0};
 static std::atomic<uint64_t> st_single_calls{0},st_moe_calls{0},st_fallback{0};
 static std::atomic<uint64_t> st_experts{0},st_wall_ns{0},st_kernel_ns{0},st_scatter_ns{0};
 static std::atomic<uint64_t> st_row_mxfp4_calls{0},st_row_mxfp4_wall_ns{0};
@@ -159,6 +161,9 @@ extern "C" void coli_metal_tile_stats(ColiMetalTileStats *stats) {
     stats->repack_count=st_repack_count.load();
     stats->repack_bytes=st_repack_bytes.load();
     stats->repack_ns=st_repack_ns.load();
+    stats->cached_install_count=st_cached_install_count.load();
+    stats->cached_install_bytes=st_cached_install_bytes.load();
+    stats->cached_install_ns=st_cached_install_ns.load();
     stats->single_calls=st_single_calls.load();
     stats->moe_calls=st_moe_calls.load();
     stats->fallback_calls=st_fallback.load();
@@ -202,34 +207,11 @@ static void tile_release(TileLease *lease) {
     g_cache_cv.notify_all();
 }
 
-extern "C" int coli_metal_tile_prepare_matrix(const void *weights,const void *scales,
-                                               int rows,int columns,
-                                               uint64_t source_generation) {
-    if(!coli_metal_tile_enabled()||!weights||!scales||rows<=0||columns<=0||
-       !source_generation||!tile_init()) return 0;
-
-    {
-        std::lock_guard<std::mutex> lock(g_cache_mutex);
-        for(auto &entry:g_cache)
-            if(same_key(entry,weights,scales,rows,columns)&&
-               entry.generation==source_generation&&entry.buffer){
-                entry.used=++g_cache_clock;
-                return 1;
-            }
-    }
-
-    size_t bytes=coli_mxfp4_apple8_tile_bytes((uint64_t)rows,(uint64_t)columns);
-    size_t wbytes=(size_t)rows*((size_t)columns+1u)/2u;
-    size_t sbytes=(size_t)rows*((size_t)columns+31u)/32u;
-    if(!bytes) return 0;
-
-    uint64_t began=tile_now_ns();
-    thread_local std::vector<uint8_t> packed;
-    packed.resize(bytes);
-    if(coli_mxfp4_apple8_tile_repack(packed.data(),bytes,
-            weights,wbytes,scales,sbytes,(uint64_t)rows,(uint64_t)columns))
-        return 0;
-
+static int tile_store_packed(const void *weights,const void *scales,
+                             int rows,int columns,uint64_t source_generation,
+                             const void *packed,size_t bytes,int from_cache,
+                             uint64_t began) {
+    if(!packed||!bytes) return 0;
     std::unique_lock<std::mutex> lock(g_cache_mutex);
     for(;;){
         for(auto &entry:g_cache)
@@ -237,23 +219,31 @@ extern "C" int coli_metal_tile_prepare_matrix(const void *weights,const void *sc
                entry.generation==source_generation&&entry.buffer){
                 entry.used=++g_cache_clock;
                 uint64_t elapsed=tile_now_ns()-began;
-                st_repack_count.fetch_add(1);
-                st_repack_bytes.fetch_add(bytes);
-                st_repack_ns.fetch_add(elapsed);
+                if(from_cache){
+                    st_cached_install_count.fetch_add(1);
+                    st_cached_install_bytes.fetch_add(bytes);
+                    st_cached_install_ns.fetch_add(elapsed);
+                } else {
+                    st_repack_count.fetch_add(1);
+                    st_repack_bytes.fetch_add(bytes);
+                    st_repack_ns.fetch_add(elapsed);
+                }
                 return 1;
             }
 
         size_t slot=std::numeric_limits<size_t>::max();
+        bool retry=false;
         for(size_t i=0;i<g_cache.size();++i){
             if(same_key(g_cache[i],weights,scales,rows,columns)){
                 if(g_cache[i].pins==0) slot=i;
                 else {
                     g_cache_cv.wait(lock);
-                    slot=std::numeric_limits<size_t>::max();
+                    retry=true;
                 }
                 break;
             }
         }
+        if(retry) continue;
         if(slot==std::numeric_limits<size_t>::max()){
             if(g_cache.size()<tile_cache_capacity()){
                 g_cache.emplace_back();
@@ -281,7 +271,7 @@ extern "C" int coli_metal_tile_prepare_matrix(const void *weights,const void *sc
             if(!entry.buffer) return 0;
             entry.capacity=bytes;
         }
-        memcpy([entry.buffer contents],packed.data(),bytes);
+        memcpy([entry.buffer contents],packed,bytes);
         entry.weights=weights;
         entry.scales=scales;
         entry.rows=rows;
@@ -289,12 +279,64 @@ extern "C" int coli_metal_tile_prepare_matrix(const void *weights,const void *sc
         entry.generation=source_generation;
         entry.used=++g_cache_clock;
         entry.bytes=bytes;
+
         uint64_t elapsed=tile_now_ns()-began;
-        st_repack_count.fetch_add(1);
-        st_repack_bytes.fetch_add(bytes);
-        st_repack_ns.fetch_add(elapsed);
+        if(from_cache){
+            st_cached_install_count.fetch_add(1);
+            st_cached_install_bytes.fetch_add(bytes);
+            st_cached_install_ns.fetch_add(elapsed);
+        } else {
+            st_repack_count.fetch_add(1);
+            st_repack_bytes.fetch_add(bytes);
+            st_repack_ns.fetch_add(elapsed);
+        }
         return 1;
     }
+}
+
+extern "C" int coli_metal_tile_prepare_matrix(const void *weights,const void *scales,
+                                               int rows,int columns,
+                                               uint64_t source_generation) {
+    if(!coli_metal_tile_enabled()||!weights||!scales||rows<=0||columns<=0||
+       !source_generation||!tile_init()) return 0;
+
+    {
+        std::lock_guard<std::mutex> lock(g_cache_mutex);
+        for(auto &entry:g_cache)
+            if(same_key(entry,weights,scales,rows,columns)&&
+               entry.generation==source_generation&&entry.buffer){
+                entry.used=++g_cache_clock;
+                return 1;
+            }
+    }
+
+    size_t bytes=coli_mxfp4_apple8_tile_bytes((uint64_t)rows,(uint64_t)columns);
+    size_t wbytes=(size_t)rows*((size_t)columns+1u)/2u;
+    size_t sbytes=(size_t)rows*((size_t)columns+31u)/32u;
+    if(!bytes) return 0;
+
+    uint64_t began=tile_now_ns();
+    thread_local std::vector<uint8_t> packed;
+    packed.resize(bytes);
+    if(coli_mxfp4_apple8_tile_repack(packed.data(),bytes,
+            weights,wbytes,scales,sbytes,(uint64_t)rows,(uint64_t)columns))
+        return 0;
+    return tile_store_packed(weights,scales,rows,columns,source_generation,
+                             packed.data(),bytes,0,began);
+}
+
+extern "C" int coli_metal_tile_prepare_packed_matrix(
+        const void *weights,const void *scales,
+        int rows,int columns,uint64_t source_generation,
+        const void *tile_bytes,size_t tile_byte_count) {
+    if(!coli_metal_tile_enabled()||!weights||!scales||rows<=0||columns<=0||
+       !source_generation||!tile_init()||!tile_bytes) return 0;
+    size_t expected=coli_mxfp4_apple8_tile_bytes(
+        (uint64_t)rows,(uint64_t)columns);
+    if(!expected||tile_byte_count!=expected) return 0;
+    uint64_t began=tile_now_ns();
+    return tile_store_packed(weights,scales,rows,columns,source_generation,
+                             tile_bytes,tile_byte_count,1,began);
 }
 
 static int tile_single_run(float *y,const float *x,id<MTLBuffer> rec,
@@ -363,11 +405,9 @@ extern "C" int coli_metal_matmul(ColiMetalTensor **tensor,
     return rc;
 }
 
-/* The V4 engine path exercised by this milestone reaches MXFP4 through the
- * per-matrix matvec shim. Keep the fused routed-MoE wrapper on the proven row
- * implementation until milestone 2 gives tile variants residency-owned
- * lifetimes. This avoids a second, pointer-addressed tile lifetime mechanism
- * while the direct A/B is validating the single-matvec execution layout. */
+/* This milestone still leaves the fused routed-MoE wrapper on the proven row
+ * implementation. The Apple8 path exercised by V4 is the per-matrix fmt7 shim;
+ * milestone-2 adds persistence, not a second GPU lifetime model. */
 extern "C" int coli_metal_moe_block_mxfp4(int nb,int D,int Iinter,
                          const void *const *g,const void *const *u,const void *const *d,
                          const uint8_t *const *gs,const uint8_t *const *us,

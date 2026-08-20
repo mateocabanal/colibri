@@ -1,7 +1,8 @@
-# Additive milestone-1 wire harness for #131's MXFP4 Apple8 tile layout.
+# Additive milestone-1/2 wire harness for #131's MXFP4 Apple8 tile layout.
 # The stock Makefile.deepseek-v4 targets/objects are not modified: this file
 # links an A/B binary whose public Metal fmt7 entrypoints are wrappers around a
-# macro-renamed copy of the exact stock backend.
+# macro-renamed copy of the exact stock backend. Milestone 2 additionally links
+# #137's persistent derived-cache core behind an explicit env gate.
 include Makefile.deepseek-v4
 
 ifneq ($(UNAME_S),Darwin)
@@ -14,6 +15,8 @@ endif
 WIRE_TILE_BINARY := deepseek_v4_tile_ab
 WIRE_BASE_OBJS := $(filter-out coli_executor.o backend_metal.o,$(V4_PREFIX_TEST_OBJS))
 WIRE_TILE_OBJS := $(WIRE_BASE_OBJS) coli_executor_tile.o mxfp4_apple8_tile.o \
+	mxfp4_apple8_tile_transform.o mxfp4_apple8_tile_cache.o \
+	wire_expert_transform.o wire_expert_derived_cache.o \
 	backend_metal_wire.o backend_metal_tile.o
 
 .PHONY: deepseek-v4-wire-tile test-mxfp4-apple8-transform wire-tile-clean
@@ -26,10 +29,10 @@ backend_metal_wire.o: backend_metal.mm backend_metal.h $(V4_BUILD_CONFIG)
 		-Dcoli_metal_moe_block_mxfp4=coli_metal_moe_block_mxfp4_row \
 		-c backend_metal.mm -o $@
 
-# This translation unit includes the C11 <stdatomic.h>-based #135 transform
-# headers and also uses C++ atomics/mutexes. Xcode-beta libc++ rejects mixing
-# <atomic> with <stdatomic.h> before C++23; keep the stock Metal backend at its
-# existing C++17 dialect and raise only this additive harness object to C++23.
+# This translation unit includes the C11 <stdatomic.h>-based transform headers
+# and also uses C++ atomics/mutexes. Xcode-beta libc++ rejects mixing <atomic>
+# with <stdatomic.h> before C++23; keep the stock backend at C++17 and raise only
+# this additive harness object.
 backend_metal_tile.o: backend_metal_tile.mm backend_metal_tile.h \
 	mxfp4_apple8_tile.h backend_metal.h $(V4_BUILD_CONFIG)
 	$(METALXX) -std=gnu++23 -c backend_metal_tile.mm -o $@
@@ -38,12 +41,31 @@ mxfp4_apple8_tile.o: mxfp4_apple8_tile.c mxfp4_apple8_tile.h \
 	expert_transform.h expert_residency.h expert_representation.h coli_format.h
 	$(CC) $(CFLAGS) -c mxfp4_apple8_tile.c -o $@
 
+mxfp4_apple8_tile_transform.o: mxfp4_apple8_tile_transform.c \
+	mxfp4_apple8_tile.h expert_transform.h expert_residency.h
+	$(CC) $(CFLAGS) -c mxfp4_apple8_tile_transform.c -o $@
+
+mxfp4_apple8_tile_cache.o: mxfp4_apple8_tile_cache.c \
+	mxfp4_apple8_tile_cache.h mxfp4_apple8_tile.h backend_metal_tile.h \
+	expert_derived_cache.h expert_transform.h expert_residency.h \
+	coli_executor.h coli_format.h
+	$(CC) $(CFLAGS) -c mxfp4_apple8_tile_cache.c -o $@
+
+wire_expert_transform.o: expert_transform.c expert_transform.h \
+	expert_residency.h expert_representation.h
+	$(CC) $(CFLAGS) -c expert_transform.c -o $@
+
+wire_expert_derived_cache.o: expert_derived_cache.c expert_derived_cache.h \
+	cache_io.h expert_transform.h expert_residency.h expert_representation.h
+	$(CC) $(CFLAGS) -c expert_derived_cache.c -o $@
+
 coli_executor_tile.o: coli_executor_tile.c coli_executor.c coli_executor.h \
-	coli_format.h backend_metal_tile.h $(V4_BUILD_CONFIG)
+	coli_format.h backend_metal_tile.h mxfp4_apple8_tile_cache.h \
+	$(V4_BUILD_CONFIG)
 	$(CC) $(CFLAGS) -c coli_executor_tile.c -o $@
 
 $(WIRE_TILE_BINARY): tools/deepseek_v4_tile_ab.c backend_metal_tile.h \
-	$(WIRE_TILE_OBJS)
+	mxfp4_apple8_tile_cache.h $(WIRE_TILE_OBJS)
 	$(CC) $(CFLAGS) tools/deepseek_v4_tile_ab.c $(WIRE_TILE_OBJS) -o $@ $(LDFLAGS)
 
 test-mxfp4-apple8-transform: test_mxfp4_apple8_transform
@@ -60,4 +82,6 @@ test_mxfp4_apple8_transform: tests/test_mxfp4_apple8_transform.c \
 wire-tile-clean:
 	rm -f $(WIRE_TILE_BINARY) test_mxfp4_apple8_transform \
 		backend_metal_wire.o backend_metal_tile.o mxfp4_apple8_tile.o \
+		mxfp4_apple8_tile_transform.o mxfp4_apple8_tile_cache.o \
+		wire_expert_transform.o wire_expert_derived_cache.o \
 		coli_executor_tile.o
