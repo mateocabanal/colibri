@@ -59,7 +59,7 @@ int main(void) {
     ColiRepresentationTransformOps ops;
     if (coli_jit_transform_registry_find(
             &registry, &src_rep, &dst_rep,
-            COLI_MXFP4_APPLE8_FIXTURE_TRANSFORM_ABI, &ops) != 0)
+            COLI_MXFP4_APPLE8_FIXTURE_TRANSFORM_ABI, &ops) != 1)
         return 4;
 
     uint64_t canonical_bytes = 0;
