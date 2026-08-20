@@ -1,0 +1,28 @@
+# Issue #131 Apple8 4-bit execution-format research harness.
+# Include after Makefile.deepseek-v4 so its Darwin/METAL toolchain variables exist:
+#   make -f Makefile.deepseek-v4 -f Makefile.apple4-bench METAL=1 apple-4bit-bench
+
+.PHONY: apple-4bit-bench apple-4bit-bench-clean
+
+ifeq ($(UNAME_S),Darwin)
+ifeq ($(METAL),1)
+APPLE4_BENCH_BINARY := test_apple_4bit_bench
+apple-4bit-bench: $(APPLE4_BENCH_BINARY)
+
+$(APPLE4_BENCH_BINARY): tests/test_apple_4bit_bench.mm tests/apple4_bench_shader.h tests/apple4_bench_pack.h
+	$(METALXX) tests/test_apple_4bit_bench.mm -framework Metal -framework Foundation -o $@
+
+apple-4bit-bench-clean:
+	rm -f $(APPLE4_BENCH_BINARY)
+else
+apple-4bit-bench:
+	@echo "apple-4bit-bench requires METAL=1" >&2; exit 1
+apple-4bit-bench-clean:
+	@:
+endif
+else
+apple-4bit-bench:
+	@echo "apple-4bit-bench is macOS/Apple-Silicon only" >&2; exit 1
+apple-4bit-bench-clean:
+	@:
+endif
