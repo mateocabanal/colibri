@@ -1,6 +1,13 @@
 
 static int ascii_ieq(const char *a,const char *b){
-    if(!a||!b)return 0; while(*a&&*b){unsigned char x=(unsigned char)*a++,y=(unsigned char)*b++; if(x>='A'&&x<='Z')x=(unsigned char)(x+32); if(y>='A'&&y<='Z')y=(unsigned char)(y+32); if(x!=y)return 0;} return *a==0&&*b==0;
+    if(!a||!b)return 0;
+    while(*a&&*b){
+        unsigned char x=(unsigned char)*a++,y=(unsigned char)*b++;
+        if(x>='A'&&x<='Z')x=(unsigned char)(x+32);
+        if(y>='A'&&y<='Z')y=(unsigned char)(y+32);
+        if(x!=y)return 0;
+    }
+    return *a==0&&*b==0;
 }
 static inline uint64_t coli_prefix_hash64(const void *data,size_t bytes,uint64_t seed){
     const unsigned char *p=(const unsigned char*)data; uint64_t h=seed?seed:PFX_FNV_OFFSET; for(size_t i=0;i<bytes;i++){h^=p[i];h*=PFX_FNV_PRIME;} return h;

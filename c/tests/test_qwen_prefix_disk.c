@@ -13,6 +13,8 @@
 
 #ifdef _WIN32
 #include <direct.h>
+#else
+#include <sys/wait.h>
 #endif
 
 #define LAYERS 2
@@ -120,6 +122,70 @@ static void unset_env(const char *name) {
 #endif
 }
 
+#ifndef _WIN32
+static void test_posix_lock_behavior(const char *dir) {
+    PrefixLock owner = {.fd = -1};
+    assert(lock_acquire(dir, &owner));
+
+    int blocked_pipe[2], acquired_pipe[2];
+    assert(pipe(blocked_pipe) == 0);
+    assert(pipe(acquired_pipe) == 0);
+    pid_t child = fork();
+    assert(child >= 0);
+    if (child == 0) {
+        close(blocked_pipe[0]);
+        close(acquired_pipe[0]);
+
+        char lock_path[COLI_PREFIX_DISK_PATH_MAX];
+        assert(join_path(lock_path, sizeof(lock_path), dir, ".lock"));
+        int probe_fd = open(lock_path, O_RDWR);
+        assert(probe_fd >= 0);
+        struct flock probe;
+        memset(&probe, 0, sizeof(probe));
+        probe.l_type = F_WRLCK;
+        probe.l_whence = SEEK_SET;
+        probe.l_start = 0;
+        probe.l_len = 1;
+        errno = 0;
+        assert(fcntl(probe_fd, F_SETLK, &probe) == -1);
+        assert(errno == EACCES || errno == EAGAIN);
+        close(probe_fd);
+        assert(write(blocked_pipe[1], "B", 1) == 1);
+
+        PrefixLock waiter = {.fd = -1};
+        assert(lock_acquire(dir, &waiter));
+        assert(write(acquired_pipe[1], "A", 1) == 1);
+        lock_release(&waiter);
+        close(blocked_pipe[1]);
+        close(acquired_pipe[1]);
+        _exit(0);
+    }
+
+    close(blocked_pipe[1]);
+    close(acquired_pipe[1]);
+    char marker = 0;
+    assert(read(blocked_pipe[0], &marker, 1) == 1 && marker == 'B');
+
+    int flags = fcntl(acquired_pipe[0], F_GETFL);
+    assert(flags >= 0);
+    assert(fcntl(acquired_pipe[0], F_SETFL, flags | O_NONBLOCK) == 0);
+    errno = 0;
+    assert(read(acquired_pipe[0], &marker, 1) == -1);
+    assert(errno == EAGAIN || errno == EWOULDBLOCK);
+    assert(fcntl(acquired_pipe[0], F_SETFL, flags) == 0);
+
+    /* lock_release must issue F_UNLCK; the blocked F_SETLKW then acquires. */
+    lock_release(&owner);
+    assert(read(acquired_pipe[0], &marker, 1) == 1 && marker == 'A');
+
+    int status = 0;
+    assert(waitpid(child, &status, 0) == child);
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    close(blocked_pipe[0]);
+    close(acquired_pipe[0]);
+}
+#endif
+
 int main(void) {
     char root[512], package[640], config[640], cache[640], path[1024];
 #ifdef _WIN32
@@ -133,6 +199,9 @@ int main(void) {
     snprintf(cache, sizeof(cache), "%s/cache", root);
     assert(mkdir_portable(root)); assert(mkdir_portable(package));
     assert(mkdir_portable(config)); assert(mkdir_portable(cache));
+#ifndef _WIN32
+    test_posix_lock_behavior(cache);
+#endif
     snprintf(path, sizeof(path), "%s/manifest.coli", package); write_file(path, "manifest-v1\n");
     snprintf(path, sizeof(path), "%s/config.json", config); write_file(path, "{\"model_type\":\"qwen-test\"}\n");
     snprintf(path, sizeof(path), "%s/tokenizer.json", config); write_file(path, "{\"version\":\"1\"}\n");

@@ -8,7 +8,18 @@ PrefixDiskHeader h;memset(&h,0,sizeof(h));memcpy(h.magic,PFX_MAGIC,8);h.version=
 #ifdef _WIN32
 if(ok)(void)remove(final_path);
 #endif
-if(ok&&rename(tmp_path,final_path)!=0)ok=0;if(!ok)(void)remove(tmp_path);if(ok){sync_directory(c->directory);c->stores++;c->write_bytes+=(uint64_t)object_bytes;(void)prune_for(c,0);if(c->log)fprintf(stderr,"[PREFIX-SSD] store tokens=%d bytes=%.2fMiB\n",n,(double)object_bytes/(1024.0*1024.0));}lock_release(&l);free(dt);return ok;}
+if(ok&&rename(tmp_path,final_path)!=0)ok=0;
+if(!ok)(void)remove(tmp_path);
+if(ok){
+    sync_directory(c->directory);
+    c->stores++;
+    c->write_bytes+=(uint64_t)object_bytes;
+    (void)prune_for(c,0);
+    if(c->log)fprintf(stderr,"[PREFIX-SSD] store tokens=%d bytes=%.2fMiB\n",n,(double)object_bytes/(1024.0*1024.0));
+}
+lock_release(&l);
+free(dt);
+return ok;}
 
 typedef struct{const ColiPrefixDiskPart*parts;size_t count;} PartStream;
 static int emit_parts(void*user,ColiPrefixDiskSinkFn sink,void*sink_data){PartStream*p=(PartStream*)user;if(!p||!sink)return -1;for(size_t i=0;i<p->count;i++){if(p->parts[i].bytes&&!p->parts[i].data)return -1;if(sink(sink_data,p->parts[i].data,p->parts[i].bytes))return -1;}return 0;}

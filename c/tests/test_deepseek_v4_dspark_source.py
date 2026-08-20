@@ -12,7 +12,7 @@ class DeepSeekV4DSparkSourceTest(unittest.TestCase):
         cls.drafter = (ROOT / "deepseek_v4_dspark.inc").read_text(
             encoding="utf-8"
         )
-        cls.launcher = (ROOT / "coli").read_text(encoding="utf-8")
+        cls.launcher = (ROOT / "tools" / "coli_cli.py").read_text(encoding="utf-8")
 
     def test_complete_three_stage_drafter_is_built(self):
         self.assertEqual(self.drafter.count("static int v4_dspark_draft("), 1)
