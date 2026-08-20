@@ -26,9 +26,13 @@ backend_metal_wire.o: backend_metal.mm backend_metal.h $(V4_BUILD_CONFIG)
 		-Dcoli_metal_moe_block_mxfp4=coli_metal_moe_block_mxfp4_row \
 		-c backend_metal.mm -o $@
 
+# This translation unit includes the C11 <stdatomic.h>-based #135 transform
+# headers and also uses C++ atomics/mutexes. Xcode-beta libc++ rejects mixing
+# <atomic> with <stdatomic.h> before C++23; keep the stock Metal backend at its
+# existing C++17 dialect and raise only this additive harness object to C++23.
 backend_metal_tile.o: backend_metal_tile.mm backend_metal_tile.h \
 	mxfp4_apple8_tile.h backend_metal.h $(V4_BUILD_CONFIG)
-	$(METALXX) -c backend_metal_tile.mm -o $@
+	$(METALXX) -std=gnu++23 -c backend_metal_tile.mm -o $@
 
 mxfp4_apple8_tile.o: mxfp4_apple8_tile.c mxfp4_apple8_tile.h \
 	expert_transform.h expert_residency.h expert_representation.h coli_format.h
