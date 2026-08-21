@@ -6,5 +6,15 @@
 # never pre-included into prerequisite objects such as coli_executor.c.
 include Makefile
 
+QWEN_APPLE8_RUNTIME_TEST := tests/test_mxfp4_apple8_runtime$(EXE)
+
+.PHONY: qwen-rans-runtime-check
+
 qwen_moe$(EXE): qwen_apple8_rans_compat.h
 	$(CC) $(QMOE_CFLAGS) -include qwen_apple8_rans_compat.h $(MIO_CFLAGS) qwen_moe.c $(QMOE_COLI_OBJS) $(QMOE_GPU_OBJ) $(MIO_OBJ) $(METAL_OBJ) -o qwen_moe$(EXE) $(QMOE_LDFLAGS) $(MIO_LDFLAGS) $(filter -framework Metal -framework Foundation -lc++,$(LDFLAGS))
+
+$(QWEN_APPLE8_RUNTIME_TEST): tests/test_mxfp4_apple8_runtime.c mxfp4_runtime.c mxfp4_runtime.h quant.h generated/coli_target_registry.h coli_format.h
+	$(CC) $(QMOE_CFLAGS) tests/test_mxfp4_apple8_runtime.c mxfp4_runtime.c -o $@ $(QMOE_LDFLAGS)
+
+qwen-rans-runtime-check: $(QWEN_APPLE8_RUNTIME_TEST) qwen_moe$(EXE)
+	./$(QWEN_APPLE8_RUNTIME_TEST)
