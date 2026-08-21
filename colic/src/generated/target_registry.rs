@@ -22,7 +22,7 @@ pub const MACOS_ARM64_METAL_APPLE8_V1_ALLOWED_LAYOUTS: &[u16] = &[0x0103];
 pub const MACOS_ARM64_METAL_APPLE8_V1: TargetProfileSpec = TargetProfileSpec {
     name: "macos-arm64-metal-apple8-v1", profile_id: 1, target_profile_abi: 1,
     execution_layout_abi: 1, kernel_abi: 1, target_class: 0x01000001,
-    compiler_emission_supported: false, operating_system: "macos",
+    compiler_emission_supported: true, operating_system: "macos",
     architecture: "aarch64", backend: "metal", record_alignment: 16384,
     io_granularity: 16384, resident_alignment: 16384, allowed_layouts: MACOS_ARM64_METAL_APPLE8_V1_ALLOWED_LAYOUTS,
 };
