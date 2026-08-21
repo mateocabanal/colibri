@@ -150,9 +150,9 @@ jobs:
           if-no-files-found: error
 
   v4-tiny-coli-macos:
-    # PR2 emits Apple8 0x0103 from exact canonical MXFP4 source. The shared V4
-    # tiny fixture is intentionally FP8, so exact mode must still fail closed
-    # instead of silently quantizing or relabelling its expert representation.
+    # The shared V4 fixture carries canonical packed MXFP4 routed experts, so
+    # native Apple Silicon must lower those exact bytes to production 0x0103
+    # records and verify the resulting package without any compatibility repack.
     name: macOS (Apple8 exact-source contract)
     needs: v4-tiny
     runs-on: macos-latest
@@ -164,19 +164,20 @@ jobs:
         with:
           name: deepseek-v4-tiny-source
           path: c/deepseek_v4_tiny
-      - name: Reject FP8 source in exact native Apple8 mode
+      - name: Compile and verify exact native Apple8 package
         run: |
-          set +e
-          output="$(cargo run --manifest-path colic/Cargo.toml -- \
+          cargo run --manifest-path colic/Cargo.toml -- \
             compile c/deepseek_v4_tiny \
             --target native --quant exact --codec none --opt default \
-            -o c/deepseek_v4_tiny.coli --verify 2>&1)"
-          rc=$?
-          set -e
-          printf '%s\n' "$output"
-          test "$rc" -ne 0
-          printf '%s\n' "$output" | grep -F 'exact Apple8 lowering requires canonical MXFP4'
-          test ! -e c/deepseek_v4_tiny.coli/manifest.coli
+            -o c/deepseek_v4_tiny.coli --verify
+          test -f c/deepseek_v4_tiny.coli/manifest.coli
+          python3 - <<'PY'
+          from pathlib import Path
+          manifest = Path('c/deepseek_v4_tiny.coli/manifest.coli').read_bytes()
+          assert b'macos-arm64-metal-apple8-v1' in manifest
+          PY
+          cargo run --manifest-path colic/Cargo.toml -- \
+            verify c/deepseek_v4_tiny.coli
 
   macos:
     # clang; libomp for the threaded path (Makefile falls back to
