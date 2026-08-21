@@ -2,29 +2,23 @@
 #define COLI_EXECUTOR_H
 
 #include "coli_format.h"
+#include "coli_target.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/* Target-selected package access for the runtime hot path. It owns no tensor
- * name mapping and never repacks a record: callers provide final resident-slot
- * storage and select experts by (layer, expert). */
 typedef struct ColiExecutor ColiExecutor;
 
 typedef struct ColiExecutorOpenOptions {
-    /* Required exact physical-layout profile. There is deliberately no native
-     * fallback: accepting another target layout would be unsafe. */
+    /* Exact physical-layout profile. There is deliberately no native fallback. */
     const char *required_profile;
     ColiCsfChecksumPolicy checksum_policy;
-    /* For a production Apple8-v1 profile these must exactly match the shared
-     * target registry. Zero is not a wildcard for that profile. Other legacy
-     * profiles ignore these fields until they gain a frozen target contract. */
-    uint32_t required_execution_layout_abi;
-    uint32_t required_kernel_abi;
-    uint32_t required_target_class;
-    /* Zero is unlimited. Otherwise reject records larger than this resident
-     * slot contract when loading them. */
+    /* Required for frozen execution profiles such as Apple8-v1. The runtime
+     * descriptor is compared against the generated target registry before any
+     * execution record is published. */
+    const ColiRuntimeTarget *runtime_target;
+    /* Zero is unlimited. */
     uint64_t max_resident_record_bytes;
 } ColiExecutorOpenOptions;
 
@@ -45,7 +39,6 @@ int coli_executor_expert_info(const ColiExecutor *executor,
                               int32_t layer, int32_t expert,
                               ColiExpertInfo *out,
                               char *error, size_t error_size);
-
 int coli_executor_load_expert(const ColiExecutor *executor,
                               int32_t layer, int32_t expert,
                               void *resident_slot, size_t resident_bytes,
@@ -57,4 +50,4 @@ const ColiPackage *coli_executor_package(const ColiExecutor *executor);
 }
 #endif
 
-#endif /* COLI_EXECUTOR_H */
+#endif
