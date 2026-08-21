@@ -339,18 +339,23 @@ int coli_v4_session_generate(ColiV4Session *session,
         coli_v4_prefix_disk_publish_session(session);
 
     coli_v4_prefix_cache_stats(&after);
+    uint64_t hits = delta_u64(after.hits, before.hits);
+    uint64_t matched = delta_u64(after.matched_tokens, before.matched_tokens);
+    uint64_t restore_bytes = delta_u64(after.restore_bytes, before.restore_bytes);
+    uint64_t restore_ns = delta_u64(after.restore_ns, before.restore_ns);
+    uint64_t stores = delta_u64(after.stores, before.stores);
+    uint64_t store_bytes = delta_u64(after.store_bytes, before.store_bytes);
+    uint64_t store_ns = delta_u64(after.store_ns, before.store_ns);
+    uint64_t evictions = delta_u64(after.evictions, before.evictions);
+
+    if (stats) {
+        stats->prefix_reused_tokens = session ? session->prefix_reused : 0;
+        stats->prefix_ram_hits = hits;
+        stats->prefix_ram_restore_bytes = restore_bytes;
+        stats->prefix_ram_restore_sec = restore_ns * 1.0e-9;
+    }
+
     if (after.budget_bytes) {
-        uint64_t hits = delta_u64(after.hits, before.hits);
-        uint64_t matched = delta_u64(after.matched_tokens,
-                                     before.matched_tokens);
-        uint64_t restore_bytes = delta_u64(after.restore_bytes,
-                                           before.restore_bytes);
-        uint64_t restore_ns = delta_u64(after.restore_ns,
-                                        before.restore_ns);
-        uint64_t stores = delta_u64(after.stores, before.stores);
-        uint64_t store_bytes = delta_u64(after.store_bytes, before.store_bytes);
-        uint64_t store_ns = delta_u64(after.store_ns, before.store_ns);
-        uint64_t evictions = delta_u64(after.evictions, before.evictions);
         fprintf(stderr,
                 "v4_prefix_cache hit=%llu matched_tokens=%llu restore_bytes=%llu "
                 "restore_ms=%.3f stores=%llu store_bytes=%llu store_ms=%.3f "
