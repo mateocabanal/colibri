@@ -150,12 +150,10 @@ jobs:
           if-no-files-found: error
 
   v4-tiny-coli-macos:
-    # PR1 freezes the native Apple8 contract before PR2 supplies the production
-    # 0x0103 lowerer. The previous lifecycle job would therefore create the very
-    # canonical/row artifact PR1 now forbids. Until PR2 lands, make native Apple
-    # compilation itself the fail-closed oracle; PR2 restores the physical and
-    # runtime lifecycle checks when the production lowerer exists.
-    name: macOS (Apple8 emission refusal contract)
+    # PR2 emits Apple8 0x0103 from exact canonical MXFP4 source. The shared V4
+    # tiny fixture is intentionally FP8, so exact mode must still fail closed
+    # instead of silently quantizing or relabelling its expert representation.
+    name: macOS (Apple8 exact-source contract)
     needs: v4-tiny
     runs-on: macos-latest
     timeout-minutes: 15
@@ -166,7 +164,7 @@ jobs:
         with:
           name: deepseek-v4-tiny-source
           path: c/deepseek_v4_tiny
-      - name: Refuse false native Apple8 exact-COLI emission until PR2
+      - name: Reject FP8 source in exact native Apple8 mode
         run: |
           set +e
           output="$(cargo run --manifest-path colic/Cargo.toml -- \
@@ -177,8 +175,7 @@ jobs:
           set -e
           printf '%s\n' "$output"
           test "$rc" -ne 0
-          printf '%s\n' "$output" | grep -F 'production lowerer is not implemented'
-          printf '%s\n' "$output" | grep -F 'refusing to emit a row/canonical artifact under that profile'
+          printf '%s\n' "$output" | grep -F 'exact Apple8 lowering requires canonical MXFP4'
           test ! -e c/deepseek_v4_tiny.coli/manifest.coli
 
   macos:
