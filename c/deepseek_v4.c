@@ -1910,11 +1910,8 @@ static int attention_token_impl(float *output,
                (size_t)head_dim * sizeof(*kv));
         if (!state->indexer) compressed_selected = state->compressed_count;
         int topk = state->window_size + compressed_selected;
-        int kv_count = state->window_size + state->compressed_count;
         int *indices = malloc((size_t)topk * sizeof(*indices));
-        float *all_kv = state->compressed_count
-            ? malloc((size_t)kv_count * head_dim * sizeof(*all_kv)) : NULL;
-        if (!indices || (state->compressed_count && !all_kv)) result = -1;
+        if (!indices) result = -1;
         if (!result) {
             if (position < state->window_size - 1) {
                 for (int i = 0; i < state->window_size; i++)
@@ -1924,29 +1921,22 @@ static int attention_token_impl(float *output,
                 for (int i = 0; i < state->window_size; i++)
                     indices[i] = (oldest + i) % state->window_size;
             }
-            const float *kv_values = state->kv;
-            if (state->compressed_count) {
-                memcpy(all_kv, state->kv,
-                       (size_t)state->window_size * head_dim * sizeof(*all_kv));
-                memcpy(all_kv + (size_t)state->window_size * head_dim,
-                       state->compressed,
-                       (size_t)state->compressed_count * head_dim * sizeof(*all_kv));
-                kv_values = all_kv;
-            }
             for (int i = 0; i < compressed_selected; i++) {
                 int ordinal = state->indexer ? compressed_indices[i] : i;
                 indices[state->window_size + i] = state->window_size + ordinal;
             }
             uint64_t step_began = g_coli_v4_profile_on
                 ? coli_v4_profile_now() : 0;
-            result = coli_v4_sparse_attention_ref(
-                attended, q, kv_values, sinks, indices, heads, head_dim,
-                kv_count, topk,
-                1.0f / sqrtf((float)head_dim));
+            ColiDeepSeekV4SparseKVView kv_view = {
+                state->kv, state->window_size,
+                state->compressed, state->compressed_count
+            };
+            result = coli_v4_sparse_attention_view_ref(
+                attended, q, &kv_view, sinks, indices, heads, head_dim,
+                topk, 1.0f / sqrtf((float)head_dim));
             if (step_began)
                 sparse_ns += coli_v4_profile_now() - step_began;
         }
-        free(all_kv);
         free(indices);
     } else for (int head = 0; !result && head < heads; head++) {
         float *query = q + (size_t)head * head_dim;
@@ -2328,11 +2318,8 @@ static int attention_token_impl(float *output,
                (size_t)head_dim * sizeof(*kv));
         if (!state->indexer) compressed_selected = state->compressed_count;
         int topk = state->window_size + compressed_selected;
-        int kv_count = state->window_size + state->compressed_count;
         int *indices = malloc((size_t)topk * sizeof(*indices));
-        float *all_kv = state->compressed_count
-            ? malloc((size_t)kv_count * head_dim * sizeof(*all_kv)) : NULL;
-        if (!indices || (state->compressed_count && !all_kv)) result = -1;
+        if (!indices) result = -1;
         if (!result) {
             if (position < state->window_size - 1) {
                 for (int i = 0; i < state->window_size; i++)
@@ -2342,29 +2329,22 @@ static int attention_token_impl(float *output,
                 for (int i = 0; i < state->window_size; i++)
                     indices[i] = (oldest + i) % state->window_size;
             }
-            const float *kv_values = state->kv;
-            if (state->compressed_count) {
-                memcpy(all_kv, state->kv,
-                       (size_t)state->window_size * head_dim * sizeof(*all_kv));
-                memcpy(all_kv + (size_t)state->window_size * head_dim,
-                       state->compressed,
-                       (size_t)state->compressed_count * head_dim * sizeof(*all_kv));
-                kv_values = all_kv;
-            }
             for (int i = 0; i < compressed_selected; i++) {
                 int ordinal = state->indexer ? compressed_indices[i] : i;
                 indices[state->window_size + i] = state->window_size + ordinal;
             }
             uint64_t step_began = g_coli_v4_profile_on
                 ? coli_v4_profile_now() : 0;
-            result = coli_v4_sparse_attention_ref(
-                attended, q, kv_values, sinks, indices, heads, head_dim,
-                kv_count, topk,
-                1.0f / sqrtf((float)head_dim));
+            ColiDeepSeekV4SparseKVView kv_view = {
+                state->kv, state->window_size,
+                state->compressed, state->compressed_count
+            };
+            result = coli_v4_sparse_attention_view_ref(
+                attended, q, &kv_view, sinks, indices, heads, head_dim,
+                topk, 1.0f / sqrtf((float)head_dim));
             if (step_began)
                 sparse_ns += coli_v4_profile_now() - step_began;
         }
-        free(all_kv);
         free(indices);
     } else for (int head = 0; !result && head < heads; head++) {
         float *query = q + (size_t)head * head_dim;
@@ -2603,11 +2583,8 @@ int coli_v4_attention_window_batch_ref(
         int selected = selected_counts[item];
         int compressed_count = compressed_counts[item];
         int topk = state->window_size + selected;
-        int kv_count = state->window_size + compressed_count;
         int *indices = malloc((size_t)topk * sizeof(*indices));
-        float *all_kv = compressed_count
-            ? malloc((size_t)kv_count * head_dim * sizeof(*all_kv)) : NULL;
-        if (!indices || (compressed_count && !all_kv)) result = -1;
+        if (!indices) result = -1;
         if (!result) {
             if (position < state->window_size - 1)
                 for (int i = 0; i < state->window_size; i++)
@@ -2617,25 +2594,20 @@ int coli_v4_attention_window_batch_ref(
                 for (int i = 0; i < state->window_size; i++)
                     indices[i] = (oldest + i) % state->window_size;
             }
-            const float *values = state->kv;
-            if (compressed_count) {
-                memcpy(all_kv, state->kv,
-                       (size_t)state->window_size * head_dim * sizeof(*all_kv));
-                memcpy(all_kv + (size_t)state->window_size * head_dim,
-                       state->compressed,
-                       (size_t)compressed_count * head_dim * sizeof(*all_kv));
-                values = all_kv;
-            }
             for (int i = 0; i < selected; i++) {
                 int ordinal = state->indexer
                     ? compressed_indices[(size_t)item * config->index_topk + i] : i;
                 indices[state->window_size + i] = state->window_size + ordinal;
             }
-            result = coli_v4_sparse_attention_ref(
-                item_attended, item_q, values, sinks, indices, heads, head_dim,
-                kv_count, topk, 1.0f / sqrtf((float)head_dim));
+            ColiDeepSeekV4SparseKVView kv_view = {
+                state->kv, state->window_size,
+                state->compressed, compressed_count
+            };
+            result = coli_v4_sparse_attention_view_ref(
+                item_attended, item_q, &kv_view, sinks, indices, heads,
+                head_dim, topk, 1.0f / sqrtf((float)head_dim));
         }
-        free(all_kv); free(indices);
+        free(indices);
         const float *item_cos = cosines + (size_t)item * rope_pairs;
         const float *item_sin = sines + (size_t)item * rope_pairs;
         for (int head = 0; !result && head < heads; head++) {
@@ -3269,58 +3241,97 @@ static void v4_attn_accumulate(float *output, const float *value,
     for (; i < n; i++) output[i] += probability * value[i];
 }
 
-int coli_v4_sparse_attention_ref(float *output, const float *queries,
-                                 const float *kv, const float *sinks,
-                                 const int *indices, int heads,
-                                 int head_dimension, int kv_count, int topk,
-                                 float softmax_scale) {
+typedef struct {
+    const float *row;
+    float score;
+} V4SparseSelectedRow;
+
+static const float *v4_sparse_kv_row(
+        const ColiDeepSeekV4SparseKVView *kv, int index,
+        int head_dimension) {
+    if (!kv || index < 0 || head_dimension < 1) return NULL;
+    if (index < kv->window_count) {
+        if (!kv->window) return NULL;
+        return kv->window + (size_t)index * head_dimension;
+    }
+    int compressed = index - kv->window_count;
+    if (compressed < 0 || compressed >= kv->compressed_count ||
+        !kv->compressed)
+        return NULL;
+    return kv->compressed + (size_t)compressed * head_dimension;
+}
+
+int coli_v4_sparse_attention_view_ref(
+        float *output, const float *queries,
+        const ColiDeepSeekV4SparseKVView *kv, const float *sinks,
+        const int *indices, int heads, int head_dimension, int topk,
+        float softmax_scale) {
     if (!output || !queries || !kv || !sinks || !indices || heads < 1 ||
-        head_dimension < 1 || kv_count < 1 || topk < 1 || !(softmax_scale > 0.0f))
+        head_dimension < 1 || topk < 1 || !(softmax_scale > 0.0f) ||
+        kv->window_count < 0 || kv->compressed_count < 0 ||
+        (kv->window_count == 0 && kv->compressed_count == 0))
         return -1;
-    float *scores = malloc((size_t)topk * sizeof(*scores));
-    if (!scores) return -1;
+    V4SparseSelectedRow *selected =
+        malloc((size_t)topk * sizeof(*selected));
+    if (!selected) return -1;
     for (int head = 0; head < heads; head++) {
         const float *query = queries + (size_t)head * head_dimension;
         float maximum = -INFINITY;
         for (int rank = 0; rank < topk; rank++) {
             int index = indices[rank];
             if (index < 0) {
-                scores[rank] = -INFINITY;
+                selected[rank].row = NULL;
+                selected[rank].score = -INFINITY;
                 continue;
             }
-            if (index >= kv_count) {
-                free(scores);
+            const float *row = v4_sparse_kv_row(kv, index, head_dimension);
+            if (!row) {
+                free(selected);
                 return -1;
             }
-            const float *key = kv + (size_t)index * head_dimension;
-            float score = v4_attn_dot(query, key, head_dimension);
+            float score = v4_attn_dot(query, row, head_dimension);
             score *= softmax_scale;
-            scores[rank] = score;
+            selected[rank].row = row;
+            selected[rank].score = score;
             if (score > maximum) maximum = score;
         }
         if (!isfinite(maximum)) {
-            free(scores);
+            free(selected);
             return -1;
         }
         float denominator = expf(sinks[head] - maximum);
         float *head_output = output + (size_t)head * head_dimension;
         memset(head_output, 0, (size_t)head_dimension * sizeof(*head_output));
         for (int rank = 0; rank < topk; rank++) {
-            if (indices[rank] < 0) continue;
-            float probability = expf(scores[rank] - maximum);
+            const float *value = selected[rank].row;
+            if (!value) continue;
+            float probability = expf(selected[rank].score - maximum);
             denominator += probability;
             /* TileLang casts the exp fragment to BF16 before value GEMM. */
             probability = coli_bf16_round(probability);
-            const float *value = kv + (size_t)indices[rank] * head_dimension;
             v4_attn_accumulate(head_output, value, probability,
                                head_dimension);
         }
         for (int column = 0; column < head_dimension; column++)
-            head_output[column] = coli_bf16_round(head_output[column] / denominator);
+            head_output[column] =
+                coli_bf16_round(head_output[column] / denominator);
     }
-    free(scores);
+    free(selected);
     return 0;
 }
+
+int coli_v4_sparse_attention_ref(float *output, const float *queries,
+                                 const float *kv, const float *sinks,
+                                 const int *indices, int heads,
+                                 int head_dimension, int kv_count, int topk,
+                                 float softmax_scale) {
+    if (!kv || kv_count < 1) return -1;
+    ColiDeepSeekV4SparseKVView view = {kv, kv_count, NULL, 0};
+    return coli_v4_sparse_attention_view_ref(
+        output, queries, &view, sinks, indices, heads, head_dimension,
+        topk, softmax_scale);
+}
+
 #endif /* COLI_V4_UNIT_SPARSE_ATTENTION */
 
 #ifdef COLI_V4_UNIT_BLOCK_HYBRID
@@ -5545,11 +5556,8 @@ static int attention_token_impl(float *output,
                (size_t)head_dim * sizeof(*kv));
         if (!state->indexer) compressed_selected = state->compressed_count;
         int topk = state->window_size + compressed_selected;
-        int kv_count = state->window_size + state->compressed_count;
         int *indices = malloc((size_t)topk * sizeof(*indices));
-        float *all_kv = state->compressed_count
-            ? malloc((size_t)kv_count * head_dim * sizeof(*all_kv)) : NULL;
-        if (!indices || (state->compressed_count && !all_kv)) result = -1;
+        if (!indices) result = -1;
         if (!result) {
             if (position < state->window_size - 1) {
                 for (int i = 0; i < state->window_size; i++)
@@ -5559,29 +5567,22 @@ static int attention_token_impl(float *output,
                 for (int i = 0; i < state->window_size; i++)
                     indices[i] = (oldest + i) % state->window_size;
             }
-            const float *kv_values = state->kv;
-            if (state->compressed_count) {
-                memcpy(all_kv, state->kv,
-                       (size_t)state->window_size * head_dim * sizeof(*all_kv));
-                memcpy(all_kv + (size_t)state->window_size * head_dim,
-                       state->compressed,
-                       (size_t)state->compressed_count * head_dim * sizeof(*all_kv));
-                kv_values = all_kv;
-            }
             for (int i = 0; i < compressed_selected; i++) {
                 int ordinal = state->indexer ? compressed_indices[i] : i;
                 indices[state->window_size + i] = state->window_size + ordinal;
             }
             uint64_t step_began = g_coli_v4_profile_on
                 ? coli_v4_profile_now() : 0;
-            result = coli_v4_sparse_attention_ref(
-                attended, q, kv_values, sinks, indices, heads, head_dim,
-                kv_count, topk,
-                1.0f / sqrtf((float)head_dim));
+            ColiDeepSeekV4SparseKVView kv_view = {
+                state->kv, state->window_size,
+                state->compressed, state->compressed_count
+            };
+            result = coli_v4_sparse_attention_view_ref(
+                attended, q, &kv_view, sinks, indices, heads, head_dim,
+                topk, 1.0f / sqrtf((float)head_dim));
             if (step_began)
                 sparse_ns += coli_v4_profile_now() - step_began;
         }
-        free(all_kv);
         free(indices);
     } else for (int head = 0; !result && head < heads; head++) {
         float *query = q + (size_t)head * head_dim;
