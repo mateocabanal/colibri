@@ -5,6 +5,7 @@
 pub mod cli;
 pub mod error;
 pub mod format;
+pub mod generated;
 pub mod ir;
 pub mod model;
 pub mod passes;
