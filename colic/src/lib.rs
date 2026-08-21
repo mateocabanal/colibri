@@ -5,6 +5,7 @@
 pub mod cli;
 pub mod error;
 pub mod format;
+pub mod generated;
 pub mod ir;
 pub mod model;
 pub mod passes;
@@ -13,6 +14,8 @@ pub mod quant;
 pub mod source;
 pub mod storage;
 pub mod target;
+pub mod target_registry;
 pub mod verify;
+pub mod verify_target;
 
 pub use error::{ColicError, Result};

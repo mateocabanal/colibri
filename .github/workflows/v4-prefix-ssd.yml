@@ -26,7 +26,12 @@ concurrency:
 
 jobs:
   linux-ssd-only-restart:
-    name: Linux SSD-only exact-COLI restart oracle
+    # PR1 freezes the Apple8 production profile before PR2 supplies its 0x0103
+    # lowerer. The old Linux SSD restart oracle compiled a canonical artifact
+    # while labelling it Apple8, which is now intentionally forbidden. Keep a
+    # fail-closed sentinel here; PR2 restores the package/restart lifecycle once
+    # the compiler can emit the frozen production layout.
+    name: Linux Apple8 emission refusal contract
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -40,33 +45,18 @@ jobs:
         run: python -m pip install -r c/tools/requirements-deepseek-v4-tiny.txt
       - name: Generate tiny V4 source fixture
         run: python c/tools/make_deepseek_v4_tiny.py --output c/deepseek_v4_tiny --force
-      - name: Compile exact COLI package for current V4 package ABI
+      - name: Refuse false Apple8 exact-COLI emission until PR2
         run: |
-          # The V4 runtime currently opens exact packages through the frozen
-          # macOS/Metal profile even when this portable correctness oracle runs
-          # on Linux. Exact tensor/expert payloads are still byte-preserving;
-          # use the profile the runtime actually negotiates so this job tests
-          # prefix/package behavior instead of failing at the profile gate.
-          cargo run --manifest-path colic/Cargo.toml -- \
+          set +e
+          output="$(cargo run --manifest-path colic/Cargo.toml -- \
             compile c/deepseek_v4_tiny \
             --target macos-arm64-metal-apple8-v1 \
             --quant exact --codec none --opt default \
-            -o c/deepseek_v4_tiny.coli --verify
-      - name: Build V4 prefix-cache helpers
-        run: make -C c -f Makefile.deepseek-v4 LTO=0 deepseek-v4-prefix-cache-test
-      - name: Validate SSD-only writer, restart restore, and cold output
-        run: |
-          python - <<'PY'
-          import json
-          import subprocess
-          from pathlib import Path
-
-          package = Path('c/deepseek_v4_tiny.coli')
-          case = json.loads((package / 'ref.json').read_text(encoding='utf-8'))['cases']['short']
-          prompt = ''.join(f'<t{token:03d}>' for token in case['prompt_ids'])
-          subprocess.run([
-              'c/test_v4_prefix_disk_sessions',
-              str(package),
-              prompt,
-          ], check=True)
-          PY
+            -o c/deepseek_v4_tiny.coli --verify 2>&1)"
+          rc=$?
+          set -e
+          printf '%s\n' "$output"
+          test "$rc" -ne 0
+          printf '%s\n' "$output" | grep -F 'production lowerer is not implemented'
+          printf '%s\n' "$output" | grep -F 'refusing to emit a row/canonical artifact under that profile'
+          test ! -e c/deepseek_v4_tiny.coli/manifest.coli

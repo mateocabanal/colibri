@@ -1062,7 +1062,7 @@ mod tests {
         let output = root.join("compiled.coli");
         let mut request = CompileRequest::new(source);
         request.output = Some(output.clone());
-        request.target = TargetRequest::Profile("macos-arm64-metal-apple8-v1".into());
+        request.target = TargetRequest::Profile("linux-x86_64-avx2-v1".into());
         request.verify = true;
         compile(&request, &mut NoProgress).unwrap();
         for name in [

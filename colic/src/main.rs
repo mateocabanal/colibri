@@ -254,6 +254,7 @@ fn run() -> colic::Result<()> {
             let summary = colic::verify::verify_package_with_progress(&package, &mut |update| {
                 progress.verification(update);
             })?;
+            colic::verify_target::verify_target_layouts(&package)?;
             println!("package={}", package.display());
             println!("shards={}", summary.shards);
             println!("records={}", summary.records);

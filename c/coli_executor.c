@@ -25,6 +25,7 @@ int coli_executor_open(ColiExecutor **out, const char *package_path,
     ColiPackage *package = NULL;
     ColiCsfChecksumPolicy policy;
     const char *actual;
+    size_t i;
     if (out) *out = NULL;
     if (!out || !package_path || !*package_path || !options ||
         !options->required_profile || !*options->required_profile) {
@@ -37,6 +38,17 @@ int coli_executor_open(ColiExecutor **out, const char *package_path,
         executor_error(error, error_size, "invalid executor checksum policy");
         return -1;
     }
+    if (!strcmp(options->required_profile, COLI_TARGET_PROFILE_MACOS_ARM64_METAL_APPLE8_V1)) {
+        if (!options->runtime_target ||
+            coli_target_check_compatibility(options->required_profile,
+                                            options->runtime_target,
+                                            COLI_APPLE8_RECORD_ALIGNMENT,
+                                            error, error_size)) {
+            if (error && error_size && !error[0])
+                executor_error(error, error_size, "Apple8 runtime target contract mismatch");
+            return -1;
+        }
+    }
     if (coli_package_open_ex(&package, package_path, policy, error, error_size)) return -1;
     actual = coli_package_profile(package);
     if (!actual || strcmp(actual, options->required_profile)) {
@@ -44,6 +56,37 @@ int coli_executor_open(ColiExecutor **out, const char *package_path,
                        actual ? actual : "<missing>", options->required_profile);
         coli_package_close(package);
         return -1;
+    }
+    if (!strcmp(actual, COLI_TARGET_PROFILE_MACOS_ARM64_METAL_APPLE8_V1) &&
+        coli_target_check_compatibility(actual, options->runtime_target,
+                                        coli_package_record_alignment(package),
+                                        error, error_size)) {
+        coli_package_close(package);
+        return -1;
+    }
+    /* Fail closed a second time at the record/layout boundary. expert_info is
+     * metadata-only: it reads the fixed expert envelope/descriptors but never
+     * scans payload tiles. */
+    for (i = 0; i < coli_package_record_count(package); ++i) {
+        const ColiRecordInfo *record = coli_package_record_at(package, i);
+        if (record && record->kind == COLI_CSF_REC_EXPERT) {
+            ColiExpertInfo info;
+            unsigned m;
+            if (coli_package_expert_info(package, record, &info, error, error_size)) {
+                coli_package_close(package);
+                return -1;
+            }
+            for (m = 0; m < 3; ++m) {
+                if (!coli_target_profile_accepts_layout(actual, info.matrices[m].layout)) {
+                    executor_error(error, error_size,
+                                   "expert (%d,%d) matrix %u layout 0x%04x is outside target profile %s",
+                                   record->layer, record->expert, m,
+                                   info.matrices[m].layout, actual);
+                    coli_package_close(package);
+                    return -1;
+                }
+            }
+        }
     }
     executor = (ColiExecutor *)calloc(1, sizeof(*executor));
     if (!executor) {

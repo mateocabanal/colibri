@@ -15,11 +15,11 @@ endif
 
 .PHONY: test test-asan clean
 
-tests/test_coli_format$(EXE): tests/test_coli_format.c coli_format.c coli_executor.c coli_format.h coli_executor.h compat.h
-	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) tests/test_coli_format.c coli_format.c coli_executor.c -o $@ -pthread $(EXTRA_LDFLAGS)
+tests/test_coli_format$(EXE): tests/test_coli_format.c coli_format.c coli_format_base.c coli_executor.c coli_target.c coli_format.h coli_executor.h coli_target.h apple8_contract.h generated/coli_target_registry.h compat.h
+	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) tests/test_coli_format.c coli_format.c coli_executor.c coli_target.c -o $@ -pthread $(EXTRA_LDFLAGS)
 
-tests/test_mxfp4_expert$(EXE): tests/test_mxfp4_expert.c mxfp4_expert.c mxfp4_expert.h coli_format.c coli_format.h compat.h
-	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) tests/test_mxfp4_expert.c mxfp4_expert.c coli_format.c -o $@ -pthread $(EXTRA_LDFLAGS)
+tests/test_mxfp4_expert$(EXE): tests/test_mxfp4_expert.c mxfp4_expert.c mxfp4_expert.h coli_format.c coli_format_base.c coli_target.c coli_format.h coli_target.h apple8_contract.h generated/coli_target_registry.h compat.h
+	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) tests/test_mxfp4_expert.c mxfp4_expert.c coli_format.c coli_target.c -o $@ -pthread $(EXTRA_LDFLAGS)
 
 tests/test_mxfp4_runtime$(EXE): tests/test_mxfp4_runtime.c mxfp4_runtime.c mxfp4_runtime.h quant.h
 	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) tests/test_mxfp4_runtime.c mxfp4_runtime.c -o $@ -lm $(EXTRA_LDFLAGS)
