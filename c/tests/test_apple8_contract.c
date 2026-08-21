@@ -78,7 +78,14 @@ static int test_descriptor(void) {
     CHECK(coli_apple8_matrix_descriptor_valid(&m, &expected));
     CHECK(expected == 544);
 
-    m.layout = 0x7131; CHECK(!coli_apple8_matrix_descriptor_valid(&m, NULL));
+    m = good_matrix(9, 33);
+    m.weight_codec = COLI_CSF_CODEC_RANS256_G0_NIBBLE;
+    m.weight_codec_table_id = 7;
+    m.weight_stored_bytes = 320;
+    CHECK(coli_apple8_matrix_descriptor_valid(&m, &expected));
+    CHECK(expected == 544);
+
+    m = good_matrix(9, 33); m.layout = 0x7131; CHECK(!coli_apple8_matrix_descriptor_valid(&m, NULL));
     m = good_matrix(9, 33); m.layout = COLI_CSF_LAYOUT_CANONICAL; CHECK(!coli_apple8_matrix_descriptor_valid(&m, NULL));
     m = good_matrix(9, 33); m.math_format = COLI_CSF_MATH_INT4_PACKED; CHECK(!coli_apple8_matrix_descriptor_valid(&m, NULL));
     m = good_matrix(9, 33); m.scale_format = COLI_CSF_SCALE_F16; CHECK(!coli_apple8_matrix_descriptor_valid(&m, NULL));
@@ -87,6 +94,8 @@ static int test_descriptor(void) {
     m = good_matrix(9, 33); m.group_size = 32; CHECK(!coli_apple8_matrix_descriptor_valid(&m, NULL));
     m = good_matrix(9, 33); m.weight_decoded_bytes--; CHECK(!coli_apple8_matrix_descriptor_valid(&m, NULL));
     m = good_matrix(9, 33); m.weight_stored_bytes--; CHECK(!coli_apple8_matrix_descriptor_valid(&m, NULL));
+    m = good_matrix(9, 33); m.weight_codec = COLI_CSF_CODEC_RANS256_G0_NIBBLE; m.weight_stored_bytes = 320; CHECK(!coli_apple8_matrix_descriptor_valid(&m, NULL));
+    m = good_matrix(9, 33); m.weight_codec = COLI_CSF_CODEC_RANS256_G0_NIBBLE; m.weight_codec_table_id = 7; m.weight_stored_bytes = 0; CHECK(!coli_apple8_matrix_descriptor_valid(&m, NULL));
     m = good_matrix(9, 33); m.scale_offset = 1024; CHECK(!coli_apple8_matrix_descriptor_valid(&m, NULL));
     m = good_matrix(9, 33); m.scale_stored_bytes = 1; CHECK(!coli_apple8_matrix_descriptor_valid(&m, NULL));
     m = good_matrix(9, 33); m.scale_decoded_bytes = 1; CHECK(!coli_apple8_matrix_descriptor_valid(&m, NULL));
