@@ -72,7 +72,7 @@ impl QuantRequest {
         if value == "exact" {
             Ok(Self::Exact)
         } else if value.is_empty() {
-            Err(ColicError::Usage("quant profile cannot be empty".into()))
+            Err(ColicError::Usage("target profile cannot be empty".into()))
         } else {
             Ok(Self::Profile(value.into()))
         }
@@ -211,11 +211,11 @@ pub fn dry_run(request: &CompileRequest) -> Result<DryRunSummary> {
         )
     })?;
     let quantization = resolve_expert_quantization(request, &model)?;
-    let target = target::resolve(&request.target, target::HostCapabilities::current())?;
-    let records = record_inventory(&model, quantization)?;
-    let plan = storage::plan_records(&records, target, 4 * 1024 * 1024 * 1024)?;
+    let target_profile = target::resolve(&request.target, target::HostCapabilities::current())?;
+    let records = record_inventory(&model, quantization, target_profile)?;
+    let plan = storage::plan_records(&records, target_profile, 4 * 1024 * 1024 * 1024)?;
     Ok(DryRunSummary {
-        target_name: target.name,
+        target_name: target_profile.name,
         source_tensors: inventory.tensors.len(),
         source_stored_bytes: inventory.source_stored_bytes,
         plan,
@@ -224,12 +224,17 @@ pub fn dry_run(request: &CompileRequest) -> Result<DryRunSummary> {
 
 /// Stable v1 record order: globals, layer-static tensors, then pageable experts.
 pub fn exact_record_inventory(model: &SemanticModel) -> Result<Vec<LoweredRecord>> {
-    record_inventory(model, ExpertQuantization::Exact)
+    record_inventory(
+        model,
+        ExpertQuantization::Exact,
+        target::LINUX_X86_64_AVX2_V1,
+    )
 }
 
 fn record_inventory(
     model: &SemanticModel,
     expert_quantization: ExpertQuantization,
+    target_profile: target::TargetProfile,
 ) -> Result<Vec<LoweredRecord>> {
     let mut records = Vec::new();
     let mut id = 1_u64;
@@ -244,15 +249,26 @@ fn record_inventory(
         }
     }
     for expert in model.routed_experts.values() {
-        let (stored_bytes, decoded_bytes) = match expert_quantization {
-            ExpertQuantization::Exact => (
-                target::exact_expert_stored_bytes(expert)?,
-                target::exact_expert_decoded_bytes(expert)?,
-            ),
-            ExpertQuantization::Mxfp4 => (
-                mxfp4_record::stored_bytes(expert)?,
-                mxfp4_record::resident_bytes(expert)?,
-            ),
+        let (stored_bytes, decoded_bytes) = if target_profile == target::MACOS_ARM64_METAL_APPLE8_V1 {
+            match expert_quantization {
+                ExpertQuantization::Exact => target::validate_apple8_exact_mxfp4_expert(expert)?,
+                ExpertQuantization::Mxfp4 => target::validate_apple8_quantized_mxfp4_expert(expert)?,
+            }
+            (
+                target::apple8_expert_stored_bytes(expert)?,
+                target::apple8_expert_decoded_bytes(expert)?,
+            )
+        } else {
+            match expert_quantization {
+                ExpertQuantization::Exact => (
+                    target::exact_expert_stored_bytes(expert)?,
+                    target::exact_expert_decoded_bytes(expert)?,
+                ),
+                ExpertQuantization::Mxfp4 => (
+                    mxfp4_record::stored_bytes(expert)?,
+                    mxfp4_record::resident_bytes(expert)?,
+                ),
+            }
         };
         records.push(LoweredRecord {
             id,
@@ -472,6 +488,7 @@ fn stream_payload(
     writer: &mut storage::DataShardWriter,
     planned: &storage::PlannedRecord,
     source: &ExactSource,
+    target_profile: target::TargetProfile,
 ) -> Result<ManifestRecord> {
     match source {
         ExactSource::Tensor {
@@ -504,20 +521,35 @@ fn stream_payload(
             expert,
             quantization,
         } => {
-            let crc = match quantization {
-                ExpertQuantization::Exact => {
-                    let mut crc = 0;
-                    writer.write_record_stream(planned, |file| {
-                        crc = target::stream_exact_expert(expert, file)?;
-                        Ok(planned.record.stored_bytes)
-                    })?;
-                    crc
+            let crc = if target_profile == target::MACOS_ARM64_METAL_APPLE8_V1 {
+                let bytes = match quantization {
+                    ExpertQuantization::Exact => target::lower_apple8_exact_mxfp4_expert(expert)?,
+                    ExpertQuantization::Mxfp4 => target::lower_apple8_quantized_mxfp4_expert(expert)?,
+                };
+                if bytes.len() as u64 != planned.record.stored_bytes {
+                    return Err(ColicError::Usage(
+                        "Apple8 expert emission does not match its raw storage plan".into(),
+                    ));
                 }
-                ExpertQuantization::Mxfp4 => {
-                    let bytes = mxfp4_record::lower_expert(expert)?;
-                    let crc = storage::crc32c(&bytes);
-                    writer.write_record(planned, &bytes)?;
-                    crc
+                let crc = storage::crc32c(&bytes);
+                writer.write_record(planned, &bytes)?;
+                crc
+            } else {
+                match quantization {
+                    ExpertQuantization::Exact => {
+                        let mut crc = 0;
+                        writer.write_record_stream(planned, |file| {
+                            crc = target::stream_exact_expert(expert, file)?;
+                            Ok(planned.record.stored_bytes)
+                        })?;
+                        crc
+                    }
+                    ExpertQuantization::Mxfp4 => {
+                        let bytes = mxfp4_record::lower_expert(expert)?;
+                        let crc = storage::crc32c(&bytes);
+                        writer.write_record(planned, &bytes)?;
+                        crc
+                    }
                 }
             };
             Ok(ManifestRecord {
@@ -611,15 +643,15 @@ pub fn compile(request: &CompileRequest, progress: &mut dyn ProgressSink) -> Res
     })?;
     let expert_quantization = resolve_expert_quantization(request, &model)?;
     progress.stage(Stage::TargetPlanning);
-    let target = target::resolve(&request.target, target::HostCapabilities::current())?;
+    let target_profile = target::resolve(&request.target, target::HostCapabilities::current())?;
     let output = request
         .output
         .as_ref()
         .ok_or_else(|| ColicError::Usage("compile requires an output package path".into()))?;
     progress.stage(Stage::StoragePlanning);
     let sources = exact_sources(&model, expert_quantization);
-    let records = record_inventory(&model, expert_quantization)?;
-    let plan = storage::plan_records(&records, target, 4 * 1024 * 1024 * 1024)?;
+    let records = record_inventory(&model, expert_quantization, target_profile)?;
+    let plan = storage::plan_records(&records, target_profile, 4 * 1024 * 1024 * 1024)?;
     let fingerprint = source::fingerprint_bytes(&inventory.source_fingerprint)?;
     let temporary = storage::temporary_package_path(output)?;
     progress.stage(Stage::Emission);
@@ -642,7 +674,7 @@ pub fn compile(request: &CompileRequest, progress: &mut dyn ProgressSink) -> Res
                 .filter(|(_, record)| record.shard_id == shard_id)
             {
                 let source = &sources[index];
-                let manifest = stream_payload(&mut writer, planned, source)?;
+                let manifest = stream_payload(&mut writer, planned, source, target_profile)?;
                 completed_bytes += planned.record.stored_bytes;
                 metadata.push(manifest);
                 progress.emission(
@@ -668,7 +700,7 @@ pub fn compile(request: &CompileRequest, progress: &mut dyn ProgressSink) -> Res
         }
         let manifest = storage::encode_manifest_with_records(
             &plan,
-            target.name,
+            target_profile.name,
             fingerprint,
             &metadata,
             &header_crcs,
@@ -776,16 +808,16 @@ mod tests {
             specs.insert(name, (dtype, shape));
         };
         for expert in 0..2 {
-            for (role, shape) in [("w1", vec![3, 2]), ("w2", vec![2, 3]), ("w3", vec![3, 2])] {
+            for (role, rows, columns) in [("w1", 3_u64, 2_u64), ("w2", 2, 3), ("w3", 3, 2)] {
                 add(
                     format!("layers.0.ffn.experts.{expert}.{role}.weight"),
-                    "F8_E4M3FN",
-                    shape,
+                    "I8",
+                    vec![rows, columns.div_ceil(2)],
                 );
                 add(
                     format!("layers.0.ffn.experts.{expert}.{role}.scale"),
                     "F8_E8M0",
-                    vec![1, 1],
+                    vec![rows, columns.div_ceil(32)],
                 );
             }
         }
@@ -857,7 +889,7 @@ mod tests {
         let mut payload = Vec::new();
         for (name, (dtype, shape)) in specs {
             let size = match dtype {
-                "U8" | "F8_E4M3FN" | "F8_E8M0" => 1,
+                "U8" | "I8" | "F8_E4M3FN" | "F8_E8M0" => 1,
                 "BF16" => 2,
                 "F32" => 4,
                 "I64" => 8,
@@ -940,8 +972,7 @@ mod tests {
         assert_eq!(records[0].decoded_bytes, 2);
     }
 
-    #[test]
-    fn mxfp4_inventory_reduces_qwen_expert_resident_bytes() {
+    fn qwen_mxfp4_inventory_model() -> SemanticModel {
         let matrix = Matrix {
             source: TensorRef {
                 source: "fixture.safetensors".into(),
@@ -965,7 +996,7 @@ mod tests {
                 down: matrix,
             },
         );
-        let model = SemanticModel {
+        SemanticModel {
             architecture: Architecture::Qwen3_5MoeMoE,
             geometry: ModelGeometry {
                 hidden_size: 32,
@@ -991,13 +1022,42 @@ mod tests {
             global_tensors: BTreeMap::new(),
             layer_static_tensors: BTreeMap::new(),
             resident_tensors: BTreeMap::new(),
-        };
-        let exact = record_inventory(&model, ExpertQuantization::Exact).unwrap();
-        let mxfp4 = record_inventory(&model, ExpertQuantization::Mxfp4).unwrap();
+        }
+    }
+
+    #[test]
+    fn mxfp4_inventory_reduces_qwen_expert_resident_bytes() {
+        let model = qwen_mxfp4_inventory_model();
+        let exact = record_inventory(
+            &model,
+            ExpertQuantization::Exact,
+            target::LINUX_X86_64_AVX2_V1,
+        )
+        .unwrap();
+        let mxfp4 = record_inventory(
+            &model,
+            ExpertQuantization::Mxfp4,
+            target::LINUX_X86_64_AVX2_V1,
+        )
+        .unwrap();
         assert_eq!(exact.len(), 1);
         assert_eq!(mxfp4.len(), 1);
         assert!(mxfp4[0].decoded_bytes < exact[0].decoded_bytes);
         assert!(mxfp4[0].stored_bytes < exact[0].stored_bytes);
+    }
+
+    #[test]
+    fn apple8_inventory_uses_tiled_raw_storage_sizes() {
+        let model = qwen_mxfp4_inventory_model();
+        let records = record_inventory(
+            &model,
+            ExpertQuantization::Mxfp4,
+            target::MACOS_ARM64_METAL_APPLE8_V1,
+        )
+        .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].stored_bytes, 872);
+        assert_eq!(records[0].decoded_bytes, 408);
     }
 
     #[test]
@@ -1091,6 +1151,28 @@ mod tests {
                 "recompiled {name} differs"
             );
         }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn compile_and_verify_synthetic_v4_apple8_package() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "colic-apple8-e2e-{}-{nonce}",
+            std::process::id()
+        ));
+        let source = root.join("source");
+        synthetic_v4_source(&source);
+        let output = root.join("compiled.coli");
+        let mut request = CompileRequest::new(source);
+        request.output = Some(output.clone());
+        request.target = TargetRequest::Profile(target::MACOS_ARM64_METAL_APPLE8_V1.name.into());
+        request.verify = true;
+        compile(&request, &mut NoProgress).unwrap();
+        assert_eq!(verify::verify_package(&output).unwrap().records, 37);
         fs::remove_dir_all(root).unwrap();
     }
 
