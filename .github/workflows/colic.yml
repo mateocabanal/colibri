@@ -4,11 +4,17 @@ on:
   pull_request:
     paths:
       - 'colic/**'
+      - 'abi/coli-target-registry.toml'
+      - 'c/generated/coli_target_registry.h'
+      - 'tools/gen_target_registry.py'
       - '.github/workflows/colic.yml'
   push:
     branches: [main]
     paths:
       - 'colic/**'
+      - 'abi/coli-target-registry.toml'
+      - 'c/generated/coli_target_registry.h'
+      - 'tools/gen_target_registry.py'
       - '.github/workflows/colic.yml'
   workflow_dispatch:
 
@@ -26,5 +32,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: colic
+      - name: Check generated target registry
+        run: python3 tools/gen_target_registry.py --check
       - name: Test
         run: cargo test --manifest-path colic/Cargo.toml --all-targets
