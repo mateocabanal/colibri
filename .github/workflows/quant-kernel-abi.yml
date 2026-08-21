@@ -1,0 +1,56 @@
+name: quant-kernel-abi
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quant-kernel-abi-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: Linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile and run portable descriptor oracle
+        run: |
+          cc -std=c11 -O2 -Wall -Wextra -Werror c/tests/test_quant_kernel_abi.c -o /tmp/test_quant_kernel_abi
+          /tmp/test_quant_kernel_abi
+
+  macos:
+    name: macOS
+    runs-on: macos-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile and run portable descriptor oracle
+        run: |
+          clang -std=c11 -O2 -Wall -Wextra -Werror c/tests/test_quant_kernel_abi.c -o /tmp/test_quant_kernel_abi
+          /tmp/test_quant_kernel_abi
+
+  windows:
+    name: Windows UCRT64
+    runs-on: windows-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: false
+          install: mingw-w64-ucrt-x86_64-gcc
+      - name: Compile and run portable descriptor oracle
+        run: |
+          gcc -std=c11 -O2 -Wall -Wextra -Werror c/tests/test_quant_kernel_abi.c -o /tmp/test_quant_kernel_abi.exe
+          /tmp/test_quant_kernel_abi.exe
