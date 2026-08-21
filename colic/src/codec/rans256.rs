@@ -89,9 +89,7 @@ impl Table {
         } else if sum > target {
             let mut order = (0..16).collect::<Vec<_>>();
             order.sort_by(|&left, &right| {
-                freq[right]
-                    .cmp(&freq[left])
-                    .then_with(|| left.cmp(&right))
+                freq[right].cmp(&freq[left]).then_with(|| left.cmp(&right))
             });
             let mut deficit = target - sum;
             let mut cursor = 0usize;
@@ -218,7 +216,9 @@ pub fn histogram_bytes<'a>(chunks: impl IntoIterator<Item = &'a [u8]>) -> Result
 pub fn encode_bytes(input: &[u8], table: &Table) -> Result<Vec<u8>> {
     table.validate()?;
     if input.is_empty() {
-        return Err(ColicError::Usage("rANS cannot encode an empty matrix".into()));
+        return Err(ColicError::Usage(
+            "rANS cannot encode an empty matrix".into(),
+        ));
     }
     let n_symbols = input
         .len()
@@ -271,9 +271,10 @@ pub fn decode_bytes(record: &[u8], table: &Table, expected_bytes: usize) -> Resu
     table.validate()?;
     let parsed = ParsedRecord::parse(record)?;
     if parsed.packed_bytes != expected_bytes
-        || parsed.n_symbols != expected_bytes.checked_mul(2).ok_or_else(|| {
-            ColicError::Usage("expected rANS symbol count overflows usize".into())
-        })?
+        || parsed.n_symbols
+            != expected_bytes.checked_mul(2).ok_or_else(|| {
+                ColicError::Usage("expected rANS symbol count overflows usize".into())
+            })?
     {
         return Err(ColicError::Usage(
             "rANS decoded length does not match matrix descriptor".into(),
@@ -285,12 +286,7 @@ pub fn decode_bytes(record: &[u8], table: &Table, expected_bytes: usize) -> Resu
         let begin = parsed.offsets[stream] as usize;
         let end = parsed.offsets[stream + 1] as usize;
         let symbols = stream_symbol_count(parsed.n_symbols, stream);
-        let decoded = decode_stream_checked(
-            &parsed.payload[begin..end],
-            symbols,
-            table,
-            &slots,
-        )?;
+        let decoded = decode_stream_checked(&parsed.payload[begin..end], symbols, table, &slots)?;
         for (index, symbol) in decoded.into_iter().enumerate() {
             let logical = stream + index * N_STREAMS;
             let byte = &mut output[logical / 2];
@@ -324,11 +320,11 @@ pub fn manifest_table_region(mut manifest: Vec<u8>, table: Option<&Table>) -> Re
         return Ok(manifest);
     }
     if manifest.len() < 256 {
-        return Err(ColicError::Usage("manifest is too short for codec tables".into()));
+        return Err(ColicError::Usage(
+            "manifest is too short for codec tables".into(),
+        ));
     }
-    if u32_at(&manifest, 160)? != 0
-        || u64_at(&manifest, 168)? != 0
-        || u64_at(&manifest, 176)? != 0
+    if u32_at(&manifest, 160)? != 0 || u64_at(&manifest, 168)? != 0 || u64_at(&manifest, 176)? != 0
     {
         return Err(ColicError::Usage(
             "manifest already contains a codec table region".into(),
@@ -366,7 +362,9 @@ pub fn manifest_table_region(mut manifest: Vec<u8>, table: Option<&Table>) -> Re
 
 pub fn table_from_manifest(manifest: &[u8], table_id: u32, codec: u16) -> Result<Table> {
     if table_id == 0 || codec != CODEC_ID {
-        return Err(ColicError::Usage("invalid rANS codec/table reference".into()));
+        return Err(ColicError::Usage(
+            "invalid rANS codec/table reference".into(),
+        ));
     }
     let count = u32_at(manifest, 160)? as usize;
     let region_offset = usize::try_from(u64_at(manifest, 168)?)
@@ -374,9 +372,12 @@ pub fn table_from_manifest(manifest: &[u8], table_id: u32, codec: u16) -> Result
     let region_bytes = usize::try_from(u64_at(manifest, 176)?)
         .map_err(|_| ColicError::Usage("codec table size exceeds usize".into()))?;
     let region = manifest
-        .get(region_offset..region_offset.checked_add(region_bytes).ok_or_else(|| {
-            ColicError::Usage("codec table region overflows usize".into())
-        })?)
+        .get(
+            region_offset
+                ..region_offset.checked_add(region_bytes).ok_or_else(|| {
+                    ColicError::Usage("codec table region overflows usize".into())
+                })?,
+        )
         .ok_or_else(|| ColicError::Usage("codec table region is outside manifest".into()))?;
     for index in 0..count {
         let desc = index
@@ -395,16 +396,21 @@ pub fn table_from_manifest(manifest: &[u8], table_id: u32, codec: u16) -> Result
             || u32_at(region, desc + 36)? != 0
             || region[desc + 40..desc + 64].iter().any(|byte| *byte != 0)
         {
-            return Err(ColicError::Usage("invalid rANS codec table descriptor".into()));
+            return Err(ColicError::Usage(
+                "invalid rANS codec table descriptor".into(),
+            ));
         }
         let data_offset = usize::try_from(u64_at(region, desc + 16)?)
             .map_err(|_| ColicError::Usage("codec table data offset exceeds usize".into()))?;
         let data_bytes = usize::try_from(u64_at(region, desc + 24)?)
             .map_err(|_| ColicError::Usage("codec table data size exceeds usize".into()))?;
         let blob = region
-            .get(data_offset..data_offset.checked_add(data_bytes).ok_or_else(|| {
-                ColicError::Usage("codec table data span overflows".into())
-            })?)
+            .get(
+                data_offset
+                    ..data_offset.checked_add(data_bytes).ok_or_else(|| {
+                        ColicError::Usage("codec table data span overflows".into())
+                    })?,
+            )
             .ok_or_else(|| ColicError::Usage("codec table data is outside region".into()))?;
         if storage::crc32c(blob) != u32_at(region, desc + 32)? {
             return Err(ColicError::Usage("codec table CRC32C mismatch".into()));
@@ -451,12 +457,16 @@ fn decode_stream_checked(
     slots: &[u16],
 ) -> Result<Vec<u8>> {
     if stream.len() < 4 {
-        return Err(ColicError::Usage("rANS stream is shorter than its state".into()));
+        return Err(ColicError::Usage(
+            "rANS stream is shorter than its state".into(),
+        ));
     }
     let mut cursor = 4usize;
     let mut state = u32::from_be_bytes(stream[..4].try_into().unwrap());
     if state < RANS_L {
-        return Err(ColicError::Usage("rANS initial state is out of range".into()));
+        return Err(ColicError::Usage(
+            "rANS initial state is out of range".into(),
+        ));
     }
     let mask = M - 1;
     let mut output = Vec::with_capacity(symbols);
@@ -474,7 +484,9 @@ fn decode_stream_checked(
         return Err(ColicError::Usage("rANS stream has trailing bytes".into()));
     }
     if state != RANS_L {
-        return Err(ColicError::Usage("rANS stream final state is invalid".into()));
+        return Err(ColicError::Usage(
+            "rANS stream final state is invalid".into(),
+        ));
     }
     Ok(output)
 }
@@ -504,7 +516,9 @@ impl<'a> ParsedRecord<'a> {
             offsets.push(u32_at(record, 16 + stream * 4)?);
         }
         if offsets[0] != 0 {
-            return Err(ColicError::Usage("rANS first stream offset is nonzero".into()));
+            return Err(ColicError::Usage(
+                "rANS first stream offset is nonzero".into(),
+            ));
         }
         for pair in offsets.windows(2) {
             if pair[1] < pair[0] || pair[1] - pair[0] < 4 {
@@ -531,7 +545,9 @@ impl<'a> ParsedRecord<'a> {
         }
         let max_symbols = (payload_bytes as u128) * 8 * (1_u128 << 15);
         if n_symbols as u128 > max_symbols {
-            return Err(ColicError::Usage("rANS record exceeds amplification bound".into()));
+            return Err(ColicError::Usage(
+                "rANS record exceeds amplification bound".into(),
+            ));
         }
         Ok(Self {
             n_symbols,
@@ -625,8 +641,14 @@ mod tests {
         let encoded_a = encode_bytes(&bytes, &table).unwrap();
         let encoded_b = encode_bytes(&bytes, &table).unwrap();
         assert_eq!(encoded_a, encoded_b);
-        assert_eq!(decode_bytes(&encoded_a, &table, bytes.len()).unwrap(), bytes);
-        assert_eq!(Table::decode_blob(&table.encode_blob().unwrap()).unwrap(), table);
+        assert_eq!(
+            decode_bytes(&encoded_a, &table, bytes.len()).unwrap(),
+            bytes
+        );
+        assert_eq!(
+            Table::decode_blob(&table.encode_blob().unwrap()).unwrap(),
+            table
+        );
     }
 
     #[test]
@@ -635,7 +657,9 @@ mod tests {
         let table = Table::from_histogram(histogram).unwrap();
         assert_eq!(
             table.freq,
-            [73, 146, 7315, 73, 0, 73, 73, 220, 146, 732, 0, 73, 73, 73, 0, 7314]
+            [
+                73, 146, 7315, 73, 0, 73, 73, 220, 146, 732, 0, 73, 73, 73, 0, 7314
+            ]
         );
     }
 

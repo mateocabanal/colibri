@@ -9,8 +9,8 @@ use crate::{
     error::{ColicError, Result},
     ir::{Architecture, SemanticModel},
     pipeline::{
-        CodecRequest, CompileRequest, DryRunSummary, OptimizationProfile, ProgressSink, QuantRequest,
-        Stage,
+        CodecRequest, CompileRequest, DryRunSummary, OptimizationProfile, ProgressSink,
+        QuantRequest, Stage,
     },
     source::{self, TensorRef},
     storage::{self, LoweredRecord, ManifestRecord},
@@ -65,11 +65,7 @@ pub fn dry_run(request: &CompileRequest) -> Result<DryRunSummary> {
         )
     })?;
     let prepared = prepare(request, &model, None)?;
-    let plan = storage::plan_records(
-        &prepared.records,
-        prepared.target,
-        4 * 1024 * 1024 * 1024,
-    )?;
+    let plan = storage::plan_records(&prepared.records, prepared.target, 4 * 1024 * 1024 * 1024)?;
     Ok(DryRunSummary {
         target_name: prepared.target.name,
         source_tensors: inventory.tensors.len(),
@@ -110,14 +106,7 @@ pub fn compile(request: &CompileRequest, progress: &mut dyn ProgressSink) -> Res
         }
     };
 
-    let result = compile_prepared(
-        request,
-        progress,
-        &inventory,
-        prepared,
-        output,
-        &spool_path,
-    );
+    let result = compile_prepared(request, progress, &inventory, prepared, output, &spool_path);
     let _ = fs::remove_file(&spool_path);
     result
 }
@@ -131,11 +120,7 @@ fn compile_prepared(
     spool_path: &Path,
 ) -> Result<()> {
     progress.stage(Stage::StoragePlanning);
-    let plan = storage::plan_records(
-        &prepared.records,
-        prepared.target,
-        4 * 1024 * 1024 * 1024,
-    )?;
+    let plan = storage::plan_records(&prepared.records, prepared.target, 4 * 1024 * 1024 * 1024)?;
     let fingerprint = source::fingerprint_bytes(&inventory.source_fingerprint)?;
     let temporary = storage::temporary_package_path(output)?;
     progress.stage(Stage::Emission);
@@ -166,13 +151,8 @@ fn compile_prepared(
                     .sources
                     .get(index)
                     .ok_or_else(|| ColicError::Usage("codec source/plan order mismatch".into()))?;
-                let manifest = write_payload(
-                    &mut writer,
-                    planned,
-                    payload,
-                    &mut spool,
-                    spool_path,
-                )?;
+                let manifest =
+                    write_payload(&mut writer, planned, payload, &mut spool, spool_path)?;
                 completed_bytes = completed_bytes
                     .checked_add(planned.record.stored_bytes)
                     .ok_or_else(|| ColicError::Usage("emitted byte total overflows u64".into()))?;
@@ -288,7 +268,14 @@ fn prepare(
     let mut records = Vec::new();
     let mut id = 1_u64;
     for (name, tensor) in &model.global_tensors {
-        push_tensor(&mut sources, &mut records, &mut id, name.clone(), -1, tensor)?;
+        push_tensor(
+            &mut sources,
+            &mut records,
+            &mut id,
+            name.clone(),
+            -1,
+            tensor,
+        )?;
     }
     for (layer, tensors) in &model.layer_static_tensors {
         let layer_i32: i32 = (*layer)
@@ -362,7 +349,14 @@ fn prepare(
     }
 
     for (name, tensor) in &model.resident_tensors {
-        push_tensor(&mut sources, &mut records, &mut id, name.clone(), -2, tensor)?;
+        push_tensor(
+            &mut sources,
+            &mut records,
+            &mut id,
+            name.clone(),
+            -2,
+            tensor,
+        )?;
     }
 
     Ok(PreparedCompile {
@@ -543,10 +537,7 @@ fn codec_spool_path(output: &Path) -> Result<PathBuf> {
         .file_name()
         .ok_or_else(|| ColicError::Usage("output package path has no file name".into()))?
         .to_string_lossy();
-    Ok(parent.join(format!(
-        ".{name}.rans-spool-{}",
-        std::process::id()
-    )))
+    Ok(parent.join(format!(".{name}.rans-spool-{}", std::process::id())))
 }
 
 fn next_id(id: u64) -> Result<u64> {

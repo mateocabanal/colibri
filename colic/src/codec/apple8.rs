@@ -47,7 +47,10 @@ impl RawExpert {
                 "rANS input is not a canonical Apple8 expert record".into(),
             ));
         }
-        let mut matrices = [MatrixSpan { offset: 0, bytes: 0 }; MATRIX_COUNT];
+        let mut matrices = [MatrixSpan {
+            offset: 0,
+            bytes: 0,
+        }; MATRIX_COUNT];
         for (index, slot) in matrices.iter_mut().enumerate() {
             let descriptor = 64 + index * DESC_BYTES;
             let codec = u16_at(bytes, descriptor + 8)?;
@@ -61,11 +64,7 @@ impl RawExpert {
             let end = offset
                 .checked_add(stored)
                 .ok_or_else(|| ColicError::Usage("Apple8 matrix span overflows usize".into()))?;
-            if codec != 0
-                || table != 0
-                || stored != decoded
-                || offset < PREFIX
-                || end > bytes.len()
+            if codec != 0 || table != 0 || stored != decoded || offset < PREFIX || end > bytes.len()
             {
                 return Err(ColicError::Usage(
                     "rANS input Apple8 record is not raw Design A".into(),
@@ -178,7 +177,9 @@ pub fn decode_to_raw(encoded: &[u8], table: &rans256::Table) -> Result<Vec<u8>> 
             .ok_or_else(|| ColicError::Usage("encoded matrix lies outside expert record".into()))?;
         let payload = if codec == 0 {
             if table_id != 0 || stored != decoded {
-                return Err(ColicError::Usage("invalid raw Apple8 matrix codec fields".into()));
+                return Err(ColicError::Usage(
+                    "invalid raw Apple8 matrix codec fields".into(),
+                ));
             }
             source.to_vec()
         } else if codec == rans256::CODEC_ID && table_id == rans256::TABLE_ID {
@@ -285,11 +286,7 @@ mod tests {
             put_u64(&mut output, descriptor + 48, offset as u64);
             put_u64(&mut output, descriptor + 56, matrix.len() as u64);
             put_u64(&mut output, descriptor + 64, matrix.len() as u64);
-            put_u32(
-                &mut output,
-                descriptor + 96,
-                crate::storage::crc32c(matrix),
-            );
+            put_u32(&mut output, descriptor + 96, crate::storage::crc32c(matrix));
             output.extend_from_slice(matrix);
         }
         output

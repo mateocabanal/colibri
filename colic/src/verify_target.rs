@@ -9,11 +9,10 @@ use crate::{
     error::{ColicError, Result},
     storage,
     target_registry::{
-        layout_registered, profile_allows_layout, profile_by_name, APPLE8_MXFP4_GROUP_SIZE,
-        APPLE8_MXFP4_MATH_FORMAT, APPLE8_MXFP4_SCALE_BLOCK_COLUMNS,
+        APPLE8_MXFP4_GROUP_SIZE, APPLE8_MXFP4_MATH_FORMAT, APPLE8_MXFP4_SCALE_BLOCK_COLUMNS,
         APPLE8_MXFP4_SCALE_BLOCK_ROWS, APPLE8_MXFP4_SCALE_FORMAT, APPLE8_MXFP4_TILE_BYTES,
         APPLE8_MXFP4_TILE_COLUMNS, APPLE8_MXFP4_TILE_LAYOUT, APPLE8_MXFP4_TILE_ROWS,
-        APPLE8_PROFILE_NAME,
+        APPLE8_PROFILE_NAME, layout_registered, profile_allows_layout, profile_by_name,
     },
 };
 
@@ -46,10 +45,7 @@ struct Matrix {
 }
 
 fn bad(message: impl Into<String>) -> ColicError {
-    ColicError::Usage(format!(
-        "invalid target-layout package: {}",
-        message.into()
-    ))
+    ColicError::Usage(format!("invalid target-layout package: {}", message.into()))
 }
 
 fn u16a(bytes: &[u8], offset: usize) -> Result<u16> {
@@ -98,8 +94,8 @@ fn string_at(manifest: &[u8], id: u32) -> Result<&str> {
     let descriptor = table
         .checked_add(id as usize * 16)
         .ok_or_else(|| bad("string descriptor overflow"))?;
-    let relative = usize::try_from(u64a(manifest, descriptor)?)
-        .map_err(|_| bad("string offset"))?;
+    let relative =
+        usize::try_from(u64a(manifest, descriptor)?).map_err(|_| bad("string offset"))?;
     let length = u32a(manifest, descriptor + 8)? as usize;
     let start = table
         .checked_add(relative)
@@ -217,7 +213,8 @@ fn decoded_matrix(
         .checked_add(matrix.wo)
         .ok_or_else(|| bad("matrix file offset overflow"))?;
     let stored = usize::try_from(matrix.ws).map_err(|_| bad("matrix stored bytes exceed usize"))?;
-    let decoded = usize::try_from(matrix.wd).map_err(|_| bad("matrix decoded bytes exceed usize"))?;
+    let decoded =
+        usize::try_from(matrix.wd).map_err(|_| bad("matrix decoded bytes exceed usize"))?;
     if matrix.wc == CODEC_NONE {
         return read_range(file, source_offset, stored);
     }
@@ -290,7 +287,8 @@ pub fn verify_target_layouts(package: &Path) -> Result<()> {
         .ok_or_else(|| bad(format!("unknown target profile `{profile_name}`")))?;
 
     let shard_count = u32a(&manifest, 40)? as usize;
-    let shard_table = usize::try_from(u64a(&manifest, 48)?).map_err(|_| bad("shard table offset"))?;
+    let shard_table =
+        usize::try_from(u64a(&manifest, 48)?).map_err(|_| bad("shard table offset"))?;
     let mut paths = Vec::with_capacity(shard_count);
     for index in 0..shard_count {
         let descriptor = shard_table
@@ -309,7 +307,8 @@ pub fn verify_target_layouts(package: &Path) -> Result<()> {
         .collect::<Result<Vec<_>>>()?;
 
     let record_count = usize::try_from(u64a(&manifest, 32)?).map_err(|_| bad("record count"))?;
-    let record_table = usize::try_from(u64a(&manifest, 64)?).map_err(|_| bad("record table offset"))?;
+    let record_table =
+        usize::try_from(u64a(&manifest, 64)?).map_err(|_| bad("record table offset"))?;
     for record_index in 0..record_count {
         let descriptor = record_table
             .checked_add(record_index * 96)
@@ -340,7 +339,11 @@ pub fn verify_target_layouts(package: &Path) -> Result<()> {
             return Err(bad(format!("expert {record_index} envelope")));
         }
 
-        let matrices = [matrix(&prefix, 0)?, matrix(&prefix, 1)?, matrix(&prefix, 2)?];
+        let matrices = [
+            matrix(&prefix, 0)?,
+            matrix(&prefix, 1)?,
+            matrix(&prefix, 2)?,
+        ];
         for (matrix_index, matrix) in matrices.iter().enumerate() {
             if !layout_registered(matrix.layout) {
                 return Err(bad(format!(

@@ -176,7 +176,12 @@ fn estimate_eta(completed: u64, total: u64, elapsed_seconds: f64) -> String {
 
 fn format_duration(seconds: u64) -> String {
     if seconds >= 3600 {
-        format!("{}h {:02}m {:02}s", seconds / 3600, (seconds % 3600) / 60, seconds % 60)
+        format!(
+            "{}h {:02}m {:02}s",
+            seconds / 3600,
+            (seconds % 3600) / 60,
+            seconds % 60
+        )
     } else if seconds >= 60 {
         format!("{}m {:02}s", seconds / 60, seconds % 60)
     } else {

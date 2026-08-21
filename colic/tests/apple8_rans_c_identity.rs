@@ -12,10 +12,7 @@ fn temp_root() -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    std::env::temp_dir().join(format!(
-        "colic-rans-rust-c-{}-{nonce}",
-        std::process::id()
-    ))
+    std::env::temp_dir().join(format!("colic-rans-rust-c-{}-{nonce}", std::process::id()))
 }
 
 fn compile_c_oracle(root: &Path) -> PathBuf {

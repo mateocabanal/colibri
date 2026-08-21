@@ -75,12 +75,36 @@ fn synthetic_v4_source(root: &Path) {
         ("hc_head_scale", "F32", vec![1]),
         ("layers.0.ffn.gate.weight", "BF16", vec![2, 2]),
         ("layers.0.ffn.gate.tid2eid", "I64", vec![4, 1]),
-        ("layers.0.ffn.shared_experts.w1.weight", "F8_E4M3FN", vec![3, 2]),
-        ("layers.0.ffn.shared_experts.w2.weight", "F8_E4M3FN", vec![2, 3]),
-        ("layers.0.ffn.shared_experts.w3.weight", "F8_E4M3FN", vec![3, 2]),
-        ("layers.0.ffn.shared_experts.w1.scale", "F8_E8M0", vec![1, 1]),
-        ("layers.0.ffn.shared_experts.w2.scale", "F8_E8M0", vec![1, 1]),
-        ("layers.0.ffn.shared_experts.w3.scale", "F8_E8M0", vec![1, 1]),
+        (
+            "layers.0.ffn.shared_experts.w1.weight",
+            "F8_E4M3FN",
+            vec![3, 2],
+        ),
+        (
+            "layers.0.ffn.shared_experts.w2.weight",
+            "F8_E4M3FN",
+            vec![2, 3],
+        ),
+        (
+            "layers.0.ffn.shared_experts.w3.weight",
+            "F8_E4M3FN",
+            vec![3, 2],
+        ),
+        (
+            "layers.0.ffn.shared_experts.w1.scale",
+            "F8_E8M0",
+            vec![1, 1],
+        ),
+        (
+            "layers.0.ffn.shared_experts.w2.scale",
+            "F8_E8M0",
+            vec![1, 1],
+        ),
+        (
+            "layers.0.ffn.shared_experts.w3.scale",
+            "F8_E8M0",
+            vec![1, 1],
+        ),
         ("layers.0.ffn_norm.weight", "BF16", vec![2]),
         ("layers.0.attn.attn_sink", "F32", vec![1]),
         ("layers.0.attn.kv_norm.weight", "BF16", vec![2]),
@@ -192,7 +216,10 @@ fn first_expert_record(package: &Path) -> (u64, Vec<u8>) {
             let shard = u32_at(&manifest, descriptor + 20);
             assert_eq!(shard, 0);
             let data = fs::read(package.join("data-00000.coli")).unwrap();
-            return (offset, data[offset as usize..offset as usize + bytes].to_vec());
+            return (
+                offset,
+                data[offset as usize..offset as usize + bytes].to_vec(),
+            );
         }
     }
     panic!("synthetic package has no expert 0/0");
@@ -205,7 +232,11 @@ fn run_decoder(decoder: &Path, package: &Path, output: &Path) {
         .arg(output)
         .status()
         .unwrap();
-    assert!(status.success(), "C package decoder failed for {}", package.display());
+    assert!(
+        status.success(),
+        "C package decoder failed for {}",
+        package.display()
+    );
 }
 
 #[test]
@@ -246,7 +277,11 @@ fn rans_package_is_deterministic_and_decodes_to_raw_resident_bytes() {
     }
 
     let manifest = fs::read(rans_a.join("manifest.coli")).unwrap();
-    assert_eq!(u32_at(&manifest, 160), 1, "forced rANS needs one artifact table");
+    assert_eq!(
+        u32_at(&manifest, 160),
+        1,
+        "forced rANS needs one artifact table"
+    );
     let table_region = u64_at(&manifest, 168) as usize;
     assert_eq!(u32_at(&manifest, table_region), 1);
     assert_eq!(u16_at(&manifest, table_region + 4), 1);
