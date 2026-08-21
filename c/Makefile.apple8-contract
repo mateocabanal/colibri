@@ -7,10 +7,11 @@ endif
 
 .PHONY: check check-registry clean
 
-check: check-registry test_apple8_contract$(EXE) tests/test_apple8_package$(EXE) tests/test_apple8_executor_contract$(EXE)
+check: check-registry test_apple8_contract$(EXE) tests/test_apple8_package$(EXE) tests/test_apple8_executor_contract$(EXE) tests/test_apple8_executor_passthrough$(EXE)
 	./test_apple8_contract$(EXE)
 	./tests/test_apple8_package$(EXE)
 	./tests/test_apple8_executor_contract$(EXE)
+	./tests/test_apple8_executor_passthrough$(EXE)
 
 check-registry:
 	python3 ../tools/gen_target_registry.py --check
@@ -24,7 +25,11 @@ tests/test_apple8_package$(EXE): tests/test_apple8_package.c coli_format.c coli_
 tests/test_apple8_executor_contract$(EXE): tests/test_apple8_executor_contract.c coli_executor.c coli_executor.h coli_target.c coli_target.h coli_format.c coli_format_base.c coli_format.h apple8_contract.h generated/coli_target_registry.h compat.h
 	$(CC) $(CFLAGS) tests/test_apple8_executor_contract.c coli_executor.c coli_format.c coli_target.c -o $@ -pthread
 
+tests/test_apple8_executor_passthrough$(EXE): tests/test_apple8_executor_passthrough.c coli_executor.c coli_executor.h coli_target.c coli_target.h coli_format.c coli_format_base.c coli_format.h apple8_contract.h generated/coli_target_registry.h compat.h
+	$(CC) $(CFLAGS) tests/test_apple8_executor_passthrough.c coli_executor.c coli_format.c coli_target.c -o $@ -pthread
+
 clean:
 	rm -f test_apple8_contract test_apple8_contract.exe \
 		tests/test_apple8_package tests/test_apple8_package.exe \
-		tests/test_apple8_executor_contract tests/test_apple8_executor_contract.exe
+		tests/test_apple8_executor_contract tests/test_apple8_executor_contract.exe \
+		tests/test_apple8_executor_passthrough tests/test_apple8_executor_passthrough.exe
