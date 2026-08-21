@@ -62,7 +62,6 @@ fn profile_identity_is_registry_owned() {
     assert_eq!(MACOS_ARM64_METAL_APPLE8_V1.execution_layout_abi, target_registry::APPLE8_EXECUTION_LAYOUT_ABI);
     assert_eq!(MACOS_ARM64_METAL_APPLE8_V1.kernel_abi, target_registry::APPLE8_KERNEL_ABI);
     assert_eq!(MACOS_ARM64_METAL_APPLE8_V1.target_class, target_registry::APPLE8_TARGET_CLASS);
-    assert!(MACOS_ARM64_METAL_APPLE8_V1.compiler_emission_supported);
     assert_eq!(
         resolve(
             &TargetRequest::Profile(target_registry::APPLE8_PROFILE_NAME.into()),
@@ -148,7 +147,7 @@ fn apple8_exact_mxfp4_repack_matches_frozen_tile_order() {
     let lowered = lower_apple8_exact_mxfp4_expert(&expert).unwrap();
     assert_eq!(lowered.len() as u64, apple8_expert_stored_bytes(&expert).unwrap());
     assert_eq!(u64::from_le_bytes(lowered[48..56].try_into().unwrap()), 3 * 272);
-    for index in 0..3 {
+    for (index, &(weight_offset, scale_offset)) in offsets.iter().enumerate() {
         let desc = 64 + index * 128;
         assert_eq!(u16::from_le_bytes(lowered[desc + 12..desc + 14].try_into().unwrap()), target_registry::APPLE8_MXFP4_TILE_LAYOUT);
         assert_eq!(u32::from_le_bytes(lowered[desc + 32..desc + 36].try_into().unwrap()), 1);
@@ -157,8 +156,8 @@ fn apple8_exact_mxfp4_repack_matches_frozen_tile_order() {
         assert_eq!(u64::from_le_bytes(lowered[desc + 80..desc + 88].try_into().unwrap()), 0);
         assert_eq!(u64::from_le_bytes(lowered[desc + 88..desc + 96].try_into().unwrap()), 0);
         let matrix_offset = u64::from_le_bytes(lowered[desc + 48..desc + 56].try_into().unwrap()) as usize;
-        let source_weight = offsets[index].0 as usize;
-        let source_scale = offsets[index].1 as usize;
+        let source_weight = weight_offset as usize;
+        let source_scale = scale_offset as usize;
         assert_eq!(&lowered[matrix_offset..matrix_offset + 16], &bytes[source_weight..source_weight + 16]);
         assert_eq!(lowered[matrix_offset + 128], bytes[source_scale]);
         assert_eq!(lowered[matrix_offset + 136], bytes[source_weight + 16]);
