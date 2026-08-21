@@ -7,6 +7,7 @@
 #undef coli_package_verify_all
 
 #include "apple8_contract.h"
+#include "coli_target.h"
 
 static int apple8_profile(const ColiPackage *p) {
     return p && coli_apple8_profile_is_v1(p->profile);
@@ -123,6 +124,7 @@ int coli_package_expert_info(const ColiPackage *p, const ColiRecordInfo *r,
         m->logical_crc32c = rd32(d + 96);
         m->group_size = rd32(d + 104);
         if (m->role != i + 1 || rd16(d + 2) || !matrix_reserved_zero(d) ||
+            !coli_target_profile_accepts_layout(p->profile, m->layout) ||
             !coli_apple8_matrix_descriptor_valid(m, &expected)) {
             csf_error(error, error_size,
                       "Apple8 expert matrix %u violates MXFP4 tile8x32 descriptor contract", i);
