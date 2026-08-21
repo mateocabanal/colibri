@@ -109,10 +109,11 @@ static int build_package(const char *dir) {
 
     {
         unsigned char *s = manifest + string_off;
-        const char *names[3] = {"data-00000.coli", COLI_TARGET_PROFILE_MACOS_ARM64_METAL_APPLE8_V1, "test-executor-passthrough"};
+        const char *names[3] = {"data-00000.coli", COLI_TARGET_PROFILE_MACOS_ARM64_METAL_APPLE8_V1, "test-pass"};
         size_t cursor = 48;
         for (i = 0; i < 3; ++i) {
             size_t n = strlen(names[i]);
+            if (cursor > string_bytes || n > string_bytes - cursor) goto fail;
             wr64(s + i * 16, cursor); wr32(s + i * 16 + 8, (uint32_t)n);
             memcpy(s + cursor, names[i], n); cursor += n;
         }
