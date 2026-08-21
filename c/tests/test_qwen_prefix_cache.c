@@ -221,12 +221,62 @@ static void test_hard_budget(void) {
     fixture_free(&f);
 }
 
+static void test_planner_inventory_and_budget(void) {
+    Fixture f;
+    fixture_init(&f, 1);
+    int a[] = {1, 2, 3};
+    int b[] = {4, 5, 6};
+    int c3[] = {7, 8, 9};
+    size_t one, kvb, gde;
+    assert(qwen_prefix_cache_entry_bytes(&f.view, 3, &one, &kvb, &gde));
+
+    QwenPrefixCache cache = {0};
+    qwen_prefix_cache_init(&cache, 2 * one, 1, 0);
+    fill_state(&f, 1);
+    qwen_prefix_cache_store(&cache, &f.view, a, 3);
+    fill_state(&f, 2);
+    qwen_prefix_cache_store(&cache, &f.view, b, 3);
+    assert(cache.count == 2 && cache.resident_bytes == 2 * one);
+
+    ColiPrefixHotEntryInfo inventory[2];
+    assert(qwen_prefix_cache_hot_inventory(&cache, inventory, 2) == 2);
+    for (size_t i = 0; i < 2; i++) {
+        assert(inventory[i].id != 0);
+        assert(inventory[i].resident_bytes == one);
+        assert(inventory[i].token_count == 3);
+        assert(inventory[i].references == 0);
+    }
+
+    /* Planner contraction reclaims LRU entries inside the policy ceiling. */
+    assert(qwen_prefix_cache_apply_planner_budget(
+        &cache, 2 * one, one) == one);
+    assert(cache.count == 1 && cache.resident_bytes == one);
+    assert(cache.budget_bytes == one);
+
+    /* A later replan may give the hot tier memory back. The policy cap remains
+     * the ceiling, but the temporary planner reduction is not permanent. */
+    assert(qwen_prefix_cache_apply_planner_budget(
+        &cache, 2 * one, 2 * one) == 2 * one);
+    fill_state(&f, 3);
+    qwen_prefix_cache_store(&cache, &f.view, c3, 3);
+    assert(cache.count == 2 && cache.resident_bytes == 2 * one);
+
+    /* Planner selection can never raise an explicit/user compatibility cap. */
+    assert(qwen_prefix_cache_apply_planner_budget(
+        &cache, one, 2 * one) == one);
+    assert(cache.count == 1 && cache.resident_bytes == one);
+
+    qwen_prefix_cache_clear(&cache);
+    fixture_free(&f);
+}
+
 int main(void) {
     test_restore(1);
     test_restore(0);
     test_ram_cap_reservation();
     test_budget_policy();
     test_hard_budget();
+    test_planner_inventory_and_budget();
     puts("qwen prefix cache: ok");
     return 0;
 }

@@ -1,3 +1,4 @@
+#include "../prefix_hot_resource.h"
 #include "../resource_planner.h"
 
 #include <assert.h>
@@ -53,6 +54,36 @@ static void test_benefit_bridge_and_saturation(void) {
     assert(coli_resource_candidate_from_benefit(&estimate, &out) != 0);
 }
 
+static void test_prefix_hot_bridge(void) {
+    ColiPrefixHotResourceEstimate prefix = {
+        .id = 42,
+        .resident_bytes = 24 * MIB,
+        .reuse_weight = 3,
+        .bytes_per_hit = 96 * MIB,
+        .exposed_ns_per_hit = UINT64_C(25000000),
+    };
+    ColiResourceBenefitEstimate estimate;
+    ColiResourceCandidate out;
+
+    assert(coli_prefix_hot_resource_estimate(&prefix, &estimate) == 0);
+    assert(estimate.kind == COLI_RESOURCE_PREFIX_HOT);
+    assert(estimate.id == 42);
+    assert(estimate.resident_bytes == 24 * MIB);
+    assert(estimate.reuse_weight == 3);
+    assert(estimate.bytes_per_miss == 96 * MIB);
+    assert(estimate.exposed_ns_per_miss == UINT64_C(25000000));
+
+    assert(coli_prefix_hot_resource_candidate(&prefix, &out) == 0);
+    assert(out.kind == COLI_RESOURCE_PREFIX_HOT);
+    assert(out.id == 42);
+    assert(out.resident_bytes == 24 * MIB);
+    assert(out.expected_bytes_avoided == 288 * MIB);
+    assert(out.expected_exposed_ns_avoided == UINT64_C(75000000));
+
+    prefix.resident_bytes = 0;
+    assert(coli_prefix_hot_resource_candidate(&prefix, &out) != 0);
+}
+
 static void test_mixed_uma_competition(void) {
     ColiResourcePlan plan;
     coli_resource_plan_init(&plan);
@@ -98,6 +129,33 @@ static void test_mixed_uma_competition(void) {
     assert(plan.tier[COLI_RESOURCE_TIER_UMA].free_bytes == 45 * MIB);
     assert(coli_resource_plan_committed(
         &plan, COLI_RESOURCE_TIER_UMA) == 9 * MIB);
+}
+
+static void test_prefix_competes_with_dense_and_expert(void) {
+    ColiResourcePlan plan;
+    coli_resource_plan_init(&plan);
+    assert(coli_resource_plan_set_budget(
+        &plan, COLI_RESOURCE_TIER_UMA, 48 * MIB) == 0);
+
+    ColiResourceCandidate candidates[] = {
+        candidate(COLI_RESOURCE_DENSE_TENSOR, 1, 24, 1, 24, 0),
+        candidate(COLI_RESOURCE_PERSISTENT_EXPERT, 2, 12, 3, 12, 0),
+        candidate(COLI_RESOURCE_PREFIX_HOT, 3, 24, 2, 48, 0),
+    };
+    unsigned char selected[3];
+    ColiResourceSelection selection;
+
+    assert(coli_resource_plan_select_optional(
+        &plan, COLI_RESOURCE_TIER_UMA,
+        candidates, 3, COLI_RESOURCE_VALUE_BYTES,
+        selected, &selection) == 0);
+    /* Prefix benefit/byte = 4, expert = 3, dense = 1. Prefix + expert fit;
+     * dense must lose the common envelope rather than receiving a fixed slice. */
+    assert(selected[0] == 0);
+    assert(selected[1] == 1);
+    assert(selected[2] == 1);
+    assert(selection.selected_count == 2);
+    assert(selection.selected_resident_bytes == 36 * MIB);
 }
 
 static void test_optional_selection_fail_clean(void) {
@@ -165,7 +223,9 @@ static void test_cuda_tiers_stay_independent(void) {
 
 int main(void) {
     test_benefit_bridge_and_saturation();
+    test_prefix_hot_bridge();
     test_mixed_uma_competition();
+    test_prefix_competes_with_dense_and_expert();
     test_optional_selection_fail_clean();
     test_bytes_mode_and_zero_reuse();
     test_cuda_tiers_stay_independent();
