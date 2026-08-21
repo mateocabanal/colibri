@@ -131,7 +131,7 @@ pub fn quantize_bf16_row(
     packed_weights: &mut Vec<u8>,
     scales: &mut Vec<u8>,
 ) -> Result<()> {
-    if row_bytes.len() % 2 != 0 {
+    if !row_bytes.len().is_multiple_of(2) {
         return Err(ColicError::Usage(
             "BF16 row has an odd byte count during MXFP4 quantization".into(),
         ));
@@ -300,8 +300,8 @@ mod tests {
     fn scale_groups_restart_for_every_row() {
         let path = std::env::temp_dir().join(format!("colic-mxfp4-{}", std::process::id()));
         let mut source = Vec::new();
-        source.extend_from_slice(&bf16_bytes(&vec![1.0; 33]));
-        source.extend_from_slice(&bf16_bytes(&vec![16.0; 33]));
+        source.extend_from_slice(&bf16_bytes(&[1.0; 33]));
+        source.extend_from_slice(&bf16_bytes(&[16.0; 33]));
         fs::write(&path, &source).unwrap();
         let matrix = Matrix {
             source: TensorRef {
@@ -326,8 +326,8 @@ mod tests {
     #[test]
     fn sliced_matrix_starts_at_tensor_offset() {
         let path = std::env::temp_dir().join(format!("colic-mxfp4-offset-{}", std::process::id()));
-        let prefix = bf16_bytes(&vec![64.0; 32]);
-        let wanted = bf16_bytes(&vec![1.0; 32]);
+        let prefix = bf16_bytes(&[64.0; 32]);
+        let wanted = bf16_bytes(&[1.0; 32]);
         let mut source = prefix.clone();
         source.extend_from_slice(&wanted);
         fs::write(&path, &source).unwrap();

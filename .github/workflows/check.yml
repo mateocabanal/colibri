@@ -150,12 +150,10 @@ jobs:
           if-no-files-found: error
 
   v4-tiny-coli-macos:
-    # PR1 freezes the native Apple8 contract before PR2 supplies the production
-    # 0x0103 lowerer. The previous lifecycle job would therefore create the very
-    # canonical/row artifact PR1 now forbids. Until PR2 lands, make native Apple
-    # compilation itself the fail-closed oracle; PR2 restores the physical and
-    # runtime lifecycle checks when the production lowerer exists.
-    name: macOS (Apple8 emission refusal contract)
+    # The shared V4 fixture carries canonical packed MXFP4 routed experts, so
+    # native Apple Silicon must lower those exact bytes to production 0x0103
+    # records and verify the resulting package without any compatibility repack.
+    name: macOS (Apple8 exact-source contract)
     needs: v4-tiny
     runs-on: macos-latest
     timeout-minutes: 15
@@ -166,20 +164,20 @@ jobs:
         with:
           name: deepseek-v4-tiny-source
           path: c/deepseek_v4_tiny
-      - name: Refuse false native Apple8 exact-COLI emission until PR2
+      - name: Compile and verify exact native Apple8 package
         run: |
-          set +e
-          output="$(cargo run --manifest-path colic/Cargo.toml -- \
+          cargo run --manifest-path colic/Cargo.toml -- \
             compile c/deepseek_v4_tiny \
             --target native --quant exact --codec none --opt default \
-            -o c/deepseek_v4_tiny.coli --verify 2>&1)"
-          rc=$?
-          set -e
-          printf '%s\n' "$output"
-          test "$rc" -ne 0
-          printf '%s\n' "$output" | grep -F 'production lowerer is not implemented'
-          printf '%s\n' "$output" | grep -F 'refusing to emit a row/canonical artifact under that profile'
-          test ! -e c/deepseek_v4_tiny.coli/manifest.coli
+            -o c/deepseek_v4_tiny.coli --verify
+          test -f c/deepseek_v4_tiny.coli/manifest.coli
+          python3 - <<'PY'
+          from pathlib import Path
+          manifest = Path('c/deepseek_v4_tiny.coli/manifest.coli').read_bytes()
+          assert b'macos-arm64-metal-apple8-v1' in manifest
+          PY
+          cargo run --manifest-path colic/Cargo.toml -- \
+            verify c/deepseek_v4_tiny.coli
 
   macos:
     # clang; libomp for the threaded path (Makefile falls back to

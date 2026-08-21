@@ -104,9 +104,10 @@ fn tile_bytes(rows: u64, cols: u64) -> Result<u64> {
     if rows == 0 || cols == 0 {
         return Err(bad("zero matrix dimension"));
     }
-    let rt = rows / APPLE8_MXFP4_TILE_ROWS + u64::from(rows % APPLE8_MXFP4_TILE_ROWS != 0);
+    let rt = rows / APPLE8_MXFP4_TILE_ROWS
+        + u64::from(!rows.is_multiple_of(APPLE8_MXFP4_TILE_ROWS));
     let kg = cols / APPLE8_MXFP4_TILE_COLUMNS
-        + u64::from(cols % APPLE8_MXFP4_TILE_COLUMNS != 0);
+        + u64::from(!cols.is_multiple_of(APPLE8_MXFP4_TILE_COLUMNS));
     rt.checked_mul(kg)
         .and_then(|v| v.checked_mul(APPLE8_MXFP4_TILE_BYTES))
         .ok_or_else(|| bad("matrix bytes overflow"))
@@ -159,7 +160,7 @@ fn valid_apple_matrix(i: usize, m: Matrix) -> Result<u64> {
         || m.wc != CODEC_NONE
         || m.wt != 0
         || m.wo == 0
-        || m.wo % 16 != 0
+        || !m.wo.is_multiple_of(16)
         || m.ws != n
         || m.wd != n
         || m.sc != CODEC_NONE
@@ -205,8 +206,8 @@ fn crc_range(f: &mut File, off: u64, bytes: u64) -> Result<u32> {
 fn padding(f: &mut File, base: u64, m: Matrix) -> Result<()> {
     let rr = m.rows % APPLE8_MXFP4_TILE_ROWS;
     let cr = m.cols % APPLE8_MXFP4_TILE_COLUMNS;
-    let rts = m.rows / APPLE8_MXFP4_TILE_ROWS + u64::from(rr != 0);
-    let gs = m.cols / APPLE8_MXFP4_TILE_COLUMNS + u64::from(cr != 0);
+    let rts = m.rows.div_ceil(APPLE8_MXFP4_TILE_ROWS);
+    let gs = m.cols.div_ceil(APPLE8_MXFP4_TILE_COLUMNS);
     let mut t = [0u8; APPLE8_MXFP4_TILE_BYTES as usize];
     for ot in 0..rts {
         for g in 0..gs {
@@ -242,7 +243,7 @@ fn padding(f: &mut File, base: u64, m: Matrix) -> Result<()> {
                 } else if ce {
                     let used = cr.div_ceil(2) as usize;
                     if row[used..].iter().any(|v| *v != 0)
-                        || (cr & 1 != 0 && row[used - 1] & 0xf0 != 0)
+                        || (!cr.is_multiple_of(2) && row[used - 1] & 0xf0 != 0)
                     {
                         return Err(bad("nonzero K padding"));
                     }

@@ -26,12 +26,10 @@ concurrency:
 
 jobs:
   linux-ssd-only-restart:
-    # PR1 freezes the Apple8 production profile before PR2 supplies its 0x0103
-    # lowerer. The old Linux SSD restart oracle compiled a canonical artifact
-    # while labelling it Apple8, which is now intentionally forbidden. Keep a
-    # fail-closed sentinel here; PR2 restores the package/restart lifecycle once
-    # the compiler can emit the frozen production layout.
-    name: Linux Apple8 emission refusal contract
+    # The generated tiny V4 source carries canonical packed MXFP4 routed
+    # experts. Compile it explicitly for the frozen Apple8 target and require
+    # the target-aware verifier to accept the production 0x0103 package.
+    name: Linux Apple8 exact-source contract
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -45,18 +43,18 @@ jobs:
         run: python -m pip install -r c/tools/requirements-deepseek-v4-tiny.txt
       - name: Generate tiny V4 source fixture
         run: python c/tools/make_deepseek_v4_tiny.py --output c/deepseek_v4_tiny --force
-      - name: Refuse false Apple8 exact-COLI emission until PR2
+      - name: Compile and verify exact Apple8 package
         run: |
-          set +e
-          output="$(cargo run --manifest-path colic/Cargo.toml -- \
+          cargo run --manifest-path colic/Cargo.toml -- \
             compile c/deepseek_v4_tiny \
             --target macos-arm64-metal-apple8-v1 \
             --quant exact --codec none --opt default \
-            -o c/deepseek_v4_tiny.coli --verify 2>&1)"
-          rc=$?
-          set -e
-          printf '%s\n' "$output"
-          test "$rc" -ne 0
-          printf '%s\n' "$output" | grep -F 'production lowerer is not implemented'
-          printf '%s\n' "$output" | grep -F 'refusing to emit a row/canonical artifact under that profile'
-          test ! -e c/deepseek_v4_tiny.coli/manifest.coli
+            -o c/deepseek_v4_tiny.coli --verify
+          test -f c/deepseek_v4_tiny.coli/manifest.coli
+          python - <<'PY'
+          from pathlib import Path
+          manifest = Path('c/deepseek_v4_tiny.coli/manifest.coli').read_bytes()
+          assert b'macos-arm64-metal-apple8-v1' in manifest
+          PY
+          cargo run --manifest-path colic/Cargo.toml -- \
+            verify c/deepseek_v4_tiny.coli
