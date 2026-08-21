@@ -47,7 +47,7 @@ fn fixture(rows: u32, columns: u32) -> PackedMatrix {
         for byte in 0..row_bytes {
             weights[row * row_bytes + byte] = ((row * 29 + byte * 17 + 3) & 0xff) as u8;
         }
-        if columns % 2 != 0 {
+        if !columns.is_multiple_of(2) {
             weights[row * row_bytes + row_bytes - 1] &= 0x0f;
         }
         for group in 0..groups {
