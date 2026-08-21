@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, fs, io::Read};
+use std::{
+    fs::{self, File, OpenOptions},
+    io::{self, Read, Seek, SeekFrom, Write},
+    path::{Path, PathBuf},
+};
 
 use crate::{
     codec::{apple8, rans256},
@@ -29,7 +33,9 @@ enum Payload {
     Expert {
         layer: u32,
         expert: u32,
-        bytes: Vec<u8>,
+        spool_offset: u64,
+        stored_bytes: u64,
+        stored_crc32c: u32,
         decoded_bytes: u64,
     },
 }
@@ -42,10 +48,11 @@ struct PreparedCompile {
 }
 
 pub fn handles(request: &CompileRequest) -> bool {
-    matches!(
-        &request.codec,
-        CodecRequest::Auto | CodecRequest::Profile(profile) if profile == "rans256-g0-nibble"
-    )
+    match &request.codec {
+        CodecRequest::Auto => true,
+        CodecRequest::Profile(profile) => profile == "rans256-g0-nibble",
+        CodecRequest::None => false,
+    }
 }
 
 pub fn dry_run(request: &CompileRequest) -> Result<DryRunSummary> {
@@ -57,8 +64,12 @@ pub fn dry_run(request: &CompileRequest) -> Result<DryRunSummary> {
             "no supported architecture frontend matched this source model",
         )
     })?;
-    let prepared = prepare(request, &model)?;
-    let plan = storage::plan_records(&prepared.records, prepared.target, 4 * 1024 * 1024 * 1024)?;
+    let prepared = prepare(request, &model, None)?;
+    let plan = storage::plan_records(
+        &prepared.records,
+        prepared.target,
+        4 * 1024 * 1024 * 1024,
+    )?;
     Ok(DryRunSummary {
         target_name: prepared.target.name,
         source_tensors: inventory.tensors.len(),
@@ -73,6 +84,12 @@ pub fn compile(request: &CompileRequest, progress: &mut dyn ProgressSink) -> Res
         return Ok(());
     }
     validate_options(request)?;
+    let output = request
+        .output
+        .as_ref()
+        .ok_or_else(|| ColicError::Usage("compile requires an output package path".into()))?;
+    let spool_path = codec_spool_path(output)?;
+
     progress.stage(Stage::SourceDiscovery);
     let inventory = source::discover_with_progress(&request.source, &mut |update| {
         progress.source_file(&update);
@@ -85,18 +102,49 @@ pub fn compile(request: &CompileRequest, progress: &mut dyn ProgressSink) -> Res
         )
     })?;
     progress.stage(Stage::TargetPlanning);
-    let prepared = prepare(request, &model)?;
-    let output = request
-        .output
-        .as_ref()
-        .ok_or_else(|| ColicError::Usage("compile requires an output package path".into()))?;
+    let prepared = match prepare(request, &model, Some(&spool_path)) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            let _ = fs::remove_file(&spool_path);
+            return Err(error);
+        }
+    };
+
+    let result = compile_prepared(
+        request,
+        progress,
+        &inventory,
+        prepared,
+        output,
+        &spool_path,
+    );
+    let _ = fs::remove_file(&spool_path);
+    result
+}
+
+fn compile_prepared(
+    request: &CompileRequest,
+    progress: &mut dyn ProgressSink,
+    inventory: &source::SourceInventory,
+    prepared: PreparedCompile,
+    output: &Path,
+    spool_path: &Path,
+) -> Result<()> {
     progress.stage(Stage::StoragePlanning);
-    let plan = storage::plan_records(&prepared.records, prepared.target, 4 * 1024 * 1024 * 1024)?;
+    let plan = storage::plan_records(
+        &prepared.records,
+        prepared.target,
+        4 * 1024 * 1024 * 1024,
+    )?;
     let fingerprint = source::fingerprint_bytes(&inventory.source_fingerprint)?;
     let temporary = storage::temporary_package_path(output)?;
     progress.stage(Stage::Emission);
 
     let write_result = (|| -> Result<()> {
+        let mut spool = File::open(spool_path).map_err(|source| ColicError::Io {
+            path: spool_path.to_owned(),
+            source,
+        })?;
         let mut header_crcs = Vec::with_capacity(plan.shards as usize);
         let mut metadata = Vec::with_capacity(plan.records.len());
         let mut completed_bytes = 0_u64;
@@ -114,11 +162,17 @@ pub fn compile(request: &CompileRequest, progress: &mut dyn ProgressSink) -> Res
                 .enumerate()
                 .filter(|(_, record)| record.shard_id == shard_id)
             {
-                let source = prepared
+                let payload = prepared
                     .sources
                     .get(index)
                     .ok_or_else(|| ColicError::Usage("codec source/plan order mismatch".into()))?;
-                let manifest = write_payload(&mut writer, planned, source)?;
+                let manifest = write_payload(
+                    &mut writer,
+                    planned,
+                    payload,
+                    &mut spool,
+                    spool_path,
+                )?;
                 completed_bytes = completed_bytes
                     .checked_add(planned.record.stored_bytes)
                     .ok_or_else(|| ColicError::Usage("emitted byte total overflows u64".into()))?;
@@ -132,7 +186,7 @@ pub fn compile(request: &CompileRequest, progress: &mut dyn ProgressSink) -> Res
             }
             writer.finish()?;
             let mut header = [0_u8; storage::DATA_SHARD_HEADER_BYTES as usize];
-            fs::File::open(&path)
+            File::open(&path)
                 .map_err(|source| ColicError::Io {
                     path: path.clone(),
                     source,
@@ -164,6 +218,7 @@ pub fn compile(request: &CompileRequest, progress: &mut dyn ProgressSink) -> Res
         let _ = fs::remove_dir_all(&temporary);
         return Err(error);
     }
+
     if request.force {
         storage::replace_package(&temporary, output)
     } else {
@@ -172,39 +227,62 @@ pub fn compile(request: &CompileRequest, progress: &mut dyn ProgressSink) -> Res
     if request.verify {
         progress.stage(Stage::Verification);
         let _ = verify::verify_package(output)?;
+        crate::verify_target::verify_target_layouts(output)?;
     }
     Ok(())
 }
 
-fn prepare(request: &CompileRequest, model: &SemanticModel) -> Result<PreparedCompile> {
+fn prepare(
+    request: &CompileRequest,
+    model: &SemanticModel,
+    spool_path: Option<&Path>,
+) -> Result<PreparedCompile> {
     let quantization = resolve_quantization(request, model)?;
     let target_profile = target::resolve(&request.target, target::HostCapabilities::current())?;
     if target_profile != target::MACOS_ARM64_METAL_APPLE8_V1 {
         return Err(ColicError::unsupported(
             Stage::TargetPlanning.as_str(),
-            "rANS256-g0-nibble storage is currently defined for the Apple8 target only",
+            "rans256-g0-nibble storage is currently defined for the Apple8 target only",
+        ));
+    }
+    if model.routed_experts.is_empty() {
+        return Err(ColicError::Usage(
+            "rans256-g0-nibble requires at least one routed expert".into(),
         ));
     }
 
-    let mut raw_experts = BTreeMap::new();
-    for (key, expert) in &model.routed_experts {
-        let raw = match quantization {
-            ExpertQuantization::Exact => target::lower_apple8_exact_mxfp4_expert(expert)?,
-            ExpertQuantization::Mxfp4 => target::lower_apple8_quantized_mxfp4_expert(expert)?,
-        };
-        raw_experts.insert(*key, raw);
+    /* Pass 1: census the exact final target-execution bytes one expert at a
+     * time. No model-wide expert byte buffer is retained. */
+    let mut histogram = [0_u64; 16];
+    for expert in model.routed_experts.values() {
+        let raw = lower_expert(expert, quantization)?;
+        apple8::accumulate_histogram(&raw, &mut histogram)?;
     }
-    let mode = match request.codec {
+    let table = rans256::Table::from_histogram(histogram)?;
+    let mode = match &request.codec {
         CodecRequest::Auto => apple8::Mode::Auto,
-        CodecRequest::Profile(ref profile) if profile == "rans256-g0-nibble" => apple8::Mode::Force,
+        CodecRequest::Profile(profile) if profile == "rans256-g0-nibble" => apple8::Mode::Force,
         _ => {
             return Err(ColicError::Usage(
                 "codec compiler called for a non-rANS request".into(),
             ));
         }
     };
-    let encoded = apple8::prepare(&raw_experts, mode)?;
-    let use_table = encoded.compressed_matrices != 0;
+
+    let mut spool = if let Some(path) = spool_path {
+        Some(
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .map_err(|source| ColicError::Io {
+                    path: path.to_owned(),
+                    source,
+                })?,
+        )
+    } else {
+        None
+    };
 
     let mut sources = Vec::new();
     let mut records = Vec::new();
@@ -227,12 +305,33 @@ fn prepare(request: &CompileRequest, model: &SemanticModel) -> Result<PreparedCo
             )?;
         }
     }
-    for (key, expert) in &model.routed_experts {
-        let bytes = encoded
-            .experts
-            .get(key)
-            .ok_or_else(|| ColicError::Usage("missing prepared rANS expert".into()))?
-            .clone();
+
+    /* Pass 2: lower+encode one expert, record its exact compressed size/CRC,
+     * and immediately spool it. Storage planning therefore sees final sizes
+     * without retaining the model's encoded experts in memory. */
+    let mut compressed_matrices = 0usize;
+    for expert in model.routed_experts.values() {
+        let raw = lower_expert(expert, quantization)?;
+        let encoded = apple8::encode_expert(&raw, &table, mode)?;
+        compressed_matrices = compressed_matrices
+            .checked_add(encoded.compressed_matrices)
+            .ok_or_else(|| ColicError::Usage("compressed matrix count overflows usize".into()))?;
+        let stored_bytes = encoded.bytes.len() as u64;
+        let stored_crc32c = storage::crc32c(&encoded.bytes);
+        let spool_offset = if let Some(file) = spool.as_mut() {
+            let offset = file.stream_position().map_err(|source| ColicError::Io {
+                path: spool_path.unwrap().to_owned(),
+                source,
+            })?;
+            file.write_all(&encoded.bytes)
+                .map_err(|source| ColicError::Io {
+                    path: spool_path.unwrap().to_owned(),
+                    source,
+                })?;
+            offset
+        } else {
+            0
+        };
         let decoded_bytes = [&expert.gate, &expert.up, &expert.down]
             .into_iter()
             .try_fold(0_u64, |sum, matrix| {
@@ -242,17 +341,26 @@ fn prepare(request: &CompileRequest, model: &SemanticModel) -> Result<PreparedCo
         records.push(LoweredRecord {
             id,
             kind: 2,
-            stored_bytes: bytes.len() as u64,
+            stored_bytes,
             decoded_bytes,
         });
         sources.push(Payload::Expert {
-            layer: key.0,
-            expert: key.1,
-            bytes,
+            layer: expert.layer,
+            expert: expert.expert,
+            spool_offset,
+            stored_bytes,
+            stored_crc32c,
             decoded_bytes,
         });
         id = next_id(id)?;
     }
+    if let Some(file) = spool.as_mut() {
+        file.flush().map_err(|source| ColicError::Io {
+            path: spool_path.unwrap().to_owned(),
+            source,
+        })?;
+    }
+
     for (name, tensor) in &model.resident_tensors {
         push_tensor(&mut sources, &mut records, &mut id, name.clone(), -2, tensor)?;
     }
@@ -261,8 +369,18 @@ fn prepare(request: &CompileRequest, model: &SemanticModel) -> Result<PreparedCo
         target: target_profile,
         sources,
         records,
-        table: use_table.then_some(encoded.table),
+        table: (compressed_matrices != 0).then_some(table),
     })
+}
+
+fn lower_expert(
+    expert: &crate::ir::RoutedExpert,
+    quantization: ExpertQuantization,
+) -> Result<Vec<u8>> {
+    match quantization {
+        ExpertQuantization::Exact => target::lower_apple8_exact_mxfp4_expert(expert),
+        ExpertQuantization::Mxfp4 => target::lower_apple8_quantized_mxfp4_expert(expert),
+    }
 }
 
 fn push_tensor(
@@ -291,9 +409,11 @@ fn push_tensor(
 fn write_payload(
     writer: &mut storage::DataShardWriter,
     planned: &storage::PlannedRecord,
-    source: &Payload,
+    payload: &Payload,
+    spool: &mut File,
+    spool_path: &Path,
 ) -> Result<ManifestRecord> {
-    match source {
+    match payload {
         Payload::Tensor {
             name,
             layer,
@@ -323,18 +443,37 @@ fn write_payload(
         Payload::Expert {
             layer,
             expert,
-            bytes,
+            spool_offset,
+            stored_bytes,
+            stored_crc32c,
             decoded_bytes,
         } => {
-            if bytes.len() as u64 != planned.record.stored_bytes
+            if *stored_bytes != planned.record.stored_bytes
                 || *decoded_bytes != planned.record.decoded_bytes
             {
                 return Err(ColicError::Usage(
-                    "prepared rANS expert does not match storage plan".into(),
+                    "spooled rANS expert does not match storage plan".into(),
                 ));
             }
-            let crc = storage::crc32c(bytes);
-            writer.write_record(planned, bytes)?;
+            spool
+                .seek(SeekFrom::Start(*spool_offset))
+                .map_err(|source| ColicError::Io {
+                    path: spool_path.to_owned(),
+                    source,
+                })?;
+            writer.write_record_stream(planned, |output| {
+                let mut limited = spool.by_ref().take(*stored_bytes);
+                let copied = io::copy(&mut limited, output).map_err(|source| ColicError::Io {
+                    path: spool_path.to_owned(),
+                    source,
+                })?;
+                if copied != *stored_bytes {
+                    return Err(ColicError::Usage(
+                        "compressed expert spool ended before planned record size".into(),
+                    ));
+                }
+                Ok(copied)
+            })?;
             Ok(ManifestRecord {
                 id: planned.record.id,
                 name: Some(format!("layers.{layer}.ffn.experts.{expert}")),
@@ -350,7 +489,7 @@ fn write_payload(
                 scale_format: 0xfffe,
                 layout: 0xfffe,
                 flags: 0,
-                stored_crc32c: crc,
+                stored_crc32c: *stored_crc32c,
                 logical_crc32c: 0,
                 codec_table_id: 0,
             })
@@ -358,7 +497,10 @@ fn write_payload(
     }
 }
 
-fn resolve_quantization(request: &CompileRequest, model: &SemanticModel) -> Result<ExpertQuantization> {
+fn resolve_quantization(
+    request: &CompileRequest,
+    model: &SemanticModel,
+) -> Result<ExpertQuantization> {
     match &request.quant {
         QuantRequest::Exact => Ok(ExpertQuantization::Exact),
         QuantRequest::Profile(profile) if profile == "mxfp4" => {
@@ -393,6 +535,20 @@ fn validate_options(request: &CompileRequest) -> Result<()> {
     Ok(())
 }
 
+fn codec_spool_path(output: &Path) -> Result<PathBuf> {
+    let parent = output
+        .parent()
+        .ok_or_else(|| ColicError::Usage("output package path has no parent directory".into()))?;
+    let name = output
+        .file_name()
+        .ok_or_else(|| ColicError::Usage("output package path has no file name".into()))?
+        .to_string_lossy();
+    Ok(parent.join(format!(
+        ".{name}.rans-spool-{}",
+        std::process::id()
+    )))
+}
+
 fn next_id(id: u64) -> Result<u64> {
     id.checked_add(1)
         .ok_or_else(|| ColicError::Usage("record ID overflows u64".into()))
@@ -405,7 +561,7 @@ fn is_source_weight_index_json(name: &str) -> bool {
         || name.ends_with(".h5.index.json")
 }
 
-fn copy_package_json_metadata(source_root: &std::path::Path, package_root: &std::path::Path) -> Result<()> {
+fn copy_package_json_metadata(source_root: &Path, package_root: &Path) -> Result<()> {
     let entries = fs::read_dir(source_root).map_err(|source| ColicError::Io {
         path: source_root.to_path_buf(),
         source,
