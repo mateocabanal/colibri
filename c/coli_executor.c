@@ -64,9 +64,9 @@ int coli_executor_open(ColiExecutor **out, const char *package_path,
         coli_package_close(package);
         return -1;
     }
-    /* Fail closed a second time at the record/layout boundary. expert_info is
-     * metadata-only: it reads the fixed expert envelope/descriptors but never
-     * scans payload tiles. */
+    /* Fail closed a second time at the record/layout/codec boundary.
+     * expert_info is metadata-only: it reads the fixed expert envelope and
+     * descriptors, validates codec-table references, but does not decode. */
     for (i = 0; i < coli_package_record_count(package); ++i) {
         const ColiRecordInfo *record = coli_package_record_at(package, i);
         if (record && record->kind == COLI_CSF_REC_EXPERT) {
@@ -146,6 +146,8 @@ int coli_executor_load_expert(const ColiExecutor *executor,
                               void *resident_slot, size_t resident_bytes,
                               char *error, size_t error_size) {
     const ColiRecordInfo *record;
+    uint64_t required = 0;
+    size_t written = 0;
     if (!executor || !resident_slot) {
         executor_error(error, error_size, "invalid executor resident-slot load");
         return -1;
@@ -155,18 +157,34 @@ int coli_executor_load_expert(const ColiExecutor *executor,
         executor_error(error, error_size, "expert (%d,%d) is absent", layer, expert);
         return -1;
     }
+    if (coli_package_expert_resident_bytes(executor->package, record, &required,
+                                           error, error_size))
+        return -1;
     if (executor->max_resident_record_bytes &&
-        record->stored_bytes > executor->max_resident_record_bytes) {
-        executor_error(error, error_size, "expert (%d,%d) exceeds resident-slot contract", layer, expert);
+        required > executor->max_resident_record_bytes) {
+        executor_error(error, error_size,
+                       "expert (%d,%d) exceeds resident-slot contract", layer, expert);
         return -1;
     }
-    if (record->stored_bytes > SIZE_MAX || resident_bytes < (size_t)record->stored_bytes) {
-        executor_error(error, error_size, "resident slot too small for expert (%d,%d): need %llu bytes",
-                       layer, expert, (unsigned long long)record->stored_bytes);
+    if (required > SIZE_MAX || resident_bytes < (size_t)required) {
+        executor_error(error, error_size,
+                       "resident slot too small for expert (%d,%d): need %llu bytes",
+                       layer, expert, (unsigned long long)required);
         return -1;
     }
-    return coli_package_read_record(executor->package, record, resident_slot,
-                                    resident_bytes, error, error_size);
+    if (coli_package_decode_expert_record(executor->package, record,
+                                          resident_slot, resident_bytes, &written,
+                                          error, error_size))
+        return -1;
+    if (written != (size_t)required) {
+        executor_error(error, error_size,
+                       "expert (%d,%d) decoder returned %llu bytes, expected %llu",
+                       layer, expert,
+                       (unsigned long long)written,
+                       (unsigned long long)required);
+        return -1;
+    }
+    return 0;
 }
 
 const ColiPackage *coli_executor_package(const ColiExecutor *executor) {

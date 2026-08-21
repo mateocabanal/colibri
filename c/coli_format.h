@@ -230,6 +230,22 @@ int coli_package_expert_info(const ColiPackage *package,
                              ColiExpertInfo *out,
                              char *error, size_t error_size);
 
+/* Synchronous codec path used before MetalIO pipeline composition lands.
+ * The returned resident record is the exact uncompressed expert envelope and
+ * target execution bytes that a --codec none package would contain. Stored CRC
+ * is checked before any decode; every decoded matrix must match its logical
+ * CRC before the function succeeds. */
+int coli_package_expert_resident_bytes(const ColiPackage *package,
+                                       const ColiRecordInfo *record,
+                                       uint64_t *out_bytes,
+                                       char *error, size_t error_size);
+int coli_package_decode_expert_record(const ColiPackage *package,
+                                      const ColiRecordInfo *record,
+                                      void *destination,
+                                      size_t destination_bytes,
+                                      size_t *written_bytes,
+                                      char *error, size_t error_size);
+
 /* Explicit tooling path: validates every typed envelope and every stored CRC.
  * This can scan the full package and is never called by package_open(). */
 int coli_package_verify_all(const ColiPackage *package,
