@@ -41,8 +41,14 @@ int  metalio_file_add(const char *path);
  * or -1. */
 int  metalio_slot_alloc(size_t max_bytes);
 void metalio_slot_free(int slot);     /* waits for in-flight, then releases */
-void *metalio_slot_ptr(int slot);             /* CPU-visible (shared storage) */
+void *metalio_slot_ptr(int slot);     /* CPU-visible (shared storage) */
 size_t metalio_slot_bytes(int slot);
+
+/* Native Metal bridge for Objective-C/Objective-C++ backends. Returns a
+ * non-owning opaque pointer to the slot's actual id<MTLBuffer>, not a wrapper
+ * around its contents. The handle is valid only while the slot remains
+ * allocated. Plain C callers should keep using metalio_slot_ptr(). */
+void *metalio_slot_native_buffer(int slot);
 
 /* --- vectored async loads ------------------------------------------------ */
 typedef enum { MIO_LOAD_DEMAND = 0, MIO_LOAD_ASYNC = 1, MIO_LOAD_SPEC = 2 }
