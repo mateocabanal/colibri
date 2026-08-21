@@ -1,5 +1,5 @@
 CC ?= cc
-CFLAGS ?= -O2 -std=c11 -Wall -Wextra -Werror
+CFLAGS ?= -O2 -std=gnu11 -Wall -Wextra -Werror
 EXE :=
 ifeq ($(OS),Windows_NT)
 EXE := .exe
