@@ -7,7 +7,7 @@ endif
 
 .PHONY: check check-registry clean
 
-check: test_apple8_contract$(EXE) tests/test_apple8_package$(EXE) tests/test_apple8_executor_contract$(EXE)
+check: check-registry test_apple8_contract$(EXE) tests/test_apple8_package$(EXE) tests/test_apple8_executor_contract$(EXE)
 	./test_apple8_contract$(EXE)
 	./tests/test_apple8_package$(EXE)
 	./tests/test_apple8_executor_contract$(EXE)
@@ -15,14 +15,14 @@ check: test_apple8_contract$(EXE) tests/test_apple8_package$(EXE) tests/test_app
 check-registry:
 	python3 ../tools/gen_target_registry.py --check
 
-test_apple8_contract$(EXE): tests/test_apple8_contract.c apple8_contract.h generated/coli_target_registry.h expert_representation.h coli_format.h
-	$(CC) $(CFLAGS) tests/test_apple8_contract.c -o $@
+test_apple8_contract$(EXE): tests/test_apple8_contract.c apple8_contract.h coli_target.c coli_target.h generated/coli_target_registry.h expert_representation.h coli_format.h
+	$(CC) $(CFLAGS) tests/test_apple8_contract.c coli_target.c -o $@
 
-tests/test_apple8_package$(EXE): tests/test_apple8_package.c coli_format.c coli_format_base.c coli_format.h apple8_contract.h generated/coli_target_registry.h compat.h
-	$(CC) $(CFLAGS) tests/test_apple8_package.c coli_format.c -o $@ -pthread
+tests/test_apple8_package$(EXE): tests/test_apple8_package.c coli_format.c coli_format_base.c coli_target.c coli_format.h coli_target.h apple8_contract.h generated/coli_target_registry.h compat.h
+	$(CC) $(CFLAGS) tests/test_apple8_package.c coli_format.c coli_target.c -o $@ -pthread
 
-tests/test_apple8_executor_contract$(EXE): tests/test_apple8_executor_contract.c coli_executor.c coli_executor.h coli_format.c coli_format_base.c coli_format.h apple8_contract.h generated/coli_target_registry.h compat.h
-	$(CC) $(CFLAGS) tests/test_apple8_executor_contract.c coli_executor.c coli_format.c -o $@ -pthread
+tests/test_apple8_executor_contract$(EXE): tests/test_apple8_executor_contract.c coli_executor.c coli_executor.h coli_target.c coli_target.h coli_format.c coli_format_base.c coli_format.h apple8_contract.h generated/coli_target_registry.h compat.h
+	$(CC) $(CFLAGS) tests/test_apple8_executor_contract.c coli_executor.c coli_format.c coli_target.c -o $@ -pthread
 
 clean:
 	rm -f test_apple8_contract test_apple8_contract.exe \
