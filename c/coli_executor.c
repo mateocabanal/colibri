@@ -1,4 +1,5 @@
 #include "coli_executor.h"
+#include "apple8_contract.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -35,6 +36,19 @@ int coli_executor_open(ColiExecutor **out, const char *package_path,
     if (policy != COLI_CSF_CHECKSUM_MANIFEST_ONLY &&
         policy != COLI_CSF_CHECKSUM_RECORD_ON_READ) {
         executor_error(error, error_size, "invalid executor checksum policy");
+        return -1;
+    }
+    if (coli_apple8_profile_is_v1(options->required_profile) &&
+        !coli_apple8_target_contract_compatible(
+            options->required_profile,
+            options->required_execution_layout_abi,
+            options->required_kernel_abi,
+            options->required_target_class)) {
+        executor_error(error, error_size,
+                       "runtime Apple8 target contract mismatch: need layout_abi=%u kernel_abi=%u class=0x%08x",
+                       COLI_EXECUTION_LAYOUT_ABI_APPLE8_V1,
+                       COLI_KERNEL_ABI_APPLE8_MXFP4_TILE_V1,
+                       COLI_TARGET_CLASS_APPLE8_METAL_V1);
         return -1;
     }
     if (coli_package_open_ex(&package, package_path, policy, error, error_size)) return -1;

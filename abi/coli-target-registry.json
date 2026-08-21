@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "profiles": {
+    "macos-arm64-metal-apple8-v1": {
+      "profile_id": 1,
+      "execution_layout_abi": 1,
+      "kernel_abi": 1,
+      "target_class": 16777217,
+      "layouts": {
+        "mxfp4-tile8x32-v1": {
+          "id": 259,
+          "tile_rows": 8,
+          "tile_columns": 32,
+          "tile_bytes": 136
+        }
+      }
+    }
+  }
+}

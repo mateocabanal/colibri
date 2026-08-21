@@ -13,10 +13,16 @@ extern "C" {
 typedef struct ColiExecutor ColiExecutor;
 
 typedef struct ColiExecutorOpenOptions {
-    /* Required exact physical-layout ABI. There is deliberately no native
-     * fallback in v1.0: accepting another target layout would be unsafe. */
+    /* Required exact physical-layout profile. There is deliberately no native
+     * fallback: accepting another target layout would be unsafe. */
     const char *required_profile;
     ColiCsfChecksumPolicy checksum_policy;
+    /* For a production Apple8-v1 profile these must exactly match the shared
+     * target registry. Zero is not a wildcard for that profile. Other legacy
+     * profiles ignore these fields until they gain a frozen target contract. */
+    uint32_t required_execution_layout_abi;
+    uint32_t required_kernel_abi;
+    uint32_t required_target_class;
     /* Zero is unlimited. Otherwise reject records larger than this resident
      * slot contract when loading them. */
     uint64_t max_resident_record_bytes;
@@ -29,8 +35,6 @@ void coli_executor_close(ColiExecutor *executor);
 
 const ColiRecordInfo *coli_executor_expert(const ColiExecutor *executor,
                                            int32_t layer, int32_t expert);
-/* Cold/static lookup remains name-addressable; routed execution should use
- * coli_executor_expert() instead. */
 const ColiRecordInfo *coli_executor_record_by_name(const ColiExecutor *executor,
                                                    const char *name);
 int coli_executor_load_record(const ColiExecutor *executor,
@@ -42,9 +46,6 @@ int coli_executor_expert_info(const ColiExecutor *executor,
                               ColiExpertInfo *out,
                               char *error, size_t error_size);
 
-/* Reads the exact stored expert record into caller-owned final resident-slot
- * storage. No heap allocation, decode, or canonical-to-target repack occurs
- * in this call. */
 int coli_executor_load_expert(const ColiExecutor *executor,
                               int32_t layer, int32_t expert,
                               void *resident_slot, size_t resident_bytes,
