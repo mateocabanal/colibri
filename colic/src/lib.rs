@@ -3,6 +3,7 @@
 //! It deliberately has no link-time relationship with the C inference runtime.
 
 pub mod cli;
+pub mod codec;
 pub mod error;
 pub mod format;
 pub mod generated;
