@@ -71,7 +71,6 @@ int main(int argc, char **argv) {
         goto done;
     }
     for (s = 0; s < 16; ++s) {
-        uint32_t k;
         freq[s] = rd32(blob + 32 + s * 4u);
         start[s] = rd32(blob + 96 + s * 4u);
         if (start[s] != cursor || freq[s] > (1u << SCALE_BITS) - cursor) {
@@ -79,7 +78,6 @@ int main(int argc, char **argv) {
             goto done;
         }
         cursor += freq[s];
-        (void)k;
     }
     if (cursor != (1u << SCALE_BITS)) goto done;
     slots = (uint16_t *)malloc((1u << SCALE_BITS) * sizeof(*slots));
