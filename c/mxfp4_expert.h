@@ -17,6 +17,14 @@ enum {
 };
 
 typedef struct ColiMxfp4ExpertLayout {
+    /* Execution representation bound into the cache. Canonical keeps separate
+     * E2M1 + UE8M0 spans. Apple8 stores the exact combined 8x32 tile stream in
+     * each *_weight buffer; *_scale_bytes are runtime-layout sidecars, not
+     * package scale payloads (Apple8 has no separate scale span). */
+    uint16_t execution_layout;
+    uint16_t reserved0;
+    uint32_t reserved1;
+
     size_t gate_weight_bytes;
     size_t gate_scale_bytes;
     size_t up_weight_bytes;
@@ -25,10 +33,9 @@ typedef struct ColiMxfp4ExpertLayout {
     size_t down_scale_bytes;
     size_t resident_bytes;
 
-    /* Smallest record-relative span covering all six executable regions.
-     * The *_span_offset fields are relative to record_span_offset. A runtime
-     * may read record_span_bytes once when padding overhead is acceptable;
-     * the generic six-span loader remains valid for arbitrary layouts. */
+    /* Canonical-only coalesced physical read view. Apple8 is decoded through
+     * coli_package_decode_expert_record(), so record_span_bytes is zero and the
+     * caller must use the generic loader rather than reading stored spans. */
     uint64_t record_span_offset;
     size_t record_span_bytes;
     size_t gate_weight_span_offset;
@@ -56,27 +63,20 @@ typedef struct ColiMxfp4ExpertBuffers {
     size_t down_scale_capacity;
 } ColiMxfp4ExpertBuffers;
 
-/*
- * Validate the compiler/runtime ABI for one routed SwiGLU expert and return
- * the exact resident byte requirements. This is deliberately independent of
- * Qwen's cache implementation so the same validator can be reused by other
- * MoE frontends that emit the same gate/up/down contract.
- *
- * gate/up: [intermediate, hidden]
- * down:    [hidden, intermediate]
- * weights: row-major packed E2M1, two columns per byte
- * scales:  raw UE8M0, one scale per 1x32 weight block
- */
+/* Validate gate/up/down geometry and return cache requirements for either
+ * canonical MXFP4 or production Apple8 0x0103. All three matrices must use the
+ * same execution layout. Apple8 matrix storage may be raw or rANS-compressed;
+ * validation is against decoded execution bytes, never compressed bytes. */
 int coli_mxfp4_expert_validate_info(const ColiExpertInfo *info,
                                     int hidden, int intermediate,
                                     ColiMxfp4ExpertLayout *layout,
                                     char *error, size_t error_size);
 
-/*
- * Parse + validate RECORD then read only its six executable MXFP4 spans into
- * caller-owned cache storage. The COLIEXPT framing and padding never become
- * resident, and this function performs no heap allocation.
- */
+/* Canonical: reads six executable spans directly.
+ * Apple8: synchronously reconstructs the raw target expert record (including
+ * rANS decode when present), then copies the three exact combined tile streams
+ * plus tiny runtime-layout sidecars into caller-owned cache storage.
+ * No Apple8->canonical repack occurs. */
 int coli_mxfp4_expert_load_ex(const ColiPackage *package,
                               const ColiRecordInfo *record,
                               int hidden, int intermediate,
@@ -95,4 +95,4 @@ int coli_mxfp4_expert_load(const ColiPackage *package,
 }
 #endif
 
-#endif /* COLIBRI_MXFP4_EXPERT_H */
+#endif
