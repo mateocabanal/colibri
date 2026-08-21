@@ -70,77 +70,6 @@ static void coli_v4_package_identity_log(const ColiExecutor *executor) {
     fputc('\n', stderr);
 }
 
-static void coli_v4_fill_apple8_runtime(ColiRuntimeTarget *runtime) {
-    if (!runtime) return;
-    memset(runtime, 0, sizeof(*runtime));
-    runtime->profile_name = COLI_TARGET_PROFILE_MACOS_ARM64_METAL_APPLE8_V1;
-    runtime->target_os = COLI_TARGET_OS_MACOS;
-    runtime->target_arch = COLI_TARGET_ARCH_ARM64;
-    runtime->backend = COLI_TARGET_BACKEND_METAL;
-    runtime->gpu_kind = COLI_TARGET_GPU_APPLE_FAMILY;
-    runtime->cpu_feature_mask = COLI_TARGET_CPU_ARM64_ASIMD;
-    runtime->gpu_family = COLI_APPLE8_GPU_FAMILY_MIN;
-    runtime->runtime_features = COLI_TARGET_RUNTIME_APPLE_UNIFIED_MEMORY |
-                                COLI_TARGET_RUNTIME_METAL_SHARED_STORAGE;
-    runtime->target_profile_abi = COLI_TARGET_PROFILE_ABI_APPLE8_V1;
-    runtime->execution_layout_abi = COLI_EXECUTION_LAYOUT_ABI_APPLE8_V1;
-    runtime->kernel_abi = COLI_KERNEL_ABI_APPLE8_MXFP4_TILE_V1;
-    runtime->target_class = COLI_TARGET_CLASS_APPLE8_METAL_V1;
-    runtime->max_record_alignment = COLI_APPLE8_RECORD_ALIGNMENT;
-    runtime->max_io_granularity = COLI_APPLE8_IO_GRANULARITY;
-    runtime->max_resident_alignment = COLI_APPLE8_RESIDENT_ALIGNMENT;
-}
-
-/* deepseek_v4.c predates the executor's frozen target contract and used to
- * hard-code Apple8 with a NULL runtime descriptor. Resolve the package's exact
- * declared profile first: canonical exact packages remain canonical, while an
- * Apple8 package receives the same concrete descriptor used by the contract
- * tests/Qwen bridge. package_open_ex only validates manifest/index metadata; it
- * does not scan expert payloads, so this preflight does not duplicate model I/O. */
-static int coli_v4_resolve_executor_options(
-        const char *package_path, const ColiExecutorOpenOptions *options,
-        ColiExecutorOpenOptions *resolved, ColiRuntimeTarget *apple8,
-        char *error, size_t error_size) {
-    if (!package_path || !options || !resolved || !apple8) return -1;
-    ColiPackage *probe = NULL;
-    if (coli_package_open_ex(&probe, package_path, options->checksum_policy,
-                             error, error_size))
-        return -1;
-    const char *actual = coli_package_profile(probe);
-    const char *required = NULL;
-    if (actual && !strcmp(actual, COLI_CSF_PROFILE_PORTABLE_V1))
-        required = COLI_CSF_PROFILE_PORTABLE_V1;
-    else if (actual && !strcmp(actual,
-                              COLI_CSF_PROFILE_MACOS_ARM64_METAL_APPLE8_V1))
-        required = COLI_CSF_PROFILE_MACOS_ARM64_METAL_APPLE8_V1;
-    else if (actual && !strcmp(actual, COLI_CSF_PROFILE_LINUX_X86_64_AVX2_V1))
-        required = COLI_CSF_PROFILE_LINUX_X86_64_AVX2_V1;
-    if (!required) {
-        if (error && error_size)
-            snprintf(error, error_size, "unsupported V4 package target profile: %s",
-                     actual ? actual : "unknown");
-        coli_package_close(probe);
-        return -1;
-    }
-    coli_package_close(probe);
-
-    *resolved = *options;
-    resolved->required_profile = required;
-    resolved->runtime_target = NULL;
-    if (!strcmp(required, COLI_CSF_PROFILE_MACOS_ARM64_METAL_APPLE8_V1)) {
-#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
-        coli_v4_fill_apple8_runtime(apple8);
-        resolved->runtime_target = apple8;
-#else
-        if (error && error_size)
-            snprintf(error, error_size,
-                     "Apple8 V4 package requires arm64 macOS Metal runtime");
-        return -1;
-#endif
-    }
-    return 0;
-}
-
 /* Intercept the executor acquire at the exact point engine->coli_static becomes
  * available. A package-only engine gets the non-owning sentinel only when full
  * MTP/DSpark or the explicit Markov proposer was requested. The sentinel exists
@@ -152,12 +81,7 @@ static int coli_v4_package_executor_open_bridge(
         ColiExecutor **out, const char *package_path,
         const ColiExecutorOpenOptions *options,
         char *error, size_t error_size) {
-    ColiExecutorOpenOptions resolved;
-    ColiRuntimeTarget apple8;
-    if (coli_v4_resolve_executor_options(package_path, options, &resolved,
-                                         &apple8, error, error_size))
-        return -1;
-    int result = coli_executor_open(out, package_path, &resolved,
+    int result = coli_executor_open(out, package_path, options,
                                     error, error_size);
     if (result || !out || !*out) return result;
     coli_v4_package_identity_log(*out);
