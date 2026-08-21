@@ -1,11 +1,10 @@
 # Qwen Apple8+rANS composition build.
 #
 # Keep the main Makefile untouched while this runtime slice is proven locally.
-# The included Makefile owns all platform/CUDA/Metal/MetalIO detection. The
-# compatibility header is pre-included ONLY while compiling qwen_moe.c; `private`
-# prevents this target-specific flag from leaking into prerequisite objects such
-# as coli_executor.c, where symbol-rewriting macros would be invalid.
+# The included Makefile owns platform/CUDA/Metal/MetalIO detection. Override
+# only the final qwen_moe compile/link recipe so the compatibility header is
+# never pre-included into prerequisite objects such as coli_executor.c.
 include Makefile
 
-qwen_moe$(EXE): private QMOE_CFLAGS += -include qwen_apple8_rans_compat.h
 qwen_moe$(EXE): qwen_apple8_rans_compat.h
+	$(CC) $(QMOE_CFLAGS) -include qwen_apple8_rans_compat.h $(MIO_CFLAGS) qwen_moe.c $(QMOE_COLI_OBJS) $(QMOE_GPU_OBJ) $(MIO_OBJ) $(METAL_OBJ) -o qwen_moe$(EXE) $(QMOE_LDFLAGS) $(MIO_LDFLAGS) $(filter -framework Metal -framework Foundation -lc++,$(LDFLAGS))
