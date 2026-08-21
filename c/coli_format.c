@@ -8,6 +8,13 @@
 
 #include "apple8_contract.h"
 #include "coli_target.h"
+/* rans.h is intentionally a broad header-only codec implementation. This TU
+ * consumes only the strict scalar decode subset, so the remaining static
+ * helpers are expected to be unused here. Keep -Werror useful for this file
+ * without making every consumer add a command-line suppression. */
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic ignored "-Wunused-function"
+#endif
 #include "rans.h"
 
 #define COLI_RANS_TABLE_BLOB_BYTES 160u
@@ -239,7 +246,7 @@ static int apple8_decode_matrix(const ColiPackage *p, const ColiRecordInfo *r,
         uint64_t max_stream_symbols;
         uint32_t stream;
         rans_err rc;
-        if (stored > SIZE_MAX ||
+        if (stored > SIZE_MAX - RANS_SLACK ||
             checked_mul_u64(decoded, 2u, &expected_symbols)) {
             csf_error(error, error_size, "Apple8 rANS matrix size exceeds host limits");
             return -1;
