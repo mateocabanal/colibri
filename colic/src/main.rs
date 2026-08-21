@@ -261,7 +261,11 @@ fn run() -> colic::Result<()> {
             Ok(())
         }
         Command::Compile(request) if request.dry_run => {
-            let summary = pipeline::dry_run(&request)?;
+            let summary = if colic::codec::compile::handles(&request) {
+                colic::codec::compile::dry_run(&request)?
+            } else {
+                pipeline::dry_run(&request)?
+            };
             println!("target={}", summary.target_name);
             println!("source_tensors={}", summary.source_tensors);
             println!("source_stored_bytes={}", summary.source_stored_bytes);
@@ -277,7 +281,14 @@ fn run() -> colic::Result<()> {
             );
             Ok(())
         }
-        Command::Compile(request) => pipeline::compile(&request, &mut ConsoleProgress::new()),
+        Command::Compile(request) => {
+            let mut progress = ConsoleProgress::new();
+            if colic::codec::compile::handles(&request) {
+                colic::codec::compile::compile(&request, &mut progress)
+            } else {
+                pipeline::compile(&request, &mut progress)
+            }
+        }
     }
 }
 
