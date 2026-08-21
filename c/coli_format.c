@@ -13,6 +13,23 @@ static int apple8_profile(const ColiPackage *p) {
     return p && coli_apple8_profile_is_v1(p->profile);
 }
 
+static int profile_accepts_expert(const ColiPackage *p,
+                                  const ColiExpertInfo *info,
+                                  char *error, size_t error_size) {
+    unsigned i;
+    if (!p || !info) return -1;
+    for (i = 0; i < 3; ++i) {
+        if (!coli_target_profile_accepts_layout(p->profile, info->matrices[i].layout)) {
+            csf_error(error, error_size,
+                      "expert matrix %u layout 0x%04x is not permitted by target profile %s",
+                      i, info->matrices[i].layout,
+                      p->profile ? p->profile : "<missing>");
+            return -1;
+        }
+    }
+    return 0;
+}
+
 static int apple8_edge_padding_valid(const ColiPackage *p,
                                      const ColiRecordInfo *r,
                                      const ColiExpertMatrixInfo *m,
@@ -73,8 +90,11 @@ int coli_package_expert_info(const ColiPackage *p, const ColiRecordInfo *r,
     size_t span_count = 0;
     uint64_t logical_sum = 0, data_start;
     unsigned i;
-    if (!apple8_profile(p))
-        return coli_package_expert_info_legacy(p, r, out, error, error_size);
+    if (!apple8_profile(p)) {
+        int rc = coli_package_expert_info_legacy(p, r, out, error, error_size);
+        if (rc) return rc;
+        return profile_accepts_expert(p, out, error, error_size);
+    }
     if (!p || !r || !out || r->kind != COLI_CSF_REC_EXPERT) {
         csf_error(error, error_size, "expert_info requires an EXPERT record");
         return -1;
@@ -167,9 +187,12 @@ int coli_package_validate_record(const ColiPackage *p, const ColiRecordInfo *r,
         csf_error(error, error_size, "invalid package/record");
         return -1;
     }
-    if (!apple8_profile(p) || r->kind != COLI_CSF_REC_EXPERT)
-        return coli_package_validate_record_legacy(
+    if (!apple8_profile(p) || r->kind != COLI_CSF_REC_EXPERT) {
+        int rc = coli_package_validate_record_legacy(
             p, r, verify_stored_crc_flag, error, error_size);
+        if (rc || r->kind != COLI_CSF_REC_EXPERT) return rc;
+        return coli_package_expert_info(p, r, &info, error, error_size);
+    }
     if (verify_stored_crc_flag && verify_record_crc(p, r, error, error_size)) return -1;
     if (coli_package_expert_info(p, r, &info, error, error_size)) return -1;
     for (i = 0; i < 3; ++i) {
