@@ -120,7 +120,11 @@ fn synthetic_v4_source(root: &Path) {
         let bytes = shape.iter().product::<u64>() * size;
         header.insert(
             name,
-            serde_json::json!({"dtype": dtype, "shape": shape, "data_offsets": [offset, offset + bytes]}),
+            serde_json::json!({
+                "dtype": dtype,
+                "shape": shape,
+                "data_offsets": [offset, offset + bytes]
+            }),
         );
         payload.resize(payload.len() + bytes as usize, 0);
         offset += bytes;

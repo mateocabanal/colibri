@@ -101,9 +101,9 @@ impl Table {
                     freq[symbol] -= 1;
                     deficit += 1;
                 }
-                cursor = cursor
-                    .checked_add(1)
-                    .ok_or_else(|| ColicError::Usage("rANS normalization cursor overflows".into()))?;
+                cursor = cursor.checked_add(1).ok_or_else(|| {
+                    ColicError::Usage("rANS normalization cursor overflows".into())
+                })?;
             }
         }
 
@@ -225,7 +225,7 @@ pub fn encode_bytes(input: &[u8], table: &Table) -> Result<Vec<u8>> {
         .checked_mul(2)
         .ok_or_else(|| ColicError::Usage("rANS symbol count overflows usize".into()))?;
     let mut streams = vec![Vec::<u8>::new(); N_STREAMS];
-    for stream in 0..N_STREAMS {
+    for (stream, slot) in streams.iter_mut().enumerate() {
         let mut symbols = Vec::with_capacity(n_symbols.div_ceil(N_STREAMS));
         let mut logical = stream;
         while logical < n_symbols {
@@ -237,7 +237,7 @@ pub fn encode_bytes(input: &[u8], table: &Table) -> Result<Vec<u8>> {
             });
             logical += N_STREAMS;
         }
-        streams[stream] = encode_stream(&symbols, table)?;
+        *slot = encode_stream(&symbols, table)?;
     }
 
     let header_bytes = round16(16 + (N_STREAMS + 1) * 4);
@@ -326,7 +326,10 @@ pub fn manifest_table_region(mut manifest: Vec<u8>, table: Option<&Table>) -> Re
     if manifest.len() < 256 {
         return Err(ColicError::Usage("manifest is too short for codec tables".into()));
     }
-    if u32_at(&manifest, 160)? != 0 || u64_at(&manifest, 168)? != 0 || u64_at(&manifest, 176)? != 0 {
+    if u32_at(&manifest, 160)? != 0
+        || u64_at(&manifest, 168)? != 0
+        || u64_at(&manifest, 176)? != 0
+    {
         return Err(ColicError::Usage(
             "manifest already contains a codec table region".into(),
         ));
