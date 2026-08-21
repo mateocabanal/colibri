@@ -22,6 +22,11 @@ pub struct Table {
 }
 
 impl Table {
+    /// Build the generation-0 table with the exact stable largest-remainder
+    /// rule used by c/tools/rans_format.py. Present symbols get at least one
+    /// slot, positive remainder ties resolve by symbol index, and a negative
+    /// deficit is corrected by repeatedly walking one fixed frequency-sorted
+    /// order (the reference deliberately does not re-sort after decrements).
     pub fn from_histogram(hist: [u64; 16]) -> Result<Self> {
         let total = hist
             .iter()
@@ -33,69 +38,72 @@ impl Table {
             ));
         }
 
+        let present = hist.iter().filter(|value| **value != 0).count();
+        if present > M as usize {
+            return Err(ColicError::Usage(
+                "rANS table scale cannot represent every present symbol".into(),
+            ));
+        }
+
         let mut freq = [0_u32; 16];
-        let mut remainder = [0_u64; 16];
+        let mut remainder = [-1.0_f64; 16];
         let mut sum = 0_i64;
+        let total_f64 = total as f64;
         for symbol in 0..16 {
-            let count = hist[symbol];
-            if count == 0 {
+            if hist[symbol] == 0 {
                 continue;
             }
-            let scaled = (count as u128)
-                .checked_mul(M as u128)
-                .ok_or_else(|| ColicError::Usage("rANS histogram scaling overflows".into()))?;
-            let base = (scaled / total as u128) as u32;
-            let assigned = base.max(1);
+            let raw = hist[symbol] as f64 / total_f64 * f64::from(M);
+            let floor = raw.floor();
+            let assigned = (floor as u32).max(1);
             freq[symbol] = assigned;
-            remainder[symbol] = (scaled % total as u128) as u64;
+            remainder[symbol] = raw - floor;
             sum += i64::from(assigned);
         }
 
         let target = i64::from(M);
         if sum < target {
-            let mut order = (0..16)
-                .filter(|&symbol| hist[symbol] != 0)
-                .collect::<Vec<_>>();
+            let mut order = (0..16).collect::<Vec<_>>();
             order.sort_by(|&left, &right| {
                 remainder[right]
-                    .cmp(&remainder[left])
+                    .total_cmp(&remainder[left])
                     .then_with(|| left.cmp(&right))
             });
-            let mut deficit = (target - sum) as usize;
-            let mut cursor = 0usize;
-            while deficit != 0 {
-                let symbol = order[cursor % order.len()];
-                freq[symbol] = freq[symbol]
-                    .checked_add(1)
-                    .ok_or_else(|| ColicError::Usage("rANS frequency overflows u32".into()))?;
-                deficit -= 1;
-                cursor += 1;
+            let mut deficit = target - sum;
+            for symbol in order {
+                if deficit == 0 {
+                    break;
+                }
+                if hist[symbol] != 0 {
+                    freq[symbol] = freq[symbol]
+                        .checked_add(1)
+                        .ok_or_else(|| ColicError::Usage("rANS frequency overflows u32".into()))?;
+                    deficit -= 1;
+                }
+            }
+            if deficit != 0 {
+                return Err(ColicError::Usage(
+                    "rANS largest-remainder normalization left a positive deficit".into(),
+                ));
             }
         } else if sum > target {
-            let mut surplus = (sum - target) as usize;
-            while surplus != 0 {
-                let mut order = (0..16)
-                    .filter(|&symbol| freq[symbol] > 1)
-                    .collect::<Vec<_>>();
-                if order.is_empty() {
-                    return Err(ColicError::Usage(
-                        "rANS frequency normalization cannot reach target".into(),
-                    ));
+            let mut order = (0..16).collect::<Vec<_>>();
+            order.sort_by(|&left, &right| {
+                freq[right]
+                    .cmp(&freq[left])
+                    .then_with(|| left.cmp(&right))
+            });
+            let mut deficit = target - sum;
+            let mut cursor = 0usize;
+            while deficit < 0 {
+                let symbol = order[cursor % order.len()];
+                if freq[symbol] > 1 {
+                    freq[symbol] -= 1;
+                    deficit += 1;
                 }
-                order.sort_by(|&left, &right| {
-                    freq[right]
-                        .cmp(&freq[left])
-                        .then_with(|| left.cmp(&right))
-                });
-                for symbol in order {
-                    if surplus == 0 {
-                        break;
-                    }
-                    if freq[symbol] > 1 {
-                        freq[symbol] -= 1;
-                        surplus -= 1;
-                    }
-                }
+                cursor = cursor
+                    .checked_add(1)
+                    .ok_or_else(|| ColicError::Usage("rANS normalization cursor overflows".into()))?;
             }
         }
 
@@ -619,6 +627,16 @@ mod tests {
     }
 
     #[test]
+    fn table_quantization_matches_reference_negative_deficit_order() {
+        let histogram = [1, 2, 100, 1, 0, 1, 1, 3, 2, 10, 0, 1, 1, 1, 0, 100];
+        let table = Table::from_histogram(histogram).unwrap();
+        assert_eq!(
+            table.freq,
+            [73, 146, 7315, 73, 0, 73, 73, 220, 146, 732, 0, 73, 73, 73, 0, 7314]
+        );
+    }
+
+    #[test]
     fn covers_every_nibble_value() {
         let bytes = (0_u8..=255).cycle().take(4096).collect::<Vec<_>>();
         let table = Table::from_histogram(histogram_bytes([bytes.as_slice()]).unwrap()).unwrap();
@@ -643,6 +661,7 @@ mod tests {
     fn auto_policy_requires_meaningful_savings() {
         assert!(!auto_should_use(4096, 3900));
         assert!(auto_should_use(4096, 3500));
-        assert!(!auto_should_use(1024, 700));
+        assert!(auto_should_use(1024, 700));
+        assert!(!auto_should_use(1024, 710));
     }
 }
