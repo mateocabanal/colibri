@@ -101,6 +101,7 @@ int main(void) {
     float *x = (float *)malloc(x_count * sizeof(float));
     float *ref = (float *)calloc(y_count, sizeof(float));
     float *got = (float *)calloc(y_count, sizeof(float));
+    int fd = -1;
     int file = -1;
     int slot = -1;
     int metalio_started = 0;
@@ -109,11 +110,12 @@ int main(void) {
     CHECK(apple8 && x && ref && got, "fixture allocation failed");
     if (!apple8 || !x || !ref || !got) goto cleanup;
 
-    int fd = mkstemp(path);
+    fd = mkstemp(path);
     CHECK(fd >= 0, "mkstemp failed");
     if (fd < 0) goto cleanup;
     CHECK(write_all(fd, apple8, apple8_bytes), "fixture write failed");
     close(fd);
+    fd = -1;
 
     if (!metalio_init()) {
         fprintf(stderr, "SKIP apple8-metalio-direct: MetalIO unavailable\n");
@@ -166,6 +168,7 @@ int main(void) {
 
 cleanup:
     coli_apple8_metalio_direct_shutdown();
+    if (fd >= 0) close(fd);
     if (slot >= 0) metalio_slot_free(slot);
     if (metalio_started) metalio_shutdown();
     unlink(path);
