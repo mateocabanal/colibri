@@ -45,6 +45,14 @@ static inline uint32_t qwen_prefix_runtime_backend_id(void) {
     return QWEN_PREFIX_BACKEND_CPU;
 }
 
+static inline const char *qwen_prefix_runtime_backend_name(void) {
+    switch (qwen_prefix_runtime_backend_id()) {
+        case QWEN_PREFIX_BACKEND_METAL: return "metal";
+        case QWEN_PREFIX_BACKEND_CUDA_HIP: return "cuda-hip";
+        default: return "cpu";
+    }
+}
+
 typedef struct {
     uint32_t version;
     uint32_t reserved;
