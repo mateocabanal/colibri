@@ -462,7 +462,7 @@ fn write_payload(
                     source,
                 })?;
             writer.write_record_stream(planned, |output| {
-                let mut limited = spool.by_ref().take(*stored_bytes);
+                let mut limited = Read::take(&mut *spool, *stored_bytes);
                 let copied = io::copy(&mut limited, output).map_err(|source| ColicError::Io {
                     path: spool_path.to_owned(),
                     source,
