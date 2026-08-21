@@ -63,12 +63,16 @@ static int v4_compat_cache_disabled(void) {
 }
 
 static int v4_disk_policy_wanted(void) {
+    const char *mode = getenv("COLI_PREFIX_CACHE");
+    /* The common cache policy owns tier selection. An explicit `ssd` (or
+     * `auto`) therefore remains valid even when the legacy V4 RAM budget is
+     * `off`; otherwise there is no way to request SSD-only persistence. */
+    if (mode && *mode)
+        return coli_prefix_disk_mode_allows_ssd();
     if (v4_compat_cache_disabled() || !coli_prefix_disk_mode_allows_ssd())
         return 0;
-    /* Cache-by-default is a serving policy. Explicit common policy may opt a
-     * non-serve engine API user into persistence for tests/tools. */
-    const char *mode = getenv("COLI_PREFIX_CACHE");
-    if (mode && *mode) return 1;
+    /* Cache-by-default is a serving policy. Without an explicit common policy,
+     * preserve the legacy V4 opt-out and only enable persistence for serve. */
     const char *serve = getenv("SERVE");
     return serve && serve[0] == '1';
 }
@@ -187,28 +191,26 @@ static ColiPrefixDiskCache *v4_disk_for_engine(ColiV4Engine *engine) {
     return result;
 }
 
-void coli_v4_prefix_disk_register_engine(ColiV4Engine *engine) {
-    if (!engine || !v4_disk_policy_wanted()) return;
-    uint8_t fingerprint[COLI_PREFIX_DISK_FINGERPRINT_BYTES];
+static int v4_disk_register_namespace(
+    ColiV4Engine *engine,
+    const uint8_t fingerprint[COLI_PREFIX_DISK_FINGERPRINT_BYTES],
+    uint64_t layout_fingerprint) {
+    if (!engine || !fingerprint || !v4_disk_policy_wanted()) return 0;
     char directory[COLI_PREFIX_DISK_PATH_MAX];
-    if (!v4_model_fingerprint(engine, fingerprint) ||
-        !coli_prefix_disk_default_directory(directory, sizeof(directory))) {
-        if (getenv("V4_PREFIX_LOG"))
-            fprintf(stderr,
-                    "[PREFIX-SSD] V4 disabled: requires package-only COLI plus fingerprintable config/tokenizer\n");
-        return;
-    }
+    if (!coli_prefix_disk_default_directory(directory, sizeof(directory))) return 0;
+
     ColiPrefixDiskCache initialized;
     size_t budget = coli_prefix_disk_budget_from_env(
         (size_t)COLI_V4_PREFIX_DISK_DEFAULT_GB * 1024u * 1024u * 1024u);
     if (!coli_prefix_disk_init(&initialized, directory, budget, v4_min_tokens(),
                                COLI_V4_PREFIX_DISK_ENGINE_ID,
                                COLI_V4_PREFIX_DISK_STATE_ABI,
-                               fingerprint, v4_layout_fingerprint(engine),
+                               fingerprint, layout_fingerprint,
                                getenv("V4_PREFIX_LOG") != NULL) ||
         !initialized.enabled)
-        return;
+        return 0;
 
+    int installed = 0;
     pthread_mutex_lock(&g_v4_disk_mutex);
     int slot = -1;
     for (int i = 0; i < COLI_V4_PREFIX_DISK_MAX_ENGINES; i++) {
@@ -218,8 +220,30 @@ void coli_v4_prefix_disk_register_engine(ColiV4Engine *engine) {
     if (slot >= 0) {
         g_v4_disk[slot].engine = engine;
         g_v4_disk[slot].disk = initialized;
+        installed = 1;
     }
     pthread_mutex_unlock(&g_v4_disk_mutex);
+    return installed;
+}
+
+void coli_v4_prefix_disk_register_engine(ColiV4Engine *engine) {
+    if (!engine || !v4_disk_policy_wanted()) return;
+    uint8_t fingerprint[COLI_PREFIX_DISK_FINGERPRINT_BYTES];
+    if (!v4_model_fingerprint(engine, fingerprint)) {
+        if (getenv("V4_PREFIX_LOG"))
+            fprintf(stderr,
+                    "[PREFIX-SSD] V4 disabled: requires package-only COLI plus fingerprintable config/tokenizer\n");
+        return;
+    }
+    (void)v4_disk_register_namespace(
+        engine, fingerprint, v4_layout_fingerprint(engine));
+}
+
+int coli_v4_prefix_disk_register_test_namespace(
+    ColiV4Engine *engine, const uint8_t model_fingerprint[32],
+    uint64_t layout_fingerprint) {
+    return v4_disk_register_namespace(engine, model_fingerprint,
+                                      layout_fingerprint);
 }
 
 void coli_v4_prefix_disk_forget_engine(ColiV4Engine *engine) {
@@ -231,6 +255,27 @@ void coli_v4_prefix_disk_forget_engine(ColiV4Engine *engine) {
             break;
         }
     pthread_mutex_unlock(&g_v4_disk_mutex);
+}
+
+void coli_v4_prefix_disk_stats(ColiV4Engine *engine,
+                               ColiV4PrefixDiskStats *stats) {
+    if (!stats) return;
+    memset(stats, 0, sizeof(*stats));
+    ColiPrefixDiskCache *disk = v4_disk_for_engine(engine);
+    if (!disk) return;
+    ColiPrefixDiskStats raw;
+    coli_prefix_disk_stats(disk, &raw);
+    stats->lookups = raw.lookups;
+    stats->hits = raw.hits;
+    stats->stores = raw.stores;
+    stats->evictions = raw.evictions;
+    stats->corruptions = raw.corruptions;
+    stats->read_bytes = raw.read_bytes;
+    stats->write_bytes = raw.write_bytes;
+    stats->resident_bytes = raw.resident_bytes;
+    stats->budget_bytes = raw.budget_bytes;
+    stats->min_free_bytes = raw.min_free_bytes;
+    stats->enabled = disk->enabled;
 }
 
 static size_t v4_payload_bytes(ColiV4AttentionSnapshot *const *attention,
