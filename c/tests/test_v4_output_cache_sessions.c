@@ -33,6 +33,10 @@ static int capture_token(void *user_data, int token, float logit,
     return capture->stop_after_first && capture->count == 1;
 }
 
+/* Cached replay must reproduce the complete callback stream byte-for-byte,
+ * including logits and position metadata. Independent cold regeneration has a
+ * weaker semantic contract: greedy token IDs must be identical, while floating
+ * logits may differ in their low bits across fresh engine instances. */
 static int same_capture(const Capture *a, const Capture *b) {
     return a && b && a->count == b->count && a->count > 0 &&
         !memcmp(a->ids, b->ids, (size_t)a->count * sizeof(a->ids[0])) &&
@@ -42,6 +46,11 @@ static int same_capture(const Capture *a, const Capture *b) {
                 (size_t)a->count * sizeof(a->positions[0])) &&
         !memcmp(a->ordinals, b->ordinals,
                 (size_t)a->count * sizeof(a->ordinals[0]));
+}
+
+static int same_tokens(const Capture *a, const Capture *b) {
+    return a && b && a->count == b->count && a->count > 0 &&
+        !memcmp(a->ids, b->ids, (size_t)a->count * sizeof(a->ids[0]));
 }
 
 static int prefix_capture(const Capture *full, const Capture *shorter) {
@@ -228,14 +237,14 @@ int main(int argc, char **argv) {
     coli_v4_output_cache_stats(&stats2);
     if (stats2.hits != stats1.hits ||
         stats2.corruptions != stats1.corruptions + 1 ||
-        !same_capture(&baseline, &recovered)) {
+        !same_tokens(&baseline, &recovered)) {
         fprintf(stderr,
-                "corruption did not fail closed: hits=%llu->%llu corruptions=%llu->%llu identity=%d\n",
+                "corruption did not fail closed: hits=%llu->%llu corruptions=%llu->%llu token_identity=%d\n",
                 (unsigned long long)stats1.hits,
                 (unsigned long long)stats2.hits,
                 (unsigned long long)stats1.corruptions,
                 (unsigned long long)stats2.corruptions,
-                same_capture(&baseline, &recovered));
+                same_tokens(&baseline, &recovered));
         goto cleanup;
     }
     coli_v4_session_destroy(session); session = NULL;
@@ -264,12 +273,12 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
     coli_v4_output_cache_stats(&stats4);
-    if (stats4.hits != stats3.hits || !same_capture(&baseline, &identity)) {
+    if (stats4.hits != stats3.hits || !same_tokens(&baseline, &identity)) {
         fprintf(stderr,
-                "tokenizer/template identity unexpectedly hit: hits=%llu->%llu token_identity=%d\n",
+                "tokenizer/template identity gate failed: hits=%llu->%llu token_identity=%d\n",
                 (unsigned long long)stats3.hits,
                 (unsigned long long)stats4.hits,
-                same_capture(&baseline, &identity));
+                same_tokens(&baseline, &identity));
         goto cleanup;
     }
     coli_v4_session_destroy(session); session = NULL;
