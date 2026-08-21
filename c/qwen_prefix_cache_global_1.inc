@@ -15,8 +15,35 @@
 
 #define QWEN_PREFIX_DISK_ENGINE_ID UINT32_C(0x5157454e) /* QWEN */
 #define QWEN_PREFIX_DISK_STATE_ABI 2u
+#define QWEN_PREFIX_DISK_COMPUTE_ABI 1u
 #define QWEN_PREFIX_DISK_DEFAULT_GB 8u
 #define QWEN_PREFIX_DISK_PAYLOAD_VERSION 1u
+
+/* Persistent native sequence state is only reusable inside the same resolved
+ * expert-compute backend. The backend flags are defined by qwen_moe.c after
+ * this header is included; these tentative definitions let the cache boundary
+ * observe the resolved values without trusting the requested environment. If a
+ * GPU/Metal init fails, qwen_moe resets the corresponding flag to zero before
+ * any serving request can touch the prefix cache. */
+#define QWEN_PREFIX_BACKEND_CPU 1u
+#define QWEN_PREFIX_BACKEND_METAL 2u
+#define QWEN_PREFIX_BACKEND_CUDA_HIP 3u
+#ifdef COLI_CUDA
+static int g_cuda_compute;
+#endif
+#ifdef COLI_METAL
+static int g_metal_compute;
+#endif
+
+static inline uint32_t qwen_prefix_runtime_backend_id(void) {
+#ifdef COLI_CUDA
+    if (g_cuda_compute) return QWEN_PREFIX_BACKEND_CUDA_HIP;
+#endif
+#ifdef COLI_METAL
+    if (g_metal_compute) return QWEN_PREFIX_BACKEND_METAL;
+#endif
+    return QWEN_PREFIX_BACKEND_CPU;
+}
 
 typedef struct {
     uint32_t version;
