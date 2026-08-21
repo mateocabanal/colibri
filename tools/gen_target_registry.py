@@ -93,20 +93,11 @@ def rust_profile(name, p):
     ident = name.upper()
     return f'''pub const {ident}_ALLOWED_LAYOUTS: &[u16] = &[{allowed}];
 pub const {ident}: TargetProfileSpec = TargetProfileSpec {{
-    name: "{p["name"]}",
-    profile_id: {p["profile_id"]},
-    target_profile_abi: {p["target_profile_abi"]},
-    execution_layout_abi: {p["execution_layout_abi"]},
-    kernel_abi: {p["kernel_abi"]},
-    target_class: 0x{p["target_class"]:08x},
-    compiler_emission_supported: {str(p["compiler_emission_supported"]).lower()},
-    operating_system: "{p["operating_system"]}",
-    architecture: "{p["architecture"]}",
-    backend: "{p["backend"]}",
-    record_alignment: {p["record_alignment"]},
-    io_granularity: {p["io_granularity"]},
-    resident_alignment: {p["resident_alignment"]},
-    allowed_layouts: {ident}_ALLOWED_LAYOUTS,
+    name: "{p["name"]}", profile_id: {p["profile_id"]}, target_profile_abi: {p["target_profile_abi"]},
+    execution_layout_abi: {p["execution_layout_abi"]}, kernel_abi: {p["kernel_abi"]}, target_class: 0x{p["target_class"]:08x},
+    compiler_emission_supported: {str(p["compiler_emission_supported"]).lower()}, operating_system: "{p["operating_system"]}",
+    architecture: "{p["architecture"]}", backend: "{p["backend"]}", record_alignment: {p["record_alignment"]},
+    io_granularity: {p["io_granularity"]}, resident_alignment: {p["resident_alignment"]}, allowed_layouts: {ident}_ALLOWED_LAYOUTS,
 }};
 '''
 
@@ -122,28 +113,15 @@ def rust_text(profiles, layouts):
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TargetProfileSpec {{
-    pub name: &'static str,
-    pub profile_id: u32,
-    pub target_profile_abi: u32,
-    pub execution_layout_abi: u32,
-    pub kernel_abi: u32,
-    pub target_class: u32,
-    pub compiler_emission_supported: bool,
-    pub operating_system: &'static str,
-    pub architecture: &'static str,
-    pub backend: &'static str,
-    pub record_alignment: u64,
-    pub io_granularity: u64,
-    pub resident_alignment: u64,
-    pub allowed_layouts: &'static [u16],
+    pub name: &'static str, pub profile_id: u32, pub target_profile_abi: u32,
+    pub execution_layout_abi: u32, pub kernel_abi: u32, pub target_class: u32,
+    pub compiler_emission_supported: bool, pub operating_system: &'static str,
+    pub architecture: &'static str, pub backend: &'static str, pub record_alignment: u64,
+    pub io_granularity: u64, pub resident_alignment: u64, pub allowed_layouts: &'static [u16],
 }}
 
 {profile_defs}
-pub const PROFILES: &[TargetProfileSpec] = &[
-    PORTABLE_V1,
-    MACOS_ARM64_METAL_APPLE8_V1,
-    LINUX_X86_64_AVX2_V1,
-];
+pub const PROFILES: &[TargetProfileSpec] = &[PORTABLE_V1, MACOS_ARM64_METAL_APPLE8_V1, LINUX_X86_64_AVX2_V1];
 
 pub const APPLE8_PROFILE_NAME: &str = MACOS_ARM64_METAL_APPLE8_V1.name;
 pub const APPLE8_PROFILE_ID: u32 = MACOS_ARM64_METAL_APPLE8_V1.profile_id;
@@ -151,8 +129,7 @@ pub const APPLE8_TARGET_PROFILE_ABI: u32 = MACOS_ARM64_METAL_APPLE8_V1.target_pr
 pub const APPLE8_EXECUTION_LAYOUT_ABI: u32 = MACOS_ARM64_METAL_APPLE8_V1.execution_layout_abi;
 pub const APPLE8_KERNEL_ABI: u32 = MACOS_ARM64_METAL_APPLE8_V1.kernel_abi;
 pub const APPLE8_TARGET_CLASS: u32 = MACOS_ARM64_METAL_APPLE8_V1.target_class;
-pub const APPLE8_COMPILER_EMISSION_SUPPORTED: bool =
-    MACOS_ARM64_METAL_APPLE8_V1.compiler_emission_supported;
+pub const APPLE8_COMPILER_EMISSION_SUPPORTED: bool = MACOS_ARM64_METAL_APPLE8_V1.compiler_emission_supported;
 pub const APPLE8_MXFP4_TILE_LAYOUT: u16 = 0x{tile["id"]:04x};
 pub const APPLE8_MXFP4_MATH_FORMAT: u16 = 0x{tile["math_format"]:04x};
 pub const APPLE8_MXFP4_SCALE_FORMAT: u16 = 0x{tile["scale_format"]:04x};
@@ -167,17 +144,9 @@ pub const APPLE8_MXFP4_WEIGHT_BYTES: u64 = {weight_bytes};
 pub const APPLE8_MXFP4_SCALE_BYTES: u64 = {scale_bytes};
 pub const APPLE8_MXFP4_TILE_BYTES: u64 = {tile["tile_bytes"]};
 
-pub fn profile_by_name(name: &str) -> Option<&'static TargetProfileSpec> {{
-    PROFILES.iter().find(|p| p.name == name)
-}}
-
-pub fn layout_registered(layout: u16) -> bool {{
-    layout == 0 || layout == APPLE8_MXFP4_TILE_LAYOUT
-}}
-
-pub fn profile_allows_layout(profile: &TargetProfileSpec, layout: u16) -> bool {{
-    profile.allowed_layouts.contains(&layout)
-}}
+pub fn profile_by_name(name: &str) -> Option<&'static TargetProfileSpec> {{ PROFILES.iter().find(|p| p.name == name) }}
+pub fn layout_registered(layout: u16) -> bool {{ layout == 0 || layout == APPLE8_MXFP4_TILE_LAYOUT }}
+pub fn profile_allows_layout(profile: &TargetProfileSpec, layout: u16) -> bool {{ profile.allowed_layouts.contains(&layout) }}
 '''
 
 
