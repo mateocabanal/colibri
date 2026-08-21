@@ -2,14 +2,14 @@
 #define COLIBRI_QWEN_APPLE8_RANS_COMPAT_H
 
 /* Qwen-specific composition seam for the first Apple8+rANS runtime slice.
- * Included before qwen_moe.c by Makefile.qwen-rans-runtime so the large engine
- * stays untouched while the shared CSF/MXFP4 contracts are proven locally.
+ * Included before qwen_moe.c by Makefile.qwen-rans-runtime.
  *
  * - supplies the concrete native Apple8 runtime descriptor required by
  *   ColiExecutorOpenOptions;
+ * - redirects qwen's MXFP4 CPU calls to layout-auto wrappers;
  * - refuses canonical-only CUDA/Metal MXFP4 kernels for Apple8 sidecars, so
- *   qwen falls through to the layout-aware CPU path;
- * - does not enable MetalIO or introduce any storage-pipeline composition. */
+ *   qwen falls through to the CPU tile path;
+ * - does not enable MetalIO or introduce storage-pipeline composition. */
 
 #include <string.h>
 
@@ -47,25 +47,26 @@ static inline int qwen_coli_executor_open(
         const ColiExecutorOpenOptions *options,
         char *error, size_t error_size) {
     ColiExecutorOpenOptions local;
-    ColiRuntimeTarget apple8;
-    if (!options) {
+    if (!options)
         return coli_executor_open(out, package_path, options, error, error_size);
-    }
     local = *options;
 #if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
     if (!local.runtime_target && local.required_profile &&
         !strcmp(local.required_profile,
                 COLI_TARGET_PROFILE_MACOS_ARM64_METAL_APPLE8_V1)) {
+        ColiRuntimeTarget apple8;
         qwen_apple8_runtime_target(&apple8);
         local.runtime_target = &apple8;
+        return coli_executor_open(out, package_path, &local, error, error_size);
     }
 #endif
     return coli_executor_open(out, package_path, &local, error, error_size);
 }
 
-/* Define after qwen_coli_executor_open so its call above resolves the real
- * executor symbol rather than recursively expanding this composition macro. */
+/* Define after wrapper bodies so calls inside them resolve the real symbols. */
 #define coli_executor_open qwen_coli_executor_open
+#define coli_mxfp4_matmul coli_mxfp4_matmul_auto
+#define coli_mxfp4_swiglu_expert coli_mxfp4_swiglu_expert_auto
 
 #if defined(COLI_CUDA)
 static inline int qwen_cuda_expert_mlp_mxfp4(
