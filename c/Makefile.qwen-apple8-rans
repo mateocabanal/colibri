@@ -1,0 +1,24 @@
+CC ?= cc
+CFLAGS ?= -O2 -std=gnu11 -Wall -Wextra -Werror -Wno-unused-function
+EXE :=
+ifeq ($(OS),Windows_NT)
+EXE := .exe
+endif
+
+TEST := tests/test_mxfp4_apple8_detile$(EXE)
+
+.PHONY: check clean
+
+check: $(TEST)
+	./$(TEST)
+
+$(TEST): tests/test_mxfp4_apple8_detile.c mxfp4_expert.c mxfp4_expert.h \
+		qwen_coli_compat.h coli_executor.c coli_executor.h coli_format.c \
+		coli_format_base.c coli_format.h coli_target.c coli_target.h \
+		apple8_contract.h generated/coli_target_registry.h rans.h compat.h
+	$(CC) $(CFLAGS) tests/test_mxfp4_apple8_detile.c \
+		mxfp4_expert.c coli_executor.c coli_format.c coli_target.c \
+		-o $@ -pthread
+
+clean:
+	rm -f tests/test_mxfp4_apple8_detile tests/test_mxfp4_apple8_detile.exe
