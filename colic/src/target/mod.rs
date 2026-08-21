@@ -140,6 +140,7 @@ pub trait TargetBackend {
 
 include!("lowering_expert.rs");
 include!("lowering_tensor.rs");
+include!("lowering_apple8.rs");
 
 #[cfg(test)]
 mod tests;
