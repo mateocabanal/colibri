@@ -26,12 +26,11 @@ concurrency:
 
 jobs:
   linux-ssd-only-restart:
-    # PR1 freezes the Apple8 production profile before PR2 supplies its 0x0103
-    # lowerer. The old Linux SSD restart oracle compiled a canonical artifact
-    # while labelling it Apple8, which is now intentionally forbidden. Keep a
-    # fail-closed sentinel here; PR2 restores the package/restart lifecycle once
-    # the compiler can emit the frozen production layout.
-    name: Linux Apple8 emission refusal contract
+    # PR2 can emit the frozen Apple8 0x0103 layout from canonical MXFP4 source.
+    # The shared tiny V4 generator still produces FP8 routed experts, so exact
+    # mode must reject that source rather than silently quantize it. Compiler
+    # MXFP4 quantization remains an explicit --quant mxfp4 Qwen path.
+    name: Linux Apple8 exact-source contract
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -45,7 +44,7 @@ jobs:
         run: python -m pip install -r c/tools/requirements-deepseek-v4-tiny.txt
       - name: Generate tiny V4 source fixture
         run: python c/tools/make_deepseek_v4_tiny.py --output c/deepseek_v4_tiny --force
-      - name: Refuse false Apple8 exact-COLI emission until PR2
+      - name: Reject FP8 source in exact Apple8 mode
         run: |
           set +e
           output="$(cargo run --manifest-path colic/Cargo.toml -- \
@@ -57,6 +56,5 @@ jobs:
           set -e
           printf '%s\n' "$output"
           test "$rc" -ne 0
-          printf '%s\n' "$output" | grep -F 'production lowerer is not implemented'
-          printf '%s\n' "$output" | grep -F 'refusing to emit a row/canonical artifact under that profile'
+          printf '%s\n' "$output" | grep -F 'exact Apple8 lowering requires canonical MXFP4'
           test ! -e c/deepseek_v4_tiny.coli/manifest.coli
