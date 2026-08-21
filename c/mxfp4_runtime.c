@@ -19,10 +19,10 @@ void coli_mxfp4_runtime_tag_init(void *storage, uint16_t layout) {
     memcpy(storage, &tag, sizeof(tag));
 }
 
-uint16_t coli_mxfp4_runtime_layout(const uint8_t *scales_or_tag) {
+uint16_t coli_mxfp4_runtime_layout(const uint8_t *tag_storage) {
     ColiMxfp4RuntimeTag tag;
-    if (!scales_or_tag) return COLI_CSF_LAYOUT_CANONICAL;
-    memcpy(&tag, scales_or_tag, sizeof(tag));
+    if (!tag_storage) return COLI_CSF_LAYOUT_CANONICAL;
+    memcpy(&tag, tag_storage, sizeof(tag));
     if (tag.magic == COLI_MXFP4_RUNTIME_TAG_MAGIC &&
         tag.version == COLI_MXFP4_RUNTIME_TAG_VERSION &&
         tag.reserved == 0 &&
@@ -31,8 +31,8 @@ uint16_t coli_mxfp4_runtime_layout(const uint8_t *scales_or_tag) {
     return COLI_CSF_LAYOUT_CANONICAL;
 }
 
-int coli_mxfp4_runtime_is_apple8(const uint8_t *scales_or_tag) {
-    return coli_mxfp4_runtime_layout(scales_or_tag) ==
+int coli_mxfp4_runtime_is_apple8(const uint8_t *tag_storage) {
+    return coli_mxfp4_runtime_layout(tag_storage) ==
            COLI_LAYOUT_APPLE_MXFP4_TILE8X32_V1;
 }
 
@@ -99,16 +99,24 @@ int coli_mxfp4_matmul_layout(float *y, const float *x,
 }
 
 void coli_mxfp4_matmul(float *y, const float *x,
-                       const uint8_t *weights, const uint8_t *scales_or_tag,
+                       const uint8_t *weights, const uint8_t *scales,
                        int rows, int input_columns, int output_rows) {
+    if (coli_mxfp4_matmul_layout(y, x, weights, scales,
+                                 COLI_CSF_LAYOUT_CANONICAL,
+                                 rows, input_columns, output_rows) != 0 &&
+        y && rows > 0 && output_rows > 0)
+        memset(y, 0, (size_t)rows * (size_t)output_rows * sizeof(float));
+}
+
+void coli_mxfp4_matmul_auto(float *y, const float *x,
+                            const uint8_t *weights,
+                            const uint8_t *scales_or_tag,
+                            int rows, int input_columns, int output_rows) {
     const uint16_t layout = coli_mxfp4_runtime_layout(scales_or_tag);
     if (coli_mxfp4_matmul_layout(y, x, weights, scales_or_tag, layout,
-                                 rows, input_columns, output_rows) != 0) {
-        /* Historical API is void. Fail closed to deterministic zeroes instead
-         * of accidentally interpreting a target layout as canonical bytes. */
-        if (y && rows > 0 && output_rows > 0)
-            memset(y, 0, (size_t)rows * (size_t)output_rows * sizeof(float));
-    }
+                                 rows, input_columns, output_rows) != 0 &&
+        y && rows > 0 && output_rows > 0)
+        memset(y, 0, (size_t)rows * (size_t)output_rows * sizeof(float));
 }
 
 int coli_mxfp4_swiglu_expert_layout(float *output, const float *x,
@@ -153,29 +161,49 @@ int coli_mxfp4_swiglu_expert_layout(float *output, const float *x,
 
 void coli_mxfp4_swiglu_expert(float *output, const float *x,
                               const uint8_t *gate,
-                              const uint8_t *gate_scales_or_tag,
+                              const uint8_t *gate_scales,
                               const uint8_t *up,
-                              const uint8_t *up_scales_or_tag,
+                              const uint8_t *up_scales,
                               const uint8_t *down,
-                              const uint8_t *down_scales_or_tag,
+                              const uint8_t *down_scales,
                               int rows, int hidden, int intermediate,
                               float route_weight,
                               float *scratch_gate, float *scratch_up,
                               float *scratch_h, float *scratch_y) {
+    (void)coli_mxfp4_swiglu_expert_layout(output, x,
+                                           gate, gate_scales,
+                                           up, up_scales,
+                                           down, down_scales,
+                                           COLI_CSF_LAYOUT_CANONICAL,
+                                           rows, hidden, intermediate,
+                                           route_weight,
+                                           scratch_gate, scratch_up,
+                                           scratch_h, scratch_y);
+}
+
+void coli_mxfp4_swiglu_expert_auto(float *output, const float *x,
+                                   const uint8_t *gate,
+                                   const uint8_t *gate_scales_or_tag,
+                                   const uint8_t *up,
+                                   const uint8_t *up_scales_or_tag,
+                                   const uint8_t *down,
+                                   const uint8_t *down_scales_or_tag,
+                                   int rows, int hidden, int intermediate,
+                                   float route_weight,
+                                   float *scratch_gate, float *scratch_up,
+                                   float *scratch_h, float *scratch_y) {
     const uint16_t gate_layout = coli_mxfp4_runtime_layout(gate_scales_or_tag);
     const uint16_t up_layout = coli_mxfp4_runtime_layout(up_scales_or_tag);
     const uint16_t down_layout = coli_mxfp4_runtime_layout(down_scales_or_tag);
-    if (gate_layout != up_layout || gate_layout != down_layout ||
-        coli_mxfp4_swiglu_expert_layout(output, x,
-                                        gate, gate_scales_or_tag,
-                                        up, up_scales_or_tag,
-                                        down, down_scales_or_tag,
-                                        gate_layout,
-                                        rows, hidden, intermediate,
-                                        route_weight,
-                                        scratch_gate, scratch_up,
-                                        scratch_h, scratch_y) != 0) {
-        /* No silent reinterpretation on malformed/mixed layouts. */
+    if (gate_layout != up_layout || gate_layout != down_layout)
         return;
-    }
+    (void)coli_mxfp4_swiglu_expert_layout(output, x,
+                                           gate, gate_scales_or_tag,
+                                           up, up_scales_or_tag,
+                                           down, down_scales_or_tag,
+                                           gate_layout,
+                                           rows, hidden, intermediate,
+                                           route_weight,
+                                           scratch_gate, scratch_up,
+                                           scratch_h, scratch_y);
 }
