@@ -150,55 +150,36 @@ jobs:
           if-no-files-found: error
 
   v4-tiny-coli-macos:
-    # Compile the Linux-generated source fixture into the actual native Apple
-    # COLI profile, then exercise the package-only runtime and reusable expert
-    # slot generations on Apple Silicon. No torch/transformers install is needed
-    # on this runner because the source fixture crosses jobs as a tiny artifact.
-    name: macOS (native exact COLI V4 trace)
+    # PR1 freezes the native Apple8 contract before PR2 supplies the production
+    # 0x0103 lowerer. The previous lifecycle job would therefore create the very
+    # canonical/row artifact PR1 now forbids. Until PR2 lands, make native Apple
+    # compilation itself the fail-closed oracle; PR2 restores the physical and
+    # runtime lifecycle checks when the production lowerer exists.
+    name: macOS (Apple8 emission refusal contract)
     needs: v4-tiny
     runs-on: macos-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      - name: install libomp
-        run: brew install libomp
       - name: Download generated V4 fixture
         uses: actions/download-artifact@v4
         with:
           name: deepseek-v4-tiny-source
           path: c/deepseek_v4_tiny
-      - name: Compile native exact COLI package
+      - name: Refuse false native Apple8 exact-COLI emission until PR2
         run: |
-          cargo run --manifest-path colic/Cargo.toml -- \
+          set +e
+          output="$(cargo run --manifest-path colic/Cargo.toml -- \
             compile c/deepseek_v4_tiny \
             --target native --quant exact --codec none --opt default \
-            -o c/deepseek_v4_tiny.coli --verify
-      - name: Build detailed-trace V4 runtime
-        run: |
-          make -C c -f Makefile.deepseek-v4 deepseek-v4-clean
-          make -C c -f Makefile.deepseek-v4 V4_TRACE_EXEC=1 deepseek-v4
-      - name: Validate exact COLI physical/logical/execution lifecycle
-        run: |
-          python3 c/tests/test_v4_exact_coli_trace_tiny.py \
-            --binary c/deepseek_v4 --package c/deepseek_v4_tiny.coli
-      - name: Validate exact COLI prefix-cache A/B on Apple Silicon
-        run: |
-          make -C c -f Makefile.deepseek-v4 V4_TRACE_EXEC=1 deepseek-v4-prefix-cache-test
-          python3 - <<'PY'
-          import json
-          from pathlib import Path
-          package = Path('c/deepseek_v4_tiny.coli')
-          case = json.loads((package / 'ref.json').read_text(encoding='utf-8'))['cases']['short']
-          prompt = ''.join(f'<t{token:03d}>' for token in case['prompt_ids'])
-          Path('/tmp/v4-prefix-coli.txt').write_text(prompt, encoding='utf-8')
-          PY
-          python3 c/tools/benchmark_v4_prefix_cache.py \
-            --binary c/benchmark_v4_prefix_cache_sessions \
-            --model c/deepseek_v4_tiny.coli \
-            --prefix-file /tmp/v4-prefix-coli.txt \
-            --cache-mb 64 --min-prefix-tokens 1 \
-            --memory-gb 3 --context 128 --max-new 1 \
-            --trials 1 --timeout-sec 180 --repo .
+            -o c/deepseek_v4_tiny.coli --verify 2>&1)"
+          rc=$?
+          set -e
+          printf '%s\n' "$output"
+          test "$rc" -ne 0
+          printf '%s\n' "$output" | grep -F 'production lowerer is not implemented'
+          printf '%s\n' "$output" | grep -F 'refusing to emit a row/canonical artifact under that profile'
+          test ! -e c/deepseek_v4_tiny.coli/manifest.coli
 
   macos:
     # clang; libomp for the threaded path (Makefile falls back to
