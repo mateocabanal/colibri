@@ -142,5 +142,14 @@ include!("lowering_expert.rs");
 include!("lowering_tensor.rs");
 include!("lowering_apple8.rs");
 
+/// Test/reference seam used to compare the Rust production packer against the
+/// independently compiled C oracle. This does not participate in compilation.
+#[doc(hidden)]
+pub fn apple8_repack_reference_input(
+    matrix: &crate::quant::mxfp4::PackedMatrix,
+) -> Result<Vec<u8>> {
+    repack_apple8_matrix(matrix)
+}
+
 #[cfg(test)]
 mod tests;
