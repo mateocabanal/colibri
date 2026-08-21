@@ -1,0 +1,11 @@
+# Qwen Apple8+rANS composition build.
+#
+# Keep the main Makefile untouched while this runtime slice is proven locally.
+# The included Makefile owns all platform/CUDA/Metal/MetalIO detection; this
+# overlay only pre-includes the qwen-specific contract shim and adds it as a
+# rebuild dependency.
+include Makefile
+
+QMOE_CFLAGS += -include qwen_apple8_rans_compat.h
+
+qwen_moe$(EXE): qwen_apple8_rans_compat.h
