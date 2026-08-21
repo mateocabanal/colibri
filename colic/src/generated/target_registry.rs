@@ -51,8 +51,12 @@ pub const APPLE8_MXFP4_SCALE_FORMAT: u16 = 0x0004;
 pub const APPLE8_MXFP4_SCALE_BLOCK_ROWS: u32 = 1;
 pub const APPLE8_MXFP4_SCALE_BLOCK_COLUMNS: u32 = 32;
 pub const APPLE8_MXFP4_GROUP_SIZE: u32 = 0;
+pub const APPLE8_MXFP4_MATRIX_ALIGNMENT: u64 = 16;
 pub const APPLE8_MXFP4_TILE_ROWS: u64 = 8;
 pub const APPLE8_MXFP4_TILE_COLUMNS: u64 = 32;
+pub const APPLE8_MXFP4_WEIGHT_ROW_BYTES: u64 = 16;
+pub const APPLE8_MXFP4_WEIGHT_BYTES: u64 = 128;
+pub const APPLE8_MXFP4_SCALE_BYTES: u64 = 8;
 pub const APPLE8_MXFP4_TILE_BYTES: u64 = 136;
 
 pub fn profile_by_name(name: &str) -> Option<&'static TargetProfileSpec> { PROFILES.iter().find(|p| p.name == name) }
