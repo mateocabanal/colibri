@@ -16,9 +16,11 @@ static inline int coli_apple8_profile_is_v1(const char *profile) {
 }
 
 static inline int coli_apple8_target_contract_compatible(
-        const char *profile, uint32_t execution_layout_abi,
-        uint32_t kernel_abi, uint32_t target_class) {
+        const char *profile, uint32_t target_profile_abi,
+        uint32_t execution_layout_abi, uint32_t kernel_abi,
+        uint32_t target_class) {
     return coli_apple8_profile_is_v1(profile) &&
+        target_profile_abi == COLI_TARGET_PROFILE_ABI_APPLE8_V1 &&
         execution_layout_abi == COLI_EXECUTION_LAYOUT_ABI_APPLE8_V1 &&
         kernel_abi == COLI_KERNEL_ABI_APPLE8_MXFP4_TILE_V1 &&
         target_class == COLI_TARGET_CLASS_APPLE8_METAL_V1;
@@ -48,10 +50,11 @@ static inline int coli_apple8_matrix_descriptor_valid(
     uint64_t bytes;
     if (!m || coli_apple8_tile_matrix_bytes(m->rows, m->columns, &bytes)) return 0;
     if (m->layout != COLI_LAYOUT_APPLE_MXFP4_TILE8X32_V1 ||
-        m->math_format != COLI_CSF_MATH_MXFP4_E2M1 ||
-        m->scale_format != COLI_CSF_SCALE_UE8M0 ||
-        m->scale_block_rows != 1 || m->scale_block_columns != 32 ||
-        m->group_size != 0 ||
+        m->math_format != COLI_APPLE8_MXFP4_MATH_FORMAT ||
+        m->scale_format != COLI_APPLE8_MXFP4_SCALE_FORMAT ||
+        m->scale_block_rows != COLI_APPLE8_MXFP4_SCALE_BLOCK_ROWS ||
+        m->scale_block_columns != COLI_APPLE8_MXFP4_SCALE_BLOCK_COLUMNS ||
+        m->group_size != COLI_APPLE8_MXFP4_GROUP_SIZE ||
         m->weight_codec != COLI_CSF_CODEC_NONE ||
         m->weight_codec_table_id != 0 ||
         m->weight_offset == 0 || (m->weight_offset & 15u) != 0 ||
