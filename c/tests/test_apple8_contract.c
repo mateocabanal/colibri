@@ -90,7 +90,7 @@ static int test_descriptor(void) {
     m = good_matrix(9, 33); m.scale_offset = 1024; CHECK(!coli_apple8_matrix_descriptor_valid(&m, NULL));
     m = good_matrix(9, 33); m.scale_stored_bytes = 1; CHECK(!coli_apple8_matrix_descriptor_valid(&m, NULL));
     m = good_matrix(9, 33); m.scale_decoded_bytes = 1; CHECK(!coli_apple8_matrix_descriptor_valid(&m, NULL));
-    m = good_matrix(9, 33); m.scale_codec = COLI_CSF_CODEC_RANS256_G0; CHECK(!coli_apple8_matrix_descriptor_valid(&m, NULL));
+    m = good_matrix(9, 33); m.scale_codec = COLI_CSF_CODEC_RANS256_G0_NIBBLE; CHECK(!coli_apple8_matrix_descriptor_valid(&m, NULL));
     m = good_matrix(9, 33); m.scale_codec_table_id = 7; CHECK(!coli_apple8_matrix_descriptor_valid(&m, NULL));
     return 0;
 }
