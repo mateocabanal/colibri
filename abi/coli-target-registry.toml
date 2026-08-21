@@ -10,6 +10,7 @@ scale_format = 0x0004
 scale_block_rows = 1
 scale_block_columns = 32
 group_size = 0
+matrix_alignment = 16
 tile_rows = 8
 tile_columns = 32
 tile_bytes = 136
