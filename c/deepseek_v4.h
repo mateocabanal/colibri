@@ -134,6 +134,13 @@ typedef struct {
     int eos_stopped;
     double time_to_first_token_sec;
     double decode_sec;
+    /* Per-request Stage-1 prefix reuse telemetry. prefix_reused_tokens covers
+     * any exact live/RAM/SSD prefix accepted by the generation path. The RAM
+     * counters are deltas from the process-local snapshot cache only. */
+    int prefix_reused_tokens;
+    uint64_t prefix_ram_hits;
+    uint64_t prefix_ram_restore_bytes;
+    double prefix_ram_restore_sec;
     uint64_t speculative_drafted;
     uint64_t speculative_accepted;
 } ColiV4SessionGenerateStats;
