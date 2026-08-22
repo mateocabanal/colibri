@@ -31,9 +31,13 @@
         entry.bytes = expected;
         ok = qpc_restore_entry(&entry, view);
     }
+    /* Keep the public Qwen restore_bytes counter tier-neutral. RAM restore
+     * accounts the in-memory snapshot size in qpc_ram_restore; an SSD hit must
+     * account the same logical restored state rather than reporting zero. The
+     * shared disk store separately tracks physical read_bytes/write_bytes. */
+    if (ok) cache->restore_bytes += (uint64_t)expected;
     if (ok && cache->budget_bytes)
         qpc_ram_store(cache, view, tokens, matched);
     coli_prefix_disk_hit_free(&hit);
     return ok ? matched : 0;
 }
-

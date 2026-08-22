@@ -29,6 +29,11 @@ static inline ColiPrefixDiskCache *qwen_prefix_disk_cache(
                                    QWEN_PREFIX_DISK_STATE_ABI, model_fp,
                                    layout, log))
             return NULL;
+        if (log)
+            fprintf(stderr,
+                    "[QWEN-PREFIX] persistent_backend=%s compute_abi=%u\n",
+                    qwen_prefix_runtime_backend_name(),
+                    (unsigned)QWEN_PREFIX_DISK_COMPUTE_ABI);
         disk = fresh;
         current_key = key;
     }
