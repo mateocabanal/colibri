@@ -99,6 +99,19 @@ static int write_all(int fd, const uint8_t *p, size_t n) {
     return 1;
 }
 
+static int load_fixture_slot(int slot, int file,
+                             size_t gate_off, size_t gate_bytes,
+                             size_t up_off, size_t up_bytes,
+                             size_t down_off, size_t down_bytes) {
+    ColiMetalioRegion regions[3] = {
+        { file, (uint64_t)gate_off, gate_bytes, (uint64_t)gate_off },
+        { file, (uint64_t)up_off, up_bytes, (uint64_t)up_off },
+        { file, (uint64_t)down_off, down_bytes, (uint64_t)down_off },
+    };
+    int64_t ev = metalio_loadv(slot, regions, 3, MIO_LOAD_DEMAND);
+    return ev > 0 && metalio_wait(ev) == 0;
+}
+
 int main(void) {
     const int S = 3, H = 65, M = 17;
     const size_t x_count = (size_t)S * (size_t)H;
@@ -122,14 +135,15 @@ int main(void) {
     float *matmul_got = (float *)calloc(mid_count, sizeof(float));
     float *ref = (float *)calloc(y_count, sizeof(float));
     float *got = (float *)calloc(y_count, sizeof(float));
+    float *topk_got = (float *)calloc((size_t)H, sizeof(float));
 
-    int fd = -1, file = -1, slot = -1, metalio_started = 0;
+    int fd = -1, file = -1, slot = -1, slot2 = -1, metalio_started = 0;
     char path[] = "/tmp/colibri-apple8-metalio-XXXXXX";
 
     CHECK(gate && up && down && file_image && x && gate_ref && up_ref && mid_ref &&
-          matmul_got && ref && got, "fixture allocation failed");
+          matmul_got && ref && got && topk_got, "fixture allocation failed");
     if (!gate || !up || !down || !file_image || !x || !gate_ref || !up_ref ||
-        !mid_ref || !matmul_got || !ref || !got)
+        !mid_ref || !matmul_got || !ref || !got || !topk_got)
         goto cleanup;
 
     memcpy(file_image + gate_off, gate, gate_bytes);
@@ -150,20 +164,16 @@ int main(void) {
     file = metalio_file_add(path);
     CHECK(file >= 0, "metalio_file_add failed");
     slot = metalio_slot_alloc(file_bytes);
-    CHECK(slot >= 0, "metalio_slot_alloc failed");
-    if (file < 0 || slot < 0) goto cleanup;
+    slot2 = metalio_slot_alloc(file_bytes);
+    CHECK(slot >= 0 && slot2 >= 0, "metalio_slot_alloc failed");
+    if (file < 0 || slot < 0 || slot2 < 0) goto cleanup;
 
-    {
-        ColiMetalioRegion regions[3] = {
-            { file, (uint64_t)gate_off, gate_bytes, (uint64_t)gate_off },
-            { file, (uint64_t)up_off, up_bytes, (uint64_t)up_off },
-            { file, (uint64_t)down_off, down_bytes, (uint64_t)down_off },
-        };
-        int64_t ev = metalio_loadv(slot, regions, 3, MIO_LOAD_DEMAND);
-        CHECK(ev > 0, "metalio_loadv failed");
-        CHECK(ev > 0 && metalio_wait(ev) == 0, "metalio_wait failed");
-        if (ev <= 0) goto cleanup;
-    }
+    CHECK(load_fixture_slot(slot, file, gate_off, gate_bytes, up_off, up_bytes,
+                            down_off, down_bytes),
+          "first MetalIO fixture load failed");
+    CHECK(load_fixture_slot(slot2, file, gate_off, gate_bytes, up_off, up_bytes,
+                            down_off, down_bytes),
+          "second MetalIO fixture load failed");
 
     {
         const uint8_t *slot_bytes = (const uint8_t *)metalio_slot_ptr(slot);
@@ -211,10 +221,34 @@ int main(void) {
     }
 
     {
+        ColiApple8MetalioExpert experts[2] = {
+            { slot, gate_off, gate_bytes, up_off, up_bytes, down_off, down_bytes },
+            { slot2, gate_off, gate_bytes, up_off, up_bytes, down_off, down_bytes },
+        };
+        const float weights[2] = { 0.25f, 0.75f };
+        CHECK(coli_apple8_metalio_moe_topk(experts, weights, 2, x, topk_got, H, M),
+              "fused Apple8 top-k dispatch failed");
+        for (int h = 0; h < H; ++h) {
+            float tol = 5e-4f * (1.0f + fabsf(ref[h]));
+            CHECK(fabsf(topk_got[h] - ref[h]) <= tol,
+                  "topk[%d] got=%g ref=%g tol=%g", h, topk_got[h], ref[h], tol);
+        }
+        uint64_t encode = 0, submit = 0, wait = 0, kernel = 0, calls = 0, experts_done = 0;
+        coli_apple8_metalio_profile_get(&encode, &submit, &wait, &kernel,
+                                        &calls, &experts_done);
+        CHECK(calls >= 1 && experts_done >= 2,
+              "fused profile counters calls=%llu experts=%llu",
+              (unsigned long long)calls, (unsigned long long)experts_done);
+        CHECK(encode > 0 && wait > 0,
+              "direct profile timing did not advance (encode=%llu wait=%llu)",
+              (unsigned long long)encode, (unsigned long long)wait);
+    }
+
+    {
         ColiMetalioStats stats = {};
         metalio_stats(&stats);
-        uint64_t logical_bytes = (uint64_t)gate_bytes + (uint64_t)up_bytes + (uint64_t)down_bytes;
-        CHECK(stats.loads >= 1, "MetalIO load counter did not advance");
+        uint64_t logical_bytes = 2u * ((uint64_t)gate_bytes + (uint64_t)up_bytes + (uint64_t)down_bytes);
+        CHECK(stats.loads >= 2, "MetalIO load counter did not advance twice");
         CHECK(stats.bytes >= logical_bytes,
               "MetalIO byte counter %llu < payload %llu",
               (unsigned long long)stats.bytes,
@@ -225,11 +259,12 @@ cleanup:
     coli_apple8_metalio_direct_shutdown();
     if (fd >= 0) close(fd);
     if (slot >= 0) metalio_slot_free(slot);
+    if (slot2 >= 0) metalio_slot_free(slot2);
     if (metalio_started) metalio_shutdown();
     unlink(path);
     free(gate); free(up); free(down); free(file_image);
     free(x); free(gate_ref); free(up_ref); free(mid_ref);
-    free(matmul_got); free(ref); free(got);
+    free(matmul_got); free(ref); free(got); free(topk_got);
     if (failures) return 1;
     puts("APPLE8_METALIO_DIRECT PASS");
     return 0;
