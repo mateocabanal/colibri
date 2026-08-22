@@ -76,6 +76,8 @@
 #include "profile.h"
 #ifdef COLI_METALIO
 #include "metalio.h"
+#include "apple8_contract.h"
+#include "apple8_metalio_direct.h"
 #endif
 
 static double now_s(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec + t.tv_nsec*1e-9; }
@@ -286,12 +288,16 @@ typedef struct {
     int eid;                       /* -1 = slot in flight */
     int loading_eid;               /* expert id being loaded into this slot (-1 when idle) */
     int pinned;
-    int fmt;                       /* 0=f32, 16=BF16, 8=int8, 7=MXFP4, 4=i4-grouped, 5=int3-g64 */
+    int fmt;                       /* 0=f32, 16=BF16, 8=int8, 7=canonical MXFP4, 17=direct Apple8, 4=i4, 5=i3 */
     int mio;                       /* 1 = weight bytes live in a MetalIO shared buffer */
     int mio_slot;                  /* metalio slot id, -1 = not backed yet */
     int mio_resident;              /* 1 = current pointers point INTO the mio buffer */
     int64_t mio_event;             /* event value of the slot's latest load */
     int64_t mio_waited;            /* highest mio event already waited (pending if < mio_event) */
+    int apple8_direct;             /* raw Apple8 payload is executable in mio_slot */
+    size_t apple8_gate_off, apple8_gate_bytes;
+    size_t apple8_up_off, apple8_up_bytes;
+    size_t apple8_down_off, apple8_down_bytes;
     float *gu, *d;                 /* f32 snapshot: [2I,H] gate|up, [H,I] down */
     uint16_t *bgu, *bd;            /* exact COLI BF16: same logical layout */
     int8_t *g, *u, *dd;            /* q8: int8 blocks */
@@ -327,6 +333,9 @@ typedef struct {
     uint64_t prefetch_misses;      /* loads triggered by lookahead prefetch */
     uint64_t prof_expert_requests; /* logical routed expert applications */
     uint64_t prof_expert_loads;    /* physical expert loads from storage */
+    uint64_t prof_apple8_direct_blocks;
+    uint64_t prof_apple8_direct_experts;
+    uint64_t prof_apple8_direct_bytes;
     double t_attn, t_gdn, t_moe, t_expio, t_head; /* legacy PROF + generic profile sources */
     double dense_load_s;
     ColiExecutor *coli; /* COLLACOLI: non-NULL = COLI package backend */
@@ -362,6 +371,9 @@ enum {
     QPC_METAL_MOE_BLOCKS,
     QPC_METAL_MOE_FALLBACKS,
     QPC_METAL_MOE_EXPERTS,
+    QPC_APPLE8_DIRECT_BLOCKS,
+    QPC_APPLE8_DIRECT_EXPERTS,
+    QPC_APPLE8_DIRECT_BYTES,
     QPC_COUNT
 };
 static const ColiProfilePhaseDef qprof_phases[QPROF_COUNT] = {
@@ -392,6 +404,9 @@ static const ColiProfileCounterDef qprof_counters[QPC_COUNT] = {
     [QPC_METAL_MOE_BLOCKS] = {"metal_moe_blocks"},
     [QPC_METAL_MOE_FALLBACKS] = {"metal_moe_fallbacks"},
     [QPC_METAL_MOE_EXPERTS] = {"metal_moe_experts"},
+    [QPC_APPLE8_DIRECT_BLOCKS] = {"apple8_direct_blocks"},
+    [QPC_APPLE8_DIRECT_EXPERTS] = {"apple8_direct_experts"},
+    [QPC_APPLE8_DIRECT_BYTES] = {"apple8_direct_bytes"},
 };
 static ColiProfile g_qprof;
 
@@ -432,6 +447,9 @@ static void qprof_sync(Model *m) {
     coli_profile_counter_set(&g_qprof, QPC_CACHE_HITS, m->hits);
     coli_profile_counter_set(&g_qprof, QPC_CACHE_MISSES, m->miss);
     coli_profile_counter_set(&g_qprof, QPC_PREFETCH_MISSES, m->prefetch_misses);
+    coli_profile_counter_set(&g_qprof, QPC_APPLE8_DIRECT_BLOCKS, m->prof_apple8_direct_blocks);
+    coli_profile_counter_set(&g_qprof, QPC_APPLE8_DIRECT_EXPERTS, m->prof_apple8_direct_experts);
+    coli_profile_counter_set(&g_qprof, QPC_APPLE8_DIRECT_BYTES, m->prof_apple8_direct_bytes);
 #ifdef COLI_METAL
     uint64_t encode = 0, submit = 0, wait = 0, kernel = 0;
     coli_metal_profile_get(&encode, &submit, &wait, &kernel);
@@ -523,6 +541,43 @@ static int g_mio_fd[64], g_mio_fid[64], g_mio_n;
 static int mio_file_for(int fd){
     for (int i = 0; i < g_mio_n; i++) if (g_mio_fd[i] == fd) return g_mio_fid[i];
     return -1;
+}
+static int g_apple8_direct = 0;
+static const ColiPackage *g_coli_mio_pkg[64];
+static uint32_t g_coli_mio_shard[64];
+static int g_coli_mio_fid[64], g_coli_mio_n;
+
+static int qwen_coli_mio_file(const ColiPackage *pkg, uint32_t shard_id){
+    for (int i = 0; i < g_coli_mio_n; i++)
+        if (g_coli_mio_pkg[i] == pkg && g_coli_mio_shard[i] == shard_id)
+            return g_coli_mio_fid[i];
+    if (!pkg || g_coli_mio_n >= 64) return -1;
+    const char *path = coli_package_shard_path(pkg, shard_id);
+    if (!path) return -1;
+    int fid = metalio_file_add(path);
+    if (fid < 0) return -1;
+    g_coli_mio_pkg[g_coli_mio_n] = pkg;
+    g_coli_mio_shard[g_coli_mio_n] = shard_id;
+    g_coli_mio_fid[g_coli_mio_n] = fid;
+    g_coli_mio_n++;
+    return fid;
+}
+
+static int qwen_apple8_raw_matrix(const ColiExpertMatrixInfo *mi,
+                                  uint64_t rows, uint64_t cols,
+                                  size_t *bytes_out){
+    uint64_t bytes = 0;
+    if (!mi || mi->rows != rows || mi->columns != cols ||
+        !coli_apple8_matrix_descriptor_valid(mi, &bytes) ||
+        mi->weight_codec != COLI_CSF_CODEC_NONE || bytes > SIZE_MAX)
+        return 0;
+    if (bytes_out) *bytes_out = (size_t)bytes;
+    return 1;
+}
+
+static size_t qwen_align16(size_t n){
+    if (n > SIZE_MAX - 15u) return 0;
+    return (n + 15u) & ~(size_t)15u;
 }
 #endif
 
@@ -1013,6 +1068,75 @@ static void load_expert_coli(Model *m, int layer, int eid, Slot *s){
     if (gi < 0 || ui < 0 || di < 0) {
         fprintf(stderr, "qwen coli: expert (%d,%d) is missing gate/up/down roles\n", layer, eid); exit(1);
     }
+
+#ifdef COLI_METALIO
+    /* Raw Apple8 fast path: the compiler's target-native bytes land directly
+     * in the persistent MetalIO slot and remain in Apple8 tile order.  No
+     * canonical MXFP4 allocation, detile, or repack is performed.  rANS is
+     * deliberately excluded: compressed records still use the validated
+     * synchronous decode+detile fallback below. */
+    if (g_apple8_direct && g_metal_io && g_metal_compute && metalio_active()) {
+        const ColiExpertMatrixInfo *gm = &ei.matrices[gi];
+        const ColiExpertMatrixInfo *um = &ei.matrices[ui];
+        const ColiExpertMatrixInfo *dm = &ei.matrices[di];
+        size_t gb = 0, ub = 0, db = 0;
+        if (qwen_apple8_raw_matrix(gm, (uint64_t)cc->moe_inter, (uint64_t)cc->hidden, &gb) &&
+            qwen_apple8_raw_matrix(um, (uint64_t)cc->moe_inter, (uint64_t)cc->hidden, &ub) &&
+            qwen_apple8_raw_matrix(dm, (uint64_t)cc->hidden, (uint64_t)cc->moe_inter, &db)) {
+            const ColiPackage *pkg = coli_executor_package(m->coli);
+            int fid = qwen_coli_mio_file(pkg, erec->shard_id);
+            size_t uoff = qwen_align16(gb);
+            size_t gu_end = uoff && ub <= SIZE_MAX - uoff ? uoff + ub : 0;
+            size_t doff = gu_end ? qwen_align16(gu_end) : 0;
+            size_t total = doff && db <= SIZE_MAX - doff ? doff + db : 0;
+            if (fid >= 0 && total &&
+                gm->weight_offset <= UINT64_MAX - erec->payload_offset &&
+                um->weight_offset <= UINT64_MAX - erec->payload_offset &&
+                dm->weight_offset <= UINT64_MAX - erec->payload_offset) {
+                if (!s->mio) { s->mio = 1; s->mio_slot = -1; }
+                if (s->mio_slot >= 0 && metalio_slot_bytes(s->mio_slot) < total) {
+                    metalio_slot_free(s->mio_slot);
+                    s->mio_slot = -1;
+                }
+                if (s->mio_slot < 0) s->mio_slot = metalio_slot_alloc(total);
+                if (s->mio_slot >= 0) {
+                    ColiMetalioRegion regions[3] = {
+                        { fid, erec->payload_offset + gm->weight_offset, gb, 0 },
+                        { fid, erec->payload_offset + um->weight_offset, ub, uoff },
+                        { fid, erec->payload_offset + dm->weight_offset, db, doff },
+                    };
+                    int64_t ev = metalio_loadv(s->mio_slot, regions, 3,
+                                               g_mio_prefetching ? MIO_LOAD_SPEC
+                                             : g_mio_async_issue ? MIO_LOAD_ASYNC
+                                             : MIO_LOAD_DEMAND);
+                    if (ev > 0) {
+                        s->mio_event = ev;
+                        if (!g_mio_prefetching && !g_mio_async_issue) {
+                            if (metalio_wait(ev) == 0) s->mio_waited = ev;
+                            else ev = -1;
+                        }
+                        if (ev > 0) {
+                            s->fmt = 17;
+                            s->apple8_direct = 1;
+                            s->mio_resident = 1;
+                            s->apple8_gate_off = 0; s->apple8_gate_bytes = gb;
+                            s->apple8_up_off = uoff; s->apple8_up_bytes = ub;
+                            s->apple8_down_off = doff; s->apple8_down_bytes = db;
+                            s->pinned = 0;
+                            m->prof_apple8_direct_bytes += (uint64_t)gb + ub + db;
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    /* A slot can move from direct raw Apple8 back to the canonical fallback
+     * (for example a mixed/codec package). Keep its MetalIO allocation for
+     * future reuse but stop treating heap MXFP4 buffers as mio-resident. */
+    s->apple8_direct = 0;
+    if (s->fmt == 17) s->mio_resident = 0;
+#endif
 
     /* Keep MXFP4 compressed in the streamed cache. The generic loader validates
      * the compiler/runtime ABI and reads only the six executable E2M1/E8M0 spans. */
@@ -2262,18 +2386,42 @@ static void gdn_token(Model *m, Layer *l, int layer, const float *x, float *out)
  * speculative prefetch both publish with the load in flight). No-op when
  * the data is already waited, pread-loaded, or MetalIO is off. */
 static void expert_wait_ready(Model *m, Slot *s){
-    (void)m;
 #ifdef COLI_METALIO
     if (s->mio && s->mio_event > s->mio_waited) {
-        metalio_wait(s->mio_event);
-        s->mio_waited = s->mio_event;
+        double began = now_s();
+        if (metalio_wait(s->mio_event) == 0) {
+            m->t_expio += now_s() - began;
+            s->mio_waited = s->mio_event;
+        }
     }
+#else
+    (void)m; (void)s;
 #endif
 }
 
 /* one expert applied to one token, result written into acc (caller zeroes) */
 static void expert_apply(Model *m, Slot *s, const float *x, float *acc){
     Cfg *c = &m->c; int I = c->moe_inter, D = c->hidden;
+#ifdef COLI_METALIO
+    if (s->fmt == 17) {
+        float *y = falloc(D);
+        if (!s->apple8_direct ||
+            !coli_apple8_metalio_swiglu_slot(s->mio_slot,
+                s->apple8_gate_off, s->apple8_gate_bytes,
+                s->apple8_up_off, s->apple8_up_bytes,
+                s->apple8_down_off, s->apple8_down_bytes,
+                x, y, 1, D, I)) {
+            fprintf(stderr, "qwen: direct Apple8 mixed-format decode dispatch failed\n");
+            free(y);
+            exit(1);
+        }
+        for (int d = 0; d < D; d++) acc[d] += y[d];
+        free(y);
+        m->prof_apple8_direct_blocks++;
+        m->prof_apple8_direct_experts++;
+        return;
+    }
+#endif
     if (s->fmt == 7) {
 #ifdef COLI_CUDA
         if (g_cuda_compute && coli_cuda_expert_mlp_mxfp4(acc, x,
@@ -2391,6 +2539,38 @@ static void moe_token(Model *m, Layer *l, int layer, const float *x, float *out)
     float *w = malloc(size_mul_or_die((size_t)K, sizeof(float), "router top-k weights"));
     if (!w) { fprintf(stderr, "OOM router weights\n"); exit(1); }
     for (int i = 0; i < K; i++) w[i] = val[i] / wsum;
+
+    /* A Slot* returned by expert_get() is not leased: a later miss may LRU-
+     * reuse that same object. Gathering K pointers is therefore invalid when
+     * the resident cache cannot simultaneously hold all K routed experts.
+     * Apply each expert before asking expert_get() for the next one so no
+     * pointer can be invalidated underneath us. */
+    if (m->cache[layer].cap < K) {
+        static int warned_alias_safe = 0;
+        if (!warned_alias_safe) {
+            fprintf(stderr,
+                    "[QWEN-DECODE] resident cap=%d < topk=%d; using alias-safe sequential routed experts\n",
+                    m->cache[layer].cap, K);
+            warned_alias_safe = 1;
+        }
+        if (K <= 64) {
+            memcpy(m->last_route, idx, (size_t)K * sizeof(int));
+            m->last_route_k = K;
+        }
+        for (int i = 0; i < K; i++) {
+            Slot *s = NULL;
+            expert_get(m, layer, idx[i], &s);
+            expert_wait_ready(m, s);
+            float *y = calloc((size_t)D, sizeof(float));
+            if (!y) { fprintf(stderr, "OOM\n"); exit(1); }
+            expert_apply(m, s, x, y);
+            for (int d = 0; d < D; d++) acc[d] += y[d] * w[i];
+            free(y);
+        }
+        rt_route(layer, 0, idx, w, K);
+        goto routed_experts_done;
+    }
+
     /* Exact-demand async issue: the router has already produced the EXACT
      * top-k for this layer — issue all K misses WITHOUT waiting (MetalIO
      * path: loads stay pending; pread path is inherently synchronous), then
@@ -2419,6 +2599,29 @@ static void moe_token(Model *m, Layer *l, int layer, const float *x, float *out)
     if (g_metal_compute) {
         int fmt0 = slots[0]->fmt, unif = 1;
         for (int i = 1; i < K; i++) if (slots[i]->fmt != fmt0) { unif = 0; break; }
+#ifdef COLI_METALIO
+        if (unif && fmt0 == 17 && K <= 64) {
+            float *yd = falloc(D);
+            for (int i = 0; i < K; i++) {
+                Slot *s = slots[i];
+                expert_wait_ready(m, s);
+                if (!s->apple8_direct ||
+                    !coli_apple8_metalio_swiglu_slot(s->mio_slot,
+                        s->apple8_gate_off, s->apple8_gate_bytes,
+                        s->apple8_up_off, s->apple8_up_bytes,
+                        s->apple8_down_off, s->apple8_down_bytes,
+                        x, yd, 1, D, c->moe_inter)) {
+                    fprintf(stderr, "qwen: direct Apple8 decode dispatch failed\n");
+                    exit(1);
+                }
+                for (int d = 0; d < D; d++) acc[d] += yd[d] * w[i];
+                m->prof_apple8_direct_blocks++;
+                m->prof_apple8_direct_experts++;
+            }
+            free(yd);
+            gpu_ok = 1;
+        } else
+#endif
         if (unif && fmt0 == 7 && K <= 64) {
             for (int i = 0; i < K; i++) expert_wait_ready(m, slots[i]);
             const void *gp[64], *up[64], *dp[64];
@@ -2477,6 +2680,8 @@ static void moe_token(Model *m, Layer *l, int layer, const float *x, float *out)
     /* routing telemetry: counts (HOT/COLI_USAGE) + ROUTE_TRACE stream */
     rt_route(layer, 0, idx, w, K);
 
+routed_experts_done:
+    ;
     /* shared expert: silu(gate(x))*up(x) -> down; * sigmoid(se_g(x)) */
     float *sg = falloc(1);
     wt_mul(sg, x, &l->se_g, 1, 1, D);
@@ -2825,7 +3030,7 @@ static void moe_batch(Model *m, Layer *l, int layer, const float *xs, int C, flo
             double t0 = now_s();
 #ifdef COLI_METALIO
             if (pool) {
-                if (wb >= QWEN_ARENA_CAP) {
+                if (wb >= WAVE) {
                     /* this expert was already pipelined into the pool slot
                      * during the previous wave's apply loop — the data
                      * pointers live in pool[a] (set by that pipeline);
@@ -2856,6 +3061,21 @@ static void moe_batch(Model *m, Layer *l, int layer, const float *xs, int C, flo
                     memcpy(xscratch + (int64_t)st * D, xs + (int64_t)j * D, (size_t)D * sizeof(float));
                     st++;
                 }
+#ifdef COLI_METALIO
+            if (s->fmt == 17) {
+                if (!s->apple8_direct ||
+                    !coli_apple8_metalio_swiglu_slot(s->mio_slot,
+                        s->apple8_gate_off, s->apple8_gate_bytes,
+                        s->apple8_up_off, s->apple8_up_bytes,
+                        s->apple8_down_off, s->apple8_down_bytes,
+                        xscratch, yscratch, st, D, I)) {
+                    fprintf(stderr, "qwen: direct Apple8 batched-prefill dispatch failed\n");
+                    exit(1);
+                }
+                m->prof_apple8_direct_blocks++;
+                m->prof_apple8_direct_experts++;
+            } else
+#endif
             if (s->fmt == 7) {
 #ifdef COLI_CUDA
                 if (g_cuda_compute && coli_cuda_expert_mlp_mxfp4(yscratch, xscratch,
@@ -2927,12 +3147,13 @@ qwen_mxfp4_batch_done:
              * next wave's expert into it NOW, so its I/O overlaps the
              * remaining applies of this wave. */
 #ifdef COLI_METALIO
-            if (pool && wb + QWEN_ARENA_CAP < nuniq) {
-                /* pipeline the next wave's expert into the SAME buffer right
-                 * after the apply finished reading it; persist the full
-                 * descriptor so the next wave's skip path finds the
-                 * pointers + mio_resident state. */
-                int ne = uniq[wb + QWEN_ARENA_CAP + a];
+            int next_i = wb + WAVE + a;
+            if (pool && next_i < nuniq) {
+                /* Pipeline only when THIS physical slot has a corresponding
+                 * expert in the next wave. A partial final wave has fewer
+                 * experts than the current wave, so a wave-level existence
+                 * check is insufficient and would read uniq[] out of bounds. */
+                int ne = uniq[next_i];
                 Slot tmp; memset(&tmp, 0, sizeof(tmp));
                 tmp.mio = 1; tmp.mio_slot = s->mio_slot;
                 double t0 = now_s();
@@ -3917,7 +4138,7 @@ int main(int argc, char **argv){
     g_expert_drop = getenv("EXPERT_DROP") ? atoi(getenv("EXPERT_DROP")) : 1;
     g_prefetch = getenv("QWEN_PREFETCH") ? atoi(getenv("QWEN_PREFETCH")) : 0;
     g_prefetch_pipe = getenv("QWEN_PREFETCH_PIPE") ? atoi(getenv("QWEN_PREFETCH_PIPE")) : 0;
-    g_chunk = getenv("QWENMOE_CHUNK") ? atoi(getenv("QWENMOE_CHUNK")) : 64;
+    g_chunk = getenv("QWENMOE_CHUNK") ? atoi(getenv("QWENMOE_CHUNK")) : 48;
     if (g_chunk < 1) g_chunk = 1;
     if (g_chunk > QWEN_CHUNK_MAX) g_chunk = QWEN_CHUNK_MAX;
     g_kv_f16 = getenv("QWEN_KV_F16") ? atoi(getenv("QWEN_KV_F16")) : 1;
@@ -3993,7 +4214,7 @@ int main(int argc, char **argv){
      * kernels stay the default and the fallback). Init must happen AFTER
      * the Qwen model is parsed (backend_metal resolves expert slabs lazily)
      * but before any expert load allocates/registers slabs. */
-    g_metal_compute = getenv("QWEN_METAL_COMPUTE") ? atoi(getenv("QWEN_METAL_COMPUTE")) : 0;
+    g_metal_compute = getenv("QWEN_METAL_COMPUTE") ? atoi(getenv("QWEN_METAL_COMPUTE")) : 1;
     if (g_metal_compute && !coli_metal_init()) {
         fprintf(stderr, "qwen_moe: Metal unavailable — QWEN_METAL_COMPUTE=1 ignored (CPU MoE)\n");
         g_metal_compute = 0;
@@ -4004,7 +4225,7 @@ int main(int argc, char **argv){
      * cache slots get a persistent shared-storage MTLBuffer each (lazily
      * allocated on first use). Any failure disables the path — pread stays
      * the fallback. */
-    g_metal_io = getenv("QWEN_METAL_IO") ? atoi(getenv("QWEN_METAL_IO")) : 0;
+    g_metal_io = getenv("QWEN_METAL_IO") ? atoi(getenv("QWEN_METAL_IO")) : 1;
     if (g_metal_io) {
         if (metalio_init()) {
             metalio_verbose(getenv("QWEN_METAL_IO_VERBOSE") ? 1 : 0);
@@ -4012,7 +4233,7 @@ int main(int argc, char **argv){
                 int fid = metalio_file_add(m.S.paths[fi]);
                 if (fid >= 0) { g_mio_fd[g_mio_n] = m.S.fds[fi]; g_mio_fid[g_mio_n] = fid; g_mio_n++; }
             }
-            if (g_mio_n == 0) { metalio_shutdown(); g_metal_io = 0; }
+            if (g_mio_n == 0 && !coli_mode) { metalio_shutdown(); g_metal_io = 0; }
         } else {
             g_metal_io = 0;
         }
@@ -4022,7 +4243,17 @@ int main(int argc, char **argv){
                     m.cache[li].slots[si].mio = 1;
                     m.cache[li].slots[si].mio_slot = -1;
                 }
-            fprintf(stderr, "[metalio] expert streaming via MTLIO active (%d shards)\n", g_mio_n);
+            fprintf(stderr, "[metalio] expert streaming via MTLIO active (%d snapshot shards; COLI shards lazy)\n", g_mio_n);
+        }
+    }
+    g_apple8_direct = getenv("QWEN_APPLE8_DIRECT") ? atoi(getenv("QWEN_APPLE8_DIRECT")) : 1;
+    if (g_apple8_direct) {
+        if (!(g_metal_io && g_metal_compute && metalio_active()) ||
+            !coli_apple8_metalio_direct_init()) {
+            fprintf(stderr, "[QWEN-APPLE8] direct path unavailable; using canonical fallback\n");
+            g_apple8_direct = 0;
+        } else {
+            fprintf(stderr, "[QWEN-APPLE8] direct raw Apple8 + MetalIO execution enabled\n");
         }
     }
 #endif
@@ -4037,6 +4268,7 @@ int main(int argc, char **argv){
     save_usage(&m, snap);
 #ifdef COLI_METALIO
     if (g_metal_io) {
+        if (g_apple8_direct) coli_apple8_metalio_direct_shutdown();
         ColiMetalioStats st;
         metalio_stats(&st);
         fprintf(stderr, "[metalio] loads=%llu bytes=%llu waits=%llu fails=%llu "

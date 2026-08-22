@@ -185,6 +185,8 @@ const char *coli_package_profile(const ColiPackage *package);
 const char *coli_package_compiler(const ColiPackage *package);
 const uint8_t *coli_package_source_fingerprint(const ColiPackage *package);
 uint32_t coli_package_record_alignment(const ColiPackage *package);
+/* Package-owned absolute shard path for backend-native async I/O. */
+const char *coli_package_shard_path(const ColiPackage *package, uint32_t shard_id);
 
 enum {
     COLI_CSF_READ_DEFAULT = 0,
