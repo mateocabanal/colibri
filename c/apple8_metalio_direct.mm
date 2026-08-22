@@ -218,6 +218,9 @@ inline float qwen_bf16(device const ushort *p, long i) {
     return as_type<float>((uint)p[i] << 16);
 }
 
+/* Match matmul_bf16 exactly in accumulation order: one GPU thread owns one
+ * output row and visits input columns 0..D-1 monotonically.  Do not replace
+ * this with simd_sum/tree reduction; close logits make that reordering visible. */
 kernel void qwen_gdn_input_bf16(
     device const ushort *wqkv [[buffer(0)]],
     device const ushort *wz   [[buffer(1)]],
@@ -232,11 +235,10 @@ kernel void qwen_gdn_input_bf16(
     constant int &C           [[buffer(10)]],
     constant int &vdim        [[buffer(11)]],
     constant int &vheads      [[buffer(12)]],
-    uint row                  [[threadgroup_position_in_grid]],
-    uint lane                 [[thread_index_in_simdgroup]])
+    uint row                  [[threadgroup_position_in_grid]])
 {
     const uint total = (uint)(C + vdim + 2 * vheads);
-    if (row >= total || lane >= 32) return;
+    if (row >= total) return;
     device const ushort *w = wqkv;
     device float *dst = qkv;
     int o = (int)row;
@@ -252,12 +254,11 @@ kernel void qwen_gdn_input_bf16(
             }
         }
     }
-    float part = 0.0f;
+    float acc = 0.0f;
     const long base = (long)o * D;
-    for (int i = (int)lane; i < D; i += 32)
-        part += x[i] * qwen_bf16(w, base + i);
-    const float acc = simd_sum(part);
-    if (lane == 0) dst[o] = acc;
+    for (int i = 0; i < D; ++i)
+        acc += x[i] * qwen_bf16(w, base + i);
+    dst[o] = acc;
 }
 
 kernel void qwen_gdn_conv(
@@ -364,22 +365,21 @@ kernel void qwen_gdn_recur_norm(
     normed[(long)h * vd + d] = norm_w[d] * (outv * sc[4]) * silu_z;
 }
 
+/* Same rule for the output projection: preserve CPU column order exactly. */
 kernel void qwen_gdn_output_bf16(
     device const ushort *w       [[buffer(0)]],
     device const float *x        [[buffer(1)]],
     device float *out            [[buffer(2)]],
     constant int &I              [[buffer(3)]],
     constant int &O              [[buffer(4)]],
-    uint o                       [[threadgroup_position_in_grid]],
-    uint lane                    [[thread_index_in_simdgroup]])
+    uint o                       [[threadgroup_position_in_grid]])
 {
-    if (o >= (uint)O || lane >= 32) return;
-    float part = 0.0f;
+    if (o >= (uint)O) return;
+    float acc = 0.0f;
     const long base = (long)o * I;
-    for (int i = (int)lane; i < I; i += 32)
-        part += x[i] * qwen_bf16(w, base + i);
-    const float acc = simd_sum(part);
-    if (lane == 0) out[o] = acc;
+    for (int i = 0; i < I; ++i)
+        acc += x[i] * qwen_bf16(w, base + i);
+    out[o] = acc;
 }
 )METAL";
 
@@ -591,7 +591,7 @@ extern "C" int coli_apple8_metalio_gdn_token(
     [inp setBytes:&vdim length:sizeof(vdim) atIndex:11];
     [inp setBytes:&vheads length:sizeof(vheads) atIndex:12];
     [inp dispatchThreadgroups:MTLSizeMake((NSUInteger)C + (NSUInteger)vdim + 2u * (NSUInteger)vheads, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
     [inp endEncoding];
 
     id<MTLComputeCommandEncoder> conv = [cb computeCommandEncoder];
@@ -641,7 +641,7 @@ extern "C" int coli_apple8_metalio_gdn_token(
     [op setBytes:&vdim length:sizeof(vdim) atIndex:3];
     [op setBytes:&D length:sizeof(D) atIndex:4];
     [op dispatchThreadgroups:MTLSizeMake((NSUInteger)D, 1, 1)
-           threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+           threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
     [op endEncoding];
 
     const uint64_t encode_ns = direct_now_ns() - encode_begin;
