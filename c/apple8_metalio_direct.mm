@@ -214,13 +214,17 @@ static const char *QWEN_GDN_SHADER = R"METAL(
 #include <metal_stdlib>
 using namespace metal;
 
+constant uint QWEN_GDN_ROWS_PER_TG = 8u;
+constant uint QWEN_GDN_DOT_LANES = 32u;
+constant uint QWEN_GDN_DOT_THREADS = QWEN_GDN_ROWS_PER_TG * QWEN_GDN_DOT_LANES;
+
 inline float qwen_bf16(device const ushort *p, long i) {
     return as_type<float>((uint)p[i] << 16);
 }
 
-/* Deterministic two-stage BF16 row dot. Stage 1 assigns each of 32 threads a
- * contiguous input interval and accumulates that interval in ascending index
- * order. Stage 2 is thread 0 combining partials strictly lane 0..31. */
+/* Deterministic two-stage BF16 row dots packed eight rows per 256-thread
+ * threadgroup. Each logical lane keeps the exact old contiguous ascending
+ * input slice; lane 0 still combines the 32 partials strictly 0..31. */
 kernel void qwen_gdn_input_bf16(
     device const ushort *wqkv [[buffer(0)]],
     device const ushort *wz   [[buffer(1)]],
@@ -235,53 +239,57 @@ kernel void qwen_gdn_input_bf16(
     constant int &C           [[buffer(10)]],
     constant int &vdim        [[buffer(11)]],
     constant int &vheads      [[buffer(12)]],
-    uint row                  [[threadgroup_position_in_grid]],
-    uint lane                 [[thread_index_in_threadgroup]])
+    uint tg                   [[threadgroup_position_in_grid]],
+    uint tid                  [[thread_index_in_threadgroup]])
 {
+    threadgroup float partial[QWEN_GDN_DOT_THREADS];
+    const uint row_slot = tid / QWEN_GDN_DOT_LANES;
+    const uint lane = tid - row_slot * QWEN_GDN_DOT_LANES;
+    const uint row = tg * QWEN_GDN_ROWS_PER_TG + row_slot;
     const uint total = (uint)(C + vdim + 2 * vheads);
-    if (row >= total) return;
-    threadgroup float partial[32];
+
     device const ushort *w = wqkv;
     device float *dst = qkv;
-    int o = (int)row;
-    if (o >= C) {
-        o -= C;
-        w = wz; dst = z;
-        if (o >= vdim) {
-            o -= vdim;
-            w = wa; dst = a;
-            if (o >= vheads) {
-                o -= vheads;
-                w = wb; dst = b;
+    int o = 0;
+    float acc = 0.0f;
+    if (row < total) {
+        o = (int)row;
+        if (o >= C) {
+            o -= C;
+            w = wz; dst = z;
+            if (o >= vdim) {
+                o -= vdim;
+                w = wa; dst = a;
+                if (o >= vheads) {
+                    o -= vheads;
+                    w = wb; dst = b;
+                }
             }
         }
+        const int span = (D + 31) / 32;
+        const int begin = (int)lane * span;
+        const int end = min(begin + span, D);
+        const long base = (long)o * D;
+        for (int i = begin; i < end; ++i)
+            acc += x[i] * qwen_bf16(w, base + i);
     }
-    const int span = (D + 31) / 32;
-    const int begin = (int)lane * span;
-    const int end = min(begin + span, D);
-    const long base = (long)o * D;
-    float acc = 0.0f;
-    for (int i = begin; i < end; ++i)
-        acc += x[i] * qwen_bf16(w, base + i);
-    partial[lane] = acc;
+    partial[tid] = acc;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lane == 0) {
+    if (row < total && lane == 0) {
         float sum = 0.0f;
-        for (int p = 0; p < 32; ++p) sum += partial[p];
+        const uint pb = row_slot * QWEN_GDN_DOT_LANES;
+        for (uint p = 0; p < QWEN_GDN_DOT_LANES; ++p) sum += partial[pb + p];
         dst[o] = sum;
     }
 }
 
-kernel void qwen_gdn_conv(
-    device const float *qkv       [[buffer(0)]],
-    device const float *weights   [[buffer(1)]],
-    device float *conv_state      [[buffer(2)]],
-    device float *y               [[buffer(3)]],
-    constant int &C               [[buffer(4)]],
-    constant int &kk              [[buffer(5)]],
-    uint ch                        [[thread_position_in_grid]])
+inline float qwen_gdn_conv_one(
+    device const float *qkv,
+    device const float *weights,
+    device float *conv_state,
+    int ch,
+    int kk)
 {
-    if (ch >= (uint)C) return;
     float acc = 0.0f;
     if (kk > 1) {
         const long sb = (long)ch * (kk - 1);
@@ -296,118 +304,166 @@ kernel void qwen_gdn_conv(
     } else {
         acc = weights[ch] * qkv[ch];
     }
-    y[ch] = acc / (1.0f + exp(-acc));
+    return acc / (1.0f + exp(-acc));
 }
 
-kernel void qwen_gdn_recur_norm(
-    device const float *y         [[buffer(0)]],
-    device const float *a         [[buffer(1)]],
-    device const float *b         [[buffer(2)]],
-    device const float *z         [[buffer(3)]],
-    device const float *A_log     [[buffer(4)]],
-    device const float *dt_bias   [[buffer(5)]],
-    device const float *norm_w    [[buffer(6)]],
-    device float *state           [[buffer(7)]],
-    device float *normed          [[buffer(8)]],
-    constant int &kheads          [[buffer(9)]],
-    constant int &kd              [[buffer(10)]],
-    constant int &vheads          [[buffer(11)]],
-    constant int &vd              [[buffer(12)]],
-    constant float &eps           [[buffer(13)]],
-    threadgroup float *head_out   [[threadgroup(0)]],
-    uint h                         [[threadgroup_position_in_grid]],
-    uint d                         [[thread_index_in_threadgroup]])
+/* Fuse causal convolution into the recurrent kernel. One threadgroup owns one
+ * key head and all of its replicated value heads, so every q/k/v convolution
+ * channel is advanced exactly once without a cross-threadgroup state race.
+ * q/k RMS sums, recurrence loops, and per-head RMS combine all retain the old
+ * ascending scalar order. */
+kernel void qwen_gdn_conv_recur_norm(
+    device const float *qkv       [[buffer(0)]],
+    device const float *conv_w    [[buffer(1)]],
+    device float *conv_state      [[buffer(2)]],
+    device const float *a         [[buffer(3)]],
+    device const float *b         [[buffer(4)]],
+    device const float *z         [[buffer(5)]],
+    device const float *A_log     [[buffer(6)]],
+    device const float *dt_bias   [[buffer(7)]],
+    device const float *norm_w    [[buffer(8)]],
+    device float *state           [[buffer(9)]],
+    device float *normed          [[buffer(10)]],
+    constant int &kheads          [[buffer(11)]],
+    constant int &kd              [[buffer(12)]],
+    constant int &vheads          [[buffer(13)]],
+    constant int &vd              [[buffer(14)]],
+    constant int &kk              [[buffer(15)]],
+    constant float &eps           [[buffer(16)]],
+    threadgroup float *scratch    [[threadgroup(0)]],
+    uint kh_u                     [[threadgroup_position_in_grid]],
+    uint t                        [[thread_index_in_threadgroup]])
 {
-    if (h >= (uint)vheads || d >= (uint)vd) return;
-    threadgroup float sc[6];
+    const int kh = (int)kh_u;
     const int rep = vheads / kheads;
-    const int kh = (int)h / rep;
+    const int threads = rep * vd;
+    const int local_head = (int)t / vd;
+    const int d = (int)t - local_head * vd;
+    const int h = kh * rep + local_head;
     const int kdim = kheads * kd;
-    const long qb = (long)kh * kd;
-    const long kb = (long)kdim + qb;
-    const long vb = (long)2 * kdim + (long)h * vd;
-    if (d == 0) {
+
+    threadgroup float *qv = scratch;
+    threadgroup float *kv = qv + kd;
+    threadgroup float *head_out = kv + kd;
+    threadgroup float *norm_inv = head_out + rep * vd;
+    threadgroup float *common = norm_inv + rep;
+    threadgroup float *decay = common + 3;
+    threadgroup float *beta = decay + rep;
+
+    for (int qi = (int)t; qi < 2 * kd; qi += threads) {
+        if (qi < kd) {
+            const int ch = kh * kd + qi;
+            qv[qi] = qwen_gdn_conv_one(qkv, conv_w, conv_state, ch, kk);
+        } else {
+            const int i = qi - kd;
+            const int ch = kdim + kh * kd + i;
+            kv[i] = qwen_gdn_conv_one(qkv, conv_w, conv_state, ch, kk);
+        }
+    }
+
+    const int vch = 2 * kdim + h * vd + d;
+    const float vv = qwen_gdn_conv_one(qkv, conv_w, conv_state, vch, kk);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (t == 0) {
         float qs = 0.0f, ks = 0.0f;
         for (int i = 0; i < kd; ++i) {
-            const float qv = y[qb + i];
-            const float kv = y[kb + i];
-            qs += qv * qv;
-            ks += kv * kv;
+            const float q = qv[i];
+            const float k = kv[i];
+            qs += q * q;
+            ks += k * k;
         }
-        sc[0] = 1.0f / sqrt(qs + 1.0e-6f);
-        sc[1] = 1.0f / sqrt(ks + 1.0e-6f);
+        common[0] = 1.0f / sqrt(qs + 1.0e-6f);
+        common[1] = 1.0f / sqrt(ks + 1.0e-6f);
+        common[2] = 1.0f / sqrt((float)kd);
+    }
+    if (d == 0) {
         const float ga = -exp(A_log[h]) * log(1.0f + exp(a[h] + dt_bias[h]));
-        sc[2] = exp(ga);
-        sc[3] = 1.0f / (1.0f + exp(-b[h]));
-        sc[5] = 1.0f / sqrt((float)kd);
+        decay[local_head] = exp(ga);
+        beta[local_head] = 1.0f / (1.0f + exp(-b[h]));
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    float kv_mem = 0.0f;
+
+    const float qinv = common[0];
+    const float kinv = common[1];
+    const float qscale = common[2];
+    const float decay_h = decay[local_head];
+    const float beta_h = beta[local_head];
     const long hs = (long)h * kd * vd;
+    float kv_mem = 0.0f;
     for (int kk2 = 0; kk2 < kd; ++kk2) {
-        const float khh = y[kb + kk2] * sc[1];
+        const float khh = kv[kk2] * kinv;
         const long si = hs + (long)kk2 * vd + d;
-        const float s = state[si] * sc[2];
+        const float s = state[si] * decay_h;
         state[si] = s;
         kv_mem += s * khh;
     }
-    const float delta = (y[vb + d] - kv_mem) * sc[3];
+    const float delta = (vv - kv_mem) * beta_h;
     for (int kk2 = 0; kk2 < kd; ++kk2) {
-        const float khh = y[kb + kk2] * sc[1];
+        const float khh = kv[kk2] * kinv;
         const long si = hs + (long)kk2 * vd + d;
         state[si] += khh * delta;
     }
     float outv = 0.0f;
     for (int kk2 = 0; kk2 < kd; ++kk2) {
-        const float qhh = (y[qb + kk2] * sc[0]) * sc[5];
+        const float qhh = (qv[kk2] * qinv) * qscale;
         const long si = hs + (long)kk2 * vd + d;
         outv += state[si] * qhh;
     }
-    head_out[d] = outv;
+    head_out[local_head * vd + d] = outv;
     threadgroup_barrier(mem_flags::mem_threadgroup);
+
     if (d == 0) {
         float ms = 0.0f;
-        for (int i = 0; i < vd; ++i) ms += head_out[i] * head_out[i];
-        sc[4] = 1.0f / sqrt(ms / (float)vd + eps);
+        const int hb = local_head * vd;
+        for (int i = 0; i < vd; ++i) {
+            const float ov = head_out[hb + i];
+            ms += ov * ov;
+        }
+        norm_inv[local_head] = 1.0f / sqrt(ms / (float)vd + eps);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+
     const float zv = z[(long)h * vd + d];
     const float silu_z = zv / (1.0f + exp(-zv));
-    normed[(long)h * vd + d] = norm_w[d] * (outv * sc[4]) * silu_z;
+    normed[(long)h * vd + d] = norm_w[d] * (outv * norm_inv[local_head]) * silu_z;
 }
 
-/* Deterministic two-stage output projection with the same contiguous-slice /
- * fixed-lane combine contract as qwen_gdn_input_bf16. */
+/* Same deterministic packed-row projection as the input side. */
 kernel void qwen_gdn_output_bf16(
     device const ushort *w       [[buffer(0)]],
     device const float *x        [[buffer(1)]],
     device float *out            [[buffer(2)]],
     constant int &I              [[buffer(3)]],
     constant int &O              [[buffer(4)]],
-    uint o                       [[threadgroup_position_in_grid]],
-    uint lane                    [[thread_index_in_threadgroup]])
+    uint tg                      [[threadgroup_position_in_grid]],
+    uint tid                     [[thread_index_in_threadgroup]])
 {
-    if (o >= (uint)O) return;
-    threadgroup float partial[32];
-    const int span = (I + 31) / 32;
-    const int begin = (int)lane * span;
-    const int end = min(begin + span, I);
-    const long base = (long)o * I;
+    threadgroup float partial[QWEN_GDN_DOT_THREADS];
+    const uint row_slot = tid / QWEN_GDN_DOT_LANES;
+    const uint lane = tid - row_slot * QWEN_GDN_DOT_LANES;
+    const uint o = tg * QWEN_GDN_ROWS_PER_TG + row_slot;
     float acc = 0.0f;
-    for (int i = begin; i < end; ++i)
-        acc += x[i] * qwen_bf16(w, base + i);
-    partial[lane] = acc;
+    if (o < (uint)O) {
+        const int span = (I + 31) / 32;
+        const int begin = (int)lane * span;
+        const int end = min(begin + span, I);
+        const long base = (long)o * I;
+        for (int i = begin; i < end; ++i)
+            acc += x[i] * qwen_bf16(w, base + i);
+    }
+    partial[tid] = acc;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lane == 0) {
+    if (o < (uint)O && lane == 0) {
         float sum = 0.0f;
-        for (int p = 0; p < 32; ++p) sum += partial[p];
+        const uint pb = row_slot * QWEN_GDN_DOT_LANES;
+        for (uint p = 0; p < QWEN_GDN_DOT_LANES; ++p) sum += partial[pb + p];
         out[o] = sum;
     }
 }
 )METAL";
 
 static id<MTLComputePipelineState> g_gdn_input_pipeline = nil;
-static id<MTLComputePipelineState> g_gdn_conv_pipeline = nil;
 static id<MTLComputePipelineState> g_gdn_recur_pipeline = nil;
 static id<MTLComputePipelineState> g_gdn_output_pipeline = nil;
 
@@ -416,7 +472,7 @@ struct QwenGdnMetalLayer {
     id<MTLBuffer> A_log = nil, dt_bias = nil, conv_w = nil, norm_w = nil;
     id<MTLBuffer> state = nil, conv_state = nil;
     id<MTLBuffer> xb = nil, outb = nil;
-    id<MTLBuffer> qkv = nil, z = nil, a = nil, b = nil, conv_y = nil, normed = nil;
+    id<MTLBuffer> qkv = nil, z = nil, a = nil, b = nil, normed = nil;
     int D = 0, kheads = 0, kd = 0, vheads = 0, vd = 0, kk = 0;
 };
 static std::vector<QwenGdnMetalLayer *> g_gdn_layers;
@@ -436,8 +492,7 @@ static id<MTLBuffer> qwen_gdn_wrap_nocopy_locked(const void *ptr, size_t bytes) 
 }
 
 static int qwen_gdn_init_locked(void) {
-    if (g_gdn_input_pipeline && g_gdn_conv_pipeline &&
-        g_gdn_recur_pipeline && g_gdn_output_pipeline)
+    if (g_gdn_input_pipeline && g_gdn_recur_pipeline && g_gdn_output_pipeline)
         return 1;
     if (!g_device || !g_queue) return 0;
     NSError *error = nil;
@@ -449,15 +504,12 @@ static int qwen_gdn_init_locked(void) {
         return 0;
     }
     g_gdn_input_pipeline = make_pipeline(library, @"qwen_gdn_input_bf16", &error);
-    g_gdn_conv_pipeline = make_pipeline(library, @"qwen_gdn_conv", &error);
-    g_gdn_recur_pipeline = make_pipeline(library, @"qwen_gdn_recur_norm", &error);
+    g_gdn_recur_pipeline = make_pipeline(library, @"qwen_gdn_conv_recur_norm", &error);
     g_gdn_output_pipeline = make_pipeline(library, @"qwen_gdn_output_bf16", &error);
-    if (!g_gdn_input_pipeline || !g_gdn_conv_pipeline ||
-        !g_gdn_recur_pipeline || !g_gdn_output_pipeline) {
+    if (!g_gdn_input_pipeline || !g_gdn_recur_pipeline || !g_gdn_output_pipeline) {
         fprintf(stderr, "[qwen-gdn-metal] pipeline creation failed: %s\n",
                 error ? error.localizedDescription.UTF8String : "missing function");
         g_gdn_input_pipeline = nil;
-        g_gdn_conv_pipeline = nil;
         g_gdn_recur_pipeline = nil;
         g_gdn_output_pipeline = nil;
         return 0;
@@ -469,7 +521,6 @@ static void qwen_gdn_clear_locked(void) {
     for (QwenGdnMetalLayer *ctx : g_gdn_layers) delete ctx;
     g_gdn_layers.clear();
     g_gdn_input_pipeline = nil;
-    g_gdn_conv_pipeline = nil;
     g_gdn_recur_pipeline = nil;
     g_gdn_output_pipeline = nil;
 }
@@ -497,7 +548,18 @@ static QwenGdnMetalLayer *qwen_gdn_layer_locked(
         !conv_w || !norm_w || !state || (kk > 1 && !conv_state))
         return nullptr;
     if (!qwen_gdn_init_locked()) return nullptr;
-    if ((NSUInteger)vd > g_gdn_recur_pipeline.maxTotalThreadsPerThreadgroup) return nullptr;
+
+    const int rep = vheads / kheads;
+    const size_t recur_threads = (size_t)rep * (size_t)vd;
+    const size_t scratch_floats = 2u * (size_t)kd + recur_threads +
+                                  3u * (size_t)rep + 3u;
+    if (g_gdn_input_pipeline.maxTotalThreadsPerThreadgroup < 256 ||
+        g_gdn_output_pipeline.maxTotalThreadsPerThreadgroup < 256 ||
+        recur_threads > (size_t)g_gdn_recur_pipeline.maxTotalThreadsPerThreadgroup ||
+        scratch_floats > SIZE_MAX / sizeof(float) ||
+        scratch_floats * sizeof(float) > (size_t)g_device.maxThreadgroupMemoryLength)
+        return nullptr;
+
     if ((size_t)layer >= g_gdn_layers.size())
         g_gdn_layers.resize((size_t)layer + 1, nullptr);
     if (g_gdn_layers[(size_t)layer]) return g_gdn_layers[(size_t)layer];
@@ -557,14 +619,12 @@ static QwenGdnMetalLayer *qwen_gdn_layer_locked(
                                     options:MTLResourceStorageModePrivate];
     ctx->b = [g_device newBufferWithLength:(size_t)vheads * sizeof(float)
                                     options:MTLResourceStorageModePrivate];
-    ctx->conv_y = [g_device newBufferWithLength:C * sizeof(float)
-                                         options:MTLResourceStorageModePrivate];
     ctx->normed = [g_device newBufferWithLength:vdim * sizeof(float)
                                          options:MTLResourceStorageModePrivate];
     if (!ctx->wqkv || !ctx->wz || !ctx->wa || !ctx->wb || !ctx->wout ||
         !ctx->A_log || !ctx->dt_bias || !ctx->conv_w || !ctx->norm_w ||
         !ctx->state || !ctx->conv_state || !ctx->xb || !ctx->outb ||
-        !ctx->qkv || !ctx->z || !ctx->a || !ctx->b || !ctx->conv_y || !ctx->normed) {
+        !ctx->qkv || !ctx->z || !ctx->a || !ctx->b || !ctx->normed) {
         delete ctx;
         return nullptr;
     }
@@ -591,6 +651,10 @@ extern "C" int coli_apple8_metalio_gdn_token(
     const int kdim = kheads * kd;
     const int vdim = vheads * vd;
     const int C = 2 * kdim + vdim;
+    const int rep = vheads / kheads;
+    const NSUInteger recur_threads = (NSUInteger)rep * (NSUInteger)vd;
+    const NSUInteger scratch_floats = 2u * (NSUInteger)kd + recur_threads +
+                                      3u * (NSUInteger)rep + 3u;
     memcpy(ctx->xb.contents, x, (size_t)D * sizeof(float));
 
     uint64_t encode_begin = direct_now_ns();
@@ -613,46 +677,35 @@ extern "C" int coli_apple8_metalio_gdn_token(
     [inp setBytes:&C length:sizeof(C) atIndex:10];
     [inp setBytes:&vdim length:sizeof(vdim) atIndex:11];
     [inp setBytes:&vheads length:sizeof(vheads) atIndex:12];
-    [inp dispatchThreadgroups:MTLSizeMake((NSUInteger)C + (NSUInteger)vdim + 2u * (NSUInteger)vheads, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    const NSUInteger input_rows = (NSUInteger)C + (NSUInteger)vdim +
+                                  2u * (NSUInteger)vheads;
+    [inp dispatchThreadgroups:MTLSizeMake((input_rows + 7u) / 8u, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     [inp endEncoding];
-
-    id<MTLComputeCommandEncoder> conv = [cb computeCommandEncoder];
-    if (!conv) return 0;
-    [conv setComputePipelineState:g_gdn_conv_pipeline];
-    [conv setBuffer:ctx->qkv offset:0 atIndex:0];
-    [conv setBuffer:ctx->conv_w offset:0 atIndex:1];
-    [conv setBuffer:ctx->conv_state offset:0 atIndex:2];
-    [conv setBuffer:ctx->conv_y offset:0 atIndex:3];
-    [conv setBytes:&C length:sizeof(C) atIndex:4];
-    [conv setBytes:&kk length:sizeof(kk) atIndex:5];
-    NSUInteger conv_threads = g_gdn_conv_pipeline.maxTotalThreadsPerThreadgroup;
-    if (conv_threads > 256) conv_threads = 256;
-    if (conv_threads < 1) return 0;
-    [conv dispatchThreadgroups:MTLSizeMake(((NSUInteger)C + conv_threads - 1) / conv_threads, 1, 1)
-             threadsPerThreadgroup:MTLSizeMake(conv_threads, 1, 1)];
-    [conv endEncoding];
 
     id<MTLComputeCommandEncoder> rec = [cb computeCommandEncoder];
     if (!rec) return 0;
     [rec setComputePipelineState:g_gdn_recur_pipeline];
-    [rec setBuffer:ctx->conv_y offset:0 atIndex:0];
-    [rec setBuffer:ctx->a offset:0 atIndex:1];
-    [rec setBuffer:ctx->b offset:0 atIndex:2];
-    [rec setBuffer:ctx->z offset:0 atIndex:3];
-    [rec setBuffer:ctx->A_log offset:0 atIndex:4];
-    [rec setBuffer:ctx->dt_bias offset:0 atIndex:5];
-    [rec setBuffer:ctx->norm_w offset:0 atIndex:6];
-    [rec setBuffer:ctx->state offset:0 atIndex:7];
-    [rec setBuffer:ctx->normed offset:0 atIndex:8];
-    [rec setBytes:&kheads length:sizeof(kheads) atIndex:9];
-    [rec setBytes:&kd length:sizeof(kd) atIndex:10];
-    [rec setBytes:&vheads length:sizeof(vheads) atIndex:11];
-    [rec setBytes:&vd length:sizeof(vd) atIndex:12];
-    [rec setBytes:&eps length:sizeof(eps) atIndex:13];
-    [rec setThreadgroupMemoryLength:(NSUInteger)vd * sizeof(float) atIndex:0];
-    [rec dispatchThreadgroups:MTLSizeMake((NSUInteger)vheads, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake((NSUInteger)vd, 1, 1)];
+    [rec setBuffer:ctx->qkv offset:0 atIndex:0];
+    [rec setBuffer:ctx->conv_w offset:0 atIndex:1];
+    [rec setBuffer:ctx->conv_state offset:0 atIndex:2];
+    [rec setBuffer:ctx->a offset:0 atIndex:3];
+    [rec setBuffer:ctx->b offset:0 atIndex:4];
+    [rec setBuffer:ctx->z offset:0 atIndex:5];
+    [rec setBuffer:ctx->A_log offset:0 atIndex:6];
+    [rec setBuffer:ctx->dt_bias offset:0 atIndex:7];
+    [rec setBuffer:ctx->norm_w offset:0 atIndex:8];
+    [rec setBuffer:ctx->state offset:0 atIndex:9];
+    [rec setBuffer:ctx->normed offset:0 atIndex:10];
+    [rec setBytes:&kheads length:sizeof(kheads) atIndex:11];
+    [rec setBytes:&kd length:sizeof(kd) atIndex:12];
+    [rec setBytes:&vheads length:sizeof(vheads) atIndex:13];
+    [rec setBytes:&vd length:sizeof(vd) atIndex:14];
+    [rec setBytes:&kk length:sizeof(kk) atIndex:15];
+    [rec setBytes:&eps length:sizeof(eps) atIndex:16];
+    [rec setThreadgroupMemoryLength:scratch_floats * sizeof(float) atIndex:0];
+    [rec dispatchThreadgroups:MTLSizeMake((NSUInteger)kheads, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(recur_threads, 1, 1)];
     [rec endEncoding];
 
     id<MTLComputeCommandEncoder> op = [cb computeCommandEncoder];
@@ -663,8 +716,8 @@ extern "C" int coli_apple8_metalio_gdn_token(
     [op setBuffer:ctx->outb offset:0 atIndex:2];
     [op setBytes:&vdim length:sizeof(vdim) atIndex:3];
     [op setBytes:&D length:sizeof(D) atIndex:4];
-    [op dispatchThreadgroups:MTLSizeMake((NSUInteger)D, 1, 1)
-           threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    [op dispatchThreadgroups:MTLSizeMake(((NSUInteger)D + 7u) / 8u, 1, 1)
+           threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     [op endEncoding];
 
     const uint64_t encode_ns = direct_now_ns() - encode_begin;
