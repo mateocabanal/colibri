@@ -4,6 +4,16 @@ MODEL ?=
 LAYER ?= 0
 EXPERT ?= 0
 
+# The objects below are built by the main Makefile and may contain OpenMP
+# regions when Homebrew libomp is installed. Mirror the main Makefile's Darwin
+# detection so this standalone C++/Metal parity executable resolves __kmpc_*.
+OMPDIR := $(shell brew --prefix libomp 2>/dev/null)
+ifneq ($(and $(OMPDIR),$(wildcard $(OMPDIR)/include/omp.h),$(wildcard $(OMPDIR)/lib/libomp.*)),)
+OMPL := -L$(OMPDIR)/lib -Wl,-rpath,$(OMPDIR)/lib -lomp
+else
+OMPL :=
+endif
+
 .PHONY: all check clean
 
 all:
@@ -11,7 +21,7 @@ all:
 	$(CXX) -O2 -std=c++17 -Wall -Wextra -Werror -fobjc-arc \
 		tests/apple8_real_expert_parity.mm \
 		qwen_coli_format.o mxfp4_expert.o mxfp4_runtime.o metalio.o apple8_metalio_direct.o \
-		-o $(TARGET) -framework Foundation -framework Metal
+		-o $(TARGET) -framework Foundation -framework Metal $(OMPL)
 
 check: all
 	@test -n "$(MODEL)" || { echo "usage: make -f Makefile.apple8-real-parity check MODEL=/path/to/Apple8.raw.coli [LAYER=0 EXPERT=0]" >&2; exit 2; }
