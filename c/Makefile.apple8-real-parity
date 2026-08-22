@@ -1,0 +1,21 @@
+CXX ?= clang++
+TARGET := tests/apple8_real_expert_parity
+MODEL ?=
+LAYER ?= 0
+EXPERT ?= 0
+
+.PHONY: all check clean
+
+all:
+	$(MAKE) -f Makefile METAL=1 qwen_coli_format.o mxfp4_expert.o mxfp4_runtime.o metalio.o apple8_metalio_direct.o
+	$(CXX) -O2 -std=c++17 -Wall -Wextra -Werror -fobjc-arc \
+		tests/apple8_real_expert_parity.mm \
+		qwen_coli_format.o mxfp4_expert.o mxfp4_runtime.o metalio.o apple8_metalio_direct.o \
+		-o $(TARGET) -framework Foundation -framework Metal
+
+check: all
+	@test -n "$(MODEL)" || { echo "usage: make -f Makefile.apple8-real-parity check MODEL=/path/to/Apple8.raw.coli [LAYER=0 EXPERT=0]" >&2; exit 2; }
+	./$(TARGET) "$(MODEL)" "$(LAYER)" "$(EXPERT)"
+
+clean:
+	rm -f $(TARGET)
