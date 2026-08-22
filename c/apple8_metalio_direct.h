@@ -2,6 +2,7 @@
 #define COLIBRI_APPLE8_METALIO_DIRECT_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -51,6 +52,41 @@ int coli_apple8_metalio_swiglu_slot(int slot,
                                     int S,
                                     int hidden,
                                     int intermediate);
+
+typedef struct ColiApple8MetalioExpert {
+    int slot;
+    size_t gate_offset, gate_bytes;
+    size_t up_offset, up_bytes;
+    size_t down_offset, down_bytes;
+} ColiApple8MetalioExpert;
+
+/*
+ * Decode-only fused routed layer. For K experts this submits exactly one Metal
+ * command buffer containing three ordered stages:
+ *
+ *   1. all K gate+up projections + SwiGLU
+ *   2. all K down projections
+ *   3. deterministic K-order weighted reduction
+ *
+ * The host waits once after the reduction. `route_weights` are consumed in
+ * caller order, matching Qwen's top-k accumulation order. K is limited to 64.
+ */
+int coli_apple8_metalio_moe_topk(const ColiApple8MetalioExpert *experts,
+                                 const float *route_weights,
+                                 int expert_count,
+                                 const float *x,
+                                 float *y,
+                                 int hidden,
+                                 int intermediate);
+
+/* Direct-path profiling uses nanoseconds, matching backend_metal's profiler.
+ * The counters are process-local and reset when direct_init creates pipelines. */
+void coli_apple8_metalio_profile_get(uint64_t *encode_ns,
+                                     uint64_t *submit_ns,
+                                     uint64_t *wait_ns,
+                                     uint64_t *kernel_ns,
+                                     uint64_t *fused_calls,
+                                     uint64_t *fused_experts);
 
 #ifdef __cplusplus
 }

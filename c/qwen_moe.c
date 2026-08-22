@@ -1,3 +1,115 @@
+/* Milestone B Metal GDN wiring.
+ *
+ * These narrowly-scoped definition interceptors add only the storage and
+ * decode seams needed by the Metal Gated DeltaNet path while leaving the
+ * verified Milestone-A engine body unchanged. Each macro pops itself at the
+ * intercepted definition, so later call sites use the wrapper normally.
+ */
+#if defined(__APPLE__) && defined(COLI_METALIO)
+
+/* GDN recurrent/conv state must back a page-rounded no-copy Shared MTLBuffer.
+ * Only allocations whose diagnostic label begins with "GDN " are changed;
+ * every other calloc_checked caller retains the Milestone-A allocator. */
+#pragma push_macro("calloc_checked")
+#define calloc_checked(A,B,C) \
+    calloc_checked_reference(A,B,C); \
+    static void *calloc_checked(size_t qn, size_t qs, const char *qw){ \
+        if (!qw || strncmp(qw, "GDN ", 4) != 0) \
+            return calloc_checked_reference(qn, qs, qw); \
+        size_t qb = size_mul_or_die(qn, qs, qw); \
+        if (qb > SIZE_MAX - 16383u) { \
+            fprintf(stderr, "%s: UMA allocation size overflow (%zu bytes)\n", qw, qb); \
+            exit(1); \
+        } \
+        size_t qa = (qb + 16383u) & ~(size_t)16383u; \
+        void *qp = NULL; \
+        if (qa && posix_memalign(&qp, 16384, qa) == 0 && qp) { \
+            memset(qp, 0, qa); \
+            return qp; \
+        } \
+        return calloc_checked_reference(qn, qs, qw); \
+    } \
+    _Pragma("pop_macro(\"calloc_checked\")") \
+    static void *calloc_checked_reference(A,B,C)
+
+/* Exact COLI BF16 GDN matrices are resident for the lifetime of the model.
+ * Re-home only linear_attn matrices into 16 KiB-aligned, page-rounded storage
+ * so Metal can wrap them zero-copy. If aligned allocation fails the original
+ * pointer is retained; the Metal entry point declines pre-submit and the CPU
+ * reference runs. */
+#pragma push_macro("coli_wt")
+#define coli_wt(A,B,C,D) \
+    coli_wt_reference(A,B,C,D); \
+    static WT coli_wt(Model *qm, const char *qcn, int64_t qO, int64_t qI){ \
+        WT qw = coli_wt_reference(qm, qcn, qO, qI); \
+        if (qw.bf16 && qcn && strstr(qcn, "linear_attn.")) { \
+            size_t qn = size_mul_or_die((size_t)qO, (size_t)qI, qcn); \
+            size_t qb = size_mul_or_die(qn, sizeof(uint16_t), qcn); \
+            if (qb <= SIZE_MAX - 16383u) { \
+                size_t qa = (qb + 16383u) & ~(size_t)16383u; \
+                void *qp = NULL; \
+                if (qa && posix_memalign(&qp, 16384, qa) == 0 && qp) { \
+                    memcpy(qp, qw.bf16, qb); \
+                    free(qw.bf16); \
+                    qw.bf16 = (uint16_t *)qp; \
+                } \
+            } \
+        } \
+        return qw; \
+    } \
+    _Pragma("pop_macro(\"coli_wt\")") \
+    static WT coli_wt_reference(A,B,C,D)
+
+/* Decode-only wrapper around the CPU GDN reference. QWEN_GDN_METAL defaults
+ * on exactly when the direct Apple8 path is active. Zero means the backend
+ * declined before submit and CPU fallback is safe; a post-submit failure is
+ * fatal because recurrent state may already have changed. */
+#pragma push_macro("gdn_token")
+#define gdn_token(A,B,C,D,E) \
+    gdn_token_reference(A,B,C,D,E); \
+    extern int coli_apple8_metalio_gdn_token( \
+        int layer, const float *x, float *out, \
+        const uint16_t *wqkv, const uint16_t *wz, \
+        const uint16_t *wa, const uint16_t *wb, const uint16_t *wout, \
+        const float *A_log, const float *dt_bias, \
+        const float *conv_w, const float *norm_w, \
+        float *state, float *conv_state, \
+        int D, int kheads, int kd, int vheads, int vd, int kk, float eps); \
+    static int qwen_gdn_metal_enabled(void){ \
+        static int qi = 0, qe = 1; \
+        if (!qi) { \
+            const char *qv = getenv("QWEN_GDN_METAL"); \
+            if (qv && qv[0] && strcmp(qv, "0") == 0) qe = 0; \
+            qi = 1; \
+        } \
+        return g_apple8_direct && qe; \
+    } \
+    static void gdn_token(Model *qm, Layer *ql, int qlayer, const float *qx, float *qout){ \
+        Cfg *qc = &qm->c; \
+        if (qwen_gdn_metal_enabled() && \
+            ql->in_qkv.bf16 && ql->in_z.bf16 && ql->in_a.bf16 && \
+            ql->in_b.bf16 && ql->gdn_out.bf16) { \
+            int qr = coli_apple8_metalio_gdn_token( \
+                qlayer, qx, qout, \
+                ql->in_qkv.bf16, ql->in_z.bf16, ql->in_a.bf16, \
+                ql->in_b.bf16, ql->gdn_out.bf16, \
+                ql->A_log, ql->dt_bias, ql->conv1d, ql->gdn_norm, \
+                qm->gdn_S[qlayer], qm->gdn_conv[qlayer], \
+                qc->hidden, qc->lin_k_heads, qc->lin_k_dim, \
+                qc->lin_v_heads, qc->lin_v_dim, qc->conv_kernel, qc->eps); \
+            if (qr > 0) return; \
+            if (qr < 0) { \
+                fprintf(stderr, "qwen: Metal GDN decode failed after submission\n"); \
+                exit(1); \
+            } \
+        } \
+        gdn_token_reference(qm, ql, qlayer, qx, qout); \
+    } \
+    _Pragma("pop_macro(\"gdn_token\")") \
+    static void gdn_token_reference(A,B,C,D,E)
+
+#endif /* __APPLE__ && COLI_METALIO */
+
 /* qwen_moe.c — Qwen3.5 / Qwen3.6 / Qwen3.7 MoE inference engine (CPU, C11).
  *
  * Architecture (from transformers Qwen3_5MoeForCausalLM, verified against the
@@ -453,6 +565,16 @@ static void qprof_sync(Model *m) {
 #ifdef COLI_METAL
     uint64_t encode = 0, submit = 0, wait = 0, kernel = 0;
     coli_metal_profile_get(&encode, &submit, &wait, &kernel);
+#ifdef COLI_METALIO
+    {
+        uint64_t de = 0, ds = 0, dw = 0, dk = 0;
+        coli_apple8_metalio_profile_get(&de, &ds, &dw, &dk, NULL, NULL);
+        encode += de;
+        submit += ds;
+        wait += dw;
+        kernel += dk;
+    }
+#endif
     coli_profile_phase_set(&g_qprof, QPROF_METAL_ENCODE, encode);
     coli_profile_phase_set(&g_qprof, QPROF_METAL_SUBMIT, submit);
     coli_profile_phase_set(&g_qprof, QPROF_METAL_WAIT, wait);
@@ -543,6 +665,22 @@ static int mio_file_for(int fd){
     return -1;
 }
 static int g_apple8_direct = 0;
+/* Decode-only split-phase Apple8 entry points. The public synchronous helper
+ * remains intact for prefill and for QWEN_APPLE8_OVERLAP=0 A/B runs. */
+extern int coli_apple8_metalio_moe_topk_begin(
+    const ColiApple8MetalioExpert *experts, const float *route_weights,
+    int expert_count, const float *x, int hidden, int intermediate,
+    void **pending_out);
+extern int coli_apple8_metalio_moe_topk_finish(void *pending, float *y);
+static int qwen_apple8_overlap_enabled(void){
+    static int initialized = 0, enabled = 1;
+    if (!initialized) {
+        const char *v = getenv("QWEN_APPLE8_OVERLAP");
+        if (v && v[0] && strcmp(v, "0") == 0) enabled = 0;
+        initialized = 1;
+    }
+    return enabled;
+}
 static const ColiPackage *g_coli_mio_pkg[64];
 static uint32_t g_coli_mio_shard[64];
 static int g_coli_mio_fid[64], g_coli_mio_n;
@@ -2539,6 +2677,12 @@ static void moe_token(Model *m, Layer *l, int layer, const float *x, float *out)
     float *w = malloc(size_mul_or_die((size_t)K, sizeof(float), "router top-k weights"));
     if (!w) { fprintf(stderr, "OOM router weights\n"); exit(1); }
     for (int i = 0; i < K; i++) w[i] = val[i] / wsum;
+#ifdef COLI_METALIO
+    /* A pending routed-MoE command may overlap only work that does not consume
+     * its output. Adjacent layers depend on this layer residual, but the
+     * same-layer shared expert is independent until the final sum. */
+    void *apple8_pending = NULL;
+#endif
 
     /* A Slot* returned by expert_get() is not leased: a later miss may LRU-
      * reuse that same object. Gathering K pointers is therefore invalid when
@@ -2601,24 +2745,63 @@ static void moe_token(Model *m, Layer *l, int layer, const float *x, float *out)
         for (int i = 1; i < K; i++) if (slots[i]->fmt != fmt0) { unif = 0; break; }
 #ifdef COLI_METALIO
         if (unif && fmt0 == 17 && K <= 64) {
-            float *yd = falloc(D);
-            for (int i = 0; i < K; i++) {
-                Slot *s = slots[i];
-                expert_wait_ready(m, s);
-                if (!s->apple8_direct ||
-                    !coli_apple8_metalio_swiglu_slot(s->mio_slot,
-                        s->apple8_gate_off, s->apple8_gate_bytes,
-                        s->apple8_up_off, s->apple8_up_bytes,
-                        s->apple8_down_off, s->apple8_down_bytes,
-                        x, yd, 1, D, c->moe_inter)) {
-                    fprintf(stderr, "qwen: direct Apple8 decode dispatch failed\n");
+            int fused_topk = 1;
+            const char *fused_env = getenv("QWEN_APPLE8_FUSED_TOPK");
+            if (fused_env && fused_env[0] && strcmp(fused_env, "0") == 0)
+                fused_topk = 0;
+            if (fused_topk) {
+                ColiApple8MetalioExpert ex[64];
+                for (int i = 0; i < K; i++) {
+                    Slot *s = slots[i];
+                    expert_wait_ready(m, s);
+                    if (!s->apple8_direct) {
+                        fprintf(stderr, "qwen: fused direct Apple8 slot is not executable\n");
+                        exit(1);
+                    }
+                    ex[i] = (ColiApple8MetalioExpert){
+                        .slot = s->mio_slot,
+                        .gate_offset = s->apple8_gate_off,
+                        .gate_bytes = s->apple8_gate_bytes,
+                        .up_offset = s->apple8_up_off,
+                        .up_bytes = s->apple8_up_bytes,
+                        .down_offset = s->apple8_down_off,
+                        .down_bytes = s->apple8_down_bytes,
+                    };
+                }
+                if (qwen_apple8_overlap_enabled()) {
+                    if (!coli_apple8_metalio_moe_topk_begin(ex, w, K, x,
+                                                            D, c->moe_inter,
+                                                            &apple8_pending)) {
+                        fprintf(stderr, "qwen: fused direct Apple8 top-k decode submit failed\n");
+                        exit(1);
+                    }
+                } else if (!coli_apple8_metalio_moe_topk(ex, w, K, x, acc,
+                                                         D, c->moe_inter)) {
+                    fprintf(stderr, "qwen: fused direct Apple8 top-k decode dispatch failed\n");
                     exit(1);
                 }
-                for (int d = 0; d < D; d++) acc[d] += yd[d] * w[i];
                 m->prof_apple8_direct_blocks++;
-                m->prof_apple8_direct_experts++;
+                m->prof_apple8_direct_experts += (uint64_t)K;
+            } else {
+                float *yd = falloc(D);
+                for (int i = 0; i < K; i++) {
+                    Slot *s = slots[i];
+                    expert_wait_ready(m, s);
+                    if (!s->apple8_direct ||
+                        !coli_apple8_metalio_swiglu_slot(s->mio_slot,
+                            s->apple8_gate_off, s->apple8_gate_bytes,
+                            s->apple8_up_off, s->apple8_up_bytes,
+                            s->apple8_down_off, s->apple8_down_bytes,
+                            x, yd, 1, D, c->moe_inter)) {
+                        fprintf(stderr, "qwen: direct Apple8 decode dispatch failed\n");
+                        exit(1);
+                    }
+                    for (int d = 0; d < D; d++) acc[d] += yd[d] * w[i];
+                    m->prof_apple8_direct_blocks++;
+                    m->prof_apple8_direct_experts++;
+                }
+                free(yd);
             }
-            free(yd);
             gpu_ok = 1;
         } else
 #endif
@@ -2693,6 +2876,18 @@ routed_experts_done:
     for (int i = 0; i < c->shared_inter; i++) h[i] = silu(gv[i]) * h[i];
     float *sy = falloc(D);
     wt_mul(sy, h, &l->se_down, 1, D, c->shared_inter);
+#ifdef COLI_METALIO
+    /* First true consumer of routed output: wait here, after all shared-expert
+     * CPU work. finish() copies the routed result into acc, preserving the
+     * original routed-then-shared floating-point accumulation order. */
+    if (apple8_pending) {
+        if (!coli_apple8_metalio_moe_topk_finish(apple8_pending, acc)) {
+            fprintf(stderr, "qwen: fused direct Apple8 top-k decode completion failed\n");
+            exit(1);
+        }
+        apple8_pending = NULL;
+    }
+#endif
     for (int d = 0; d < D; d++) acc[d] += sy[d] * gs;
     memcpy(out, acc, (size_t)D * sizeof(float));
 
