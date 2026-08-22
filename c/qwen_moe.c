@@ -453,6 +453,16 @@ static void qprof_sync(Model *m) {
 #ifdef COLI_METAL
     uint64_t encode = 0, submit = 0, wait = 0, kernel = 0;
     coli_metal_profile_get(&encode, &submit, &wait, &kernel);
+#ifdef COLI_METALIO
+    {
+        uint64_t de = 0, ds = 0, dw = 0, dk = 0;
+        coli_apple8_metalio_profile_get(&de, &ds, &dw, &dk, NULL, NULL);
+        encode += de;
+        submit += ds;
+        wait += dw;
+        kernel += dk;
+    }
+#endif
     coli_profile_phase_set(&g_qprof, QPROF_METAL_ENCODE, encode);
     coli_profile_phase_set(&g_qprof, QPROF_METAL_SUBMIT, submit);
     coli_profile_phase_set(&g_qprof, QPROF_METAL_WAIT, wait);
@@ -2601,24 +2611,56 @@ static void moe_token(Model *m, Layer *l, int layer, const float *x, float *out)
         for (int i = 1; i < K; i++) if (slots[i]->fmt != fmt0) { unif = 0; break; }
 #ifdef COLI_METALIO
         if (unif && fmt0 == 17 && K <= 64) {
-            float *yd = falloc(D);
-            for (int i = 0; i < K; i++) {
-                Slot *s = slots[i];
-                expert_wait_ready(m, s);
-                if (!s->apple8_direct ||
-                    !coli_apple8_metalio_swiglu_slot(s->mio_slot,
-                        s->apple8_gate_off, s->apple8_gate_bytes,
-                        s->apple8_up_off, s->apple8_up_bytes,
-                        s->apple8_down_off, s->apple8_down_bytes,
-                        x, yd, 1, D, c->moe_inter)) {
-                    fprintf(stderr, "qwen: direct Apple8 decode dispatch failed\n");
+            int fused_topk = 1;
+            const char *fused_env = getenv("QWEN_APPLE8_FUSED_TOPK");
+            if (fused_env && fused_env[0] && strcmp(fused_env, "0") == 0)
+                fused_topk = 0;
+            if (fused_topk) {
+                ColiApple8MetalioExpert ex[64];
+                for (int i = 0; i < K; i++) {
+                    Slot *s = slots[i];
+                    expert_wait_ready(m, s);
+                    if (!s->apple8_direct) {
+                        fprintf(stderr, "qwen: fused direct Apple8 slot is not executable\n");
+                        exit(1);
+                    }
+                    ex[i] = (ColiApple8MetalioExpert){
+                        .slot = s->mio_slot,
+                        .gate_offset = s->apple8_gate_off,
+                        .gate_bytes = s->apple8_gate_bytes,
+                        .up_offset = s->apple8_up_off,
+                        .up_bytes = s->apple8_up_bytes,
+                        .down_offset = s->apple8_down_off,
+                        .down_bytes = s->apple8_down_bytes,
+                    };
+                }
+                if (!coli_apple8_metalio_moe_topk(ex, w, K, x, acc,
+                                                  D, c->moe_inter)) {
+                    fprintf(stderr, "qwen: fused direct Apple8 top-k decode dispatch failed\n");
                     exit(1);
                 }
-                for (int d = 0; d < D; d++) acc[d] += yd[d] * w[i];
                 m->prof_apple8_direct_blocks++;
-                m->prof_apple8_direct_experts++;
+                m->prof_apple8_direct_experts += (uint64_t)K;
+            } else {
+                float *yd = falloc(D);
+                for (int i = 0; i < K; i++) {
+                    Slot *s = slots[i];
+                    expert_wait_ready(m, s);
+                    if (!s->apple8_direct ||
+                        !coli_apple8_metalio_swiglu_slot(s->mio_slot,
+                            s->apple8_gate_off, s->apple8_gate_bytes,
+                            s->apple8_up_off, s->apple8_up_bytes,
+                            s->apple8_down_off, s->apple8_down_bytes,
+                            x, yd, 1, D, c->moe_inter)) {
+                        fprintf(stderr, "qwen: direct Apple8 decode dispatch failed\n");
+                        exit(1);
+                    }
+                    for (int d = 0; d < D; d++) acc[d] += yd[d] * w[i];
+                    m->prof_apple8_direct_blocks++;
+                    m->prof_apple8_direct_experts++;
+                }
+                free(yd);
             }
-            free(yd);
             gpu_ok = 1;
         } else
 #endif
