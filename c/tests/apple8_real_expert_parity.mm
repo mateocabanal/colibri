@@ -13,23 +13,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
-#include <unistd.h>
 
 static size_t align16(size_t n) { return (n + 15u) & ~(size_t)15u; }
 
 static const ColiExpertMatrixInfo *role(const ColiExpertInfo &info, uint16_t wanted) {
     for (const auto &m : info.matrices) if (m.role == wanted) return &m;
     return nullptr;
-}
-
-static bool write_all(int fd, const uint8_t *p, size_t n) {
-    while (n) {
-        ssize_t w = write(fd, p, n);
-        if (w <= 0) return false;
-        p += (size_t)w;
-        n -= (size_t)w;
-    }
-    return true;
 }
 
 static void fill_input(std::vector<float> &x, int hidden) {
@@ -172,49 +161,57 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    /* Match Qwen's direct loader exactly: source ranges are absolute offsets
+     * inside the real COLI data shard; destination ranges are packed into one
+     * persistent MetalIO slot with 16-byte matrix alignment.  The older test
+     * copied these bytes into a temporary offset-zero fixture, which proved the
+     * kernel/layout but did not validate Qwen's shard-offset arithmetic. */
+    const char *shard_path = coli_package_shard_path(package, record->shard_id);
+    if (!shard_path ||
+        gm->weight_offset > UINT64_MAX - record->payload_offset ||
+        um->weight_offset > UINT64_MAX - record->payload_offset ||
+        dm->weight_offset > UINT64_MAX - record->payload_offset) {
+        std::fprintf(stderr, "invalid shard path/source offset\n");
+        coli_package_close(package);
+        return 1;
+    }
     size_t gate_off = 0;
     size_t up_off = align16(gate_bytes);
+    if (up_off < gate_bytes || up_bytes > SIZE_MAX - up_off) {
+        std::fprintf(stderr, "slot packing overflow\n");
+        coli_package_close(package);
+        return 1;
+    }
     size_t down_off = align16(up_off + up_bytes);
-    size_t file_bytes = down_off + down_bytes;
-    std::vector<uint8_t> image(file_bytes, 0);
-    if (coli_package_read_range(package, record, gm->weight_offset,
-                                image.data() + gate_off, gate_bytes, error, sizeof(error)) ||
-        coli_package_read_range(package, record, um->weight_offset,
-                                image.data() + up_off, up_bytes, error, sizeof(error)) ||
-        coli_package_read_range(package, record, dm->weight_offset,
-                                image.data() + down_off, down_bytes, error, sizeof(error))) {
-        std::fprintf(stderr, "raw-read: %s\n", error);
+    if (down_off < up_off + up_bytes || down_bytes > SIZE_MAX - down_off) {
+        std::fprintf(stderr, "slot packing overflow\n");
         coli_package_close(package);
         return 1;
     }
-
-    char path[] = "/tmp/colibri-apple8-real-parity-XXXXXX";
-    int fd = mkstemp(path);
-    if (fd < 0 || !write_all(fd, image.data(), image.size())) {
-        std::perror("fixture-file");
-        if (fd >= 0) close(fd);
-        unlink(path);
-        coli_package_close(package);
-        return 1;
-    }
-    close(fd);
+    size_t slot_bytes = down_off + down_bytes;
 
     int rc = 1, file = -1, slot = -1;
-    if (!metalio_init() || (file = metalio_file_add(path)) < 0 ||
-        (slot = metalio_slot_alloc(file_bytes)) < 0 ||
+    if (!metalio_init() || (file = metalio_file_add(shard_path)) < 0 ||
+        (slot = metalio_slot_alloc(slot_bytes)) < 0 ||
         !coli_apple8_metalio_direct_init()) {
         std::fprintf(stderr, "MetalIO/direct init failed\n");
         goto done;
     }
     {
         ColiMetalioRegion regions[3] = {
-            { file, (uint64_t)gate_off, gate_bytes, gate_off },
-            { file, (uint64_t)up_off, up_bytes, up_off },
-            { file, (uint64_t)down_off, down_bytes, down_off },
+            { file, record->payload_offset + gm->weight_offset, gate_bytes, gate_off },
+            { file, record->payload_offset + um->weight_offset, up_bytes, up_off },
+            { file, record->payload_offset + dm->weight_offset, down_bytes, down_off },
         };
+        std::printf("APPLE8_REAL_SHARD layer=%d expert=%d shard=%u record_off=%llu gate_src=%llu up_src=%llu down_src=%llu\n",
+                    layer, expert, record->shard_id,
+                    (unsigned long long)record->payload_offset,
+                    (unsigned long long)regions[0].src_off,
+                    (unsigned long long)regions[1].src_off,
+                    (unsigned long long)regions[2].src_off);
         int64_t ev = metalio_loadv(slot, regions, 3, MIO_LOAD_DEMAND);
         if (ev <= 0 || metalio_wait(ev)) {
-            std::fprintf(stderr, "MetalIO load failed\n");
+            std::fprintf(stderr, "MetalIO real-shard load failed\n");
             goto done;
         }
     }
@@ -229,7 +226,6 @@ done:
     coli_apple8_metalio_direct_shutdown();
     if (slot >= 0) metalio_slot_free(slot);
     metalio_shutdown();
-    unlink(path);
     coli_package_close(package);
     return rc;
 }
