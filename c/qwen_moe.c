@@ -553,6 +553,22 @@ static int mio_file_for(int fd){
     return -1;
 }
 static int g_apple8_direct = 0;
+/* Decode-only split-phase Apple8 entry points. The public synchronous helper
+ * remains intact for prefill and for QWEN_APPLE8_OVERLAP=0 A/B runs. */
+extern int coli_apple8_metalio_moe_topk_begin(
+    const ColiApple8MetalioExpert *experts, const float *route_weights,
+    int expert_count, const float *x, int hidden, int intermediate,
+    void **pending_out);
+extern int coli_apple8_metalio_moe_topk_finish(void *pending, float *y);
+static int qwen_apple8_overlap_enabled(void){
+    static int initialized = 0, enabled = 1;
+    if (!initialized) {
+        const char *v = getenv("QWEN_APPLE8_OVERLAP");
+        if (v && v[0] && strcmp(v, "0") == 0) enabled = 0;
+        initialized = 1;
+    }
+    return enabled;
+}
 static const ColiPackage *g_coli_mio_pkg[64];
 static uint32_t g_coli_mio_shard[64];
 static int g_coli_mio_fid[64], g_coli_mio_n;
@@ -2549,6 +2565,12 @@ static void moe_token(Model *m, Layer *l, int layer, const float *x, float *out)
     float *w = malloc(size_mul_or_die((size_t)K, sizeof(float), "router top-k weights"));
     if (!w) { fprintf(stderr, "OOM router weights\n"); exit(1); }
     for (int i = 0; i < K; i++) w[i] = val[i] / wsum;
+#ifdef COLI_METALIO
+    /* A pending routed-MoE command may overlap only work that does not consume
+     * its output. Adjacent layers depend on this layer residual, but the
+     * same-layer shared expert is independent until the final sum. */
+    void *apple8_pending = NULL;
+#endif
 
     /* A Slot* returned by expert_get() is not leased: a later miss may LRU-
      * reuse that same object. Gathering K pointers is therefore invalid when
@@ -2634,8 +2656,15 @@ static void moe_token(Model *m, Layer *l, int layer, const float *x, float *out)
                         .down_bytes = s->apple8_down_bytes,
                     };
                 }
-                if (!coli_apple8_metalio_moe_topk(ex, w, K, x, acc,
-                                                  D, c->moe_inter)) {
+                if (qwen_apple8_overlap_enabled()) {
+                    if (!coli_apple8_metalio_moe_topk_begin(ex, w, K, x,
+                                                            D, c->moe_inter,
+                                                            &apple8_pending)) {
+                        fprintf(stderr, "qwen: fused direct Apple8 top-k decode submit failed\n");
+                        exit(1);
+                    }
+                } else if (!coli_apple8_metalio_moe_topk(ex, w, K, x, acc,
+                                                         D, c->moe_inter)) {
                     fprintf(stderr, "qwen: fused direct Apple8 top-k decode dispatch failed\n");
                     exit(1);
                 }
@@ -2735,6 +2764,18 @@ routed_experts_done:
     for (int i = 0; i < c->shared_inter; i++) h[i] = silu(gv[i]) * h[i];
     float *sy = falloc(D);
     wt_mul(sy, h, &l->se_down, 1, D, c->shared_inter);
+#ifdef COLI_METALIO
+    /* First true consumer of routed output: wait here, after all shared-expert
+     * CPU work. finish() copies the routed result into acc, preserving the
+     * original routed-then-shared floating-point accumulation order. */
+    if (apple8_pending) {
+        if (!coli_apple8_metalio_moe_topk_finish(apple8_pending, acc)) {
+            fprintf(stderr, "qwen: fused direct Apple8 top-k decode completion failed\n");
+            exit(1);
+        }
+        apple8_pending = NULL;
+    }
+#endif
     for (int d = 0; d < D; d++) acc[d] += sy[d] * gs;
     memcpy(out, acc, (size_t)D * sizeof(float));
 
