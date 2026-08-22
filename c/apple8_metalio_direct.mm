@@ -1083,3 +1083,343 @@ extern "C" int coli_apple8_metalio_moe_topk(const ColiApple8MetalioExpert *exper
         return 0;
     return coli_apple8_metalio_moe_topk_finish(pending, y);
 }
+
+/* Milestone C1: decode-only Qwen BF16 router + exact top-k on Metal.
+ *
+ * The projection uses one GPU thread per expert and deliberately keeps the
+ * hidden-dimension accumulation serial so the arithmetic order remains as
+ * close as possible to qwen_moe.c's decode GEMV.  A single thread then runs
+ * the same softmax -> deterministic lower-index tie-break -> selected-weight
+ * renormalization sequence as the CPU path.  The selected route-weight buffer
+ * stays GPU-resident and can be consumed directly by the routed Apple8 MoE
+ * begin helper below; only ids/weights needed by host cache/telemetry are read
+ * back.  This removes the route-weight CPU->GPU copy in C1b without changing
+ * the existing synchronous API. */
+static const char *QWEN_ROUTER_SHADER = R"METAL(
+#include <metal_stdlib>
+using namespace metal;
+
+inline float qwen_router_bf16(ushort v) {
+    return as_type<float>((uint)v << 16);
+}
+
+kernel void qwen_router_topk_bf16(
+    device const ushort *router [[buffer(0)]],
+    device const float *x       [[buffer(1)]],
+    device int *idx             [[buffer(2)]],
+    device float *weights       [[buffer(3)]],
+    constant int &E             [[buffer(4)]],
+    constant int &D             [[buffer(5)]],
+    constant int &K             [[buffer(6)]],
+    threadgroup float *prob     [[threadgroup(0)]],
+    uint tid                    [[thread_index_in_threadgroup]])
+{
+    if (tid < (uint)E) {
+        float acc = 0.0f;
+        const long base = (long)tid * D;
+        for (int d = 0; d < D; ++d)
+            acc += x[d] * qwen_router_bf16(router[base + d]);
+        prob[tid] = acc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid != 0) return;
+
+    float mx = prob[0];
+    for (int e = 1; e < E; ++e) if (prob[e] > mx) mx = prob[e];
+    float sum = 0.0f;
+    for (int e = 0; e < E; ++e) {
+        prob[e] = exp(prob[e] - mx);
+        sum += prob[e];
+    }
+    for (int e = 0; e < E; ++e) prob[e] /= sum;
+
+    for (int k = 0; k < K; ++k) {
+        int best = -1;
+        float bestv = -INFINITY;
+        for (int e = 0; e < E; ++e) {
+            bool taken = false;
+            for (int j = 0; j < k; ++j) if (idx[j] == e) { taken = true; break; }
+            if (!taken && (prob[e] > bestv ||
+                           (prob[e] == bestv && (best < 0 || e < best)))) {
+                best = e;
+                bestv = prob[e];
+            }
+        }
+        idx[k] = best;
+        weights[k] = bestv;
+    }
+    float wsum = 0.0f;
+    for (int k = 0; k < K; ++k) wsum += weights[k];
+    for (int k = 0; k < K; ++k) weights[k] /= wsum;
+}
+)METAL";
+
+static id<MTLComputePipelineState> g_router_topk_pipeline = nil;
+static id<MTLDevice> g_router_device = nil;
+
+struct QwenRouterWeight {
+    const uint16_t *key = nullptr;
+    id<MTLBuffer> buffer = nil;
+    int E = 0, D = 0;
+};
+static std::vector<QwenRouterWeight *> g_router_weights;
+
+struct QwenRouterRoute {
+    id<MTLBuffer> weights = nil;
+    int K = 0;
+};
+
+static void qwen_router_reset_locked(void) {
+    for (QwenRouterWeight *w : g_router_weights) delete w;
+    g_router_weights.clear();
+    g_router_topk_pipeline = nil;
+    g_router_device = nil;
+}
+
+static int qwen_router_init_locked(void) {
+    if (!g_device || !g_queue) return 0;
+    if (g_router_device && g_router_device != g_device &&
+        ![g_router_device isEqual:g_device])
+        qwen_router_reset_locked();
+    if (g_router_topk_pipeline) return 1;
+
+    NSError *error = nil;
+    NSString *source = [NSString stringWithUTF8String:QWEN_ROUTER_SHADER];
+    id<MTLLibrary> library = [g_device newLibraryWithSource:source options:nil error:&error];
+    if (!library) {
+        fprintf(stderr, "[qwen-router-metal] shader compile failed: %s\n",
+                error ? error.localizedDescription.UTF8String : "unknown");
+        return 0;
+    }
+    g_router_topk_pipeline = make_pipeline(library, @"qwen_router_topk_bf16", &error);
+    if (!g_router_topk_pipeline) {
+        fprintf(stderr, "[qwen-router-metal] pipeline creation failed: %s\n",
+                error ? error.localizedDescription.UTF8String : "missing function");
+        return 0;
+    }
+    g_router_device = g_device;
+    return 1;
+}
+
+static QwenRouterWeight *qwen_router_weight_locked(const uint16_t *router,
+                                                    int E, int D) {
+    if (!router || E <= 0 || E > 256 || D <= 0) return nullptr;
+    for (QwenRouterWeight *w : g_router_weights)
+        if (w->key == router && w->E == E && w->D == D) return w;
+    if ((size_t)E > SIZE_MAX / (size_t)D ||
+        (size_t)E * (size_t)D > SIZE_MAX / sizeof(uint16_t))
+        return nullptr;
+    size_t bytes = (size_t)E * (size_t)D * sizeof(uint16_t);
+    QwenRouterWeight *w = new (std::nothrow) QwenRouterWeight();
+    if (!w) return nullptr;
+    w->key = router; w->E = E; w->D = D;
+    w->buffer = qwen_gdn_wrap_nocopy_locked(router, bytes);
+    if (!w->buffer)
+        w->buffer = [g_device newBufferWithBytes:router length:bytes
+                                         options:MTLResourceStorageModeShared];
+    if (!w->buffer) { delete w; return nullptr; }
+    g_router_weights.push_back(w);
+    return w;
+}
+
+extern "C" int coli_apple8_metalio_router_topk_bf16(
+    const uint16_t *router, const float *x,
+    int E, int D, int K,
+    int *idx_out, float *weights_out, void **route_out) {
+    if (route_out) *route_out = nullptr;
+    if (!router || !x || !idx_out || !weights_out || !route_out ||
+        E <= 0 || E > 256 || D <= 0 || K <= 0 || K > E || K > 64)
+        return 0;
+
+    std::lock_guard<std::mutex> guard(g_lock);
+    if (!qwen_router_init_locked()) return 0;
+    QwenRouterWeight *rw = qwen_router_weight_locked(router, E, D);
+    if (!rw || (NSUInteger)E > g_router_topk_pipeline.maxTotalThreadsPerThreadgroup)
+        return 0;
+
+    const size_t x_bytes = (size_t)D * sizeof(float);
+    const size_t idx_bytes = (size_t)K * sizeof(int);
+    const size_t weight_bytes = (size_t)K * sizeof(float);
+    id<MTLBuffer> xb = [g_device newBufferWithBytes:x length:x_bytes
+                                            options:MTLResourceStorageModeShared];
+    id<MTLBuffer> ib = [g_device newBufferWithLength:idx_bytes
+                                             options:MTLResourceStorageModeShared];
+    id<MTLBuffer> wb = [g_device newBufferWithLength:weight_bytes
+                                             options:MTLResourceStorageModeShared];
+    if (!xb || !ib || !wb) return 0;
+    memset(ib.contents, 0xFF, idx_bytes);
+
+    uint64_t encode_begin = direct_now_ns();
+    id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = cb ? [cb computeCommandEncoder] : nil;
+    if (!cb || !enc) return 0;
+    [enc setComputePipelineState:g_router_topk_pipeline];
+    [enc setBuffer:rw->buffer offset:0 atIndex:0];
+    [enc setBuffer:xb offset:0 atIndex:1];
+    [enc setBuffer:ib offset:0 atIndex:2];
+    [enc setBuffer:wb offset:0 atIndex:3];
+    [enc setBytes:&E length:sizeof(E) atIndex:4];
+    [enc setBytes:&D length:sizeof(D) atIndex:5];
+    [enc setBytes:&K length:sizeof(K) atIndex:6];
+    [enc setThreadgroupMemoryLength:(NSUInteger)E * sizeof(float) atIndex:0];
+    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+           threadsPerThreadgroup:MTLSizeMake((NSUInteger)E, 1, 1)];
+    [enc endEncoding];
+    uint64_t encode_ns = direct_now_ns() - encode_begin;
+    uint64_t submit_begin = direct_now_ns();
+    [cb commit];
+    uint64_t submit_ns = direct_now_ns() - submit_begin;
+    uint64_t wait_begin = direct_now_ns();
+    [cb waitUntilCompleted];
+    uint64_t wait_ns = direct_now_ns() - wait_begin;
+    if (cb.status != MTLCommandBufferStatusCompleted) {
+        fprintf(stderr, "[qwen-router-metal] command failed: %s\n",
+                cb.error ? cb.error.localizedDescription.UTF8String : "unknown");
+        return 0;
+    }
+    profile_completed_locked(cb, encode_ns, submit_ns, wait_ns, 0);
+    memcpy(idx_out, ib.contents, idx_bytes);
+    memcpy(weights_out, wb.contents, weight_bytes);
+
+    QwenRouterRoute *route = new (std::nothrow) QwenRouterRoute();
+    if (!route) return 0;
+    route->weights = wb;
+    route->K = K;
+    *route_out = route;
+    return 1;
+}
+
+extern "C" void coli_apple8_metalio_router_route_free(void *opaque) {
+    delete static_cast<QwenRouterRoute *>(opaque);
+}
+
+/* Same fused Apple8 expert body as coli_apple8_metalio_moe_topk_begin(), but
+ * the reduction reads the GPU-resident weights produced by the router kernel.
+ * On success the route handle is consumed; on a pre-submit failure ownership
+ * stays with the caller so C1b can fall back cleanly. */
+extern "C" int coli_apple8_metalio_moe_topk_begin_routed(
+    const ColiApple8MetalioExpert *experts,
+    void *route_opaque,
+    int expert_count,
+    const float *x,
+    int hidden,
+    int intermediate,
+    void **pending_out) {
+    if (pending_out) *pending_out = nullptr;
+    QwenRouterRoute *route = static_cast<QwenRouterRoute *>(route_opaque);
+    if (!experts || !route || !route->weights || route->K != expert_count ||
+        !x || !pending_out || expert_count <= 0 || expert_count > 64 ||
+        hidden <= 0 || intermediate <= 0)
+        return 0;
+
+    std::lock_guard<std::mutex> guard(g_lock);
+    if (!g_gu_pipeline || !g_down_pipeline || !g_reduce_pipeline ||
+        !g_queue || !g_device)
+        return 0;
+
+    const size_t H = (size_t)hidden, M = (size_t)intermediate, K = (size_t)expert_count;
+    if (H > SIZE_MAX / sizeof(float) || M > SIZE_MAX / sizeof(float) ||
+        K > SIZE_MAX / M || K * M > SIZE_MAX / sizeof(float) ||
+        K > SIZE_MAX / H || K * H > SIZE_MAX / sizeof(float))
+        return 0;
+    const size_t x_bytes = H * sizeof(float);
+    const size_t y_bytes = H * sizeof(float);
+    const size_t mid_stride = M * sizeof(float);
+    const size_t out_stride = H * sizeof(float);
+    const size_t mid_bytes = K * mid_stride;
+    const size_t expert_y_bytes = K * out_stride;
+
+    id<MTLBuffer> weight_buffers[64] = {};
+    for (int i = 0; i < expert_count; ++i) {
+        size_t slot_bytes = 0;
+        weight_buffers[i] = slot_buffer_locked(experts[i].slot, &slot_bytes);
+        if (!weight_buffers[i] ||
+            !matrix_fits(slot_bytes, experts[i].gate_offset, experts[i].gate_bytes,
+                         intermediate, hidden) ||
+            !matrix_fits(slot_bytes, experts[i].up_offset, experts[i].up_bytes,
+                         intermediate, hidden) ||
+            !matrix_fits(slot_bytes, experts[i].down_offset, experts[i].down_bytes,
+                         hidden, intermediate))
+            return 0;
+    }
+
+    id<MTLBuffer> xb = [g_device newBufferWithBytes:x length:x_bytes
+                                            options:MTLResourceStorageModeShared];
+    id<MTLBuffer> mid = [g_device newBufferWithLength:mid_bytes
+                                              options:MTLResourceStorageModePrivate];
+    id<MTLBuffer> expert_y = [g_device newBufferWithLength:expert_y_bytes
+                                                   options:MTLResourceStorageModePrivate];
+    id<MTLBuffer> yb = [g_device newBufferWithLength:y_bytes
+                                             options:MTLResourceStorageModeShared];
+    if (!xb || !mid || !expert_y || !yb) return 0;
+
+    Apple8MoePending *pending = new (std::nothrow) Apple8MoePending();
+    if (!pending) return 0;
+    const int S = 1;
+    uint64_t encode_begin = direct_now_ns();
+    id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+    if (!cb) { delete pending; return 0; }
+
+    id<MTLComputeCommandEncoder> gu = [cb computeCommandEncoder];
+    if (!gu) { delete pending; return 0; }
+    [gu setComputePipelineState:g_gu_pipeline];
+    for (int i = 0; i < expert_count; ++i) {
+        [gu setBuffer:weight_buffers[i] offset:experts[i].gate_offset atIndex:0];
+        [gu setBuffer:weight_buffers[i] offset:experts[i].up_offset atIndex:1];
+        [gu setBuffer:xb offset:0 atIndex:2];
+        [gu setBuffer:mid offset:(NSUInteger)i * mid_stride atIndex:3];
+        [gu setBytes:&S length:sizeof(S) atIndex:4];
+        [gu setBytes:&hidden length:sizeof(hidden) atIndex:5];
+        [gu setBytes:&intermediate length:sizeof(intermediate) atIndex:6];
+        [gu dispatchThreadgroups:MTLSizeMake((NSUInteger)intermediate, 1, 1)
+              threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    }
+    [gu endEncoding];
+
+    id<MTLComputeCommandEncoder> down = [cb computeCommandEncoder];
+    if (!down) { delete pending; return 0; }
+    [down setComputePipelineState:g_down_pipeline];
+    for (int i = 0; i < expert_count; ++i) {
+        [down setBuffer:weight_buffers[i] offset:experts[i].down_offset atIndex:0];
+        [down setBuffer:mid offset:(NSUInteger)i * mid_stride atIndex:1];
+        [down setBuffer:expert_y offset:(NSUInteger)i * out_stride atIndex:2];
+        [down setBytes:&S length:sizeof(S) atIndex:3];
+        [down setBytes:&hidden length:sizeof(hidden) atIndex:4];
+        [down setBytes:&intermediate length:sizeof(intermediate) atIndex:5];
+        [down dispatchThreadgroups:MTLSizeMake((NSUInteger)hidden, 1, 1)
+              threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    }
+    [down endEncoding];
+
+    id<MTLComputeCommandEncoder> reduce = [cb computeCommandEncoder];
+    if (!reduce) { delete pending; return 0; }
+    [reduce setComputePipelineState:g_reduce_pipeline];
+    [reduce setBuffer:expert_y offset:0 atIndex:0];
+    [reduce setBuffer:route->weights offset:0 atIndex:1];
+    [reduce setBuffer:yb offset:0 atIndex:2];
+    [reduce setBytes:&expert_count length:sizeof(expert_count) atIndex:3];
+    [reduce setBytes:&hidden length:sizeof(hidden) atIndex:4];
+    NSUInteger threads = g_reduce_pipeline.maxTotalThreadsPerThreadgroup;
+    if (threads > 256) threads = 256;
+    if (threads < 1) { delete pending; return 0; }
+    NSUInteger groups = ((NSUInteger)hidden + threads - 1) / threads;
+    [reduce dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+           threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+    [reduce endEncoding];
+
+    uint64_t encode_ns = direct_now_ns() - encode_begin;
+    uint64_t submit_begin = direct_now_ns();
+    [cb commit];
+    uint64_t submit_ns = direct_now_ns() - submit_begin;
+
+    pending->cb = cb;
+    pending->yb = yb;
+    pending->expert_count = expert_count;
+    pending->y_bytes = y_bytes;
+    pending->encode_ns = encode_ns;
+    pending->submit_ns = submit_ns;
+    for (int i = 0; i < expert_count; ++i) pending->slots[i] = experts[i].slot;
+    *pending_out = pending;
+    delete route;
+    return 1;
+}
