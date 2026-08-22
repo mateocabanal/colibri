@@ -1,3 +1,115 @@
+/* Milestone B Metal GDN wiring.
+ *
+ * These narrowly-scoped definition interceptors add only the storage and
+ * decode seams needed by the Metal Gated DeltaNet path while leaving the
+ * verified Milestone-A engine body unchanged. Each macro pops itself at the
+ * intercepted definition, so later call sites use the wrapper normally.
+ */
+#if defined(__APPLE__) && defined(COLI_METALIO)
+
+/* GDN recurrent/conv state must back a page-rounded no-copy Shared MTLBuffer.
+ * Only allocations whose diagnostic label begins with "GDN " are changed;
+ * every other calloc_checked caller retains the Milestone-A allocator. */
+#pragma push_macro("calloc_checked")
+#define calloc_checked(A,B,C) \
+    calloc_checked_reference(A,B,C); \
+    static void *calloc_checked(size_t qn, size_t qs, const char *qw){ \
+        if (!qw || strncmp(qw, "GDN ", 4) != 0) \
+            return calloc_checked_reference(qn, qs, qw); \
+        size_t qb = size_mul_or_die(qn, qs, qw); \
+        if (qb > SIZE_MAX - 16383u) { \
+            fprintf(stderr, "%s: UMA allocation size overflow (%zu bytes)\n", qw, qb); \
+            exit(1); \
+        } \
+        size_t qa = (qb + 16383u) & ~(size_t)16383u; \
+        void *qp = NULL; \
+        if (qa && posix_memalign(&qp, 16384, qa) == 0 && qp) { \
+            memset(qp, 0, qa); \
+            return qp; \
+        } \
+        return calloc_checked_reference(qn, qs, qw); \
+    } \
+    _Pragma("pop_macro(\"calloc_checked\")") \
+    static void *calloc_checked_reference(A,B,C)
+
+/* Exact COLI BF16 GDN matrices are resident for the lifetime of the model.
+ * Re-home only linear_attn matrices into 16 KiB-aligned, page-rounded storage
+ * so Metal can wrap them zero-copy. If aligned allocation fails the original
+ * pointer is retained; the Metal entry point declines pre-submit and the CPU
+ * reference runs. */
+#pragma push_macro("coli_wt")
+#define coli_wt(A,B,C,D) \
+    coli_wt_reference(A,B,C,D); \
+    static WT coli_wt(Model *qm, const char *qcn, int64_t qO, int64_t qI){ \
+        WT qw = coli_wt_reference(qm, qcn, qO, qI); \
+        if (qw.bf16 && qcn && strstr(qcn, "linear_attn.")) { \
+            size_t qn = size_mul_or_die((size_t)qO, (size_t)qI, qcn); \
+            size_t qb = size_mul_or_die(qn, sizeof(uint16_t), qcn); \
+            if (qb <= SIZE_MAX - 16383u) { \
+                size_t qa = (qb + 16383u) & ~(size_t)16383u; \
+                void *qp = NULL; \
+                if (qa && posix_memalign(&qp, 16384, qa) == 0 && qp) { \
+                    memcpy(qp, qw.bf16, qb); \
+                    free(qw.bf16); \
+                    qw.bf16 = (uint16_t *)qp; \
+                } \
+            } \
+        } \
+        return qw; \
+    } \
+    _Pragma("pop_macro(\"coli_wt\")") \
+    static WT coli_wt_reference(A,B,C,D)
+
+/* Decode-only wrapper around the CPU GDN reference. QWEN_GDN_METAL defaults
+ * on exactly when the direct Apple8 path is active. Zero means the backend
+ * declined before submit and CPU fallback is safe; a post-submit failure is
+ * fatal because recurrent state may already have changed. */
+#pragma push_macro("gdn_token")
+#define gdn_token(A,B,C,D,E) \
+    gdn_token_reference(A,B,C,D,E); \
+    extern int coli_apple8_metalio_gdn_token( \
+        int layer, const float *x, float *out, \
+        const uint16_t *wqkv, const uint16_t *wz, \
+        const uint16_t *wa, const uint16_t *wb, const uint16_t *wout, \
+        const float *A_log, const float *dt_bias, \
+        const float *conv_w, const float *norm_w, \
+        float *state, float *conv_state, \
+        int D, int kheads, int kd, int vheads, int vd, int kk, float eps); \
+    static int qwen_gdn_metal_enabled(void){ \
+        static int qi = 0, qe = 1; \
+        if (!qi) { \
+            const char *qv = getenv("QWEN_GDN_METAL"); \
+            if (qv && qv[0] && strcmp(qv, "0") == 0) qe = 0; \
+            qi = 1; \
+        } \
+        return g_apple8_direct && qe; \
+    } \
+    static void gdn_token(Model *qm, Layer *ql, int qlayer, const float *qx, float *qout){ \
+        Cfg *qc = &qm->c; \
+        if (qwen_gdn_metal_enabled() && \
+            ql->in_qkv.bf16 && ql->in_z.bf16 && ql->in_a.bf16 && \
+            ql->in_b.bf16 && ql->gdn_out.bf16) { \
+            int qr = coli_apple8_metalio_gdn_token( \
+                qlayer, qx, qout, \
+                ql->in_qkv.bf16, ql->in_z.bf16, ql->in_a.bf16, \
+                ql->in_b.bf16, ql->gdn_out.bf16, \
+                ql->A_log, ql->dt_bias, ql->conv1d, ql->gdn_norm, \
+                qm->gdn_S[qlayer], qm->gdn_conv[qlayer], \
+                qc->hidden, qc->lin_k_heads, qc->lin_k_dim, \
+                qc->lin_v_heads, qc->lin_v_dim, qc->conv_kernel, qc->eps); \
+            if (qr > 0) return; \
+            if (qr < 0) { \
+                fprintf(stderr, "qwen: Metal GDN decode failed after submission\n"); \
+                exit(1); \
+            } \
+        } \
+        gdn_token_reference(qm, ql, qlayer, qx, qout); \
+    } \
+    _Pragma("pop_macro(\"gdn_token\")") \
+    static void gdn_token_reference(A,B,C,D,E)
+
+#endif /* __APPLE__ && COLI_METALIO */
+
 /* qwen_moe.c — Qwen3.5 / Qwen3.6 / Qwen3.7 MoE inference engine (CPU, C11).
  *
  * Architecture (from transformers Qwen3_5MoeForCausalLM, verified against the
