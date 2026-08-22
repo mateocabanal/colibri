@@ -13,6 +13,41 @@
 #undef qwen_prefix_cache_budget_for_serve
 #undef qwen_prefix_cache_budget_from_env
 
+#if defined(COLI_EXECUTOR_H) && defined(COLIBRI_MXFP4_EXPERT_H)
+/* Qwen3.6-35B-A3B routes top_k=8.  On the Apple8 direct decode path the
+ * measured useful resident working set is one to two router generations
+ * (8..16 slots/layer); filling the whole RAM_GB-derived allowance instead
+ * increases cache-management / UMA pressure and slows steady-state decode.
+ *
+ * Treat RAM_GB as a hard ceiling, not a residency target.  Keeping one spare
+ * top-k generation lets the existing per-layer LRU decide which experts stay:
+ * repeated (frequent) routes refresh recency naturally, while cold experts
+ * fall out without permanent pinning.  Explicit CACHE / positional caps never
+ * call this default helper and therefore remain authoritative. */
+#define QWEN_APPLE8_DIRECT_WORKING_SET_CAP 16
+static inline int qpc_apple8_working_set_ram_cap(const char *value,
+                                                 size_t prefix_budget_bytes,
+                                                 const char *package_path,
+                                                 int *valid) {
+    int budget_valid = 0;
+    int budget_cap = qpc_package_ram_cap(value, prefix_budget_bytes,
+                                         package_path, &budget_valid);
+    if (valid) *valid = budget_valid;
+    if (!budget_valid || budget_cap <= QWEN_APPLE8_DIRECT_WORKING_SET_CAP)
+        return budget_cap;
+
+    fprintf(stderr,
+            "[QWEN-RESIDENCY] expert_resident_budget_cap_per_layer=%d "
+            "expert_resident_working_set_cap_per_layer=%d "
+            "policy=bounded-lru target=apple8-direct\n",
+            budget_cap, QWEN_APPLE8_DIRECT_WORKING_SET_CAP);
+    return QWEN_APPLE8_DIRECT_WORKING_SET_CAP;
+}
+#undef qwen_prefix_cache_ram_cap
+#define qwen_prefix_cache_ram_cap(value, prefix_budget_bytes, valid) \
+    qpc_apple8_working_set_ram_cap((value), (prefix_budget_bytes), snap, (valid))
+#endif
+
 #define QWEN_PREFIX_DISK_ENGINE_ID UINT32_C(0x5157454e) /* QWEN */
 #define QWEN_PREFIX_DISK_STATE_ABI 2u
 #define QWEN_PREFIX_DISK_COMPUTE_ABI 1u
