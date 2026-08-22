@@ -7,8 +7,10 @@ EXPERT ?= 0
 # Command-line make assignments such as MODEL=~/models/foo preserve the
 # literal '~' on shells that do not expand tildes after '='. The recipe quotes
 # the model path (correctly, so spaces remain safe), which means the shell also
-# cannot expand it later. Normalize the common ~/ prefix here instead.
-MODEL_PATH := $(patsubst ~/%, $(HOME)/%, $(MODEL))
+# cannot expand it later. Normalize the common ~/ prefix here instead. Keep the
+# patsubst arguments adjacent: whitespace after a comma is part of a GNU make
+# function argument and would become a leading space in the resulting path.
+MODEL_PATH := $(patsubst ~/%,$(HOME)/%,$(MODEL))
 
 # The objects below are built by the main Makefile and may contain OpenMP
 # regions when Homebrew libomp is installed. Mirror the main Makefile's Darwin
