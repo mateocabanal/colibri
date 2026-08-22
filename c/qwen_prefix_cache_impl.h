@@ -118,10 +118,10 @@ static inline void qwen_prefix_cache_init(QwenPrefixCache *c,
     c->initialized = 1;
 }
 
-/* Qwen's legacy RAM_GB policy treats one expert slot per sparse layer as
- * roughly 2 decimal GB. Reserve the prompt-cache bytes before applying
- * that same heuristic so an implicit RAM budget remains a total budget.
- * Explicit CACHE/positional caps are intentionally outside this helper. */
+/* Standalone compatibility helper for prefix-cache-only users. The Qwen engine
+ * overrides this call below when package metadata is available, so production
+ * residency never derives a cap from this legacy approximation. Explicit
+ * CACHE/positional caps remain outside both helpers. */
 static inline int qwen_prefix_cache_ram_cap(const char *value,
                                             size_t prefix_budget_bytes,
                                             int *valid) {
@@ -129,8 +129,6 @@ static inline int qwen_prefix_cache_ram_cap(const char *value,
     if (!value || !*value) return 0;
     char *end = NULL;
     long double gib = strtold(value, &end);
-    /* Keep RAM_GB's historical permissive trailing-text behavior while
-     * rejecting NaN/inf/negative values before any integer conversion. */
     if (end == value || !(gib > 0.0L) || gib > 1000000.0L) return 0;
     if (valid) *valid = 1;
     const long double gb = 1000000000.0L;
@@ -140,6 +138,183 @@ static inline int qwen_prefix_cache_ram_cap(const char *value,
     if (slots >= (long double)INT_MAX) return INT_MAX;
     return slots > 0.0L ? (int)slots : 0;
 }
+
+#if defined(COLI_EXECUTOR_H) && defined(COLIBRI_MXFP4_EXPERT_H)
+#include "apple8_contract.h"
+
+/* The direct Apple8 runtime packs gate/up/down into one MetalIO MTLBuffer with
+ * 16-byte region starts. On M2 shared buffers are physically page-backed at
+ * 16 KiB granularity, so round the executable payload to that allocation unit.
+ * This is deliberately package-derived: no GB-per-slot estimate participates. */
+static inline int qpc_apple8_direct_slot_bytes(const ColiExpertInfo *info,
+                                                uint64_t *bytes_out) {
+    const ColiExpertMatrixInfo *gate = NULL, *up = NULL, *down = NULL;
+    if (!info || !bytes_out) return 0;
+    for (int i = 0; i < 3; i++) {
+        const ColiExpertMatrixInfo *m = &info->matrices[i];
+        if (m->role == COLI_MXFP4_EXPERT_ROLE_GATE) gate = m;
+        else if (m->role == COLI_MXFP4_EXPERT_ROLE_UP) up = m;
+        else if (m->role == COLI_MXFP4_EXPERT_ROLE_DOWN) down = m;
+    }
+    if (!gate || !up || !down || gate->rows != up->rows ||
+        gate->columns != up->columns || down->rows != gate->columns ||
+        down->columns != gate->rows) return 0;
+
+    uint64_t gb = 0, ub = 0, db = 0;
+    if (!coli_apple8_matrix_descriptor_valid(gate, &gb) ||
+        !coli_apple8_matrix_descriptor_valid(up, &ub) ||
+        !coli_apple8_matrix_descriptor_valid(down, &db) ||
+        gate->weight_codec != COLI_CSF_CODEC_NONE ||
+        up->weight_codec != COLI_CSF_CODEC_NONE ||
+        down->weight_codec != COLI_CSF_CODEC_NONE) return 0;
+
+    const uint64_t a16 = 15u;
+    if (gb > UINT64_MAX - a16) return 0;
+    uint64_t uoff = (gb + a16) & ~a16;
+    if (ub > UINT64_MAX - uoff) return 0;
+    uint64_t gu_end = uoff + ub;
+    if (gu_end > UINT64_MAX - a16) return 0;
+    uint64_t doff = (gu_end + a16) & ~a16;
+    if (db > UINT64_MAX - doff) return 0;
+    uint64_t total = doff + db;
+
+    const uint64_t page = 16384u;
+    if (total > UINT64_MAX - (page - 1u)) return 0;
+    *bytes_out = (total + page - 1u) & ~(page - 1u);
+    return *bytes_out != 0;
+}
+
+static inline int qpc_ram_budget_bytes(const char *value,
+                                       size_t prefix_budget_bytes,
+                                       uint64_t *budget_out) {
+    if (!value || !*value || !budget_out) return 0;
+    char *end = NULL;
+    long double gb = strtold(value, &end);
+    /* Preserve RAM_GB's historical permissive suffix parsing, but reject
+     * non-positive, NaN, infinity, and values outside a practical range. */
+    if (end == value || !(gb > 0.0L) || gb > 1000000.0L) return 0;
+    long double total = gb * 1000000000.0L;
+    if (total > (long double)UINT64_MAX) total = (long double)UINT64_MAX;
+    uint64_t bytes = (uint64_t)total;
+    *budget_out = bytes > (uint64_t)prefix_budget_bytes
+                ? bytes - (uint64_t)prefix_budget_bytes : 0;
+    return 1;
+}
+
+/* Metadata-only prepass over the actual package. Each cap increment allocates
+ * one expert slot in every routed layer, so its true cost is the sum of the
+ * largest executable slot in each layer. This matches the direct Apple8
+ * MetalIO allocation geometry, including per-matrix padding and page backing. */
+static inline int qpc_package_ram_cap(const char *value,
+                                      size_t prefix_budget_bytes,
+                                      const char *package_path,
+                                      int *valid) {
+    if (valid) *valid = 0;
+    uint64_t budget = 0;
+    if (!qpc_ram_budget_bytes(value, prefix_budget_bytes, &budget)) return 0;
+
+    ColiPackage *pkg = NULL;
+    char err[256] = {0};
+    if (!package_path ||
+        coli_package_open_ex(&pkg, package_path, COLI_CSF_CHECKSUM_MANIFEST_ONLY,
+                             err, sizeof(err)) != 0) {
+        fprintf(stderr,
+                "[QWEN-RESIDENCY] package accounting unavailable%s%s; using top-k default\n",
+                err[0] ? ": " : "", err[0] ? err : "");
+        return 0;
+    }
+    const char *profile = coli_package_profile(pkg);
+    if (!coli_apple8_profile_is_v1(profile)) {
+        fprintf(stderr,
+                "[QWEN-RESIDENCY] target %s has no native slot accounting yet; using top-k default\n",
+                profile ? profile : "<missing>");
+        coli_package_close(pkg);
+        return 0;
+    }
+
+    int max_layer = -1;
+    size_t records = coli_package_record_count(pkg);
+    for (size_t i = 0; i < records; i++) {
+        const ColiRecordInfo *r = coli_package_record_at(pkg, i);
+        if (r && r->kind == COLI_CSF_REC_EXPERT && r->layer > max_layer)
+            max_layer = r->layer;
+    }
+    if (max_layer < 0 || max_layer >= 4096) {
+        coli_package_close(pkg);
+        return 0;
+    }
+
+    size_t layers = (size_t)max_layer + 1u;
+    uint64_t *layer_bytes = (uint64_t *)calloc(layers, sizeof(uint64_t));
+    uint32_t *layer_experts = (uint32_t *)calloc(layers, sizeof(uint32_t));
+    if (!layer_bytes || !layer_experts) {
+        free(layer_bytes); free(layer_experts); coli_package_close(pkg);
+        return 0;
+    }
+
+    uint64_t max_slot = 0;
+    int ok = 1;
+    for (size_t i = 0; i < records && ok; i++) {
+        const ColiRecordInfo *r = coli_package_record_at(pkg, i);
+        if (!r || r->kind != COLI_CSF_REC_EXPERT) continue;
+        ColiExpertInfo info;
+        uint64_t slot_bytes = 0;
+        if (r->layer < 0 || (size_t)r->layer >= layers ||
+            coli_package_expert_info(pkg, r, &info, err, sizeof(err)) != 0 ||
+            !qpc_apple8_direct_slot_bytes(&info, &slot_bytes)) {
+            ok = 0;
+            break;
+        }
+        size_t l = (size_t)r->layer;
+        if (slot_bytes > layer_bytes[l]) layer_bytes[l] = slot_bytes;
+        if (slot_bytes > max_slot) max_slot = slot_bytes;
+        if (layer_experts[l] != UINT32_MAX) layer_experts[l]++;
+    }
+
+    uint64_t one_cap_bytes = 0;
+    uint32_t cap_limit = UINT32_MAX;
+    for (size_t l = 0; l < layers && ok; l++) {
+        if (!layer_bytes[l] || !layer_experts[l] ||
+            layer_bytes[l] > UINT64_MAX - one_cap_bytes) {
+            ok = 0;
+            break;
+        }
+        one_cap_bytes += layer_bytes[l];
+        if (layer_experts[l] < cap_limit) cap_limit = layer_experts[l];
+    }
+
+    int cap = 0;
+    if (ok && one_cap_bytes && cap_limit) {
+        uint64_t derived = budget / one_cap_bytes;
+        if (derived < 1u && budget) derived = 1u;
+        if (derived > cap_limit) derived = cap_limit;
+        if (derived > 4096u) derived = 4096u;
+        cap = (int)derived;
+        if (valid) *valid = 1;
+        fprintf(stderr,
+                "[QWEN-RESIDENCY] expert_resident_bytes_per_slot=%llu "
+                "expert_resident_bytes_per_cap=%llu expert_resident_budget_bytes=%llu "
+                "expert_resident_cap_per_layer=%d layers=%zu target=apple8-direct\n",
+                (unsigned long long)max_slot,
+                (unsigned long long)one_cap_bytes,
+                (unsigned long long)budget, cap, layers);
+    } else {
+        fprintf(stderr,
+                "[QWEN-RESIDENCY] native expert footprint could not be derived; using top-k default\n");
+    }
+
+    free(layer_bytes);
+    free(layer_experts);
+    coli_package_close(pkg);
+    return cap;
+}
+
+/* qwen_moe.c has the resolved package path as local `snap` at the only implicit
+ * RAM_GB call site. Bind that path into the package-aware helper without
+ * changing the public prefix-cache-only API used by standalone tests. */
+#define qwen_prefix_cache_ram_cap(value, prefix_budget_bytes, valid) \
+    qpc_package_ram_cap((value), (prefix_budget_bytes), snap, (valid))
+#endif
 
 static inline int qpc_ascii_ieq(const char *a, const char *b) {
     if (!a || !b) return 0;
