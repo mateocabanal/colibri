@@ -5,9 +5,11 @@
 #include "apple8_contract.h"
 #include "metalio.h"
 
+#include <chrono>
 #include <mutex>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /*
@@ -113,6 +115,23 @@ kernel void apple8_swiglu_down(
     float acc = simd_sum(apple8_dot_partial(down, mr, M, h, lane));
     if (lane == 0) y[(long)s * H + h] = acc;
 }
+
+/* Keep the routed-expert reduction order identical to the host's top-k loop:
+ * expert 0, then 1, ... K-1 for every hidden element. */
+kernel void apple8_moe_reduce(
+    device const float *expert_y [[buffer(0)]],
+    device const float *weights  [[buffer(1)]],
+    device float *y              [[buffer(2)]],
+    constant int &K              [[buffer(3)]],
+    constant int &H              [[buffer(4)]],
+    uint h                        [[thread_position_in_grid]])
+{
+    if (h >= (uint)H) return;
+    float acc = 0.0f;
+    for (int i = 0; i < K; ++i)
+        acc += expert_y[(long)i * H + (long)h] * weights[i];
+    y[h] = acc;
+}
 )METAL";
 
 static id<MTLDevice> g_device = nil;
@@ -120,12 +139,41 @@ static id<MTLCommandQueue> g_queue = nil;
 static id<MTLComputePipelineState> g_matmul_pipeline = nil;
 static id<MTLComputePipelineState> g_gu_pipeline = nil;
 static id<MTLComputePipelineState> g_down_pipeline = nil;
+static id<MTLComputePipelineState> g_reduce_pipeline = nil;
 static std::mutex g_lock;
+
+static struct {
+    uint64_t encode_ns, submit_ns, wait_ns, kernel_ns;
+    uint64_t command_buffers, fused_calls, fused_experts;
+} g_prof;
+
+static uint64_t direct_now_ns(void) {
+    using namespace std::chrono;
+    return (uint64_t)duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
+static void profile_completed_locked(id<MTLCommandBuffer> cb,
+                                     uint64_t encode_ns,
+                                     uint64_t submit_ns,
+                                     uint64_t wait_ns,
+                                     int fused_experts) {
+    g_prof.encode_ns += encode_ns;
+    g_prof.submit_ns += submit_ns;
+    g_prof.wait_ns += wait_ns;
+    g_prof.command_buffers++;
+    if (cb.GPUEndTime > cb.GPUStartTime && cb.GPUStartTime > 0.0)
+        g_prof.kernel_ns += (uint64_t)((cb.GPUEndTime - cb.GPUStartTime) * 1.0e9);
+    if (fused_experts > 0) {
+        g_prof.fused_calls++;
+        g_prof.fused_experts += (uint64_t)fused_experts;
+    }
+}
 
 static void clear_locked(void) {
     g_matmul_pipeline = nil;
     g_gu_pipeline = nil;
     g_down_pipeline = nil;
+    g_reduce_pipeline = nil;
     g_queue = nil;
     g_device = nil;
 }
@@ -140,7 +188,8 @@ static id<MTLComputePipelineState> make_pipeline(id<MTLLibrary> library,
 
 extern "C" int coli_apple8_metalio_direct_init(void) {
     std::lock_guard<std::mutex> guard(g_lock);
-    if (g_matmul_pipeline && g_gu_pipeline && g_down_pipeline && g_queue && g_device)
+    if (g_matmul_pipeline && g_gu_pipeline && g_down_pipeline && g_reduce_pipeline &&
+        g_queue && g_device)
         return 1;
     if (!metalio_active()) return 0;
 
@@ -165,6 +214,9 @@ extern "C" int coli_apple8_metalio_direct_init(void) {
     if (!g_gu_pipeline) goto pipeline_fail;
     g_down_pipeline = make_pipeline(library, @"apple8_swiglu_down", &error);
     if (!g_down_pipeline) goto pipeline_fail;
+    g_reduce_pipeline = make_pipeline(library, @"apple8_moe_reduce", &error);
+    if (!g_reduce_pipeline) goto pipeline_fail;
+    memset(&g_prof, 0, sizeof(g_prof));
     return 1;
 
 pipeline_fail:
@@ -176,7 +228,36 @@ pipeline_fail:
 
 extern "C" void coli_apple8_metalio_direct_shutdown(void) {
     std::lock_guard<std::mutex> guard(g_lock);
+    const char *profile = getenv("QWEN_PROFILE");
+    if (profile && profile[0] && strcmp(profile, "0") != 0 && g_prof.command_buffers) {
+        fprintf(stderr,
+                "[apple8-metalio-profile] command_buffers=%llu fused_layers=%llu "
+                "fused_experts=%llu metal_encode_ms=%.3f metal_submit_ms=%.3f "
+                "metal_wait_ms=%.3f metal_kernel_ms=%.3f\n",
+                (unsigned long long)g_prof.command_buffers,
+                (unsigned long long)g_prof.fused_calls,
+                (unsigned long long)g_prof.fused_experts,
+                (double)g_prof.encode_ns / 1.0e6,
+                (double)g_prof.submit_ns / 1.0e6,
+                (double)g_prof.wait_ns / 1.0e6,
+                (double)g_prof.kernel_ns / 1.0e6);
+    }
     clear_locked();
+}
+
+extern "C" void coli_apple8_metalio_profile_get(uint64_t *encode_ns,
+                                                  uint64_t *submit_ns,
+                                                  uint64_t *wait_ns,
+                                                  uint64_t *kernel_ns,
+                                                  uint64_t *fused_calls,
+                                                  uint64_t *fused_experts) {
+    std::lock_guard<std::mutex> guard(g_lock);
+    if (encode_ns) *encode_ns = g_prof.encode_ns;
+    if (submit_ns) *submit_ns = g_prof.submit_ns;
+    if (wait_ns) *wait_ns = g_prof.wait_ns;
+    if (kernel_ns) *kernel_ns = g_prof.kernel_ns;
+    if (fused_calls) *fused_calls = g_prof.fused_calls;
+    if (fused_experts) *fused_experts = g_prof.fused_experts;
 }
 
 static id<MTLBuffer> slot_buffer_locked(int slot, size_t *slot_bytes_out) {
@@ -234,6 +315,7 @@ extern "C" int coli_apple8_metalio_matmul_slot(int slot,
                                              options:MTLResourceStorageModeShared];
     if (!xb || !yb) return 0;
 
+    uint64_t encode_begin = direct_now_ns();
     id<MTLCommandBuffer> cb = [g_queue commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
     if (!cb || !enc) return 0;
@@ -247,13 +329,19 @@ extern "C" int coli_apple8_metalio_matmul_slot(int slot,
     [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)S * (NSUInteger)O, 1, 1)
           threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
     [enc endEncoding];
+    uint64_t encode_ns = direct_now_ns() - encode_begin;
+    uint64_t submit_begin = direct_now_ns();
     [cb commit];
+    uint64_t submit_ns = direct_now_ns() - submit_begin;
+    uint64_t wait_begin = direct_now_ns();
     [cb waitUntilCompleted];
+    uint64_t wait_ns = direct_now_ns() - wait_begin;
     if (cb.status != MTLCommandBufferStatusCompleted) {
         fprintf(stderr, "[apple8-metalio] GPU command failed: %s\n",
                 cb.error ? cb.error.localizedDescription.UTF8String : "unknown");
         return 0;
     }
+    profile_completed_locked(cb, encode_ns, submit_ns, wait_ns, 0);
     memcpy(y, yb.contents, y_bytes);
     metalio_slot_consumed(slot);
     return 1;
@@ -298,6 +386,7 @@ extern "C" int coli_apple8_metalio_swiglu_slot(int slot,
                                              options:MTLResourceStorageModeShared];
     if (!xb || !mid || !yb) return 0;
 
+    uint64_t encode_begin = direct_now_ns();
     id<MTLCommandBuffer> cb = [g_queue commandBuffer];
     if (!cb) return 0;
 
@@ -328,14 +417,151 @@ extern "C" int coli_apple8_metalio_swiglu_slot(int slot,
           threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
     [down endEncoding];
 
+    uint64_t encode_ns = direct_now_ns() - encode_begin;
+    uint64_t submit_begin = direct_now_ns();
     [cb commit];
+    uint64_t submit_ns = direct_now_ns() - submit_begin;
+    uint64_t wait_begin = direct_now_ns();
     [cb waitUntilCompleted];
+    uint64_t wait_ns = direct_now_ns() - wait_begin;
     if (cb.status != MTLCommandBufferStatusCompleted) {
         fprintf(stderr, "[apple8-metalio] SwiGLU command failed: %s\n",
                 cb.error ? cb.error.localizedDescription.UTF8String : "unknown");
         return 0;
     }
+    profile_completed_locked(cb, encode_ns, submit_ns, wait_ns, 0);
     memcpy(y, yb.contents, y_bytes);
     metalio_slot_consumed(slot);
+    return 1;
+}
+
+extern "C" int coli_apple8_metalio_moe_topk(const ColiApple8MetalioExpert *experts,
+                                              const float *route_weights,
+                                              int expert_count,
+                                              const float *x,
+                                              float *y,
+                                              int hidden,
+                                              int intermediate) {
+    if (!experts || !route_weights || !x || !y || expert_count <= 0 ||
+        expert_count > 64 || hidden <= 0 || intermediate <= 0)
+        return 0;
+    std::lock_guard<std::mutex> guard(g_lock);
+    if (!g_gu_pipeline || !g_down_pipeline || !g_reduce_pipeline ||
+        !g_queue || !g_device)
+        return 0;
+
+    const size_t H = (size_t)hidden, M = (size_t)intermediate, K = (size_t)expert_count;
+    if (H > SIZE_MAX / sizeof(float) || M > SIZE_MAX / sizeof(float) ||
+        K > SIZE_MAX / M || K * M > SIZE_MAX / sizeof(float) ||
+        K > SIZE_MAX / H || K * H > SIZE_MAX / sizeof(float))
+        return 0;
+    const size_t x_bytes = H * sizeof(float);
+    const size_t y_bytes = H * sizeof(float);
+    const size_t mid_stride = M * sizeof(float);
+    const size_t out_stride = H * sizeof(float);
+    const size_t mid_bytes = K * mid_stride;
+    const size_t expert_y_bytes = K * out_stride;
+
+    id<MTLBuffer> weight_buffers[64] = {};
+    for (int i = 0; i < expert_count; ++i) {
+        size_t slot_bytes = 0;
+        weight_buffers[i] = slot_buffer_locked(experts[i].slot, &slot_bytes);
+        if (!weight_buffers[i] ||
+            !matrix_fits(slot_bytes, experts[i].gate_offset, experts[i].gate_bytes,
+                         intermediate, hidden) ||
+            !matrix_fits(slot_bytes, experts[i].up_offset, experts[i].up_bytes,
+                         intermediate, hidden) ||
+            !matrix_fits(slot_bytes, experts[i].down_offset, experts[i].down_bytes,
+                         hidden, intermediate))
+            return 0;
+    }
+
+    id<MTLBuffer> xb = [g_device newBufferWithBytes:x length:x_bytes
+                                            options:MTLResourceStorageModeShared];
+    id<MTLBuffer> mid = [g_device newBufferWithLength:mid_bytes
+                                              options:MTLResourceStorageModePrivate];
+    id<MTLBuffer> expert_y = [g_device newBufferWithLength:expert_y_bytes
+                                                   options:MTLResourceStorageModePrivate];
+    id<MTLBuffer> rw = [g_device newBufferWithBytes:route_weights
+                                             length:K * sizeof(float)
+                                            options:MTLResourceStorageModeShared];
+    id<MTLBuffer> yb = [g_device newBufferWithLength:y_bytes
+                                             options:MTLResourceStorageModeShared];
+    if (!xb || !mid || !expert_y || !rw || !yb) return 0;
+
+    const int S = 1;
+    uint64_t encode_begin = direct_now_ns();
+    id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+    if (!cb) return 0;
+
+    /* Stage 1: every gate+up/SwiGLU dispatch. No host wait and no command-buffer
+     * boundary between experts. */
+    id<MTLComputeCommandEncoder> gu = [cb computeCommandEncoder];
+    if (!gu) return 0;
+    [gu setComputePipelineState:g_gu_pipeline];
+    for (int i = 0; i < expert_count; ++i) {
+        [gu setBuffer:weight_buffers[i] offset:experts[i].gate_offset atIndex:0];
+        [gu setBuffer:weight_buffers[i] offset:experts[i].up_offset atIndex:1];
+        [gu setBuffer:xb offset:0 atIndex:2];
+        [gu setBuffer:mid offset:(NSUInteger)i * mid_stride atIndex:3];
+        [gu setBytes:&S length:sizeof(S) atIndex:4];
+        [gu setBytes:&hidden length:sizeof(hidden) atIndex:5];
+        [gu setBytes:&intermediate length:sizeof(intermediate) atIndex:6];
+        [gu dispatchThreadgroups:MTLSizeMake((NSUInteger)intermediate, 1, 1)
+              threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    }
+    [gu endEncoding];
+
+    /* Stage 2: all downs consume the private intermediates produced above.
+     * Encoder ordering in one command buffer establishes the dependency. */
+    id<MTLComputeCommandEncoder> down = [cb computeCommandEncoder];
+    if (!down) return 0;
+    [down setComputePipelineState:g_down_pipeline];
+    for (int i = 0; i < expert_count; ++i) {
+        [down setBuffer:weight_buffers[i] offset:experts[i].down_offset atIndex:0];
+        [down setBuffer:mid offset:(NSUInteger)i * mid_stride atIndex:1];
+        [down setBuffer:expert_y offset:(NSUInteger)i * out_stride atIndex:2];
+        [down setBytes:&S length:sizeof(S) atIndex:3];
+        [down setBytes:&hidden length:sizeof(hidden) atIndex:4];
+        [down setBytes:&intermediate length:sizeof(intermediate) atIndex:5];
+        [down dispatchThreadgroups:MTLSizeMake((NSUInteger)hidden, 1, 1)
+              threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    }
+    [down endEncoding];
+
+    /* Stage 3: one deterministic top-k reduction, still in the same command
+     * buffer. This replaces K host readbacks + K CPU scatter-adds. */
+    id<MTLComputeCommandEncoder> reduce = [cb computeCommandEncoder];
+    if (!reduce) return 0;
+    [reduce setComputePipelineState:g_reduce_pipeline];
+    [reduce setBuffer:expert_y offset:0 atIndex:0];
+    [reduce setBuffer:rw offset:0 atIndex:1];
+    [reduce setBuffer:yb offset:0 atIndex:2];
+    [reduce setBytes:&expert_count length:sizeof(expert_count) atIndex:3];
+    [reduce setBytes:&hidden length:sizeof(hidden) atIndex:4];
+    NSUInteger threads = g_reduce_pipeline.maxTotalThreadsPerThreadgroup;
+    if (threads > 256) threads = 256;
+    if (threads < 1) return 0;
+    NSUInteger groups = ((NSUInteger)hidden + threads - 1) / threads;
+    [reduce dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+           threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+    [reduce endEncoding];
+
+    uint64_t encode_ns = direct_now_ns() - encode_begin;
+    uint64_t submit_begin = direct_now_ns();
+    [cb commit];
+    uint64_t submit_ns = direct_now_ns() - submit_begin;
+    uint64_t wait_begin = direct_now_ns();
+    [cb waitUntilCompleted];
+    uint64_t wait_ns = direct_now_ns() - wait_begin;
+    if (cb.status != MTLCommandBufferStatusCompleted) {
+        fprintf(stderr, "[apple8-metalio] fused top-k command failed: %s\n",
+                cb.error ? cb.error.localizedDescription.UTF8String : "unknown");
+        return 0;
+    }
+    profile_completed_locked(cb, encode_ns, submit_ns, wait_ns, expert_count);
+    memcpy(y, yb.contents, y_bytes);
+    for (int i = 0; i < expert_count; ++i)
+        metalio_slot_consumed(experts[i].slot);
     return 1;
 }
