@@ -7,6 +7,7 @@ without duplicating engine protocols or rewriting the large CLI module.
 """
 import os
 import signal
+import socket
 import sys
 
 _PUBLIC_FILE = os.path.abspath(__file__)
@@ -46,6 +47,83 @@ def env_for_engine(a, arch):
             os.path.isfile(os.path.join(model, "manifest.coli"))):
         env["COLI_CONFIG"] = os.path.realpath(model)
     return env
+
+
+def _free_loopback_port():
+    """Ask the kernel for an unused TCP port for a private chat server."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+# Non-GLM chat uses the OpenAI server internally so chat/serve/web share the
+# same persistent engine path.  The legacy core hardcodes localhost:8000 for
+# this *private* child, which makes an unrelated process on 8000 kill `coli chat`.
+# Keep 8000 only as the conventional auto-attach target for an already-running
+# `coli serve`; otherwise spawn the private child on a kernel-selected free port.
+_core_cmd_chat = cmd_chat
+def cmd_chat(a):
+    arch = model_arch(a.model)
+    if arch == "glm" or getattr(a, "attach", None):
+        return _core_cmd_chat(a)
+
+    if not getattr(a, "no_attach", False):
+        conventional = "http://127.0.0.1:8000"
+        if server_probe(conventional, getattr(a, "api_key", None)):
+            return _core_cmd_chat(a)
+
+    engine = engine_for(a.model)
+    need_model(a.model, engine)
+    model_id = (
+        "kimi-k3-colibri" if arch == "kimi" else
+        "inkling-colibri" if arch == "inkling" else
+        "olmoe-colibri" if arch == "olmoe" else
+        "qwen3-moe-colibri" if arch == "qwen3_moe" else
+        "deepseek-v4-colibri"
+    )
+    port = _free_loopback_port()
+    base = f"http://127.0.0.1:{port}"
+    banner(f"chat · {model_id} · local server", model=a.model)
+
+    import openai_server
+    command = [
+        sys.executable, openai_server.__file__,
+        "--model", a.model,
+        "--engine", engine,
+        "--arch", arch,
+        "--model-id", model_id,
+        "--host", "127.0.0.1",
+        "--port", str(port),
+        "--max-tokens", str(ngen_for(a, interactive=True)),
+    ]
+    if a.cap is not None:
+        command += ["--cap", str(a.cap)]
+    if a.api_key:
+        command += ["--api-key", a.api_key]
+
+    process = subprocess.Popen(command, env=env_for_engine(a, arch))
+    try:
+        spinner = Spinner(f"loading {model_id}…")
+        spinner.start()
+        for _ in range(1800):
+            if process.poll() is not None:
+                spinner.stop()
+                sys.exit(f"{model_id} server exited while loading")
+            if server_probe(base, a.api_key, timeout=1.0):
+                spinner.stop()
+                chat_attached(a, base, model_id)
+                return
+            time.sleep(1)
+        spinner.stop()
+        sys.exit(f"timed out loading {model_id}")
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+
 
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, signal.default_int_handler)
