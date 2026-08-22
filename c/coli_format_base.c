@@ -1165,6 +1165,10 @@ const char *coli_package_profile(const ColiPackage *p) { return p ? p->profile :
 const char *coli_package_compiler(const ColiPackage *p) { return p ? p->compiler : NULL; }
 const uint8_t *coli_package_source_fingerprint(const ColiPackage *p) { return p ? p->source_fingerprint : NULL; }
 uint32_t coli_package_record_alignment(const ColiPackage *p) { return p ? p->record_alignment : 0; }
+const char *coli_package_shard_path(const ColiPackage *p, uint32_t shard_id) {
+    if (!p || shard_id >= p->shard_count) return NULL;
+    return p->shards[shard_id].path;
+}
 
 int coli_package_read_range_ex(const ColiPackage *p, const ColiRecordInfo *r,
                                uint64_t record_offset, void *destination, size_t bytes,

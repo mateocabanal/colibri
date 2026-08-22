@@ -481,7 +481,7 @@ endif
 CFLAGS   += -DCOLI_METAL
 LDFLAGS  += -framework Metal -framework Foundation -lc++
 METAL_OBJ = backend_metal.o
-MIO_OBJ   = metalio.o
+MIO_OBJ   = metalio.o apple8_metalio_direct.o
 MIO_LDFLAGS = -framework Metal -framework Foundation
 MIO_CFLAGS  = -DCOLI_METALIO
 endif
@@ -653,6 +653,9 @@ backend_metal.o: backend_metal.mm backend_metal.h
 # COLI_METAL without changing the Linux build surface.
 metalio.o: metalio.mm metalio.h
 	$(METALXX) -c metalio.mm -o $@
+
+apple8_metalio_direct.o: apple8_metalio_direct.mm apple8_metalio_direct.h apple8_contract.h metalio.h
+	$(METALXX) -c apple8_metalio_direct.mm -o $@
 
 metalio-test: tests/test_metalio.mm metalio.mm metalio.h
 	$(METALXX) tests/test_metalio.mm metalio.mm -framework Metal -framework Foundation -o metalio_test

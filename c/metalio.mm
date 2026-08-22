@@ -60,7 +60,7 @@ static int g_nfiles;
 
 /* persistent slots: [slot id] -> buffer + size + last-load event value.
  * Ids are REUSABLE: freed ids return to the pool, active set stays bounded. */
-#define METALIO_MAX_SLOTS 256
+#define METALIO_MAX_SLOTS 4096
 static struct {
     id<MTLBuffer> buf;
     size_t bytes;
