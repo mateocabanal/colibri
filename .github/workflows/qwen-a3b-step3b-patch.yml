@@ -67,10 +67,10 @@ static const ColiPackage *g_coli_mio_pkg[64];''',
 
           once(
               '''                if (!coli_apple8_metalio_moe_topk(ex, w, K, x, acc,
-                                                  D, c->moe_inter)) {
-                    fprintf(stderr, "qwen: fused direct Apple8 top-k decode dispatch failed\\n");
-                    exit(1);
-                }''',
+                                                            D, c->moe_inter)) {
+                              fprintf(stderr, "qwen: fused direct Apple8 top-k decode dispatch failed\\n");
+                              exit(1);
+                          }''',
               '''                if (qwen_apple8_overlap_enabled()) {
                     if (!coli_apple8_metalio_moe_topk_begin(ex, w, K, x,
                                                             D, c->moe_inter,
