@@ -22,6 +22,7 @@ for script in (
     "apply_qwen_apple8_direct_m2.py",
     "fix_qwen_apple8_direct_decode.py",
     "fix_qwen_decode_topk_alias.py",
+    "fix_qwen_prefill_wave_bounds.py",
 ):
     runpy.run_path(str(ROOT / "tools" / script), run_name="__main__")
 
