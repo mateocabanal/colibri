@@ -7,6 +7,7 @@
 
 #include <chrono>
 #include <mutex>
+#include <new>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -146,6 +147,19 @@ static struct {
     uint64_t encode_ns, submit_ns, wait_ns, kernel_ns;
     uint64_t command_buffers, fused_calls, fused_experts;
 } g_prof;
+
+/* Split-phase fused MoE handle. The Objective-C object fields are retained by
+ * ARC, so the command buffer and shared output remain alive while the host
+ * executes independent CPU work between begin() and finish(). */
+struct Apple8MoePending {
+    id<MTLCommandBuffer> cb = nil;
+    id<MTLBuffer> yb = nil;
+    int slots[64] = {};
+    int expert_count = 0;
+    size_t y_bytes = 0;
+    uint64_t encode_ns = 0;
+    uint64_t submit_ns = 0;
+};
 
 static uint64_t direct_now_ns(void) {
     using namespace std::chrono;
@@ -435,14 +449,21 @@ extern "C" int coli_apple8_metalio_swiglu_slot(int slot,
     return 1;
 }
 
-extern "C" int coli_apple8_metalio_moe_topk(const ColiApple8MetalioExpert *experts,
-                                              const float *route_weights,
-                                              int expert_count,
-                                              const float *x,
-                                              float *y,
-                                              int hidden,
-                                              int intermediate) {
-    if (!experts || !route_weights || !x || !y || expert_count <= 0 ||
+/* Split-phase fused routed MoE. begin() performs the exact same validation,
+ * encoding and submission as the synchronous entry point, but deliberately
+ * leaves the command buffer in flight. finish() is the first host-side
+ * synchronization point and accounts only the residual time the CPU actually
+ * blocked after doing useful independent work. */
+extern "C" int coli_apple8_metalio_moe_topk_begin(
+    const ColiApple8MetalioExpert *experts,
+    const float *route_weights,
+    int expert_count,
+    const float *x,
+    int hidden,
+    int intermediate,
+    void **pending_out) {
+    if (pending_out) *pending_out = nullptr;
+    if (!experts || !route_weights || !x || !pending_out || expert_count <= 0 ||
         expert_count > 64 || hidden <= 0 || intermediate <= 0)
         return 0;
     std::lock_guard<std::mutex> guard(g_lock);
@@ -489,15 +510,18 @@ extern "C" int coli_apple8_metalio_moe_topk(const ColiApple8MetalioExpert *exper
                                              options:MTLResourceStorageModeShared];
     if (!xb || !mid || !expert_y || !rw || !yb) return 0;
 
+    Apple8MoePending *pending = new (std::nothrow) Apple8MoePending();
+    if (!pending) return 0;
+
     const int S = 1;
     uint64_t encode_begin = direct_now_ns();
     id<MTLCommandBuffer> cb = [g_queue commandBuffer];
-    if (!cb) return 0;
+    if (!cb) { delete pending; return 0; }
 
     /* Stage 1: every gate+up/SwiGLU dispatch. No host wait and no command-buffer
      * boundary between experts. */
     id<MTLComputeCommandEncoder> gu = [cb computeCommandEncoder];
-    if (!gu) return 0;
+    if (!gu) { delete pending; return 0; }
     [gu setComputePipelineState:g_gu_pipeline];
     for (int i = 0; i < expert_count; ++i) {
         [gu setBuffer:weight_buffers[i] offset:experts[i].gate_offset atIndex:0];
@@ -515,7 +539,7 @@ extern "C" int coli_apple8_metalio_moe_topk(const ColiApple8MetalioExpert *exper
     /* Stage 2: all downs consume the private intermediates produced above.
      * Encoder ordering in one command buffer establishes the dependency. */
     id<MTLComputeCommandEncoder> down = [cb computeCommandEncoder];
-    if (!down) return 0;
+    if (!down) { delete pending; return 0; }
     [down setComputePipelineState:g_down_pipeline];
     for (int i = 0; i < expert_count; ++i) {
         [down setBuffer:weight_buffers[i] offset:experts[i].down_offset atIndex:0];
@@ -532,7 +556,7 @@ extern "C" int coli_apple8_metalio_moe_topk(const ColiApple8MetalioExpert *exper
     /* Stage 3: one deterministic top-k reduction, still in the same command
      * buffer. This replaces K host readbacks + K CPU scatter-adds. */
     id<MTLComputeCommandEncoder> reduce = [cb computeCommandEncoder];
-    if (!reduce) return 0;
+    if (!reduce) { delete pending; return 0; }
     [reduce setComputePipelineState:g_reduce_pipeline];
     [reduce setBuffer:expert_y offset:0 atIndex:0];
     [reduce setBuffer:rw offset:0 atIndex:1];
@@ -541,7 +565,7 @@ extern "C" int coli_apple8_metalio_moe_topk(const ColiApple8MetalioExpert *exper
     [reduce setBytes:&hidden length:sizeof(hidden) atIndex:4];
     NSUInteger threads = g_reduce_pipeline.maxTotalThreadsPerThreadgroup;
     if (threads > 256) threads = 256;
-    if (threads < 1) return 0;
+    if (threads < 1) { delete pending; return 0; }
     NSUInteger groups = ((NSUInteger)hidden + threads - 1) / threads;
     [reduce dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
            threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
@@ -551,17 +575,55 @@ extern "C" int coli_apple8_metalio_moe_topk(const ColiApple8MetalioExpert *exper
     uint64_t submit_begin = direct_now_ns();
     [cb commit];
     uint64_t submit_ns = direct_now_ns() - submit_begin;
-    uint64_t wait_begin = direct_now_ns();
-    [cb waitUntilCompleted];
-    uint64_t wait_ns = direct_now_ns() - wait_begin;
-    if (cb.status != MTLCommandBufferStatusCompleted) {
-        fprintf(stderr, "[apple8-metalio] fused top-k command failed: %s\n",
-                cb.error ? cb.error.localizedDescription.UTF8String : "unknown");
-        return 0;
-    }
-    profile_completed_locked(cb, encode_ns, submit_ns, wait_ns, expert_count);
-    memcpy(y, yb.contents, y_bytes);
-    for (int i = 0; i < expert_count; ++i)
-        metalio_slot_consumed(experts[i].slot);
+
+    pending->cb = cb;
+    pending->yb = yb;
+    pending->expert_count = expert_count;
+    pending->y_bytes = y_bytes;
+    pending->encode_ns = encode_ns;
+    pending->submit_ns = submit_ns;
+    for (int i = 0; i < expert_count; ++i) pending->slots[i] = experts[i].slot;
+    *pending_out = pending;
     return 1;
+}
+
+extern "C" int coli_apple8_metalio_moe_topk_finish(void *opaque, float *y) {
+    if (!opaque || !y) return 0;
+    Apple8MoePending *pending = static_cast<Apple8MoePending *>(opaque);
+    uint64_t wait_begin = direct_now_ns();
+    [pending->cb waitUntilCompleted];
+    uint64_t wait_ns = direct_now_ns() - wait_begin;
+    const int ok = pending->cb.status == MTLCommandBufferStatusCompleted;
+    if (ok) memcpy(y, pending->yb.contents, pending->y_bytes);
+
+    {
+        std::lock_guard<std::mutex> guard(g_lock);
+        if (ok)
+            profile_completed_locked(pending->cb, pending->encode_ns,
+                                     pending->submit_ns, wait_ns,
+                                     pending->expert_count);
+        for (int i = 0; i < pending->expert_count; ++i)
+            metalio_slot_consumed(pending->slots[i]);
+    }
+    if (!ok) {
+        fprintf(stderr, "[apple8-metalio] fused top-k command failed: %s\n",
+                pending->cb.error ? pending->cb.error.localizedDescription.UTF8String : "unknown");
+    }
+    delete pending;
+    return ok;
+}
+
+extern "C" int coli_apple8_metalio_moe_topk(const ColiApple8MetalioExpert *experts,
+                                              const float *route_weights,
+                                              int expert_count,
+                                              const float *x,
+                                              float *y,
+                                              int hidden,
+                                              int intermediate) {
+    if (!y) return 0;
+    void *pending = nullptr;
+    if (!coli_apple8_metalio_moe_topk_begin(experts, route_weights, expert_count,
+                                             x, hidden, intermediate, &pending))
+        return 0;
+    return coli_apple8_metalio_moe_topk_finish(pending, y);
 }
