@@ -95,8 +95,6 @@ int metalio_init(void){
     if (@available(macOS 13.0, *)) {
         g_dev = MTLCreateSystemDefaultDevice();
         if (!g_dev) return 0;
-        /* MTLIOCommandQueueDescriptor: default priority/depth; the engine can
-         * later expose queue-depth via env if H3 measurements call for it. */
         MTLIOCommandQueueDescriptor *desc = [MTLIOCommandQueueDescriptor new];
         const char *depth_env = getenv("MTLIO_DEPTH");
         int depth = depth_env && atoi(depth_env) > 0 ? atoi(depth_env) : 64;
@@ -125,7 +123,7 @@ void metalio_shutdown(void){
     if (!atomic_load_explicit(&g_active, memory_order_relaxed)) return;
     [g_lock lock];
     if (g_ev && g_ev_val > 1) {
-        [g_ev waitUntilSignaledValue:g_ev_val - 1 timeoutMS:UINT64_MAX];   /* drain */
+        [g_ev waitUntilSignaledValue:g_ev_val - 1 timeoutMS:UINT64_MAX];
         verbose("shutdown: drained event=%llu", (unsigned long long)(g_ev_val - 1));
     }
     for (int i = 0; i < g_nfiles; i++) g_files[i] = nil;
@@ -167,7 +165,6 @@ int metalio_slot_alloc(size_t max_bytes){
     [g_lock lock];
     int sid = -1;
     if (@available(macOS 13.0, *)) {
-        /* reuse a freed id first; else grow up to the hard ceiling */
         for (int i = 0; i < g_nslots && sid < 0; i++)
             if (!g_slots[i].in_use) sid = i;
         if (sid < 0 && g_nslots < METALIO_MAX_SLOTS) sid = g_nslots++;
@@ -192,7 +189,6 @@ void metalio_slot_free(int slot){
     if (!atomic_load_explicit(&g_active, memory_order_relaxed)) return;
     if (slot < 0 || slot >= g_nslots || !g_slots[slot].in_use) return;
     [g_lock lock];
-    /* wait for any in-flight load into this slot before releasing */
     int64_t ev = atomic_load_explicit(&g_slots[slot].last_event, memory_order_relaxed);
     if (ev > 0 && g_ev) [g_ev waitUntilSignaledValue:(uint64_t)ev timeoutMS:UINT64_MAX];
     g_slots[slot].buf = nil;
@@ -211,8 +207,16 @@ size_t metalio_slot_bytes(int slot){
     return g_slots[slot].bytes;
 }
 
-/* all regions must be valid BEFORE anything is committed: a rejected set
- * enqueues nothing (the caller falls back to pread). */
+void *metalio_slot_native_buffer(int slot){
+    if (!atomic_load_explicit(&g_active, memory_order_relaxed)) return NULL;
+    [g_lock lock];
+    void *out = NULL;
+    if (slot >= 0 && slot < g_nslots && g_slots[slot].in_use && g_slots[slot].buf)
+        out = (__bridge void *)g_slots[slot].buf;
+    [g_lock unlock];
+    return out;
+}
+
 static int regions_ok(int slot, const ColiMetalioRegion *regions, int count){
     if (count <= 0 || !regions) return 0;
     size_t cap = g_slots[slot].bytes, highest = 0;
@@ -221,12 +225,13 @@ static int regions_ok(int slot, const ColiMetalioRegion *regions, int count){
         const ColiMetalioRegion *r = &regions[i];
         if (r->file < 0 || r->file >= g_nfiles || !g_files[r->file]) return 0;
         if (r->bytes == 0) return 0;
-        if (r->dst_off > cap || r->bytes > cap - r->dst_off) return 0;  /* slot bound */
-        if (r->src_off > UINT64_MAX - r->bytes) return 0;               /* src overflow */
+        if (r->dst_off > cap || r->bytes > cap - r->dst_off) return 0;
+        if (r->src_off > UINT64_MAX - r->bytes) return 0;
         if (r->bytes > SIZE_MAX - total) return 0;
         total += r->bytes;
         if (r->dst_off + r->bytes > highest) highest = r->dst_off + r->bytes;
     }
+    (void)highest;
     return 1;
 }
 
@@ -278,11 +283,11 @@ int metalio_wait(int64_t event_value){
     if (!atomic_load_explicit(&g_active, memory_order_relaxed)) return -1;
     if (event_value <= 0 || !g_ev) return -1;
     [g_lock lock];
-    if (event_value <= g_consumed_high) {          /* a later wait already covered it */
+    if (event_value <= g_consumed_high) {
         [g_lock unlock];
         return 0;
     }
-    if (event_value > (int64_t)g_ev_val - 1) { [g_lock unlock]; return -1; }   /* not yet issued */
+    if (event_value > (int64_t)g_ev_val - 1) { [g_lock unlock]; return -1; }
     [g_lock unlock];
     uint64_t t0 = mach_absolute_time();
     [g_ev waitUntilSignaledValue:(uint64_t)event_value timeoutMS:UINT64_MAX];
@@ -304,7 +309,6 @@ int metalio_wait(int64_t event_value){
     return 0;
 }
 
-/* mark a slot's contents as consumed (prefetch accounting) */
 void metalio_slot_consumed(int slot){
     if (slot < 0 || slot >= g_nslots) return;
     int64_t ev = atomic_load_explicit(&g_slots[slot].last_event, memory_order_relaxed);

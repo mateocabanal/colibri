@@ -1,0 +1,39 @@
+CXX ?= clang++
+TARGET := tests/apple8_real_expert_parity
+MODEL ?=
+LAYER ?= 0
+EXPERT ?= 0
+
+# Command-line make assignments such as MODEL=~/models/foo preserve the
+# literal '~' on shells that do not expand tildes after '='. The recipe quotes
+# the model path (correctly, so spaces remain safe), which means the shell also
+# cannot expand it later. Normalize the common ~/ prefix here instead. Keep the
+# patsubst arguments adjacent: whitespace after a comma is part of a GNU make
+# function argument and would become a leading space in the resulting path.
+MODEL_PATH := $(patsubst ~/%,$(HOME)/%,$(MODEL))
+
+# The objects below are built by the main Makefile and may contain OpenMP
+# regions when Homebrew libomp is installed. Mirror the main Makefile's Darwin
+# detection so this standalone C++/Metal parity executable resolves __kmpc_*.
+OMPDIR := $(shell brew --prefix libomp 2>/dev/null)
+ifneq ($(and $(OMPDIR),$(wildcard $(OMPDIR)/include/omp.h),$(wildcard $(OMPDIR)/lib/libomp.*)),)
+OMPL := -L$(OMPDIR)/lib -Wl,-rpath,$(OMPDIR)/lib -lomp
+else
+OMPL :=
+endif
+
+.PHONY: all check clean
+
+all:
+	$(MAKE) -f Makefile METAL=1 qwen_coli_format.o mxfp4_expert.o mxfp4_runtime.o metalio.o apple8_metalio_direct.o
+	$(CXX) -O2 -std=c++17 -Wall -Wextra -Werror -fobjc-arc \
+		tests/apple8_real_expert_parity.mm \
+		qwen_coli_format.o mxfp4_expert.o mxfp4_runtime.o metalio.o apple8_metalio_direct.o \
+		-o $(TARGET) -framework Foundation -framework Metal $(OMPL)
+
+check: all
+	@test -n "$(MODEL_PATH)" || { echo "usage: make -f Makefile.apple8-real-parity check MODEL=/path/to/Apple8.raw.coli [LAYER=0 EXPERT=0]" >&2; exit 2; }
+	./$(TARGET) "$(MODEL_PATH)" "$(LAYER)" "$(EXPERT)"
+
+clean:
+	rm -f $(TARGET)

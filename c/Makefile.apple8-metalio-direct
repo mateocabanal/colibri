@@ -1,0 +1,18 @@
+CXX ?= clang++
+CXXFLAGS ?= -O2 -std=c++17 -Wall -Wextra -Werror -fobjc-arc
+FRAMEWORKS := -framework Foundation -framework Metal
+TEST := tests/test_apple8_metalio_direct
+
+.PHONY: check clean
+
+check: $(TEST)
+	./$(TEST)
+
+$(TEST): tests/test_apple8_metalio_direct.mm apple8_metalio_direct.mm \
+		apple8_metalio_direct.h apple8_contract.h metalio.mm metalio.h \
+		coli_format.h generated/coli_target_registry.h
+	$(CXX) $(CXXFLAGS) tests/test_apple8_metalio_direct.mm \
+		apple8_metalio_direct.mm metalio.mm -o $@ $(FRAMEWORKS)
+
+clean:
+	rm -f $(TEST)
