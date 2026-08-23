@@ -1431,6 +1431,41 @@ static void wt_mul(float *y, const float *x, WT *w, int S, int O, int I){
     else               matmul(y, x, w->f, S, O, I);
 }
 
+/* lm_head seam: the head is the single biggest CPU matmul per token
+ * (151936x2048 BF16 ~= 33 ms).  QWEN_HEAD_METAL=1 opts into the deterministic
+ * Metal BF16 matmul when direct Apple8 is active; rc==0 means Metal declined
+ * before commit (CPU fallback safe), rc<0 is post-submit failure (fatal). */
+#ifdef COLI_METALIO
+extern int coli_apple8_metalio_bf16_matmul(const uint16_t *w, const float *x,
+                                           float *y, int S, int O, int I);
+static int qwen_head_metal_enabled(void){
+    static int initialized = 0, enabled = 0;
+    if (!initialized) {
+        const char *v = getenv("QWEN_HEAD_METAL");
+        if (v && v[0] && strcmp(v, "1") == 0) enabled = 1;
+        initialized = 1;
+    }
+    return g_apple8_direct && enabled;
+}
+static void head_mul(Model *m, const float *normed, float *logits){
+    Cfg *c = &m->c;
+    if (qwen_head_metal_enabled() && m->lm_head.bf16) {
+        int rc = coli_apple8_metalio_bf16_matmul(
+            m->lm_head.bf16, normed, logits, 1, c->vocab, c->hidden);
+        if (rc > 0) return;
+        if (rc < 0) {
+            fprintf(stderr, "qwen: Metal lm_head failed after submission\n");
+            exit(1);
+        }
+    }
+    wt_mul(logits, normed, &m->lm_head, 1, c->vocab, c->hidden);
+}
+#else
+static void head_mul(Model *m, const float *normed, float *logits){
+    wt_mul(logits, normed, &m->lm_head, 1, m->c.vocab, m->c.hidden);
+}
+#endif
+
 /* ---------- packed expert kernels (copied from quant.h per the standalone-
  * engine convention; the layouts are part of the snapshot format) ---------- */
 
@@ -3804,7 +3839,7 @@ static void mtp_chain(Model *m, int last_token, const float *h_main, int pos, in
     int tok = last_token;
     for (int i = 0; i < k; i++) {
         mtp_forward(m, tok, pos + i, h, out);
-        wt_mul(logits, out, &m->lm_head, 1, c->vocab, D);
+        head_mul(m, out, logits);
         drafts[i] = qwen_pick_token(m, logits, -1);
         tok = drafts[i];
         memcpy(h, out, (size_t)D * sizeof(float));
@@ -4344,8 +4379,8 @@ static float *step_batched_h(Model *m, const int *ids, int n, int pos_base,
     if (per_logits) {
         for (int j = 0; j < last_cj; j++) {
             rmsnorm_row(normed + (int64_t)j * D, hbuf + (int64_t)j * D, m->final_norm, D, c->eps);
-            wt_mul(per_logits + (int64_t)j * c->vocab, normed + (int64_t)j * D,
-                   &m->lm_head, 1, c->vocab, D);
+            head_mul(m, normed + (int64_t)j * D,
+                     per_logits + (int64_t)j * c->vocab);
         }
     }
     rmsnorm_row(normed, hbuf + (int64_t)(last_cj - 1) * D, m->final_norm, D, c->eps);
@@ -4486,7 +4521,7 @@ static float *step_h(Model *m, const int *ids, int n, int pos_base, float **h_ou
     rmsnorm_row(normed, h, m->final_norm, D, c->eps);
     float *logits = falloc(c->vocab);
     double qhead_began = qprof_head_begin();
-    wt_mul(logits, normed, &m->lm_head, 1, c->vocab, D);
+    head_mul(m, normed, logits);
     qprof_head_end(m, qhead_began);
     if (h_out) *h_out = h; else free(h);
     free(normed);

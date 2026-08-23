@@ -135,6 +135,55 @@ kernel void apple8_moe_reduce(
         acc += expert_y[(long)i * H + (long)h] * weights[i];
     y[h] = acc;
 }
+
+/* Dense BF16 matmul (lm_head etc.): deterministic two-stage row dots, eight
+ * rows per 256-thread threadgroup.  Each lane keeps a contiguous ascending
+ * input slice; lane 0 combines the 32 partials strictly 0..31 — the same
+ * deterministic pattern as the GDN input kernel. */
+constant uint QWEN_HEAD_ROWS_PER_TG = 8u;
+constant uint QWEN_HEAD_DOT_LANES = 32u;
+constant uint QWEN_HEAD_DOT_THREADS = QWEN_HEAD_ROWS_PER_TG * QWEN_HEAD_DOT_LANES;
+
+inline float qwen_bf16(device const ushort *p, long i) {
+    return as_type<float>((uint)p[i] << 16);
+}
+
+kernel void qwen_bf16_matmul(
+    device const ushort *w [[buffer(0)]],
+    device const float *x  [[buffer(1)]],
+    device float *y        [[buffer(2)]],
+    constant int &S        [[buffer(3)]],
+    constant int &O        [[buffer(4)]],
+    constant int &I        [[buffer(5)]],
+    uint tg                [[threadgroup_position_in_grid]],
+    uint tid               [[thread_index_in_threadgroup]])
+{
+    threadgroup float partial[QWEN_HEAD_DOT_THREADS];
+    const uint row_slot = tid / QWEN_HEAD_DOT_LANES;
+    const uint lane = tid - row_slot * QWEN_HEAD_DOT_LANES;
+    const uint row = tg * QWEN_HEAD_ROWS_PER_TG + row_slot;
+    const uint total = (uint)(S * O);
+    float acc = 0.0f;
+    if (row < total) {
+        const int s = (int)(row / (uint)O);
+        const int o = (int)(row % (uint)O);
+        device const float *xr = x + (long)s * I;
+        device const ushort *wr = w + (long)o * I;
+        const int span = (I + 31) / 32;
+        const int begin = (int)lane * span;
+        const int end = min(begin + span, I);
+        for (int i = begin; i < end; ++i)
+            acc += xr[i] * qwen_bf16(wr, i);
+    }
+    partial[tid] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (row < total && lane == 0) {
+        float sum = 0.0f;
+        const uint pb = row_slot * QWEN_HEAD_DOT_LANES;
+        for (uint p = 0; p < QWEN_HEAD_DOT_LANES; ++p) sum += partial[pb + p];
+        y[row] = sum;
+    }
+}
 )METAL";
 
 static id<MTLDevice> g_device = nil;
@@ -143,6 +192,7 @@ static id<MTLComputePipelineState> g_matmul_pipeline = nil;
 static id<MTLComputePipelineState> g_gu_pipeline = nil;
 static id<MTLComputePipelineState> g_down_pipeline = nil;
 static id<MTLComputePipelineState> g_reduce_pipeline = nil;
+static id<MTLComputePipelineState> g_bf16_matmul_pipeline = nil;
 static std::mutex g_lock;
 
 static struct {
@@ -162,6 +212,13 @@ struct Apple8MoePending {
     uint64_t encode_ns = 0;
     uint64_t submit_ns = 0;
 };
+
+/* Dense BF16 weight buffer cache: the lm_head pointer is stable for the
+ * model lifetime, so the 622 MB copy happens once and every later token
+ * reuses the buffer. */
+static const uint16_t *g_bf16_w = NULL;
+static id<MTLBuffer> g_bf16_wbuf = nil;
+static int g_bf16_O = 0, g_bf16_I = 0;
 
 static uint64_t direct_now_ns(void) {
     using namespace std::chrono;
@@ -194,6 +251,10 @@ static void clear_locked(void) {
     g_gu_pipeline = nil;
     g_down_pipeline = nil;
     g_reduce_pipeline = nil;
+    g_bf16_matmul_pipeline = nil;
+    g_bf16_wbuf = nil;
+    g_bf16_w = NULL;
+    g_bf16_O = g_bf16_I = 0;
     g_queue = nil;
     g_device = nil;
 }
@@ -266,15 +327,12 @@ kernel void qwen_gdn_input_bf16(
                 }
             }
         }
-        /* Coalesced BF16 dot (CCBPLAN B, Hermes): SIMD lanes read x[w] and
-         * w[] at the SAME index i = lane + 32*g - contiguous per instruction.
-         * Reduction stays fixed-order: each lane's running acc, then lane 0
-         * combines partial[pb + 0..31] in ascending lane order - deterministic. */
+        const int span = (D + 31) / 32;
+        const int begin = (int)lane * span;
+        const int end = min(begin + span, D);
         const long base = (long)o * D;
-        float laneacc = 0.0f;
-        for (int i = (int)lane; i < D; i += 32)
-            laneacc += x[i] * qwen_bf16(w, base + i);
-        acc = laneacc;
+        for (int i = begin; i < end; ++i)
+            acc += x[i] * qwen_bf16(w, base + i);
     }
     partial[tid] = acc;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -448,12 +506,12 @@ kernel void qwen_gdn_output_bf16(
     const uint o = tg * QWEN_GDN_ROWS_PER_TG + row_slot;
     float acc = 0.0f;
     if (o < (uint)O) {
-        /* Coalesced BF16 dot (CCBPLAN B): lane reads index i = lane + 32*g. */
+        const int span = (I + 31) / 32;
+        const int begin = (int)lane * span;
+        const int end = min(begin + span, I);
         const long base = (long)o * I;
-        float laneacc = 0.0f;
-        for (int i = (int)lane; i < I; i += 32)
-            laneacc += x[i] * qwen_bf16(w, base + i);
-        acc = laneacc;
+        for (int i = begin; i < end; ++i)
+            acc += x[i] * qwen_bf16(w, base + i);
     }
     partial[tid] = acc;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -743,7 +801,7 @@ extern "C" int coli_apple8_metalio_gdn_token(
 extern "C" int coli_apple8_metalio_direct_init(void) {
     std::lock_guard<std::mutex> guard(g_lock);
     if (g_matmul_pipeline && g_gu_pipeline && g_down_pipeline && g_reduce_pipeline &&
-        g_queue && g_device)
+        g_bf16_matmul_pipeline && g_queue && g_device)
         return 1;
     if (!metalio_active()) return 0;
 
@@ -770,6 +828,8 @@ extern "C" int coli_apple8_metalio_direct_init(void) {
     if (!g_down_pipeline) goto pipeline_fail;
     g_reduce_pipeline = make_pipeline(library, @"apple8_moe_reduce", &error);
     if (!g_reduce_pipeline) goto pipeline_fail;
+    g_bf16_matmul_pipeline = make_pipeline(library, @"qwen_bf16_matmul", &error);
+    if (!g_bf16_matmul_pipeline) goto pipeline_fail;
     (void)qwen_gdn_init_locked();
     memset(&g_prof, 0, sizeof(g_prof));
     return 1;
@@ -899,6 +959,64 @@ extern "C" int coli_apple8_metalio_matmul_slot(int slot,
     profile_completed_locked(cb, encode_ns, submit_ns, wait_ns, 0);
     memcpy(y, yb.contents, y_bytes);
     metalio_slot_consumed(slot);
+    return 1;
+}
+
+extern "C" int coli_apple8_metalio_bf16_matmul(
+    const uint16_t *w, const float *x, float *y, int S, int O, int I)
+{
+    if (!w || !x || !y || S <= 0 || O <= 0 || I <= 0) return 0;
+    std::lock_guard<std::mutex> guard(g_lock);
+    if (!g_bf16_matmul_pipeline || !g_queue || !g_device) return 0;
+
+    if (w != g_bf16_w || O != g_bf16_O || I != g_bf16_I) {
+        g_bf16_wbuf = [g_device newBufferWithBytes:w
+                        length:(size_t)O * (size_t)I * sizeof(uint16_t)
+                       options:MTLResourceStorageModeShared];
+        if (!g_bf16_wbuf) return 0;
+        g_bf16_w = w;
+        g_bf16_O = O;
+        g_bf16_I = I;
+    }
+
+    const size_t x_bytes = (size_t)S * (size_t)I * sizeof(float);
+    const size_t y_bytes = (size_t)S * (size_t)O * sizeof(float);
+    id<MTLBuffer> xb = [g_device newBufferWithBytes:x length:x_bytes
+                                            options:MTLResourceStorageModeShared];
+    id<MTLBuffer> yb = [g_device newBufferWithLength:y_bytes
+                                             options:MTLResourceStorageModeShared];
+    if (!xb || !yb) return 0;
+
+    uint64_t encode_begin = direct_now_ns();
+    id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+    if (!cb) return 0;
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    if (!enc) return 0;
+    [enc setComputePipelineState:g_bf16_matmul_pipeline];
+    [enc setBuffer:g_bf16_wbuf offset:0 atIndex:0];
+    [enc setBuffer:xb offset:0 atIndex:1];
+    [enc setBuffer:yb offset:0 atIndex:2];
+    [enc setBytes:&S length:sizeof(S) atIndex:3];
+    [enc setBytes:&O length:sizeof(O) atIndex:4];
+    [enc setBytes:&I length:sizeof(I) atIndex:5];
+    const NSUInteger total_rows = (NSUInteger)S * (NSUInteger)O;
+    [enc dispatchThreadgroups:MTLSizeMake((total_rows + 7u) / 8u, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [enc endEncoding];
+    uint64_t encode_ns = direct_now_ns() - encode_begin;
+    uint64_t submit_begin = direct_now_ns();
+    [cb commit];
+    uint64_t submit_ns = direct_now_ns() - submit_begin;
+    uint64_t wait_begin = direct_now_ns();
+    [cb waitUntilCompleted];
+    uint64_t wait_ns = direct_now_ns() - wait_begin;
+    if (cb.status != MTLCommandBufferStatusCompleted) {
+        fprintf(stderr, "[apple8-metalio] BF16 matmul failed: %s\n",
+                cb.error ? cb.error.localizedDescription.UTF8String : "unknown");
+        return -1;
+    }
+    profile_completed_locked(cb, encode_ns, submit_ns, wait_ns, 0);
+    memcpy(y, yb.contents, y_bytes);
     return 1;
 }
 
