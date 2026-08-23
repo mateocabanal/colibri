@@ -3080,6 +3080,10 @@ static int qwen_token_forward_metal(
     mr->layer = 0;
     mr->token_pos = pos;
 
+    /* bisect gates: bit0 = skip MoE, bit1 = skip pre-MoE */
+    if (getenv("QWEN_TOKEN_SKIP_MOE")) mr->reserved0 |= 1u;
+    if (getenv("QWEN_TOKEN_SKIP_PREMOE")) mr->reserved0 |= 2u;
+
     for (int i = 0; i < 16; ++i) {
         mr->routed_expert[i] = -1;
         mr->missing_expert[i] = -1;
@@ -3089,6 +3093,7 @@ static int qwen_token_forward_metal(
      * warms as layers are filled, so steady-state is 1 dispatch/token. */
     const int max_redispatch = m->c.n_layers + 1;
     for (int redispatch = 0; redispatch <= max_redispatch; ++redispatch) {
+        double t_d0 = now_s();
         if (!qwen_token_kernel_dispatch_once(
                 m->token_blob,
                 m->token_state,
@@ -3101,11 +3106,13 @@ static int qwen_token_forward_metal(
         }
 
         __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        double t_d1 = now_s();
 
         if (getenv("QWEN_TOKEN_DEBUG")) {
             const float *rr = (const float *)(state + dl->residual_off);
-            fprintf(stderr, "[WT-DEBUG] dispatch %d status=%u layer=%u resid[0..3]=%.6g %.6g %.6g %.6g\n",
-                    redispatch, mr->status, mr->layer, rr[0], rr[1], rr[2], rr[3]);
+            fprintf(stderr, "[WT-DEBUG] dispatch %d status=%u layer=%u resid[0..3]=%.6g %.6g %.6g %.6g dispatch_ms=%.3f\n",
+                    redispatch, mr->status, mr->layer, rr[0], rr[1], rr[2], rr[3],
+                    (t_d1 - t_d0) * 1e3);
         }
 
         if (mr->status == QWEN_TOKEN_STATUS_DONE) {
@@ -3250,7 +3257,9 @@ static int qwen_token_forward_metal(
                 continue;
 
             Slot *s = NULL;
+            double t_g0 = now_s();
             expert_get(m, layer, eid, &s);
+            double t_g1 = now_s();
             if (!s) {
                 snprintf(why, sizeof(why),
                          "expert_get returned NULL for (%d,%d)",
@@ -3264,6 +3273,11 @@ static int qwen_token_forward_metal(
                 qwen_token_runtime_disable(why);
                 return 0;
             }
+            double t_f1 = now_s();
+
+            if (getenv("QWEN_TOKEN_DEBUG"))
+                fprintf(stderr, "[WT-TIME] redispatch=%d expert=%d get_ms=%.3f fill_ms=%.3f\n",
+                        redispatch, eid, (t_g1 - t_g0) * 1e3, (t_f1 - t_g1) * 1e3);
 
             filled++;
         }

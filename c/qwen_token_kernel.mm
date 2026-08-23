@@ -586,14 +586,26 @@ qtk_bf16_matvec(device const uchar *blob,
                 uint cols,
                 uint tid)
 {
-    for (uint r = tid; r < rows; r += QTK_THREADS) {
-        float s = 0.0f;
-        ulong base = (ulong)r * (ulong)cols;
+    /*
+     * Coalesced BF16 dot, ported from the verified apple8_mxfp4_matmul
+     * pattern: one SIMD group per output row, simd_sum reduction.
+     * No threadgroup barriers - safe under any thread count.
+     */
+    const uint lane = tid & 31u;
+    const uint row_slot = tid >> 5;
+    const uint rows_per_tg = QTK_THREADS >> 5;
 
-        for (uint c = 0; c < cols; ++c)
-            s += qtk_bf16(blob, w_off, (uint)(base + c)) * x[c];
+    for (uint r0 = row_slot; r0 < rows; r0 += rows_per_tg) {
+        float laneacc = 0.0f;
+        const ulong base = (ulong)r0 * (ulong)cols;
 
-        dst[r] = s;
+        for (uint c = lane; c < cols; c += 32u)
+            laneacc += qtk_bf16(blob, w_off, (uint)(base + c)) * x[c];
+
+        const float acc = simd_sum(laneacc);
+
+        if (lane == 0u)
+            dst[r0] = acc;
     }
 }
 
@@ -625,14 +637,14 @@ qtk_rmsnorm(device const float *x,
             rsqrt(ss / (float)n + eps);
     }
 
-    threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     const float inv = tg_scalar[0];
 
     for (uint i = tid; i < n; i += QTK_THREADS)
         y[i] = x[i] * (1.0f + qtk_f32(blob, w_off, i)) * inv;
 
-    threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 
 static inline void
@@ -644,7 +656,7 @@ qtk_residual_add(device float *residual,
     for (uint i = tid; i < n; i += QTK_THREADS)
         residual[i] += delta[i];
 
-    threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 
 /*
@@ -740,7 +752,7 @@ qtk_attn_norm_rope(device float *q,
         qtk_rope_head(k, base, rotary_dim, token_pos, theta);
     }
 
-    threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 
 /*
@@ -791,7 +803,7 @@ qtk_gdn_conv(device float *qkv,
         qkv[c] = qtk_silu(y);
     }
 
-    threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 
 /*
@@ -972,14 +984,14 @@ qtk_gdn_output_norm(device float *y,
         }
     }
 
-    threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 
 static inline void
 qtk_gdn_layer(device const uchar *blob,
               constant QwenTokenKernelParams &p,
-              QwenTokenLayerBlob L,
-              QwenTokenDeviceLayout dl,
+              constant QwenTokenLayerBlob &L,
+              constant QwenTokenDeviceLayout &dl,
               device uchar *state,
               device const float *normed,
               device float *attn,
@@ -1050,7 +1062,7 @@ qtk_gdn_layer(device const uchar *blob,
                     hidden,
                     tid);
 
-    threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     device float *conv_state =
         qtk_state_f32(state,
@@ -1084,7 +1096,7 @@ qtk_gdn_layer(device const uchar *blob,
                            tid);
     }
 
-    threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     qtk_gdn_output_norm(w3,
                         w1,
@@ -1103,7 +1115,7 @@ qtk_gdn_layer(device const uchar *blob,
                     vdim,
                     tid);
 
-    threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 
 /*
@@ -1133,7 +1145,7 @@ qtk_attn_store_kv(device float *kv_k,
         kv_v[base + i] = v[i];
     }
 
-    threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 
 /*
@@ -1233,8 +1245,8 @@ qtk_attention_scan(device const float *q,
 static inline void
 qtk_attention_layer(device const uchar *blob,
                     constant QwenTokenKernelParams &p,
-                    QwenTokenLayerBlob L,
-                    QwenTokenDeviceLayout dl,
+                    constant QwenTokenLayerBlob &L,
+                    constant QwenTokenDeviceLayout &dl,
                     device uchar *state,
                     device const float *normed,
                     device float *attn,
@@ -1288,7 +1300,7 @@ qtk_attention_layer(device const uchar *blob,
                     p.hidden,
                     tid);
 
-    threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     qtk_attn_norm_rope(q,
                        k,
@@ -1333,7 +1345,7 @@ qtk_attention_layer(device const uchar *blob,
                            tid);
     }
 
-    threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     /* Output gate: attn * sigmoid(gate) elementwise (gate = 2nd half of the
      * q|gate block), matching the CPU attention_token. */
@@ -1344,7 +1356,7 @@ qtk_attention_layer(device const uchar *blob,
         ctx[i] *= qtk_sigmoid(g);
     }
 
-    threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     qtk_bf16_matvec(blob,
                     L.attn_o,
@@ -1354,7 +1366,7 @@ qtk_attention_layer(device const uchar *blob,
                     qdim,
                     tid);
 
-    threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 
 /*
@@ -1371,8 +1383,8 @@ qtk_attention_layer(device const uchar *blob,
 static inline void
 qtk_pre_moe_layer(device const uchar *blob,
                   constant QwenTokenKernelParams &p,
-                  QwenTokenLayerBlob L,
-                  QwenTokenDeviceLayout dl,
+                  constant QwenTokenLayerBlob &L,
+                  constant QwenTokenDeviceLayout &dl,
                   device uchar *state,
                   uint layer,
                   uint token_pos,
@@ -1485,7 +1497,7 @@ static constant float APPLE8_MX4[16] = {
 
 static inline device QwenTokenMissRecord *
 qtk_miss_record(device uchar *state,
-                QwenTokenDeviceLayout dl)
+                constant QwenTokenDeviceLayout &dl)
 {
     return reinterpret_cast<device QwenTokenMissRecord *>(
         state + dl.miss_off);
@@ -1493,7 +1505,7 @@ qtk_miss_record(device uchar *state,
 
 static inline device float *
 qtk_moe_input(device uchar *state,
-              QwenTokenDeviceLayout dl)
+              constant QwenTokenDeviceLayout &dl)
 {
     return qtk_state_f32(state, dl.moe_input_off);
 }
@@ -1507,7 +1519,7 @@ qtk_copy_f32(device const float *src,
     for (uint i = tid; i < n; i += QTK_THREADS)
         dst[i] = src[i];
 
-    threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 
 /*
@@ -1520,7 +1532,9 @@ qtk_copy_f32(device const float *src,
 static inline float
 qtk_e8m0(uchar e)
 {
-    return exp2((float)((int)e - 127));
+    /* Exact 2^(e-127) via the bit trick - matches the verified
+     * apple8_ue8m0.  No per-element exp2(). */
+    return as_type<float>((uint)e << 23);
 }
 
 /*
@@ -1533,44 +1547,30 @@ qtk_e8m0(uchar e)
  * Edge tiles are zero padded by the packer.
  */
 static inline float
-qtk_apple8_get(device const uchar *matrix,
-               uint row,
-               uint col,
-               uint cols)
+qtk_apple8_dot_partial(device const uchar *tiles,
+                       device const float *x,
+                       uint I,
+                       uint o,
+                       uint lane)
 {
-    const uint ng =
-        (cols + 31u) >> 5;
+    /* One SIMD lane consumes one value from each 32-column MXFP4 group.
+     * Ported from the verified apple8_dot_partial. */
+    const uint groups = (I + 31u) >> 5;
+    const uint output_tile = o >> 3;
+    const uint tile_row = o & 7u;
+    float acc = 0.0f;
 
-    const uint otile =
-        row >> 3;
+    for (uint g = 0u; g < groups; ++g) {
+        const uint k = g * 32u + lane;
+        if (k >= I) continue;
+        const ulong tile_index = (ulong)output_tile * (ulong)groups + g;
+        device const uchar *tile = tiles + tile_index * 136ul;
+        const uchar packed = tile[tile_row * 16u + (lane >> 1)];
+        const uchar code = ((lane & 1u) != 0u) ? (packed >> 4) : (packed & 15u);
+        acc += APPLE8_MX4[code] * qtk_e8m0(tile[128u + tile_row]) * x[k];
+    }
 
-    const uint orow =
-        row & 7u;
-
-    const uint g =
-        col >> 5;
-
-    const uint k =
-        col & 31u;
-
-    const ulong tile_index =
-        (ulong)otile * (ulong)ng + (ulong)g;
-
-    device const uchar *tile =
-        matrix + tile_index * 136ul;
-
-    const uchar packed =
-        tile[orow * 16u + (k >> 1)];
-
-    const uint code =
-        ((k & 1u) == 0u)
-            ? ((uint)packed & 0x0fu)
-            : ((uint)packed >> 4);
-
-    const float scale =
-        qtk_e8m0(tile[128u + orow]);
-
-    return APPLE8_MX4[code] * scale;
+    return acc;
 }
 
 /*
@@ -1587,13 +1587,18 @@ qtk_apple8_matvec(device const uchar *matrix,
                   uint cols,
                   uint tid)
 {
-    for (uint r = tid; r < rows; r += QTK_THREADS) {
-        float s = 0.0f;
+    /* Ported from the verified apple8_mxfp4_matmul: one SIMD group per
+     * output row, simd_sum reduction. */
+    const uint lane = tid & 31u;
+    const uint row_slot = tid >> 5;
+    const uint rows_per_tg = QTK_THREADS >> 5;
 
-        for (uint c = 0u; c < cols; ++c)
-            s += qtk_apple8_get(matrix, r, c, cols) * x[c];
+    for (uint r0 = row_slot; r0 < rows; r0 += rows_per_tg) {
+        const float acc =
+            simd_sum(qtk_apple8_dot_partial(matrix, x, cols, r0, lane));
 
-        dst[r] = s;
+        if (lane == 0u)
+            dst[r0] = acc;
     }
 }
 
@@ -1611,8 +1616,8 @@ qtk_apple8_matvec(device const uchar *matrix,
  */
 static inline void
 qtk_router(device const uchar *blob,
-           QwenTokenKernelParams p,
-           QwenTokenLayerBlob L,
+           constant QwenTokenKernelParams &p,
+           constant QwenTokenLayerBlob &L,
            device const float *moe_input,
            device float *router_scratch,
            device QwenTokenMissRecord *miss,
@@ -1627,7 +1632,7 @@ qtk_router(device const uchar *blob,
                     p.hidden,
                     tid);
 
-    threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     if (tid == 0u) {
         float mx = -INFINITY;
@@ -1703,7 +1708,7 @@ qtk_router(device const uchar *blob,
         miss->missing_count = 0u;
     }
 
-    threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 
 /*
@@ -1740,8 +1745,8 @@ qtk_find_expert_slot(device const uint *map,
  * tg_u32[1] is the uniform "must return" flag consumed by the kernel.
  */
 static inline void
-qtk_check_expert_residency(QwenTokenKernelParams p,
-                           QwenTokenDeviceLayout dl,
+qtk_check_expert_residency(constant QwenTokenKernelParams &p,
+                           constant QwenTokenDeviceLayout &dl,
                            device uchar *state,
                            device QwenTokenMissRecord *miss,
                            uint layer,
@@ -1791,7 +1796,7 @@ qtk_check_expert_residency(QwenTokenKernelParams p,
         }
     }
 
-    threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 
 /*
@@ -1807,9 +1812,9 @@ qtk_check_expert_residency(QwenTokenKernelParams p,
  */
 static inline void
 qtk_routed_experts(device const uchar *blob,
-                   QwenTokenKernelParams p,
-                   QwenTokenLayerBlob L,
-                   QwenTokenDeviceLayout dl,
+                   constant QwenTokenKernelParams &p,
+                   constant QwenTokenLayerBlob &L,
+                   constant QwenTokenDeviceLayout &dl,
                    device uchar *state,
                    device const float *moe_input,
                    device QwenTokenMissRecord *miss,
@@ -1824,7 +1829,7 @@ qtk_routed_experts(device const uchar *blob,
     for (uint d = tid; d < p.hidden; d += QTK_THREADS)
         acc[d] = 0.0f;
 
-    threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     device const uint *map =
         reinterpret_cast<device const uint *>(
@@ -1849,7 +1854,7 @@ qtk_routed_experts(device const uchar *blob,
                                      miss->routed_expert[r]);
         }
 
-        threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
         const uint bank_slot =
             tg_u32[0];
@@ -1885,7 +1890,7 @@ qtk_routed_experts(device const uchar *blob,
                           p.hidden,
                           tid);
 
-        threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
         /*
          * SwiGLU expert activation.
@@ -1897,7 +1902,7 @@ qtk_routed_experts(device const uchar *blob,
                 qtk_silu(w0[j]) * w1[j];
         }
 
-        threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
         /*
          * [hidden, moe_inter]
@@ -1909,7 +1914,7 @@ qtk_routed_experts(device const uchar *blob,
                           p.moe_inter,
                           tid);
 
-        threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
         const float routed_weight =
             miss->routed_weight[r];
@@ -1925,7 +1930,7 @@ qtk_routed_experts(device const uchar *blob,
                 routed_weight * w2[d];
         }
 
-        threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
 
@@ -1941,8 +1946,8 @@ qtk_routed_experts(device const uchar *blob,
  */
 static inline void
 qtk_shared_expert(device const uchar *blob,
-                  QwenTokenKernelParams p,
-                  QwenTokenLayerBlob L,
+                  constant QwenTokenKernelParams &p,
+                  constant QwenTokenLayerBlob &L,
                   device const float *moe_input,
                   device float *w0,
                   device float *w1,
@@ -1966,7 +1971,7 @@ qtk_shared_expert(device const uchar *blob,
                     p.hidden,
                     tid);
 
-    threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (uint j = tid;
          j < p.shared_inter;
@@ -1975,7 +1980,7 @@ qtk_shared_expert(device const uchar *blob,
             qtk_silu(w0[j]) * w1[j];
     }
 
-    threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     qtk_bf16_matvec(blob,
                     L.se_down,
@@ -1985,7 +1990,7 @@ qtk_shared_expert(device const uchar *blob,
                     p.shared_inter,
                     tid);
 
-    threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     /*
      * Keep this scalar projection completely serial so its FP order matches
@@ -2002,7 +2007,7 @@ qtk_shared_expert(device const uchar *blob,
             qtk_sigmoid(g);
     }
 
-    threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     const float sg =
         tg_scalar[0];
@@ -2013,7 +2018,7 @@ qtk_shared_expert(device const uchar *blob,
         sy[d] *= sg;
     }
 
-    threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 
 /*
@@ -2028,9 +2033,9 @@ qtk_shared_expert(device const uchar *blob,
  */
 static inline void
 qtk_moe_execute(device const uchar *blob,
-                QwenTokenKernelParams p,
-                QwenTokenLayerBlob L,
-                QwenTokenDeviceLayout dl,
+                constant QwenTokenKernelParams &p,
+                constant QwenTokenLayerBlob &L,
+                constant QwenTokenDeviceLayout &dl,
                 device uchar *state,
                 device const float *moe_input,
                 device QwenTokenMissRecord *miss,
@@ -2095,7 +2100,7 @@ qtk_moe_execute(device const uchar *blob,
             moe_acc[d] + w2[d];
     }
 
-    threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 
 kernel void
@@ -2119,7 +2124,7 @@ qwen_token_whole(device const uchar *weights       [[buffer(0)]],
     /*
      * Use the existing layout member/accessor here.  Do not duplicate the ABI.
      */
-    const QwenTokenDeviceLayout dl = *dl_param;
+    constant QwenTokenDeviceLayout &dl = *dl_param;
 
     threadgroup float tg_scalar[1];
 
@@ -2148,12 +2153,12 @@ qwen_token_whole(device const uchar *weights       [[buffer(0)]],
         resume_moe = true;
     }
 
-    threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (uint layer = first_layer;
          layer < p->n_layers;
          ++layer) {
-        const QwenTokenLayerBlob L =
+        constant QwenTokenLayerBlob &L =
             p->layer[layer];
 
         const bool this_is_moe_resume =
@@ -2162,7 +2167,7 @@ qwen_token_whole(device const uchar *weights       [[buffer(0)]],
         device float *moe_input =
             qtk_moe_input(state, dl);
 
-        if (!this_is_moe_resume) {
+        if (!this_is_moe_resume && (miss->reserved0 & 2u) == 0u) {
             /*
              * Fresh layer:
              *
@@ -2228,7 +2233,7 @@ qwen_token_whole(device const uchar *weights       [[buffer(0)]],
              * the miss-producing dispatch.
              */
             threadgroup_barrier(
-                mem_flags::mem_device_and_threadgroup);
+                mem_flags::mem_threadgroup);
         }
 
         /*
@@ -2265,17 +2270,19 @@ qwen_token_whole(device const uchar *weights       [[buffer(0)]],
          * Every routed expert is resident.  Execute routed experts in fixed
          * top-k order, execute shared expert, then update residual.
          */
-        qtk_moe_execute(weights,
-                        *p,
-                        L,
-                        dl,
-                        state,
-                        moe_input,
-                        miss,
-                        layer,
-                        tid,
-                        tg_scalar,
-                        tg_u32);
+        if ((miss->reserved0 & 1u) == 0u) {
+            qtk_moe_execute(weights,
+                            *p,
+                            L,
+                            dl,
+                            state,
+                            moe_input,
+                            miss,
+                            layer,
+                            tid,
+                            tg_scalar,
+                            tg_u32);
+        }
 
         /*
          * Only AFTER the residual update is committed is the resume record
@@ -2288,7 +2295,7 @@ qwen_token_whole(device const uchar *weights       [[buffer(0)]],
         }
 
         threadgroup_barrier(
-            mem_flags::mem_device_and_threadgroup);
+            mem_flags::mem_threadgroup);
 
         /*
          * A resumed layer has now fully caught up with the normal forward
@@ -2441,7 +2448,12 @@ qwen_token_kernel_dispatch_once(
             return 0;
         }
 
-        id<MTLCommandQueue> queue = [dev newCommandQueue];
+        static id<MTLDevice> queue_dev = nil;
+        static id<MTLCommandQueue> queue = nil;
+        if (!queue || queue_dev != dev) {
+            queue = [dev newCommandQueue];
+            queue_dev = dev;
+        }
         if (!queue) {
             if (why && why_n) snprintf(why, why_n, "newCommandQueue failed");
             return 0;
@@ -2474,6 +2486,25 @@ qwen_token_kernel_dispatch_once(
 
         [cb commit];
         [cb waitUntilCompleted];
+
+        if (getenv("QWEN_TOKEN_DEBUG")) {
+            fprintf(stderr,
+                    "[WT-GPUTIME] gpu_ms=%.3f\n",
+                    ([cb GPUEndTime] - [cb GPUStartTime]) * 1e-6);
+
+            /* Empty command buffer on the same queue: isolates the wait
+             * mechanism from the kernel's actual GPU work. */
+            double t_e0 = CFAbsoluteTimeGetCurrent();
+            id<MTLCommandBuffer> ecb = [queue commandBuffer];
+            id<MTLComputeCommandEncoder> eenc = [ecb computeCommandEncoder];
+            [eenc endEncoding];
+            [ecb commit];
+            [ecb waitUntilCompleted];
+            double t_e1 = CFAbsoluteTimeGetCurrent();
+            fprintf(stderr,
+                    "[WT-EMPTY] empty_cb_ms=%.3f\n",
+                    (t_e1 - t_e0) * 1e3);
+        }
 
         if ([cb status] != MTLCommandBufferStatusCompleted) {
             NSError *err = [cb error];
