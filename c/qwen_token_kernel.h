@@ -126,6 +126,156 @@ typedef struct QwenTokenKernelParams {
     QwenTokenLayerBlob layer[QWEN_TOKEN_MAX_LAYERS];
 } QwenTokenKernelParams;
 
+/* ---------- Stage 2: mutable whole-token device state ---------- */
+
+#define QWEN_TOKEN_MAX_TOPK          16u
+#define QWEN_TOKEN_STATE_ALIGN       256u
+#define QWEN_TOKEN_WORK_VECS         4u
+#define QWEN_TOKEN_EXPERT_EMPTY      UINT32_MAX
+
+#define QWEN_TOKEN_STATUS_RUNNABLE       0u
+#define QWEN_TOKEN_STATUS_DONE           1u
+#define QWEN_TOKEN_STATUS_NEED_EXPERTS   2u
+#define QWEN_TOKEN_STATUS_ERROR          3u
+
+#define QWEN_TOKEN_PHASE_LAYER_START     0u
+#define QWEN_TOKEN_PHASE_MOE             1u
+
+/*
+ * Host-visible continuation record.
+ *
+ * Critical invariant:
+ *   NEED_EXPERTS => resume_phase == QWEN_TOKEN_PHASE_MOE.
+ *
+ * At that point the layer's attention/GDN path has already executed and any
+ * recurrent state mutation is committed.  routed_expert/routed_weight and
+ * the postnorm vector at layout.moe_input_off are therefore the authoritative
+ * continuation state.  Resume MUST NOT rerun the router or pre-MoE half.
+ */
+typedef struct QwenTokenMissRecord {
+    uint32_t status;
+    uint32_t resume_phase;
+    uint32_t layer;
+    uint32_t token_pos;
+
+    uint32_t routed_count;
+    uint32_t missing_count;
+    uint32_t error_code;
+    uint32_t reserved0;
+
+    uint64_t dispatch_id;
+
+    uint32_t routed_expert[QWEN_TOKEN_MAX_TOPK];
+    float    routed_weight[QWEN_TOKEN_MAX_TOPK];
+    uint32_t missing_expert[QWEN_TOKEN_MAX_TOPK];
+} QwenTokenMissRecord;
+
+/*
+ * Byte offsets into one mutable MTLBuffer.
+ *
+ * The regions are deliberately disjoint:
+ *
+ *   hidden_scratch | KV | GDN conv | GDN S | expert map | miss record
+ *
+ * In particular, gdn_s_* can never alias kv_*.
+ */
+typedef struct QwenTokenDeviceLayout {
+    uint64_t total_bytes;
+
+    uint64_t hidden_scratch_off;
+    uint64_t hidden_scratch_bytes;
+
+    uint64_t kv_off;
+    uint64_t kv_bytes;
+
+    uint64_t gdn_conv_off;
+    uint64_t gdn_conv_bytes;
+
+    uint64_t gdn_s_off;
+    uint64_t gdn_s_bytes;
+
+    uint64_t expert_map_off;
+    uint64_t expert_map_bytes;
+
+    uint64_t miss_off;
+    uint64_t miss_bytes;
+
+    /*
+     * Persistent/scratch vectors inside hidden_scratch.
+     *
+     * residual:
+     *   current residual stream.
+     *
+     * moe_input:
+     *   postnorm input to MoE.  This MUST survive NEED_EXPERTS because it is
+     *   the input used when resuming directly at QWEN_TOKEN_PHASE_MOE.
+     *
+     * work[]:
+     *   generic device-memory workspace.  No large GDN temporaries belong in
+     *   threadgroup memory.
+     */
+    uint64_t residual_off;
+    uint64_t normed_off;
+    uint64_t branch_off;
+    uint64_t moe_input_off;
+    uint64_t moe_acc_off;
+    uint64_t work_off[QWEN_TOKEN_WORK_VECS];
+    uint64_t work_width;
+
+    /*
+     * Per-layer offsets.  Irrelevant entries are QWEN_TOKEN_OFF_NONE.
+     *
+     * Attention KV is F32.
+     * GDN convolution history is F32.
+     * GDN recurrent S is F32.
+     * Expert-map entries are uint32_t expert IDs, one per bank slot.
+     */
+    uint64_t kv_k_off[QWEN_TOKEN_MAX_LAYERS];
+    uint64_t kv_v_off[QWEN_TOKEN_MAX_LAYERS];
+
+    uint64_t gdn_conv_layer_off[QWEN_TOKEN_MAX_LAYERS];
+    uint64_t gdn_s_layer_off[QWEN_TOKEN_MAX_LAYERS];
+
+    uint64_t expert_map_layer_off[QWEN_TOKEN_MAX_LAYERS];
+    uint32_t expert_map_slots[QWEN_TOKEN_MAX_LAYERS];
+} QwenTokenDeviceLayout;
+
+typedef struct QwenTokenDeviceState QwenTokenDeviceState;
+
+/*
+ * Pure layout builder: no Metal interaction.
+ * Returns 1 on success, 0 on invalid geometry/overflow.
+ */
+int qwen_token_device_layout_init(
+    const QwenTokenKernelParams *p,
+    QwenTokenDeviceLayout *layout,
+    char *err,
+    uint64_t err_cap);
+
+/*
+ * Stage-2 standalone Metal allocation.
+ *
+ * The buffer uses Shared storage on Apple Silicon: it is directly visible to
+ * the GPU while allowing the host to inspect the small miss record after the
+ * token dispatch.  Kernel execution still keeps KV/GDN state resident in this
+ * buffer; there is no host round-trip for those regions.
+ */
+QwenTokenDeviceState *qwen_token_device_state_create(
+    const QwenTokenKernelParams *p,
+    char *err,
+    uint64_t err_cap);
+
+void qwen_token_device_state_destroy(QwenTokenDeviceState *state);
+
+const QwenTokenDeviceLayout *qwen_token_device_state_layout(
+    const QwenTokenDeviceState *state);
+
+/* Stage-4/kernel plumbing will consume the opaque MTLBuffer handle. */
+void *qwen_token_device_state_mtl_buffer(QwenTokenDeviceState *state);
+
+/* Host-visible contents, primarily for the miss record and Stage-2 tests. */
+void *qwen_token_device_state_contents(QwenTokenDeviceState *state);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
