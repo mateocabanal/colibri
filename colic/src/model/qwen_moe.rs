@@ -190,6 +190,25 @@ impl QwenMoeFrontend {
             }
         }
 
+        // ---- MTP routed experts: layer = n_layers + stage (speculative head) ----
+        // The MTP head is one full-attention MoE layer per stage with the same
+        // fused expert layout as the main layers; its experts ride the same
+        // (layer, expert) index space at layer n_layers + stage.
+        if let Some(mtp) = crate::model::qwen_mtp::inspect(source)? {
+            for (stage, st) in mtp.stages.iter().enumerate() {
+                let layer = geometry.layers + stage as u32;
+                for expert in 0..mtp.experts {
+                    let gate = slice_fused(&st.expert_gate_up, expert, 2 * inter, hidden, 0, inter)?;
+                    let up = slice_fused(&st.expert_gate_up, expert, 2 * inter, hidden, inter, inter)?;
+                    let down = slice_fused(&st.expert_down, expert, hidden, inter, 0, hidden)?;
+                    routed_experts.insert(
+                        (layer, expert),
+                        RoutedExpert { layer, expert, gate, up, down },
+                    );
+                }
+            }
+        }
+
         // ---- global tensors (embed, final norm, lm_head) ----
         let mut global_tensors: BTreeMap<String, TensorRef> = BTreeMap::new();
         global_tensors.insert(

@@ -193,6 +193,7 @@ typedef struct {
     int eos;
     int n_stop, stop_ids[8];        /* sample.h stop contract (empty = none) */
     int8_t *layer_is_gdn;           /* 1 = linear_attention (GDN), 0 = full */
+    int mtp_layers;                 /* speculative MTP head layers (0 = none) */
 } Cfg;
 
 #include "tok.h"
@@ -318,6 +319,9 @@ typedef struct {
     Tok *tok;                       /* tokenizer owns the valid-vocabulary map */
     WT embed, lm_head; float *final_norm;
     Layer *L;
+    Layer *MTP;                    /* speculative MTP head (mtp_layers rows) */
+    WT mtp_fc;                     /* MTP fc: [D, 2D] */
+    float *mtp_norm, *mtp_pre_fc_norm_embedding, *mtp_pre_fc_norm_hidden;
     LCache *cache;                 /* [n_layers] */
     uint64_t clock, hits, miss;
     float **K, **V;                /* [n_layers][kv_heads*max_t*head_dim] (f32 KV) */
@@ -860,6 +864,7 @@ static void load_cfg(Cfg *c, const char *snap){
     c->max_pos   = opt_int(root, "max_position_embeddings", 262144);
     c->eps       = (float)opt_num(root, "rms_norm_eps", 1e-6);
     c->eos       = opt_int(root, "eos_token_id", 248044);
+    c->mtp_layers = opt_int(root, "mtp_num_hidden_layers", 0);
 
     jval *rp = json_get(root, "rope_parameters");
     c->theta = (rp && rp->t == J_OBJ) ? (float)opt_num(rp, "rope_theta", 10000000.0)
@@ -1307,6 +1312,70 @@ static WT load_wt_named(Model *m, const char *base, int64_t O, int64_t I){
     st_read_f32(&m->S, base, w.f, g_dense_drop);
     return w;
 }
+/* ---------- MTP speculative head ---------- */
+
+static float *load_t_named(Model *m, const char *name, int64_t want){
+    int64_t n = st_numel(&m->S, name);
+    if (n < 0) { fprintf(stderr, "missing %s\n", name); exit(1); }
+    if (!tensor_numel_ok(n, want)) {
+        fprintf(stderr, "%s: %lld elems — expected %lld, refusing\n",
+                name, (long long)n, (long long)want);
+        exit(1);
+    }
+    float *p = falloc(n);
+    st_read_f32(&m->S, name, p, g_dense_drop);
+    return p;
+}
+
+/* Load the MTP head: one full-attention MoE layer + fc/norm head. The MTP
+ * routed experts ride the package's (layer, expert) space at layer = n_layers
+ * (colic emits them there); dense statics keep their HF names. */
+static void mtp_load(Model *m){
+    Cfg *c = &m->c;
+    if (c->mtp_layers <= 0) return;
+    int D = c->hidden, H = c->n_heads, hd = c->head_dim, kv = c->n_kv_heads;
+    m->MTP = calloc((size_t)c->mtp_layers, sizeof(Layer));
+    if (!m->MTP) { fprintf(stderr, "OOM MTP layers\n"); exit(1); }
+    Layer *l = &m->MTP[0];
+    if (m->coli_load) {
+        m->mtp_fc = coli_wt(m, "mtp.fc.weight", D, 2 * D);
+        m->mtp_norm = coli_vec(m, "mtp.norm.weight", D);
+        m->mtp_pre_fc_norm_embedding = coli_vec(m, "mtp.pre_fc_norm_embedding.weight", D);
+        m->mtp_pre_fc_norm_hidden = coli_vec(m, "mtp.pre_fc_norm_hidden.weight", D);
+        l->q = coli_wt(m, "mtp.layers.0.self_attn.q_proj.weight", 2*H*hd, D);
+        l->k = coli_wt(m, "mtp.layers.0.self_attn.k_proj.weight", kv*hd, D);
+        l->v = coli_wt(m, "mtp.layers.0.self_attn.v_proj.weight", kv*hd, D);
+        l->o = coli_wt(m, "mtp.layers.0.self_attn.o_proj.weight", D, H*hd);
+        l->qn = coli_vec(m, "mtp.layers.0.self_attn.q_norm.weight", hd);
+        l->kn = coli_vec(m, "mtp.layers.0.self_attn.k_norm.weight", hd);
+        l->in_ln = coli_vec(m, "mtp.layers.0.input_layernorm.weight", D);
+        l->post_ln = coli_vec(m, "mtp.layers.0.post_attention_layernorm.weight", D);
+        l->router = coli_wt(m, "mtp.layers.0.mlp.gate.weight", c->n_experts, D);
+        l->se_gate = coli_wt(m, "mtp.layers.0.mlp.shared_expert.gate_proj.weight", c->shared_inter, D);
+        l->se_up = coli_wt(m, "mtp.layers.0.mlp.shared_expert.up_proj.weight", c->shared_inter, D);
+        l->se_down = coli_wt(m, "mtp.layers.0.mlp.shared_expert.down_proj.weight", D, c->shared_inter);
+        l->se_g = coli_wt(m, "mtp.layers.0.mlp.shared_expert_gate.weight", 1, D);
+    } else {
+        m->mtp_fc = load_wt_named(m, "mtp.fc.weight", D, 2 * D);
+        m->mtp_norm = load_t_named(m, "mtp.norm.weight", D);
+        m->mtp_pre_fc_norm_embedding = load_t_named(m, "mtp.pre_fc_norm_embedding.weight", D);
+        m->mtp_pre_fc_norm_hidden = load_t_named(m, "mtp.pre_fc_norm_hidden.weight", D);
+        l->q = load_wt_named(m, "mtp.layers.0.self_attn.q_proj.weight", 2*H*hd, D);
+        l->k = load_wt_named(m, "mtp.layers.0.self_attn.k_proj.weight", kv*hd, D);
+        l->v = load_wt_named(m, "mtp.layers.0.self_attn.v_proj.weight", kv*hd, D);
+        l->o = load_wt_named(m, "mtp.layers.0.self_attn.o_proj.weight", D, H*hd);
+        l->qn = load_t_named(m, "mtp.layers.0.self_attn.q_norm.weight", hd);
+        l->kn = load_t_named(m, "mtp.layers.0.self_attn.k_norm.weight", hd);
+        l->in_ln = load_t_named(m, "mtp.layers.0.input_layernorm.weight", D);
+        l->post_ln = load_t_named(m, "mtp.layers.0.post_attention_layernorm.weight", D);
+        l->router = load_wt_named(m, "mtp.layers.0.mlp.gate.weight", c->n_experts, D);
+        l->se_gate = load_wt_named(m, "mtp.layers.0.mlp.shared_expert.gate_proj.weight", c->shared_inter, D);
+        l->se_up = load_wt_named(m, "mtp.layers.0.mlp.shared_expert.up_proj.weight", c->shared_inter, D);
+        l->se_down = load_wt_named(m, "mtp.layers.0.mlp.shared_expert.down_proj.weight", D, c->shared_inter);
+        l->se_g = load_wt_named(m, "mtp.layers.0.mlp.shared_expert_gate.weight", 1, D);
+    }
+}
+
 static WT load_wt(Model *m, const char *name, int64_t O, int64_t I){
     char base[512]; snprintf(base, sizeof(base), "%s%s", g_prefix, name);
     return load_wt_named(m, base, O, I);
@@ -3693,6 +3762,56 @@ static void embed_row(Model *m, int token, float *out){
 
 /* batched full attention over a chunk: projections with S=C, per-token
  * QK-norm/RoPE/KV-store/scores/gate in token order, o_proj with S=C. */
+/* One MTP head step: fc over [embed(draft) | main_hidden], one full-attention
+ * MoE layer (own KV at layer n_layers), final norm. Mirrors vLLM's
+ * Qwen3NextMultiTokenPredictor.forward. */
+static void mtp_forward(Model *m, int token, int pos, const float *main_hidden, float *out){
+    Cfg *c = &m->c; int D = c->hidden;
+    Layer *l = &m->MTP[0];
+    float *emb = falloc(D);
+    embed_row(m, token, emb);
+    rmsnorm_row(emb, emb, m->mtp_pre_fc_norm_embedding, D, c->eps);
+    float *hh = falloc(D);
+    rmsnorm_row(hh, main_hidden, m->mtp_pre_fc_norm_hidden, D, c->eps);
+    float *cat = falloc(2 * D);
+    memcpy(cat, emb, (size_t)D * sizeof(float));
+    memcpy(cat + D, hh, (size_t)D * sizeof(float));
+    float *h = falloc(D);
+    wt_mul(h, cat, &m->mtp_fc, 1, D, 2 * D);
+    float *normed = falloc(D);
+    rmsnorm_row(normed, h, l->in_ln, D, c->eps);
+    float *attn = falloc(D);
+    attention_token(m, l, c->n_layers, normed, pos, attn);
+    for (int d = 0; d < D; d++) h[d] += attn[d];
+    rmsnorm_row(normed, h, l->post_ln, D, c->eps);
+    float *moe_out = falloc(D);
+    moe_token(m, l, c->n_layers, normed, moe_out);
+    for (int d = 0; d < D; d++) h[d] += moe_out[d];
+    if (out) rmsnorm_row(out, h, m->mtp_norm, D, c->eps);
+    free(emb); free(hh); free(cat); free(h); free(normed); free(attn); free(moe_out);
+}
+
+/* Draft k tokens by self-chaining the MTP head (vLLM spec_step_idx % layers:
+ * with 1 MTP layer the same layer is reused; its KV at layer n_layers
+ * accumulates the draft positions and self-heals on partial acceptance —
+ * the next chain overwrites the rejected tail). */
+static void mtp_chain(Model *m, int last_token, const float *h_main, int pos, int k, int *drafts){
+    Cfg *c = &m->c; int D = c->hidden;
+    float *h = falloc(D);
+    memcpy(h, h_main, (size_t)D * sizeof(float));
+    float *out = falloc(D);
+    float *logits = falloc(c->vocab);
+    int tok = last_token;
+    for (int i = 0; i < k; i++) {
+        mtp_forward(m, tok, pos + i, h, out);
+        wt_mul(logits, out, &m->lm_head, 1, c->vocab, D);
+        drafts[i] = qwen_pick_token(m, logits, -1);
+        tok = drafts[i];
+        memcpy(h, out, (size_t)D * sizeof(float));
+    }
+    free(h); free(out); free(logits);
+}
+
 static void attention_batch(Model *m, Layer *l, int layer, const float *xs, int C,
                             int pos0, float *out){
     Cfg *c = &m->c; int H = c->n_heads, hd = c->head_dim, D = c->hidden;
@@ -4184,7 +4303,18 @@ qwen_mxfp4_batch_done:
 }
 
 /* chunked layer-major prefill: returns logits for the last token */
+static float *step_batched_h(Model *m, const int *ids, int n, int pos_base,
+                             float *per_logits, float **h_last);
 static float *step_batched(Model *m, const int *ids, int n, int pos_base){
+    return step_batched_h(m, ids, n, pos_base, NULL, NULL);
+}
+
+/* step_batched + per-position predictions for the last chunk and the last
+ * pre-final-norm hidden state. per_logits[j] = prediction at pos_base+j0+j+1
+ * (from hbuf[j], the hidden after processing token j of the last chunk) —
+ * exactly what MTP acceptance compares drafts against. */
+static float *step_batched_h(Model *m, const int *ids, int n, int pos_base,
+                             float *per_logits, float **h_last){
     Cfg *c = &m->c; int D = c->hidden;
     int C = g_chunk;
     if (C < 1) C = 1;
@@ -4211,11 +4341,22 @@ static float *step_batched(Model *m, const int *ids, int n, int pos_base){
             if (m->token_count >= m->warmup_tokens) pin_hot_experts(m);
         }
     }
+    if (per_logits) {
+        for (int j = 0; j < last_cj; j++) {
+            rmsnorm_row(normed + (int64_t)j * D, hbuf + (int64_t)j * D, m->final_norm, D, c->eps);
+            wt_mul(per_logits + (int64_t)j * c->vocab, normed + (int64_t)j * D,
+                   &m->lm_head, 1, c->vocab, D);
+        }
+    }
     rmsnorm_row(normed, hbuf + (int64_t)(last_cj - 1) * D, m->final_norm, D, c->eps);
     float *logits = falloc(c->vocab);
     double qhead_began = qprof_head_begin();
     wt_mul(logits, normed, &m->lm_head, 1, c->vocab, D);
     qprof_head_end(m, qhead_began);
+    if (h_last) {
+        *h_last = falloc(D);
+        memcpy(*h_last, hbuf + (int64_t)(last_cj - 1) * D, (size_t)D * sizeof(float));
+    }
     free(hbuf); free(normed);
     return logits;
 }
@@ -4323,7 +4464,14 @@ static void forward_token(Model *m, int token, int pos, float *out){
 }
 
 /* process n ids (prefill or decode), return logits for the next token */
+static float *step_h(Model *m, const int *ids, int n, int pos_base, float **h_out);
 static float *step(Model *m, const int *ids, int n, int pos_base){
+    return step_h(m, ids, n, pos_base, NULL);
+}
+
+/* step() + the pre-final-norm hidden state of the last processed token
+ * (the MTP head consumes exactly this, applying pre_fc_norm_hidden itself). */
+static float *step_h(Model *m, const int *ids, int n, int pos_base, float **h_out){
     Cfg *c = &m->c; int D = c->hidden;
     if (!ids_in_vocab(c, ids, n, "input")) exit(1);
     if (pos_base < 0 || n > m->max_t - pos_base) {
@@ -4331,7 +4479,7 @@ static float *step(Model *m, const int *ids, int n, int pos_base){
                 pos_base, pos_base + n, m->max_t);
         exit(1);
     }
-    if (n > 1 && g_chunk > 1) return step_batched(m, ids, n, pos_base);
+    if (n > 1 && g_chunk > 1) return step_batched_h(m, ids, n, pos_base, NULL, h_out);
     float *h = falloc(D);
     for (int i = 0; i < n; i++) forward_token(m, ids[i], pos_base + i, h);
     float *normed = falloc(D);
@@ -4340,7 +4488,8 @@ static float *step(Model *m, const int *ids, int n, int pos_base){
     double qhead_began = qprof_head_begin();
     wt_mul(logits, normed, &m->lm_head, 1, c->vocab, D);
     qprof_head_end(m, qhead_began);
-    free(h); free(normed);
+    if (h_out) *h_out = h; else free(h);
+    free(normed);
     return logits;
 }
 
@@ -4434,21 +4583,22 @@ static void model_init(Model *m, const char *snap, int cap){
         #undef LDW
     }
 coli_dense_done:
-    m->cache = calloc_checked((size_t)c->n_layers, sizeof(LCache), "expert cache rows");
-    for (int i = 0; i < c->n_layers; i++) {
+    mtp_load(m);
+    m->cache = calloc_checked((size_t)(c->n_layers + c->mtp_layers), sizeof(LCache), "expert cache rows");
+    for (int i = 0; i < c->n_layers + c->mtp_layers; i++) {
         m->cache[i].cap = cap;
         m->cache[i].slots = calloc_checked((size_t)cap, sizeof(Slot), "expert cache slots");
         for (int s = 0; s < cap; s++) m->cache[i].slots[s].eid = -2;   /* empty */
     }
     rt_init("qwen3_moe", c->n_layers, c->n_experts);
-    rt_drop_row(c->n_layers);                    /* every layer routes; no MTP row */
+    if (c->mtp_layers <= 0) rt_drop_row(c->n_layers);   /* MTP row routes when present */
     m->freq = rt_counts_all();
     { const char *up = getenv("COLI_USAGE");
       if (up && *up) { int64_t h = rt_load(up);
         if (h > 0) fprintf(stderr, "[USAGE] expert history: %lld selections (%s)\n", (long long)h, up); } }
     m->hot_n         = getenv("HOT")    ? atoi(getenv("HOT"))    : 0;
     m->warmup_tokens = getenv("WARMUP") ? atoi(getenv("WARMUP")) : 5;
-    size_t pin_count = size_mul_or_die((size_t)c->n_layers, c->n_experts, "expert pin map");
+    size_t pin_count = size_mul_or_die((size_t)(c->n_layers + c->mtp_layers), c->n_experts, "expert pin map");
     m->is_pinned = calloc_checked(pin_count, 1, "expert pin map");
     char pinpath[512]; snprintf(pinpath, sizeof(pinpath), "%s/hot_pinned.bin", snap);
     FILE *pinf = fopen(pinpath, "rb");
@@ -4919,18 +5069,108 @@ static int mode_greedy(Model *m){
     if (np < 1 || !ids_in_vocab(&m->c, ids, np, "QWENMOE_PROMPT_IDS")) {
         fprintf(stderr, "invalid QWENMOE_PROMPT_IDS\n"); free(ids); return 1;
     }
+    Cfg *c = &m->c;
+    int mtp = getenv("QWEN_MTP") ? atoi(getenv("QWEN_MTP")) : 0;
+    if (mtp < 2 || mtp > g_chunk) mtp = 0;   /* spec decode needs k>=2, one chunk */
+    int mtp_accept = 0, mtp_total = 0;
     qprof_request_begin(m);
     float *logits = step(m, ids, np, 0);
     qprof_prefill_end(m, np);
     int qprof_gen = 0;
-    for (int s = 0; s < max_new; s++) {
+    int pos = np, emitted = 0;
+    float *h = NULL;
+    while (emitted < max_new) {
         int best = qwen_pick_token(m, logits, -1);
         logits_free(&logits);
         if (best == m->c.eos) break;
         printf("ID %d\n", best);
-        qprof_gen++;
-        logits = step(m, &best, 1, np + s);
+        qprof_gen++; emitted++;
+        if (!mtp) {
+            logits = step(m, &best, 1, pos);
+            pos++;
+            continue;
+        }
+        /* main step on best: h = pre-final-norm hidden at pos */
+        float *h_new = NULL;
+        logits = step_h(m, &best, 1, pos, &h_new);
+        free(h); h = h_new;
+        pos++;
+        if (emitted >= max_new) break;
+        /* MTP draft chain for positions pos..pos+k-1 */
+        int drafts[64];
+        mtp_chain(m, best, h, pos, mtp, drafts);
+        /* batched verify: main model on all k drafts in one pass. The pass
+         * advances the GDN recurrence state with the drafts; on rejection it
+         * must be restored before re-running the accepted prefix (GDN state
+         * is recurrent, not invertible). */
+        float *per_logits = falloc((int64_t)mtp * c->vocab);
+        float *h_v = NULL;
+        float **save_S = malloc((size_t)c->n_layers * sizeof(float*));
+        float **save_conv = malloc((size_t)c->n_layers * sizeof(float*));
+        for (int l = 0; l < c->n_layers; l++) {
+            if (c->layer_is_gdn[l]) {
+                size_t ns = gdn_state_count(c), nc = gdn_conv_count(c);
+                save_S[l] = malloc(ns * sizeof(float));
+                memcpy(save_S[l], m->gdn_S[l], ns * sizeof(float));
+                save_conv[l] = malloc(nc * sizeof(float));
+                memcpy(save_conv[l], m->gdn_conv[l], nc * sizeof(float));
+            } else { save_S[l] = NULL; save_conv[l] = NULL; }
+        }
+        float *logits_v = step_batched_h(m, drafts, mtp, pos, per_logits, &h_v);
+        /* acceptance: drafts[0] vs logits (prediction at pos), drafts[i] vs
+         * per_logits[i-1] (prediction at pos+i). Exact-verify: the emitted
+         * stream is baseline-identical by construction. */
+        int p = 0;
+        if (drafts[0] != m->c.eos && qwen_pick_token(m, logits, -1) == drafts[0]) {
+            p = 1;
+            while (p < mtp && drafts[p] != m->c.eos &&
+                   qwen_pick_token(m, per_logits + (int64_t)(p - 1) * c->vocab, -1) == drafts[p])
+                p++;
+        }
+        for (int i = 0; i < p; i++) { printf("ID %d\n", drafts[i]); qprof_gen++; emitted++; }
+        mtp_total += mtp; mtp_accept += p;
+        if (p == mtp) {
+            /* all accepted: the batched pass advanced the state */
+            logits_free(&logits);
+            logits = logits_v;
+            free(h); h = h_v;
+            pos += mtp;
+        } else {
+            /* rejected at p: emit the main model's pick, re-advance the state
+             * with the correct token, and fix the MTP KV at the rejection
+             * position (the chain wrote the draft's state there). */
+            int actual = p == 0 ? qwen_pick_token(m, logits, -1)
+                               : qwen_pick_token(m, per_logits + (int64_t)(p - 1) * c->vocab, -1);
+            logits_free(&logits_v);
+            if (actual == m->c.eos) { free(h); free(per_logits); break; }
+            printf("ID %d\n", actual);
+            qprof_gen++; emitted++;
+            /* restore the GDN state the batched pass polluted with the
+             * rejected drafts, then re-run the accepted prefix + actual in
+             * one batched pass (rebuilds GDN state and KV correctly). */
+            for (int l = 0; l < c->n_layers; l++) {
+                if (save_S[l]) {
+                    memcpy(m->gdn_S[l], save_S[l], gdn_state_count(c) * sizeof(float));
+                    memcpy(m->gdn_conv[l], save_conv[l], gdn_conv_count(c) * sizeof(float));
+                }
+            }
+            int redo[64];
+            for (int i = 0; i < p; i++) redo[i] = drafts[i];
+            redo[p] = actual;
+            free(h);
+            logits = step_batched_h(m, redo, p + 1, pos, NULL, &h);
+            mtp_forward(m, actual, pos + p, h, NULL);   /* fix MTP KV at pos+p */
+            pos += p + 1;
+        }
+        for (int l = 0; l < c->n_layers; l++) {
+            if (save_S[l]) { free(save_S[l]); free(save_conv[l]); }
+        }
+        free(save_S); free(save_conv);
+        free(per_logits);
     }
+    if (mtp && mtp_total > 0)
+        fprintf(stderr, "[MTP] acceptance %d/%d = %.1f%%\n",
+                mtp_accept, mtp_total, 100.0 * mtp_accept / mtp_total);
     qprof_request_end(m, np, qprof_gen);
     logits_free(&logits);
     free(ids);
@@ -5544,14 +5784,16 @@ int main(int argc, char **argv){
     int ctx_cap = getenv("CTX") ? atoi(getenv("CTX")) : 65536;
     if (ctx_cap < 1 || ctx_cap > (1 << 20)) { fprintf(stderr, "CTX out of range\n"); return 1; }
     m.max_t = ctx_cap;
-    m.K = calloc_checked((size_t)m.c.n_layers, sizeof(float*), "K cache rows");
-    m.V = calloc_checked((size_t)m.c.n_layers, sizeof(float*), "V cache rows");
-    m.K16 = calloc_checked((size_t)m.c.n_layers, sizeof(uint16_t*), "K16 cache rows");
-    m.V16 = calloc_checked((size_t)m.c.n_layers, sizeof(uint16_t*), "V16 cache rows");
-    m.gdn_S = calloc_checked((size_t)m.c.n_layers, sizeof(float*), "GDN recurrence rows");
-    m.gdn_conv = calloc_checked((size_t)m.c.n_layers, sizeof(float*), "GDN convolution rows");
-    for (int i = 0; i < m.c.n_layers; i++) {
-        if (!m.c.layer_is_gdn[i]) {     /* only full_attention layers use K/V */
+    int kv_rows = m.c.n_layers + m.c.mtp_layers;
+    m.K = calloc_checked((size_t)kv_rows, sizeof(float*), "K cache rows");
+    m.V = calloc_checked((size_t)kv_rows, sizeof(float*), "V cache rows");
+    m.K16 = calloc_checked((size_t)kv_rows, sizeof(uint16_t*), "K16 cache rows");
+    m.V16 = calloc_checked((size_t)kv_rows, sizeof(uint16_t*), "V16 cache rows");
+    m.gdn_S = calloc_checked((size_t)kv_rows, sizeof(float*), "GDN recurrence rows");
+    m.gdn_conv = calloc_checked((size_t)kv_rows, sizeof(float*), "GDN convolution rows");
+    for (int i = 0; i < kv_rows; i++) {
+        int is_gdn = i < m.c.n_layers ? m.c.layer_is_gdn[i] : 0;  /* MTP rows = full attn */
+        if (!is_gdn) {              /* only full_attention layers use K/V */
             size_t n = kv_state_count(&m.c, m.max_t);
             if (g_kv_f16) {
                 m.K16[i] = calloc_checked(n, sizeof(uint16_t), "K cache (f16)");
