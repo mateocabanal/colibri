@@ -184,6 +184,92 @@ kernel void qwen_bf16_matmul(
         y[row] = sum;
     }
 }
+
+/* Merged top-k MoE layer: ONE grid per stage with the expert slot buffers
+ * bound at fixed indices 0..7 and a per-expert offset table (gate/up/down).
+ * Grid = K*S*M threadgroups for gu (one SwiGLU mid element each), K*S*H for
+ * down.  Per-row reduction order is unchanged (lane 0 combines 0..31), so
+ * output is bit-identical to the per-expert dispatches — only the launch
+ * count drops from 8 to 1 per stage. */
+kernel void apple8_moe_gu8(
+    device const uchar *e0 [[buffer(0)]],
+    device const uchar *e1 [[buffer(1)]],
+    device const uchar *e2 [[buffer(2)]],
+    device const uchar *e3 [[buffer(3)]],
+    device const uchar *e4 [[buffer(4)]],
+    device const uchar *e5 [[buffer(5)]],
+    device const uchar *e6 [[buffer(6)]],
+    device const uchar *e7 [[buffer(7)]],
+    device const float *x  [[buffer(8)]],
+    device float *mid      [[buffer(9)]],
+    constant int &S        [[buffer(10)]],
+    constant int &H        [[buffer(11)]],
+    constant int &M        [[buffer(12)]],
+    constant int &K        [[buffer(13)]],
+    constant int3 *offs    [[buffer(14)]],
+    uint tg                [[threadgroup_position_in_grid]],
+    uint lane              [[thread_index_in_simdgroup]])
+{
+    const uint nt = (uint)(K * S * M);
+    if (tg >= nt || lane >= 32) return;
+    const int m = (int)(tg % (uint)M);
+    const int s = (int)((tg / (uint)M) % (uint)S);
+    const int e = (int)(tg / ((uint)M * (uint)S));
+    device const uchar *base = e0;
+    if (e == 1) base = e1;
+    else if (e == 2) base = e2;
+    else if (e == 3) base = e3;
+    else if (e == 4) base = e4;
+    else if (e == 5) base = e5;
+    else if (e == 6) base = e6;
+    else if (e == 7) base = e7;
+    const int3 off = offs[e];
+    device const float *xr = x + (long)s * H;
+    float gv = simd_sum(apple8_dot_partial(base + off.x, xr, H, m, lane));
+    float uv = simd_sum(apple8_dot_partial(base + off.y, xr, H, m, lane));
+    if (lane == 0) {
+        const float silu = gv / (1.0f + exp(-gv));
+        mid[(long)(e * S + s) * M + m] = silu * uv;
+    }
+}
+
+kernel void apple8_moe_down8(
+    device const uchar *e0 [[buffer(0)]],
+    device const uchar *e1 [[buffer(1)]],
+    device const uchar *e2 [[buffer(2)]],
+    device const uchar *e3 [[buffer(3)]],
+    device const uchar *e4 [[buffer(4)]],
+    device const uchar *e5 [[buffer(5)]],
+    device const uchar *e6 [[buffer(6)]],
+    device const uchar *e7 [[buffer(7)]],
+    device const float *mid      [[buffer(8)]],
+    device float *expert_y       [[buffer(9)]],
+    constant int &S              [[buffer(10)]],
+    constant int &H              [[buffer(11)]],
+    constant int &M              [[buffer(12)]],
+    constant int &K              [[buffer(13)]],
+    constant int3 *offs          [[buffer(14)]],
+    uint tg                      [[threadgroup_position_in_grid]],
+    uint lane                    [[thread_index_in_simdgroup]])
+{
+    const uint nt = (uint)(K * S * H);
+    if (tg >= nt || lane >= 32) return;
+    const int h = (int)(tg % (uint)H);
+    const int s = (int)((tg / (uint)H) % (uint)S);
+    const int e = (int)(tg / ((uint)H * (uint)S));
+    device const uchar *base = e0;
+    if (e == 1) base = e1;
+    else if (e == 2) base = e2;
+    else if (e == 3) base = e3;
+    else if (e == 4) base = e4;
+    else if (e == 5) base = e5;
+    else if (e == 6) base = e6;
+    else if (e == 7) base = e7;
+    const int3 off = offs[e];
+    device const float *mr = mid + (long)(e * S + s) * M;
+    float acc = simd_sum(apple8_dot_partial(base + off.z, mr, M, h, lane));
+    if (lane == 0) expert_y[(long)(e * S + s) * H + h] = acc;
+}
 )METAL";
 
 static id<MTLDevice> g_device = nil;
@@ -193,6 +279,8 @@ static id<MTLComputePipelineState> g_gu_pipeline = nil;
 static id<MTLComputePipelineState> g_down_pipeline = nil;
 static id<MTLComputePipelineState> g_reduce_pipeline = nil;
 static id<MTLComputePipelineState> g_bf16_matmul_pipeline = nil;
+static id<MTLComputePipelineState> g_gu8_pipeline = nil;
+static id<MTLComputePipelineState> g_down8_pipeline = nil;
 static std::mutex g_lock;
 
 static struct {
@@ -255,6 +343,8 @@ static void clear_locked(void) {
     g_bf16_wbuf = nil;
     g_bf16_w = NULL;
     g_bf16_O = g_bf16_I = 0;
+    g_gu8_pipeline = nil;
+    g_down8_pipeline = nil;
     g_queue = nil;
     g_device = nil;
 }
@@ -801,7 +891,7 @@ extern "C" int coli_apple8_metalio_gdn_token(
 extern "C" int coli_apple8_metalio_direct_init(void) {
     std::lock_guard<std::mutex> guard(g_lock);
     if (g_matmul_pipeline && g_gu_pipeline && g_down_pipeline && g_reduce_pipeline &&
-        g_bf16_matmul_pipeline && g_queue && g_device)
+        g_bf16_matmul_pipeline && g_gu8_pipeline && g_down8_pipeline && g_queue && g_device)
         return 1;
     if (!metalio_active()) return 0;
 
@@ -830,6 +920,10 @@ extern "C" int coli_apple8_metalio_direct_init(void) {
     if (!g_reduce_pipeline) goto pipeline_fail;
     g_bf16_matmul_pipeline = make_pipeline(library, @"qwen_bf16_matmul", &error);
     if (!g_bf16_matmul_pipeline) goto pipeline_fail;
+    g_gu8_pipeline = make_pipeline(library, @"apple8_moe_gu8", &error);
+    if (!g_gu8_pipeline) goto pipeline_fail;
+    g_down8_pipeline = make_pipeline(library, @"apple8_moe_down8", &error);
+    if (!g_down8_pipeline) goto pipeline_fail;
     (void)qwen_gdn_init_locked();
     memset(&g_prof, 0, sizeof(g_prof));
     return 1;
@@ -1176,34 +1270,73 @@ extern "C" int coli_apple8_metalio_moe_topk_begin(
     id<MTLCommandBuffer> cb = [g_queue commandBuffer];
     if (!cb) { delete pending; return 0; }
 
+    struct { int gate, up, down; } offs[8] = {};
+    for (int i = 0; i < expert_count && i < 8; ++i) {
+        offs[i].gate = (int)experts[i].gate_offset;
+        offs[i].up = (int)experts[i].up_offset;
+        offs[i].down = (int)experts[i].down_offset;
+    }
+
     id<MTLComputeCommandEncoder> gu = [cb computeCommandEncoder];
     if (!gu) { delete pending; return 0; }
-    [gu setComputePipelineState:g_gu_pipeline];
-    for (int i = 0; i < expert_count; ++i) {
-        [gu setBuffer:weight_buffers[i] offset:experts[i].gate_offset atIndex:0];
-        [gu setBuffer:weight_buffers[i] offset:experts[i].up_offset atIndex:1];
-        [gu setBuffer:xb offset:0 atIndex:2];
-        [gu setBuffer:mid offset:(NSUInteger)i * mid_stride atIndex:3];
-        [gu setBytes:&S length:sizeof(S) atIndex:4];
-        [gu setBytes:&hidden length:sizeof(hidden) atIndex:5];
-        [gu setBytes:&intermediate length:sizeof(intermediate) atIndex:6];
-        [gu dispatchThreadgroups:MTLSizeMake((NSUInteger)intermediate, 1, 1)
+    if (expert_count <= 8) {
+        /* Merged dispatch: one grid for all experts, slot buffers at fixed
+         * indices 0..7, per-expert offset table.  Kills 7 of 8 launches. */
+        [gu setComputePipelineState:g_gu8_pipeline];
+        for (int i = 0; i < 8; ++i)
+            [gu setBuffer:weight_buffers[i < expert_count ? i : 0] offset:0 atIndex:i];
+        [gu setBuffer:xb offset:0 atIndex:8];
+        [gu setBuffer:mid offset:0 atIndex:9];
+        [gu setBytes:&S length:sizeof(S) atIndex:10];
+        [gu setBytes:&hidden length:sizeof(hidden) atIndex:11];
+        [gu setBytes:&intermediate length:sizeof(intermediate) atIndex:12];
+        [gu setBytes:&expert_count length:sizeof(expert_count) atIndex:13];
+        [gu setBytes:offs length:(NSUInteger)expert_count * sizeof(offs[0]) atIndex:14];
+        [gu dispatchThreadgroups:MTLSizeMake((NSUInteger)expert_count * (NSUInteger)S * (NSUInteger)intermediate, 1, 1)
               threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    } else {
+        [gu setComputePipelineState:g_gu_pipeline];
+        for (int i = 0; i < expert_count; ++i) {
+            [gu setBuffer:weight_buffers[i] offset:experts[i].gate_offset atIndex:0];
+            [gu setBuffer:weight_buffers[i] offset:experts[i].up_offset atIndex:1];
+            [gu setBuffer:xb offset:0 atIndex:2];
+            [gu setBuffer:mid offset:(NSUInteger)i * mid_stride atIndex:3];
+            [gu setBytes:&S length:sizeof(S) atIndex:4];
+            [gu setBytes:&hidden length:sizeof(hidden) atIndex:5];
+            [gu setBytes:&intermediate length:sizeof(intermediate) atIndex:6];
+            [gu dispatchThreadgroups:MTLSizeMake((NSUInteger)intermediate, 1, 1)
+                  threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        }
     }
     [gu endEncoding];
 
     id<MTLComputeCommandEncoder> down = [cb computeCommandEncoder];
     if (!down) { delete pending; return 0; }
-    [down setComputePipelineState:g_down_pipeline];
-    for (int i = 0; i < expert_count; ++i) {
-        [down setBuffer:weight_buffers[i] offset:experts[i].down_offset atIndex:0];
-        [down setBuffer:mid offset:(NSUInteger)i * mid_stride atIndex:1];
-        [down setBuffer:expert_y offset:(NSUInteger)i * out_stride atIndex:2];
-        [down setBytes:&S length:sizeof(S) atIndex:3];
-        [down setBytes:&hidden length:sizeof(hidden) atIndex:4];
-        [down setBytes:&intermediate length:sizeof(intermediate) atIndex:5];
-        [down dispatchThreadgroups:MTLSizeMake((NSUInteger)hidden, 1, 1)
+    if (expert_count <= 8) {
+        [down setComputePipelineState:g_down8_pipeline];
+        for (int i = 0; i < 8; ++i)
+            [down setBuffer:weight_buffers[i < expert_count ? i : 0] offset:0 atIndex:i];
+        [down setBuffer:mid offset:0 atIndex:8];
+        [down setBuffer:expert_y offset:0 atIndex:9];
+        [down setBytes:&S length:sizeof(S) atIndex:10];
+        [down setBytes:&hidden length:sizeof(hidden) atIndex:11];
+        [down setBytes:&intermediate length:sizeof(intermediate) atIndex:12];
+        [down setBytes:&expert_count length:sizeof(expert_count) atIndex:13];
+        [down setBytes:offs length:(NSUInteger)expert_count * sizeof(offs[0]) atIndex:14];
+        [down dispatchThreadgroups:MTLSizeMake((NSUInteger)expert_count * (NSUInteger)S * (NSUInteger)hidden, 1, 1)
               threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    } else {
+        [down setComputePipelineState:g_down_pipeline];
+        for (int i = 0; i < expert_count; ++i) {
+            [down setBuffer:weight_buffers[i] offset:experts[i].down_offset atIndex:0];
+            [down setBuffer:mid offset:(NSUInteger)i * mid_stride atIndex:1];
+            [down setBuffer:expert_y offset:(NSUInteger)i * out_stride atIndex:2];
+            [down setBytes:&S length:sizeof(S) atIndex:3];
+            [down setBytes:&hidden length:sizeof(hidden) atIndex:4];
+            [down setBytes:&intermediate length:sizeof(intermediate) atIndex:5];
+            [down dispatchThreadgroups:MTLSizeMake((NSUInteger)hidden, 1, 1)
+                  threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        }
     }
     [down endEncoding];
 
