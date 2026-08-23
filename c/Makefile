@@ -472,7 +472,6 @@ METAL     ?= 0
 METAL_OBJ  =
 METALXX    = clang++ -x objective-c++ -std=gnu++17 -fobjc-arc -O3
 MIO_OBJ    =
-QTK_OBJ    =
 MIO_LDFLAGS =
 MIO_CFLAGS  =
 ifeq ($(METAL),1)
@@ -483,7 +482,6 @@ CFLAGS   += -DCOLI_METAL
 LDFLAGS  += -framework Metal -framework Foundation -lc++
 METAL_OBJ = backend_metal.o
 MIO_OBJ   = metalio.o apple8_metalio_direct.o
-QTK_OBJ   = qwen_token_kernel.o
 MIO_LDFLAGS = -framework Metal -framework Foundation
 MIO_CFLAGS  = -DCOLI_METALIO
 endif
@@ -659,12 +657,6 @@ metalio.o: metalio.mm metalio.h
 apple8_metalio_direct.o: apple8_metalio_direct.mm apple8_metalio_direct.h apple8_contract.h metalio.h
 	$(METALXX) -c apple8_metalio_direct.mm -o $@
 
-# Whole-token Qwen Metal state/blob backend.  Stage 2 uses explicit
-# retain/release, so compile this object without ARC even though METALXX
-# defaults to ARC for the older Metal backends.
-qwen_token_kernel.o: qwen_token_kernel.mm qwen_token_kernel.h
-	$(METALXX) -fno-objc-arc -c qwen_token_kernel.mm -o $@
-
 metalio-test: tests/test_metalio.mm metalio.mm metalio.h
 	$(METALXX) tests/test_metalio.mm metalio.mm -framework Metal -framework Foundation -o metalio_test
 	./metalio_test
@@ -774,8 +766,8 @@ ifneq ($(EXE),)
 qwen_moe: qwen_moe$(EXE)
 endif
 
-qwen_moe$(EXE): qwen_moe.c qwen_prefix_cache.h qwen_token_kernel.h st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h profile.h mxfp4_expert.h mxfp4_runtime.h quant.h backend_cuda.h $(QMOE_COLI_OBJS) $(QMOE_GPU_OBJ) $(MIO_OBJ) $(METAL_OBJ) $(QTK_OBJ)
-	$(CC) $(QMOE_CFLAGS) $(MIO_CFLAGS) qwen_moe.c $(QMOE_COLI_OBJS) $(QMOE_GPU_OBJ) $(MIO_OBJ) $(METAL_OBJ) $(QTK_OBJ) -o qwen_moe$(EXE) $(QMOE_LDFLAGS) $(MIO_LDFLAGS) $(filter -framework Metal -framework Foundation -lc++,$(LDFLAGS))
+qwen_moe$(EXE): qwen_moe.c qwen_prefix_cache.h st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h profile.h mxfp4_expert.h mxfp4_runtime.h quant.h backend_cuda.h $(QMOE_COLI_OBJS) $(QMOE_GPU_OBJ) $(MIO_OBJ) $(METAL_OBJ)
+	$(CC) $(QMOE_CFLAGS) $(MIO_CFLAGS) qwen_moe.c $(QMOE_COLI_OBJS) $(QMOE_GPU_OBJ) $(MIO_OBJ) $(METAL_OBJ) -o qwen_moe$(EXE) $(QMOE_LDFLAGS) $(MIO_LDFLAGS) $(filter -framework Metal -framework Foundation -lc++,$(LDFLAGS))
 
 inkling$(EXE): inkling.c st.h json.h compat.h $(INK_CUDA_OBJ) $(METAL_OBJ)
 	$(CC) $(CFLAGS) inkling.c $(INK_CUDA_OBJ) $(METAL_OBJ) -o inkling$(EXE) $(LDFLAGS)
@@ -1189,3 +1181,38 @@ tests/test_kimi_request_state$(EXE): tests/test_kimi_request_state.c kimi_k3.c k
 
 tests/test_qwen_moe$(EXE): tests/test_qwen_moe.c qwen_moe.c st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h sample.h omp_tune.h route_trace.h profile.h mxfp4_expert.h mxfp4_runtime.h quant.h $(QMOE_COLI_OBJS)
 	$(CC) $(NOCUDA_CFLAGS) tests/test_qwen_moe.c $(QMOE_COLI_OBJS) -o tests/test_qwen_moe$(EXE) $(NOCUDA_LDFLAGS)
+
+.PHONY: test_qwen_token_kernel
+
+test_qwen_token_kernel:
+	@echo "[TEST] qwen whole-token kernel"
+	clang++ \
+		-std=c++17 \
+		-O2 \
+		-Wall -Wextra \
+		-Wno-unused-parameter \
+		-fobjc-arc \
+		-I. \
+		tests/test_qwen_token_kernel.mm \
+		-framework Foundation \
+		-framework Metal \
+		-c -o tests/test_qwen_token_kernel.o
+	clang++ \
+		-std=c++17 \
+		-O2 \
+		-Wall -Wextra \
+		-Wno-unused-parameter \
+		-fno-objc-arc \
+		-I. \
+		qwen_token_kernel.mm \
+		-framework Foundation \
+		-framework Metal \
+		-c -o qwen_token_kernel_test.o
+	clang++ \
+		-std=c++17 \
+		-framework Foundation \
+		-framework Metal \
+		tests/test_qwen_token_kernel.o \
+		qwen_token_kernel_test.o \
+		-o tests/test_qwen_token_kernel.bin
+	./tests/test_qwen_token_kernel.bin

@@ -528,7 +528,7 @@ struct QwenTokenDeviceLayout {
     uint  expert_map_slots[QWEN_TOKEN_MAX_LAYERS];
 };
 
-#define QTK_THREADS 1024u
+#define QTK_THREADS 256u
 
 static inline float
 qtk_bf16(device const uchar *blob, ulong byte_off, uint i)
