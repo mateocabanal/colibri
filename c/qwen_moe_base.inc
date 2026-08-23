@@ -2321,6 +2321,9 @@ static void l2norm(float *x, int D){
 /* one token through one GDN layer; updates conv + recurrence state */
 static void gdn_token(Model *m, Layer *l, int layer, const float *x, float *out){
     Cfg *c = &m->c;
+    if (getenv("QWEN_TOKEN_DEBUG") && layer == 0)
+        fprintf(stderr, "[CPU-GDNIN] x[0..3]=%.6g %.6g %.6g %.6g\n",
+                x[0], x[1], x[2], x[3]);
     int kd = c->lin_k_dim, kheads = c->lin_k_heads;
     int vd = c->lin_v_dim, vheads = c->lin_v_heads;
     int kdim = kd * kheads, vdim = vd * vheads, C = kdim * 2 + vdim, D = c->hidden;
@@ -2350,6 +2353,14 @@ static void gdn_token(Model *m, Layer *l, int layer, const float *x, float *out)
                 acc += l->conv1d[ch * kk + j] * vv;
             }
             y[ch] = silu(acc);
+        }
+        if (getenv("QWEN_TOKEN_DEBUG") && layer == 0) {
+            fprintf(stderr, "[CPU-GDNCONV] y[0..3]=%.6g %.6g %.6g %.6g\n",
+                    y[0], y[1], y[2], y[3]);
+            fprintf(stderr, "[CPU-GDNCONV] q1=%d: y[128..131]=%.6g %.6g %.6g %.6g q2: y[256..259]=%.6g %.6g %.6g %.6g\n",
+                    1, y[128], y[129], y[130], y[131], y[256], y[257], y[258], y[259]);
+            fprintf(stderr, "[CPU-GDNCONV] k1: y[1152..1155]=%.6g %.6g %.6g %.6g v1: y[2176..2179]=%.6g %.6g %.6g %.6g\n",
+                    y[1152], y[1153], y[1154], y[1155], y[2176], y[2177], y[2178], y[2179]);
         }
         /* per-channel shift: state[ch][s] = x_{t-(kk-2)+s} (oldest first);
          * drop slot 0, append the current qkv at slot kk-2. */
@@ -2411,6 +2422,9 @@ static void gdn_token(Model *m, Layer *l, int layer, const float *x, float *out)
         /* write out_h for this head */
         for (int d = 0; d < vd; d++) vh[(int64_t)h * vd + d] = kv_mem[d];
     }
+    if (getenv("QWEN_TOKEN_DEBUG") && layer == 0)
+        fprintf(stderr, "[CPU-GDNREC] vh[0..3]=%.6g %.6g %.6g %.6g\n",
+                vh[0], vh[1], vh[2], vh[3]);
     memcpy(S, Snew, (size_t)vheads * kd * vd * sizeof(float));
 
     /* RMSNormGated: per-head over head_v_dim (weight is [head_v_dim]),
@@ -2419,6 +2433,21 @@ static void gdn_token(Model *m, Layer *l, int layer, const float *x, float *out)
     for (int h = 0; h < vheads; h++)
         rmsnorm_gated_row(normed + (int64_t)h * vd, vh + (int64_t)h * vd,
                           z + (int64_t)h * vd, l->gdn_norm, vd, c->eps);
+    if (getenv("QWEN_TOKEN_DEBUG") && layer == 0) {
+        fprintf(stderr, "[CPU-GDNNORM] normed[0..3]=%.6g %.6g %.6g %.6g\n",
+                normed[0], normed[1], normed[2], normed[3]);
+        fprintf(stderr, "[CPU-GDNNORM] normed[128..131]=%.6g %.6g %.6g %.6g normed[256..259]=%.6g %.6g %.6g %.6g\n",
+                normed[128], normed[129], normed[130], normed[131],
+                normed[256], normed[257], normed[258], normed[259]);
+        fprintf(stderr, "[CPU-GDNNORM] normed[1020..1023]=%.6g %.6g %.6g %.6g\n",
+                normed[1020], normed[1021], normed[1022], normed[1023]);
+        fprintf(stderr, "[CPU-GDNZ] z[0..3]=%.6g %.6g %.6g %.6g z[128..131]=%.6g %.6g %.6g %.6g z[256..259]=%.6g %.6g %.6g %.6g\n",
+                z[0], z[1], z[2], z[3], z[128], z[129], z[130], z[131],
+                z[256], z[257], z[258], z[259]);
+        fprintf(stderr, "[CPU-GDNAB] a[0..7]=%.6g %.6g %.6g %.6g %.6g %.6g %.6g %.6g b[0..7]=%.6g %.6g %.6g %.6g %.6g %.6g %.6g %.6g\n",
+                a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7],
+                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
+    }
     wt_mul(out, normed, &l->gdn_out, 1, D, vdim);
 
     free(qkv); free(a); free(b); free(z); free(y);
@@ -2557,8 +2586,719 @@ static void expert_prefetch_next_early(Model *m, int layer, int nr){
 #endif
 }
 
+
+#if defined(COLI_METAL) && defined(COLI_METALIO)
+
+/* Forward decl: defined with the Stage-3 seam later in this file. */
+static int qwen_token_metal_requested(void);
+
+/*
+ * Runtime failure latch.  Do not clear token_metal_ready: teardown owns the
+ * already-created blob/state objects and must still destroy them.
+ */
+static int g_qwen_token_runtime_disabled = 0;
+static Model *g_qwen_token_runtime_model = NULL;
+static int g_qwen_token_last_committed_pos = -2;
+
+/* ponytail: LRU stamps for bank eviction.  Mirrors the residency bounded-LRU
+ * (working-set 16): evict the oldest non-routed slot instead of the first. */
+static uint32_t g_qwen_token_lru[QWEN_TOKEN_MAX_LAYERS][64];
+static uint32_t g_qwen_token_clock = 0;
+
+static void qwen_token_runtime_disable(const char *why)
+{
+    if (!g_qwen_token_runtime_disabled) {
+        fprintf(stderr, "[QWEN-TOKEN] disabled: %s\n",
+                (why && *why) ? why : "runtime failure");
+        g_qwen_token_runtime_disabled = 1;
+    }
+}
+
+static int qwen_token_routed_contains(
+    const QwenTokenMissRecord *mr, int topk, int eid)
+{
+    int n = topk;
+    if (n > 16) n = 16;
+    for (int i = 0; i < n; ++i)
+        if (mr->routed_expert[i] == eid)
+            return 1;
+    return 0;
+}
+
+/*
+ * Copy one loaded raw-Apple8 Slot into the kernel's packed expert bank and
+ * publish the expert id last.
+ */
+static int qwen_token_fill_publish(
+    Model *m, int layer, Slot *s, char *why, size_t why_n)
+{
+    if (!m || !s || !m->token_metal_ready ||
+        !m->token_blob || !m->token_state) {
+        snprintf(why, why_n, "fill: token objects not ready");
+        return 0;
+    }
+
+    if (layer < 0 || layer >= m->c.n_layers) {
+        snprintf(why, why_n, "fill: bad layer %d", layer);
+        return 0;
+    }
+
+    expert_wait_ready(m, s);
+
+    if (s->eid < 0 || s->fmt != 17 || !s->apple8_direct ||
+        s->mio_slot < 0) {
+        snprintf(why, why_n,
+                 "fill: expert %d layer %d is not raw Apple8",
+                 s->eid, layer);
+        return 0;
+    }
+
+    const uint8_t *src =
+        (const uint8_t *)metalio_slot_ptr(s->mio_slot);
+    size_t src_bytes = metalio_slot_bytes(s->mio_slot);
+    if (!src || !src_bytes) {
+        snprintf(why, why_n, "fill: MetalIO slot has no contents");
+        return 0;
+    }
+
+    if (s->apple8_gate_off > src_bytes ||
+        s->apple8_gate_bytes > src_bytes - s->apple8_gate_off ||
+        s->apple8_up_off > src_bytes ||
+        s->apple8_up_bytes > src_bytes - s->apple8_up_off ||
+        s->apple8_down_off > src_bytes ||
+        s->apple8_down_bytes > src_bytes - s->apple8_down_off) {
+        snprintf(why, why_n, "fill: Apple8 source span out of range");
+        return 0;
+    }
+
+    uint8_t *blob =
+        (uint8_t *)qwen_token_weight_blob_contents(m->token_blob);
+    uint8_t *state =
+        (uint8_t *)qwen_token_device_state_contents(m->token_state);
+    const QwenTokenDeviceLayout *dl =
+        qwen_token_device_state_layout(m->token_state);
+
+    if (!blob || !state || !dl) {
+        snprintf(why, why_n, "fill: blob/state contents unavailable");
+        return 0;
+    }
+
+    const QwenTokenLayerBlob *L = &m->token_params.layer[layer];
+
+    int32_t *map =
+        (int32_t *)(state + dl->expert_map_layer_off[layer]);
+    int map_slots = (int)dl->expert_map_slots[layer];
+
+    if (map_slots <= 0) {
+        snprintf(why, why_n, "fill: layer %d has no expert-bank slots", layer);
+        return 0;
+    }
+
+    QwenTokenMissRecord *mr =
+        (QwenTokenMissRecord *)(state + dl->miss_off);
+
+    int slot_idx = -1;
+
+    /* Existing copy wins. */
+    for (int i = 0; i < map_slots; ++i) {
+        if (map[i] == s->eid) {
+            slot_idx = i;
+            break;
+        }
+    }
+
+    /* Otherwise first unused bank slot. */
+    if (slot_idx < 0) {
+        for (int i = 0; i < map_slots; ++i) {
+            if (map[i] < 0) {
+                slot_idx = i;
+                break;
+            }
+        }
+    }
+
+    /* Warm bank: evict the LEAST-RECENTLY-USED slot not required by the
+     * current routed set (bounded-LRU, mirrors the per-layer residency). */
+    if (slot_idx < 0) {
+        uint32_t oldest = UINT32_MAX;
+        for (int i = 0; i < map_slots; ++i) {
+            if (!qwen_token_routed_contains(mr, m->c.topk, map[i]) &&
+                g_qwen_token_lru[layer][i] < oldest) {
+                oldest = g_qwen_token_lru[layer][i];
+                slot_idx = i;
+            }
+        }
+    }
+
+    if (slot_idx < 0) {
+        snprintf(why, why_n,
+                 "fill: expert bank full with current routed set");
+        return 0;
+    }
+
+    size_t stride = (size_t)L->expert_slot_stride;
+
+    if ((size_t)m->token_params.expert_gate_rel > stride ||
+        s->apple8_gate_bytes >
+            stride - (size_t)m->token_params.expert_gate_rel ||
+        (size_t)m->token_params.expert_up_rel > stride ||
+        s->apple8_up_bytes >
+            stride - (size_t)m->token_params.expert_up_rel ||
+        (size_t)m->token_params.expert_down_rel > stride ||
+        s->apple8_down_bytes >
+            stride - (size_t)m->token_params.expert_down_rel) {
+        snprintf(why, why_n, "fill: Apple8 payload exceeds bank stride");
+        return 0;
+    }
+
+    uint8_t *dst =
+        blob + (size_t)L->expert_bank + (size_t)slot_idx * stride;
+
+    memcpy(dst + (size_t)m->token_params.expert_gate_rel,
+           src + s->apple8_gate_off,
+           s->apple8_gate_bytes);
+    memcpy(dst + (size_t)m->token_params.expert_up_rel,
+           src + s->apple8_up_off,
+           s->apple8_up_bytes);
+    memcpy(dst + (size_t)m->token_params.expert_down_rel,
+           src + s->apple8_down_off,
+           s->apple8_down_bytes);
+
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    map[slot_idx] = (int32_t)s->eid;
+    g_qwen_token_lru[layer][slot_idx] = ++g_qwen_token_clock;
+
+    return 1;
+}
+
+/*
+ * Bring the CPU engine state into the device state when execution crosses
+ * from the old path to the whole-token path at a non-sequential position.
+ *
+ * CPU KV layout: [g][t][d]  (off = g*max_t*hd + t*hd + d)
+ * Device KV layout: [t][g][d] (off = t*(n_kv_heads*hd) + g*hd + d)
+ * GDN is copied in full (same layout both sides).
+ */
+static int qwen_token_state_cpu_to_device(
+    Model *m, int upto_pos, char *why, size_t why_n)
+{
+    uint8_t *state =
+        (uint8_t *)qwen_token_device_state_contents(m->token_state);
+    const QwenTokenDeviceLayout *dl =
+        qwen_token_device_state_layout(m->token_state);
+
+    if (!state || !dl) {
+        snprintf(why, why_n, "state sync: device state unavailable");
+        return 0;
+    }
+
+    Cfg *c = &m->c;
+    const size_t s_elems = gdn_state_count(c);
+    const size_t conv_elems = gdn_conv_count(c);
+    const size_t kv_width = (size_t)c->n_kv_heads * (size_t)c->head_dim;
+
+    for (int l = 0; l < c->n_layers; ++l) {
+        if (c->layer_is_gdn[l]) {
+            float *ds =
+                (float *)(state + dl->gdn_s_layer_off[l]);
+            float *dc =
+                (float *)(state + dl->gdn_conv_layer_off[l]);
+
+            if (!m->gdn_S[l] || !m->gdn_conv[l]) {
+                snprintf(why, why_n,
+                         "state sync: missing CPU GDN layer %d", l);
+                return 0;
+            }
+
+            memcpy(ds, m->gdn_S[l], s_elems * sizeof(float));
+            memcpy(dc, m->gdn_conv[l], conv_elems * sizeof(float));
+            continue;
+        }
+
+        float *dk =
+            (float *)(state + dl->kv_k_off[l]);
+        float *dv =
+            (float *)(state + dl->kv_v_off[l]);
+
+        for (int t = 0; t < upto_pos; ++t) {
+            for (int g = 0; g < c->n_kv_heads; ++g) {
+                size_t cpu_off =
+                    ((size_t)g * (size_t)m->max_t + (size_t)t) *
+                    (size_t)c->head_dim;
+                size_t dev_off =
+                    (size_t)t * kv_width + (size_t)g * (size_t)c->head_dim;
+
+                if (g_kv_f16) {
+                    if (!m->K16[l] || !m->V16[l]) {
+                        snprintf(why, why_n,
+                                 "state sync: missing CPU KV layer %d", l);
+                        return 0;
+                    }
+                    for (int d = 0; d < c->head_dim; ++d) {
+                        dk[dev_off + (size_t)d] =
+                            f16_to_f32(m->K16[l][cpu_off + (size_t)d]);
+                        dv[dev_off + (size_t)d] =
+                            f16_to_f32(m->V16[l][cpu_off + (size_t)d]);
+                    }
+                } else {
+                    if (!m->K[l] || !m->V[l]) {
+                        snprintf(why, why_n,
+                                 "state sync: missing CPU KV layer %d", l);
+                        return 0;
+                    }
+                    memcpy(dk + dev_off, m->K[l] + cpu_off,
+                           (size_t)c->head_dim * sizeof(float));
+                    memcpy(dv + dev_off, m->V[l] + cpu_off,
+                           (size_t)c->head_dim * sizeof(float));
+                }
+            }
+        }
+    }
+
+    return 1;
+}
+
+/*
+ * Commit the persistent state produced by a successful whole-token call back
+ * to the old engine.  Incremental for attention (only KV[pos] is new);
+ * GDN recurrence is mirrored in full.
+ */
+static int qwen_token_state_device_to_cpu(
+    Model *m, int pos, char *why, size_t why_n)
+{
+    const uint8_t *state =
+        (const uint8_t *)qwen_token_device_state_contents(m->token_state);
+    const QwenTokenDeviceLayout *dl =
+        qwen_token_device_state_layout(m->token_state);
+
+    if (!state || !dl) {
+        snprintf(why, why_n, "state commit: device state unavailable");
+        return 0;
+    }
+
+    Cfg *c = &m->c;
+    const size_t s_elems = gdn_state_count(c);
+    const size_t conv_elems = gdn_conv_count(c);
+    const size_t kv_width = (size_t)c->n_kv_heads * (size_t)c->head_dim;
+
+    for (int l = 0; l < c->n_layers; ++l) {
+        if (c->layer_is_gdn[l]) {
+            const float *ss =
+                (const float *)(state + dl->gdn_s_layer_off[l]);
+            const float *sc =
+                (const float *)(state + dl->gdn_conv_layer_off[l]);
+
+            if (!m->gdn_S[l] || !m->gdn_conv[l]) {
+                snprintf(why, why_n,
+                         "state commit: missing CPU GDN layer %d", l);
+                return 0;
+            }
+
+            memcpy(m->gdn_S[l], ss, s_elems * sizeof(float));
+            memcpy(m->gdn_conv[l], sc, conv_elems * sizeof(float));
+            continue;
+        }
+
+        const float *sk =
+            (const float *)(state + dl->kv_k_off[l]);
+        const float *sv =
+            (const float *)(state + dl->kv_v_off[l]);
+
+        for (int g = 0; g < c->n_kv_heads; ++g) {
+            size_t cpu_off =
+                ((size_t)g * (size_t)m->max_t + (size_t)pos) *
+                (size_t)c->head_dim;
+            size_t dev_off =
+                (size_t)pos * kv_width + (size_t)g * (size_t)c->head_dim;
+
+            if (g_kv_f16) {
+                if (!m->K16[l] || !m->V16[l]) {
+                    snprintf(why, why_n,
+                             "state commit: missing CPU KV layer %d", l);
+                    return 0;
+                }
+                for (int d = 0; d < c->head_dim; ++d) {
+                    m->K16[l][cpu_off + (size_t)d] =
+                        f32_to_f16(sk[dev_off + (size_t)d]);
+                    m->V16[l][cpu_off + (size_t)d] =
+                        f32_to_f16(sv[dev_off + (size_t)d]);
+                }
+            } else {
+                if (!m->K[l] || !m->V[l]) {
+                    snprintf(why, why_n,
+                             "state commit: missing CPU KV layer %d", l);
+                    return 0;
+                }
+                memcpy(m->K[l] + cpu_off, sk + dev_off,
+                       (size_t)c->head_dim * sizeof(float));
+                memcpy(m->V[l] + cpu_off, sv + dev_off,
+                       (size_t)c->head_dim * sizeof(float));
+            }
+        }
+    }
+
+    return 1;
+}
+
+/*
+ * Full host seam.
+ *
+ * Returns:
+ *   1 -> whole-token path completed; `out` contains the final residual.
+ *   0 -> caller must execute the untouched per-layer path.
+ */
+static int qwen_token_forward_metal(
+    Model *m, int token, int pos, const float *input, float *out)
+{
+    (void)token;
+
+    if (!qwen_token_metal_requested() ||
+        !m->token_metal_ready ||
+        !m->token_blob ||
+        !m->token_state ||
+        g_qwen_token_runtime_disabled)
+        return 0;
+
+    char why[256] = {0};
+
+    uint8_t *state =
+        (uint8_t *)qwen_token_device_state_contents(m->token_state);
+    const QwenTokenDeviceLayout *dl =
+        qwen_token_device_state_layout(m->token_state);
+
+    if (!state || !dl) {
+        qwen_token_runtime_disable("state contents unavailable");
+        return 0;
+    }
+
+    if (g_qwen_token_runtime_model != m ||
+        pos != g_qwen_token_last_committed_pos + 1) {
+        if (!qwen_token_state_cpu_to_device(m, pos, why, sizeof(why))) {
+            qwen_token_runtime_disable(why);
+            return 0;
+        }
+    }
+
+    g_qwen_token_runtime_model = m;
+
+    memcpy(state + dl->residual_off,
+           input,
+           (size_t)m->c.hidden * sizeof(float));
+
+    if (getenv("QWEN_TOKEN_DEBUG")) {
+        fprintf(stderr, "[WT-EMB] pos=%d emb[0..3]=%.6g %.6g %.6g %.6g\n",
+                pos, input[0], input[1], input[2], input[3]);
+        /* host rmsnorm(emb) with blob in_ln, to compare vs CPU normed */
+        const uint8_t *blob = (const uint8_t *)qwen_token_weight_blob_contents(m->token_blob);
+        const QwenTokenLayerBlob *L0 = &m->token_params.layer[0];
+        const float *inln = (const float *)(blob + L0->in_ln);
+        double ms = 0; for (int i = 0; i < m->c.hidden; i++) ms += (double)input[i] * input[i];
+        float r = 1.f / sqrtf((float)(ms / m->c.hidden) + m->c.eps);
+        fprintf(stderr, "[WT-NORMED] normed[0..3]=%.6g %.6g %.6g %.6g\n",
+                input[0] * r * (1.f + inln[0]), input[1] * r * (1.f + inln[1]),
+                input[2] * r * (1.f + inln[2]), input[3] * r * (1.f + inln[3]));
+        /* blob vs engine GDN weights sanity (full memcmp + first-4 dumps) */
+        {
+            const uint16_t *bw = (const uint16_t *)(blob + L0->gdn_in_qkv);
+            const uint16_t *ew = m->L[0].in_qkv.bf16;
+            size_t qkv_n = (size_t)(2ull * m->c.lin_k_heads * m->c.lin_k_dim +
+                                    m->c.lin_v_heads * m->c.lin_v_dim) * m->c.hidden;
+            size_t vdim = (size_t)m->c.lin_v_heads * m->c.lin_v_dim;
+            fprintf(stderr, "[WT-WEIGHTS] qkv[0..3]: blob=%u %u %u %u engine=%u %u %u %u %s\n",
+                    bw[0], bw[1], bw[2], bw[3], ew[0], ew[1], ew[2], ew[3],
+                    memcmp(bw, ew, qkv_n * 2) == 0 ? "FULLMATCH" : "FULLDIFFER");
+            const uint16_t *bz = (const uint16_t *)(blob + L0->gdn_in_z);
+            fprintf(stderr, "[WT-WEIGHTS] in_z: %s\n",
+                    memcmp(bz, m->L[0].in_z.bf16, vdim * m->c.hidden * 2) == 0 ? "FULLMATCH" : "FULLDIFFER");
+            const uint16_t *ba = (const uint16_t *)(blob + L0->gdn_in_a);
+            fprintf(stderr, "[WT-WEIGHTS] in_a: %s\n",
+                    memcmp(ba, m->L[0].in_a.bf16, m->c.lin_v_heads * m->c.hidden * 2) == 0 ? "FULLMATCH" : "FULLDIFFER");
+            const uint16_t *bb = (const uint16_t *)(blob + L0->gdn_in_b);
+            fprintf(stderr, "[WT-WEIGHTS] in_b: %s\n",
+                    memcmp(bb, m->L[0].in_b.bf16, m->c.lin_v_heads * m->c.hidden * 2) == 0 ? "FULLMATCH" : "FULLDIFFER");
+            /* HOST-SIDE b hypotheses (settles what the kernel actually read) */
+            {
+                const float *inln = (const float *)(blob + L0->in_ln);
+                double ms = 0; for (int i2 = 0; i2 < m->c.hidden; i2++) ms += (double)input[i2] * input[i2];
+                float r = 1.f / sqrtf((float)(ms / m->c.hidden) + m->c.eps);
+                float b_norm[8] = {0}, b_raw[8] = {0}, b_now[8] = {0}, b_now2[8] = {0};
+                for (int rr = 0; rr < m->c.lin_v_heads; rr++) {
+                    double a1 = 0, a2 = 0, a3 = 0, a4 = 0;
+                    for (int c2 = 0; c2 < m->c.hidden; c2++) {
+                        uint32_t u = (uint32_t)bb[(size_t)rr * m->c.hidden + c2] << 16;
+                        float f; memcpy(&f, &u, 4);
+                        double n = (double)input[c2] * (double)r * (double)(1.f + inln[c2]);
+                        a1 += (double)f * n;                    /* in_b @ normed (correct) */
+                        a2 += (double)f * (double)input[c2];    /* in_b @ emb (no norm) */
+                        a3 += (double)f * (double)input[c2] * (double)(1.f + inln[c2]); /* no inv */
+                        a4 += (double)f * (double)n * (double)(1.f + inln[c2]);          /* double (1+w) */
+                    }
+                    b_norm[rr] = (float)a1; b_raw[rr] = (float)a2;
+                    b_now[rr] = (float)a3; b_now2[rr] = (float)a4;
+                }
+                fprintf(stderr, "[WT-HOSTB] norm: %.6g %.6g %.6g %.6g %.6g %.6g %.6g %.6g\n",
+                        b_norm[0], b_norm[1], b_norm[2], b_norm[3],
+                        b_norm[4], b_norm[5], b_norm[6], b_norm[7]);
+                fprintf(stderr, "[WT-HOSTB] raw:  %.6g %.6g %.6g %.6g %.6g %.6g %.6g %.6g\n",
+                        b_raw[0], b_raw[1], b_raw[2], b_raw[3],
+                        b_raw[4], b_raw[5], b_raw[6], b_raw[7]);
+                fprintf(stderr, "[WT-HOSTB] now:  %.6g %.6g %.6g %.6g %.6g %.6g %.6g %.6g\n",
+                        b_now[0], b_now[1], b_now[2], b_now[3],
+                        b_now[4], b_now[5], b_now[6], b_now[7]);
+                fprintf(stderr, "[WT-HOSTB] now2: %.6g %.6g %.6g %.6g %.6g %.6g %.6g %.6g\n",
+                        b_now2[0], b_now2[1], b_now2[2], b_now2[3],
+                        b_now2[4], b_now2[5], b_now2[6], b_now2[7]);
+            }
+            const uint16_t *bo = (const uint16_t *)(blob + L0->gdn_out);
+            fprintf(stderr, "[WT-WEIGHTS] gdn_out: %s\n",
+                    memcmp(bo, m->L[0].gdn_out.bf16, m->c.hidden * vdim * 2) == 0 ? "FULLMATCH" : "FULLDIFFER");
+            const float *bc = (const float *)(blob + L0->gdn_conv1d);
+            size_t conv_n = (size_t)(2ull * m->c.lin_k_heads * m->c.lin_k_dim +
+                                     m->c.lin_v_heads * m->c.lin_v_dim) * m->c.conv_kernel;
+            fprintf(stderr, "[WT-WEIGHTS] conv1d: blob[0..3]=%.9g %.9g %.9g %.9g engine[0..3]=%.9g %.9g %.9g %.9g %s\n",
+                    bc[0], bc[1], bc[2], bc[3],
+                    m->L[0].conv1d[0], m->L[0].conv1d[1], m->L[0].conv1d[2], m->L[0].conv1d[3],
+                    memcmp(bc, m->L[0].conv1d, conv_n * 4) == 0 ? "FULLMATCH" : "FULLDIFFER");
+            const float *bn = (const float *)(blob + L0->gdn_norm);
+            fprintf(stderr, "[WT-WEIGHTS] gdn_norm: blob[0..3]=%.9g %.9g %.9g %.9g engine[0..3]=%.9g %.9g %.9g %.9g %s\n",
+                    bn[0], bn[1], bn[2], bn[3],
+                    m->L[0].gdn_norm[0], m->L[0].gdn_norm[1], m->L[0].gdn_norm[2], m->L[0].gdn_norm[3],
+                    memcmp(bn, m->L[0].gdn_norm, m->c.lin_v_dim * 4) == 0 ? "FULLMATCH" : "FULLDIFFER");
+            const float *bA = (const float *)(blob + L0->gdn_A_log);
+            fprintf(stderr, "[WT-WEIGHTS] A_log: %s dt_bias: %s\n",
+                    memcmp(bA, m->L[0].A_log, m->c.lin_v_heads * 4) == 0 ? "FULLMATCH" : "FULLDIFFER",
+                    memcmp((const float *)(blob + L0->gdn_dt_bias), m->L[0].dt_bias, m->c.lin_v_heads * 4) == 0 ? "FULLMATCH" : "FULLDIFFER");
+        }
+    }
+
+    QwenTokenMissRecord *mr =
+        (QwenTokenMissRecord *)(state + dl->miss_off);
+
+    memset(mr, 0, sizeof(*mr));
+    mr->status = QWEN_TOKEN_STATUS_RUNNABLE;
+    mr->resume_phase = QWEN_TOKEN_PHASE_LAYER_START;
+    mr->layer = 0;
+    mr->token_pos = pos;
+
+    for (int i = 0; i < 16; ++i) {
+        mr->routed_expert[i] = -1;
+        mr->missing_expert[i] = -1;
+    }
+
+    /* One miss per layer worst case (empty bank on first token); the bank
+     * warms as layers are filled, so steady-state is 1 dispatch/token. */
+    const int max_redispatch = m->c.n_layers + 1;
+    for (int redispatch = 0; redispatch <= max_redispatch; ++redispatch) {
+        if (!qwen_token_kernel_dispatch_once(
+                m->token_blob,
+                m->token_state,
+                &m->token_params,
+                pos,
+                why,
+                sizeof(why))) {
+            qwen_token_runtime_disable(why);
+            return 0;
+        }
+
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+
+        if (getenv("QWEN_TOKEN_DEBUG")) {
+            const float *rr = (const float *)(state + dl->residual_off);
+            fprintf(stderr, "[WT-DEBUG] dispatch %d status=%u layer=%u resid[0..3]=%.6g %.6g %.6g %.6g\n",
+                    redispatch, mr->status, mr->layer, rr[0], rr[1], rr[2], rr[3]);
+        }
+
+        if (mr->status == QWEN_TOKEN_STATUS_DONE) {
+            if (!qwen_token_state_device_to_cpu(
+                    m, pos, why, sizeof(why))) {
+                qwen_token_runtime_disable(why);
+                return 0;
+            }
+
+            memcpy(out,
+                   state + dl->residual_off,
+                   (size_t)m->c.hidden * sizeof(float));
+
+            g_qwen_token_last_committed_pos = pos;
+
+            if (getenv("QWEN_TOKEN_DEBUG"))
+                fprintf(stderr, "[WT-DEBUG] whole-token residual[0..3] = %.6g %.6g %.6g %.6g\n",
+                        out[0], out[1], out[2], out[3]);
+
+            m->prof_expert_requests +=
+                (uint64_t)m->c.n_layers * (uint64_t)m->c.topk;
+
+            if (m->hot_n > 0) {
+                m->token_count++;
+                if (m->token_count == m->warmup_tokens)
+                    pin_hot_experts(m);
+            }
+
+            return 1;
+        }
+
+        if (mr->status != QWEN_TOKEN_STATUS_NEED_EXPERTS) {
+            snprintf(why, sizeof(why),
+                     "kernel status %d at layer %d",
+                     mr->status, mr->layer);
+            qwen_token_runtime_disable(why);
+            return 0;
+        }
+
+        if (redispatch == max_redispatch) {
+            qwen_token_runtime_disable(
+                "miss/resume exceeded layer count");
+            return 0;
+        }
+
+        const int layer = mr->layer;
+        if (getenv("QWEN_TOKEN_DEBUG") && redispatch == 0) {
+            const float *mi = (const float *)(state + dl->moe_input_off);
+            fprintf(stderr, "[WT-MOEIN] layer=%d moe_input[0..3]=%.6g %.6g %.6g %.6g\n",
+                    layer, mi[0], mi[1], mi[2], mi[3]);
+            const float *w3 = (const float *)(state + dl->work_off[3]);
+            const float *w0 = (const float *)(state + dl->work_off[0]);
+            fprintf(stderr, "[WT-GDNNORM] w3[0..3]=%.6g %.6g %.6g %.6g\n",
+                    w3[0], w3[1], w3[2], w3[3]);
+            fprintf(stderr, "[WT-GDNNORM] w3[128..131]=%.6g %.6g %.6g %.6g w3[256..259]=%.6g %.6g %.6g %.6g\n",
+                    w3[128], w3[129], w3[130], w3[131],
+                    w3[256], w3[257], w3[258], w3[259]);
+            fprintf(stderr, "[WT-GDNNORM] w3[1020..1023]=%.6g %.6g %.6g %.6g\n",
+                    w3[1020], w3[1021], w3[1022], w3[1023]);
+            {
+                const float *w1 = (const float *)(state + dl->work_off[1]);
+                const float *w2 = (const float *)(state + dl->work_off[2]);
+                const float *snap = (const float *)(state + dl->moe_acc_off);
+                fprintf(stderr, "[WT-GDNZ] w1[0..3]=%.6g %.6g %.6g %.6g w1[128..131]=%.6g %.6g %.6g %.6g w1[256..259]=%.6g %.6g %.6g %.6g\n",
+                        w1[0], w1[1], w1[2], w1[3], w1[128], w1[129], w1[130], w1[131],
+                        w1[256], w1[257], w1[258], w1[259]);
+                fprintf(stderr, "[WT-GDNAB] a[0..7]=%.6g %.6g %.6g %.6g %.6g %.6g %.6g %.6g b[0..7]=%.6g %.6g %.6g %.6g %.6g %.6g %.6g %.6g\n",
+                        w2[0], w2[1], w2[2], w2[3], w2[4], w2[5], w2[6], w2[7],
+                        w2[8], w2[9], w2[10], w2[11], w2[12], w2[13], w2[14], w2[15]);
+                fprintf(stderr, "[WT-SNAP] a[0..7]=%.6g %.6g %.6g %.6g %.6g %.6g %.6g %.6g b[0..7]=%.6g %.6g %.6g %.6g %.6g %.6g %.6g %.6g\n",
+                        snap[0], snap[1], snap[2], snap[3], snap[4], snap[5], snap[6], snap[7],
+                        snap[8], snap[9], snap[10], snap[11], snap[12], snap[13], snap[14], snap[15]);
+                /* kernel introspection region: moe_acc_off + 128 (ulong x11) + 256 (float x8) */
+                {
+                    const uint64_t *ud = (const uint64_t *)(state + dl->moe_acc_off + 128);
+                    const float *fd = (const float *)(state + dl->moe_acc_off + 256);
+                    fprintf(stderr, "[WT-INTRO] lin_v_heads=%llu lin_v_dim=%llu lin_k_heads=%llu lin_k_dim=%llu hidden=%llu n_layers=%llu\n",
+                            (unsigned long long)ud[0], (unsigned long long)ud[1],
+                            (unsigned long long)ud[2], (unsigned long long)ud[3],
+                            (unsigned long long)ud[9], (unsigned long long)ud[10]);
+                    fprintf(stderr, "[WT-INTRO] in_a_off=%llu in_b_off=%llu in_qkv_off=%llu in_z_off=%llu gdn_out_off=%llu\n",
+                            (unsigned long long)ud[4], (unsigned long long)ud[5],
+                            (unsigned long long)ud[6], (unsigned long long)ud[7],
+                            (unsigned long long)ud[8]);
+                    fprintf(stderr, "[WT-INTRO] normed0..3=%.6g %.6g %.6g %.6g b_w0..3=%.6g %.6g %.6g %.6g\n",
+                            fd[0], fd[1], fd[2], fd[3], fd[4], fd[5], fd[6], fd[7]);
+                    /* host-side values for comparison */
+                    fprintf(stderr, "[WT-INTRO] host in_a=%llu in_b=%llu in_qkv=%llu in_z=%llu gdn_out=%llu\n",
+                            (unsigned long long)m->token_params.layer[0].gdn_in_a,
+                            (unsigned long long)m->token_params.layer[0].gdn_in_b,
+                            (unsigned long long)m->token_params.layer[0].gdn_in_qkv,
+                            (unsigned long long)m->token_params.layer[0].gdn_in_z,
+                            (unsigned long long)m->token_params.layer[0].gdn_out);
+                }
+            }
+            fprintf(stderr, "[WT-GDNQKV] w0[0..3]=%.6g %.6g %.6g %.6g\n",
+                    w0[0], w0[1], w0[2], w0[3]);
+            fprintf(stderr, "[WT-GDNQKV] q1: w0[128..131]=%.6g %.6g %.6g %.6g q2: w0[256..259]=%.6g %.6g %.6g %.6g\n",
+                    w0[128], w0[129], w0[130], w0[131], w0[256], w0[257], w0[258], w0[259]);
+            fprintf(stderr, "[WT-GDNQKV] k1: w0[1152..1155]=%.6g %.6g %.6g %.6g v1: w0[2176..2179]=%.6g %.6g %.6g %.6g\n",
+                    w0[1152], w0[1153], w0[1154], w0[1155], w0[2176], w0[2177], w0[2178], w0[2179]);
+        }
+        if (getenv("QWEN_TOKEN_DEBUG") && redispatch < 3) {
+            fprintf(stderr, "[WT-ROUTE] layer=%d routed=", layer);
+            for (int ri = 0; ri < m->c.topk; ri++)
+                fprintf(stderr, "%d(%.3f) ", mr->routed_expert[ri], mr->routed_weight[ri]);
+            fprintf(stderr, "\n");
+        }
+        if (layer < 0 || layer >= m->c.n_layers) {
+            snprintf(why, sizeof(why),
+                     "kernel requested experts for bad layer %d", layer);
+            qwen_token_runtime_disable(why);
+            return 0;
+        }
+
+        int filled = 0;
+
+        /* Only the kernel-reported missing_count entries are valid. */
+        int nmiss = mr->missing_count;
+        if (nmiss > 16) nmiss = 16;
+
+        for (int i = 0; i < nmiss; ++i) {
+            const int eid = mr->missing_expert[i];
+            if (eid < 0)
+                continue;
+
+            if (eid >= m->c.n_experts) {
+                snprintf(why, sizeof(why),
+                         "kernel requested bad expert %d", eid);
+                qwen_token_runtime_disable(why);
+                return 0;
+            }
+
+            int duplicate = 0;
+            for (int j = 0; j < i; ++j) {
+                if (mr->missing_expert[j] == eid) {
+                    duplicate = 1;
+                    break;
+                }
+            }
+            if (duplicate)
+                continue;
+
+            Slot *s = NULL;
+            expert_get(m, layer, eid, &s);
+            if (!s) {
+                snprintf(why, sizeof(why),
+                         "expert_get returned NULL for (%d,%d)",
+                         layer, eid);
+                qwen_token_runtime_disable(why);
+                return 0;
+            }
+
+            if (!qwen_token_fill_publish(
+                    m, layer, s, why, sizeof(why))) {
+                qwen_token_runtime_disable(why);
+                return 0;
+            }
+
+            filled++;
+        }
+
+        if (!filled) {
+            qwen_token_runtime_disable(
+                "NEED_EXPERTS with empty missing list");
+            return 0;
+        }
+    }
+
+    qwen_token_runtime_disable("unreachable miss/resume exit");
+    return 0;
+}
+
+#else
+
+static int qwen_token_forward_metal(
+    Model *m, int token, int pos, const float *input, float *out)
+{
+    (void)m;
+    (void)token;
+    (void)pos;
+    (void)input;
+    (void)out;
+    return 0;
+}
+
+#endif
+
 static void moe_token(Model *m, Layer *l, int layer, const float *x, float *out){
     Cfg *c = &m->c; int E = c->n_experts, K = c->topk, D = c->hidden;
+    if (getenv("QWEN_TOKEN_DEBUG") && layer == 0)
+        fprintf(stderr, "[CPU-MOEIN] layer=%d moe_input[0..3]=%.6g %.6g %.6g %.6g\n",
+                layer, x[0], x[1], x[2], x[3]);
     m->prof_expert_requests += (uint64_t)K;
     double moe_t_r = now_s() * 1e3, moe_t_i = 0, moe_t_g = 0, moe_t_w = 0;
     float *logits = falloc(E);
@@ -2579,6 +3319,12 @@ static void moe_token(Model *m, Layer *l, int layer, const float *x, float *out)
         float tv = val[i]; val[i] = val[best]; val[best] = tv;
     }
     float wsum = 0; for (int i = 0; i < K; i++) wsum += val[i];
+    if (getenv("QWEN_TOKEN_DEBUG") && layer < 3) {
+        fprintf(stderr, "[CPU-ROUTE] layer=%d routed=", layer);
+        for (int ri = 0; ri < K; ri++)
+            fprintf(stderr, "%d(%.3f) ", idx[ri], val[ri] / wsum);
+        fprintf(stderr, "\n");
+    }
 
     float *acc = calloc((size_t)D, sizeof(float));
     if (!acc) { fprintf(stderr, "OOM\n"); exit(1); }
@@ -3484,6 +4230,25 @@ static void forward_token(Model *m, int token, int pos, float *out){
     } else {
         memcpy(out, m->embed.f + (int64_t)token * D, (size_t)D * sizeof(float));
     }
+
+#if defined(COLI_METAL) && defined(COLI_METALIO)
+    /*
+     * Whole-token executor is explicitly opt-in.  Unset/default remains the
+     * verified per-layer engine byte-for-byte.
+     *
+     * `out` currently contains the embedding and is therefore the initial
+     * residual consumed by qwen_token_whole.
+     */
+    if (qwen_token_metal_requested() &&
+        m->token_metal_ready &&
+        !g_qwen_token_runtime_disabled) {
+        if (qwen_token_forward_metal(m, token, pos, out, out))
+            return;
+        /* Failure is latched/printed by qwen_token_forward_metal().
+         * Fall straight through and recompute this token on the old path. */
+    }
+#endif
+
     float *h = falloc(D);
     for (int l = 0; l < c->n_layers; l++) {
         Layer *L = &m->L[l];
@@ -3491,9 +4256,18 @@ static void forward_token(Model *m, int token, int pos, float *out){
         float *attn = falloc(D);
         double t0 = now_s();
         rmsnorm_row(normed, out, L->in_ln, D, c->eps);
+        if (getenv("QWEN_TOKEN_DEBUG") && l == 0)
+            fprintf(stderr, "[CPU-NORMED] normed[0..3]=%.6g %.6g %.6g %.6g\n",
+                    normed[0], normed[1], normed[2], normed[3]);
         if (c->layer_is_gdn[l]) gdn_token(m, L, l, normed, attn);
         else                    attention_token(m, L, l, normed, pos, attn);
+        if (getenv("QWEN_TOKEN_DEBUG") && l == 0)
+            fprintf(stderr, "[CPU-GDN0] attn[0..3]=%.6g %.6g %.6g %.6g\n",
+                    attn[0], attn[1], attn[2], attn[3]);
         for (int d = 0; d < D; d++) out[d] += attn[d];
+        if (getenv("QWEN_TOKEN_DEBUG") && l == 0)
+            fprintf(stderr, "[CPU-RES0] resid[0..3]=%.6g %.6g %.6g %.6g\n",
+                    out[0], out[1], out[2], out[3]);
         if (c->layer_is_gdn[l]) m->t_gdn += now_s() - t0;
         else                    m->t_attn += now_s() - t0;
         t0 = now_s();
@@ -3524,6 +4298,9 @@ static void forward_token(Model *m, int token, int pos, float *out){
         }
         free(normed); free(attn);
     }
+    if (getenv("QWEN_TOKEN_DEBUG"))
+        fprintf(stderr, "[WT-DEBUG] per-layer residual[0..3] = %.6g %.6g %.6g %.6g\n",
+                out[0], out[1], out[2], out[3]);
     free(h);
     if (m->hot_n > 0) {
         m->token_count++;

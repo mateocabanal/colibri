@@ -2,6 +2,7 @@
 #define COLIBRI_QWEN_TOKEN_KERNEL_H
 
 #include <stdint.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -306,6 +307,21 @@ void *qwen_token_device_state_contents(QwenTokenDeviceState *state);
 
 /* Stage-4: runtime-compile the whole-token kernel; 1 on success. */
 int qwen_token_kernel_selfcheck(char *err, uint64_t err_cap);
+
+/*
+ * Submit exactly one qwen_token_whole invocation.
+ *
+ * Returns 1 iff the command buffer completed successfully.  Kernel-level
+ * NEED_EXPERTS/DONE state is reported through QwenTokenMissRecord in `state`;
+ * this function only reports host/Metal submission failure.
+ */
+int qwen_token_kernel_dispatch_once(
+    QwenTokenWeightBlob *blob,
+    QwenTokenDeviceState *state,
+    const QwenTokenKernelParams *params,
+    int token_pos,
+    char *why,
+    size_t why_n);
 
 #ifdef __cplusplus
 } /* extern "C" */

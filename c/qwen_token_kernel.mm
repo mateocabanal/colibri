@@ -455,9 +455,8 @@ qwen_token_weight_blob_contents(QwenTokenWeightBlob *b)
     return b ? [b->buffer contents] : NULL;
 }
 
-// ---- Stage-5 runtime compile selfcheck (Hermes) ----
-extern "C" int qwen_token_kernel_selfcheck(char *err, uint64_t err_cap) {
-    static const char *QTK_MSL = R"METAL(
+
+static const char *QTK_MSL = R"METAL(
 #include <metal_stdlib>
 using namespace metal;
 
@@ -631,7 +630,7 @@ qtk_rmsnorm(device const float *x,
     const float inv = tg_scalar[0];
 
     for (uint i = tid; i < n; i += QTK_THREADS)
-        y[i] = x[i] * qtk_f32(blob, w_off, i) * inv;
+        y[i] = x[i] * (1.0f + qtk_f32(blob, w_off, i)) * inv;
 
     threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
 }
@@ -703,7 +702,8 @@ qtk_attn_norm_rope(device float *q,
                    uint tid)
 {
     if (tid < n_heads) {
-        const uint base = tid * head_dim;
+        /* q buffer packs [q | gate] per head: 2*head_dim per head. */
+        const uint base = tid * 2u * head_dim;
 
         float ss = 0.0f;
         for (uint d = 0; d < head_dim; ++d) {
@@ -716,7 +716,7 @@ qtk_attn_norm_rope(device float *q,
 
         for (uint d = 0; d < head_dim; ++d)
             q[base + d] =
-                q[base + d] * qtk_f32(blob, qn_off, d) * inv;
+                q[base + d] * (1.0f + qtk_f32(blob, qn_off, d)) * inv;
 
         qtk_rope_head(q, base, rotary_dim, token_pos, theta);
     }
@@ -735,7 +735,7 @@ qtk_attn_norm_rope(device float *q,
 
         for (uint d = 0; d < head_dim; ++d)
             k[base + d] =
-                k[base + d] * qtk_f32(blob, kn_off, d) * inv;
+                k[base + d] * (1.0f + qtk_f32(blob, kn_off, d)) * inv;
 
         qtk_rope_head(k, base, rotary_dim, token_pos, theta);
     }
@@ -829,12 +829,12 @@ qtk_gdn_recurrence(device float *qkv,
     const uint h = tid;
 
     /*
-     * Current model geometry is 1:1:
-     *     k_heads == v_heads == 8.
-     *
-     * Keep the indexing explicit so no head writes another head's state.
+     * GQA mapping: rep = v_heads / k_heads value heads share one key head
+     * (real model: 32/16 = 2).  kh = h / rep, exactly like the CPU
+     * gdn_token (int khd = h / rep).
      */
-    const uint kh = h;
+    const uint rep = v_heads / k_heads;
+    const uint kh = h / rep;
 
     const uint kdim = k_heads * k_head_dim;
     const uint vdim = v_heads * v_head_dim;
@@ -869,11 +869,13 @@ qtk_gdn_recurrence(device float *qkv,
 
     const float qinv = rsqrt(qss + 1.0e-6f);
     const float kinv = rsqrt(kss + 1.0e-6f);
+    const float qscale = rsqrt((float)k_head_dim);
 
-    for (uint kd = 0; kd < k_head_dim; ++kd) {
-        q[kd] *= qinv;
-        k[kd] *= kinv;
-    }
+    /*
+     * q/k are SHARED between rep value heads and MUST NOT be mutated in
+     * place (rep=2 heads would double-apply the norm and race).  The norms
+     * are applied at every use site below instead.
+     */
 
     const float A =
         qtk_f32(blob, A_log_off, h);
@@ -904,7 +906,7 @@ qtk_gdn_recurrence(device float *qkv,
                 Sh[si] * gamma;
 
             Sh[si] = decayed;
-            kv_mem += decayed * k[kd];
+            kv_mem += decayed * (k[kd] * kinv);
         }
 
         const float delta =
@@ -920,10 +922,10 @@ qtk_gdn_recurrence(device float *qkv,
                 (ulong)kd * (ulong)v_head_dim + vd;
 
             const float updated =
-                Sh[si] + k[kd] * delta;
+                Sh[si] + (k[kd] * kinv) * delta;
 
             Sh[si] = updated;
-            out += updated * q[kd];
+            out += updated * ((q[kd] * qinv) * qscale);
         }
 
         yh[vd] = out;
@@ -1167,7 +1169,7 @@ qtk_attention_scan(device const float *q,
         (h * n_kv_heads) / n_heads;
 
     const uint qbase =
-        h * head_dim;
+        h * 2u * head_dim;   /* [q | gate] packing */
 
     const uint kv_width =
         n_kv_heads * head_dim;
@@ -1243,6 +1245,9 @@ qtk_attention_layer(device const uchar *blob,
     const uint qdim =
         p.n_heads * p.head_dim;
 
+    const uint qgdim =
+        2u * p.n_heads * p.head_dim;   /* [q | gate] per head */
+
     const uint kvdim =
         p.n_kv_heads * p.head_dim;
 
@@ -1258,11 +1263,12 @@ qtk_attention_layer(device const uchar *blob,
     device float *ctx =
         qtk_state_f32(state, dl.work_off[3]);
 
+    /* attn_q packs [q | gate] per head (2*H*hd rows), matching the CPU. */
     qtk_bf16_matvec(blob,
                     L.attn_q,
                     normed,
                     q,
-                    qdim,
+                    qgdim,
                     p.hidden,
                     tid);
 
@@ -1325,6 +1331,17 @@ qtk_attention_layer(device const uchar *blob,
                            p.n_kv_heads,
                            p.head_dim,
                            tid);
+    }
+
+    threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+
+    /* Output gate: attn * sigmoid(gate) elementwise (gate = 2nd half of the
+     * q|gate block), matching the CPU attention_token. */
+    for (uint i = tid; i < qdim; i += QTK_THREADS) {
+        const uint h = i / p.head_dim;
+        const uint d = i % p.head_dim;
+        const float g = q[(2u * h + 1u) * p.head_dim + d];
+        ctx[i] *= qtk_sigmoid(g);
     }
 
     threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
@@ -1442,8 +1459,8 @@ qtk_pre_moe_layer(device const uchar *blob,
 /* Stage 5: resident MoE + miss/resume                                         */
 /* ========================================================================== */
 
-static constant uint QTK_STATUS_OK             = 0u;
-static constant uint QTK_STATUS_NEED_EXPERTS   = 1u;
+static constant uint QTK_STATUS_OK             = 1u; /* = QWEN_TOKEN_STATUS_DONE */
+static constant uint QTK_STATUS_NEED_EXPERTS   = 2u; /* = QWEN_TOKEN_STATUS_NEED_EXPERTS */
 
 static constant uint QTK_RESUME_NONE           = 0u;
 static constant uint QTK_RESUME_MOE            = 1u;
@@ -1666,6 +1683,16 @@ qtk_router(device const uchar *blob,
 
             miss->routed_expert[r] = best_id;
             miss->routed_weight[r] = best_p;
+        }
+
+        /* Renormalize top-k weights over the selected set (CPU parity). */
+        {
+            float wsum = 0.0f;
+            for (uint r = 0u; r < p.topk; ++r)
+                wsum += miss->routed_weight[r];
+            const float inv_wsum = 1.0f / wsum;
+            for (uint r = 0u; r < p.topk; ++r)
+                miss->routed_weight[r] *= inv_wsum;
         }
 
         /*
@@ -2271,6 +2298,204 @@ qwen_token_whole(device const uchar *weights       [[buffer(0)]],
     }
 }
 )METAL";
+
+/* ---- Whole-token dispatch (host seam) ---- */
+static id<MTLComputePipelineState>
+qtk_whole_pipeline(id<MTLDevice> dev, char *why, size_t why_n)
+{
+    static id<MTLDevice> cached_dev = nil;
+    static id<MTLComputePipelineState> cached_pso = nil;
+
+    if (!dev) {
+        if (why && why_n) snprintf(why, why_n, "no Metal device");
+        return nil;
+    }
+
+    if (cached_pso && cached_dev == dev)
+        return cached_pso;
+
+    NSError *err = nil;
+
+    NSString *src = [NSString stringWithUTF8String:QTK_MSL];
+    if (!src) {
+        if (why && why_n) snprintf(why, why_n, "missing qwen token MSL source");
+        return nil;
+    }
+
+    id<MTLLibrary> lib =
+        [dev newLibraryWithSource:src options:nil error:&err];
+    if (!lib) {
+        if (why && why_n)
+            snprintf(why, why_n, "MSL compile: %s",
+                     err ? [[err localizedDescription] UTF8String]
+                         : "unknown error");
+        return nil;
+    }
+
+    id<MTLFunction> fn = [lib newFunctionWithName:@"qwen_token_whole"];
+    if (!fn) {
+        if (why && why_n)
+            snprintf(why, why_n, "qwen_token_whole not found");
+        return nil;
+    }
+
+    id<MTLComputePipelineState> pso =
+        [dev newComputePipelineStateWithFunction:fn error:&err];
+    if (!pso) {
+        if (why && why_n)
+            snprintf(why, why_n, "pipeline compile: %s",
+                     err ? [[err localizedDescription] UTF8String]
+                         : "unknown error");
+        return nil;
+    }
+
+    cached_dev = dev;
+    cached_pso = pso;
+    return cached_pso;
+}
+
+/*
+ * Cached constant buffers for params + layout.
+ * setBytes() caps at 4KB; QwenTokenKernelParams (~13KB) and
+ * QwenTokenDeviceLayout (~12KB) exceed it, so they must ride real MTLBuffers.
+ */
+static id<MTLBuffer>
+qtk_const_buffer(id<MTLDevice> dev, const void *bytes, size_t n,
+                 const void **cache_key, id<MTLBuffer> *cache_buf)
+{
+    if (*cache_buf && *cache_key == bytes)
+        return *cache_buf;
+
+    id<MTLBuffer> b =
+        [dev newBufferWithBytes:bytes
+                        length:n
+                       options:MTLResourceStorageModeShared];
+    if (b) {
+        *cache_key = bytes;
+        *cache_buf = b;
+    }
+    return b;
+}
+
+extern "C" int
+qwen_token_kernel_dispatch_once(
+    QwenTokenWeightBlob *blob,
+    QwenTokenDeviceState *state,
+    const QwenTokenKernelParams *params,
+    int token_pos,
+    char *why,
+    size_t why_n)
+{
+    @autoreleasepool {
+        if (why && why_n) why[0] = '\0';
+
+        if (!blob || !state || !params) {
+            if (why && why_n) snprintf(why, why_n, "null blob/state/params");
+            return 0;
+        }
+
+        id<MTLBuffer> blob_buf  = blob->buffer;
+        id<MTLBuffer> state_buf = state->buffer;
+
+        if (!blob_buf || !state_buf) {
+            if (why && why_n) snprintf(why, why_n, "missing Metal buffer");
+            return 0;
+        }
+
+        id<MTLDevice> dev = [state_buf device];
+        if (!dev || [blob_buf device] != dev) {
+            if (why && why_n) snprintf(why, why_n, "blob/state device mismatch");
+            return 0;
+        }
+
+        id<MTLComputePipelineState> pso =
+            qtk_whole_pipeline(dev, why, why_n);
+        if (!pso)
+            return 0;
+
+        static const void *params_key = NULL;
+        static id<MTLBuffer> params_buf = nil;
+        static const void *layout_key = NULL;
+        static id<MTLBuffer> layout_buf = nil;
+
+        id<MTLBuffer> pbuf =
+            qtk_const_buffer(dev, params, sizeof(*params),
+                             &params_key, &params_buf);
+        if (!pbuf) {
+            if (why && why_n) snprintf(why, why_n, "params buffer alloc failed");
+            return 0;
+        }
+
+        const QwenTokenDeviceLayout *dl =
+            qwen_token_device_state_layout(state);
+        if (!dl) {
+            if (why && why_n) snprintf(why, why_n, "missing device layout");
+            return 0;
+        }
+
+        id<MTLBuffer> lbuf =
+            qtk_const_buffer(dev, dl, sizeof(*dl),
+                             &layout_key, &layout_buf);
+        if (!lbuf) {
+            if (why && why_n) snprintf(why, why_n, "layout buffer alloc failed");
+            return 0;
+        }
+
+        id<MTLCommandQueue> queue = [dev newCommandQueue];
+        if (!queue) {
+            if (why && why_n) snprintf(why, why_n, "newCommandQueue failed");
+            return 0;
+        }
+
+        id<MTLCommandBuffer> cb = [queue commandBuffer];
+        if (!cb) {
+            if (why && why_n) snprintf(why, why_n, "commandBuffer failed");
+            return 0;
+        }
+
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        if (!enc) {
+            if (why && why_n) snprintf(why, why_n, "compute encoder failed");
+            return 0;
+        }
+
+        [enc setComputePipelineState:pso];
+
+        [enc setBuffer:blob_buf offset:0 atIndex:0];
+        [enc setBuffer:pbuf offset:0 atIndex:1];
+        [enc setBuffer:state_buf offset:0 atIndex:2];
+        [enc setBytes:&token_pos length:sizeof(token_pos) atIndex:3];
+        [enc setBuffer:lbuf offset:0 atIndex:4];
+
+        const NSUInteger threads = 256; /* QTK_THREADS; M2 cap is 384. */
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+        [enc endEncoding];
+
+        [cb commit];
+        [cb waitUntilCompleted];
+
+        if ([cb status] != MTLCommandBufferStatusCompleted) {
+            NSError *err = [cb error];
+            if (why && why_n)
+                snprintf(why, why_n, "command buffer: %s",
+                         err ? [[err localizedDescription] UTF8String]
+                             : "did not complete");
+            return 0;
+        }
+
+        return 1;
+    }
+}
+
+
+
+
+
+
+// ---- Stage-5 runtime compile selfcheck (Hermes) ----
+extern "C" int qwen_token_kernel_selfcheck(char *err, uint64_t err_cap) {
+
     id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
     if (!dev) { if (err&&err_cap) snprintf(err,(size_t)err_cap,"no Metal device"); return 0; }
     NSError *e = nil;
@@ -2286,4 +2511,3 @@ qwen_token_whole(device const uchar *weights       [[buffer(0)]],
     if (!fn) { if (err&&err_cap) snprintf(err,(size_t)err_cap,"kernel qwen_token_whole not found"); return 0; }
     return 1;
 }
-
