@@ -333,6 +333,7 @@ typedef struct {
     uint64_t prefetch_misses;      /* loads triggered by lookahead prefetch */
     uint64_t prof_expert_requests; /* logical routed expert applications */
     uint64_t prof_expert_loads;    /* physical expert loads from storage */
+    double t_moe_route, t_moe_io, t_moe_shared, t_moe_gpu, t_moe_fill; /* split spans (s) */
     uint64_t prof_apple8_direct_blocks;
     uint64_t prof_apple8_direct_experts;
     uint64_t prof_apple8_direct_bytes;
@@ -364,6 +365,7 @@ enum {
 };
 enum {
     QPC_ROUTED_EXPERT_REQUESTS = 0,
+    QPC_MOE_ROUTE_MS, QPC_MOE_IO_MS, QPC_MOE_SHARED_MS, QPC_MOE_GPU_MS, QPC_MOE_FILL_MS,
     QPC_EXPERT_LOADS,
     QPC_CACHE_HITS,
     QPC_CACHE_MISSES,
@@ -397,6 +399,11 @@ static const ColiProfilePhaseDef qprof_phases[QPROF_COUNT] = {
 };
 static const ColiProfileCounterDef qprof_counters[QPC_COUNT] = {
     [QPC_ROUTED_EXPERT_REQUESTS] = {"routed_expert_requests"},
+    [QPC_MOE_ROUTE_MS] = {"moe_route_ms"},
+    [QPC_MOE_IO_MS] = {"moe_io_ms"},
+    [QPC_MOE_SHARED_MS] = {"moe_shared_ms"},
+    [QPC_MOE_GPU_MS] = {"moe_gpu_ms"},
+    [QPC_MOE_FILL_MS] = {"moe_fill_ms"},
     [QPC_EXPERT_LOADS] = {"expert_loads"},
     [QPC_CACHE_HITS] = {"cache_hits"},
     [QPC_CACHE_MISSES] = {"cache_misses"},
@@ -444,6 +451,11 @@ static void qprof_sync(Model *m) {
     coli_profile_phase_set(&g_qprof, QPROF_HEAD, qprof_s_to_ns(m->t_head));
     coli_profile_counter_set(&g_qprof, QPC_ROUTED_EXPERT_REQUESTS, m->prof_expert_requests);
     coli_profile_counter_set(&g_qprof, QPC_EXPERT_LOADS, m->prof_expert_loads);
+    coli_profile_counter_set(&g_qprof, QPC_MOE_ROUTE_MS, (uint64_t)(m->t_moe_route * 1e3));
+    coli_profile_counter_set(&g_qprof, QPC_MOE_IO_MS, (uint64_t)(m->t_moe_io * 1e3));
+    coli_profile_counter_set(&g_qprof, QPC_MOE_SHARED_MS, (uint64_t)(m->t_moe_shared * 1e3));
+    coli_profile_counter_set(&g_qprof, QPC_MOE_GPU_MS, (uint64_t)(m->t_moe_gpu * 1e3));
+    coli_profile_counter_set(&g_qprof, QPC_MOE_FILL_MS, (uint64_t)(m->t_moe_fill * 1e3));
     coli_profile_counter_set(&g_qprof, QPC_CACHE_HITS, m->hits);
     coli_profile_counter_set(&g_qprof, QPC_CACHE_MISSES, m->miss);
     coli_profile_counter_set(&g_qprof, QPC_PREFETCH_MISSES, m->prefetch_misses);
@@ -2541,6 +2553,7 @@ static void expert_prefetch_next_early(Model *m, int layer, int nr){
 static void moe_token(Model *m, Layer *l, int layer, const float *x, float *out){
     Cfg *c = &m->c; int E = c->n_experts, K = c->topk, D = c->hidden;
     m->prof_expert_requests += (uint64_t)K;
+    double moe_t_r = now_s() * 1e3, moe_t_i = 0, moe_t_g = 0, moe_t_w = 0;
     float *logits = falloc(E);
     wt_mul(logits, x, &l->router, 1, E, D);
     softmax_row(logits, E);
@@ -2565,6 +2578,8 @@ static void moe_token(Model *m, Layer *l, int layer, const float *x, float *out)
     float *w = malloc(size_mul_or_die((size_t)K, sizeof(float), "router top-k weights"));
     if (!w) { fprintf(stderr, "OOM router weights\n"); exit(1); }
     for (int i = 0; i < K; i++) w[i] = val[i] / wsum;
+    m->t_moe_route += (now_s() * 1e3) - moe_t_r;
+    moe_t_i = now_s() * 1e3;
 #ifdef COLI_METALIO
     /* A pending routed-MoE command may overlap only work that does not consume
      * its output. Adjacent layers depend on this layer residual, but the
@@ -2618,6 +2633,8 @@ static void moe_token(Model *m, Layer *l, int layer, const float *x, float *out)
     g_mio_async_issue = 0;
 #endif
     if (K <= 64) { memcpy(m->last_route, idx, (size_t)K * sizeof(int)); m->last_route_k = K; }
+    m->t_moe_io += (now_s() * 1e3) - moe_t_i;
+    moe_t_g = now_s() * 1e3;
     /* Early pipeline: layer l+1's guesses go in flight BEFORE the layer-l
      * expert GEMVs below — overlap I/O with compute (MetalIO only). The
      * old post-layer lookahead in forward_token is disabled in pipe mode. */
@@ -2764,6 +2781,8 @@ routed_experts_done:
     for (int i = 0; i < c->shared_inter; i++) h[i] = silu(gv[i]) * h[i];
     float *sy = falloc(D);
     wt_mul(sy, h, &l->se_down, 1, D, c->shared_inter);
+    m->t_moe_shared += (now_s() * 1e3) - moe_t_g;
+    moe_t_w = now_s() * 1e3;
 #ifdef COLI_METALIO
     /* First true consumer of routed output: wait here, after all shared-expert
      * CPU work. finish() copies the routed result into acc, preserving the
@@ -2773,11 +2792,13 @@ routed_experts_done:
             fprintf(stderr, "qwen: fused direct Apple8 top-k decode completion failed\n");
             exit(1);
         }
+        m->t_moe_gpu += (now_s() * 1e3) - moe_t_w;
         apple8_pending = NULL;
     }
 #endif
     for (int d = 0; d < D; d++) acc[d] += sy[d] * gs;
     memcpy(out, acc, (size_t)D * sizeof(float));
+    m->t_moe_fill += (now_s() * 1e3) - moe_t_w;
 
     free(logits); free(idx); free(val); free(acc); free(w);
     free(sg); free(h); free(gv); free(sy);
