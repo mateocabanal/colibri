@@ -2585,6 +2585,10 @@ static void moe_token(Model *m, Layer *l, int layer, const float *x, float *out)
      * its output. Adjacent layers depend on this layer residual, but the
      * same-layer shared expert is independent until the final sum. */
     void *apple8_pending = NULL;
+/* Non-NULL only for the second wave of the optional ready-vs-pending
+ * routed-expert split.  finish() overwrites its destination, so wave 2
+ * needs a separate result before we add it to wave 1. */
+    float *apple8_pending_acc = NULL;
 #endif
 
     /* A Slot* returned by expert_get() is not leased: a later miss may LRU-
@@ -2658,7 +2662,6 @@ static void moe_token(Model *m, Layer *l, int layer, const float *x, float *out)
                 ColiApple8MetalioExpert ex[64];
                 for (int i = 0; i < K; i++) {
                     Slot *s = slots[i];
-                    expert_wait_ready(m, s);
                     if (!s->apple8_direct) {
                         fprintf(stderr, "qwen: fused direct Apple8 slot is not executable\n");
                         exit(1);
@@ -2673,20 +2676,100 @@ static void moe_token(Model *m, Layer *l, int layer, const float *x, float *out)
                         .down_bytes = s->apple8_down_bytes,
                     };
                 }
-                if (qwen_apple8_overlap_enabled()) {
-                    if (!coli_apple8_metalio_moe_topk_begin(ex, w, K, x,
-                                                            D, c->moe_inter,
-                                                            &apple8_pending)) {
-                        fprintf(stderr, "qwen: fused direct Apple8 top-k decode submit failed\n");
+
+                int split_done = 0;
+                const char *iogpu_env = getenv("QWEN_APPLE8_IO_GPU_OVERLAP");
+                const int iogpu_overlap =
+                    iogpu_env && iogpu_env[0] && strcmp(iogpu_env, "0") != 0 &&
+                    qwen_apple8_overlap_enabled();
+
+                if (iogpu_overlap) {
+                    ColiApple8MetalioExpert ready_ex[64], pending_ex[64];
+                    float ready_w[64], pending_w[64];
+                    int nready = 0, npending = 0;
+
+                    /* Conservative classification: only slots whose latest MetalIO event
+                     * has already been drained are allowed into wave 1.  A physically
+                     * completed-but-not-yet-waited prefetch stays in wave 2 for now. */
+                    for (int i = 0; i < K; i++) {
+                        Slot *s = slots[i];
+                        if (!s->mio || s->mio_event <= s->mio_waited) {
+                            ready_ex[nready] = ex[i];
+                            ready_w[nready++] = w[i];
+                        } else {
+                            pending_ex[npending] = ex[i];
+                            pending_w[npending++] = w[i];
+                        }
+                    }
+
+                    if (nready > 0 && npending > 0) {
+                        /* Wave 1: compute known-ready experts immediately.  MetalIO keeps
+                         * loading wave 2 concurrently on its independent I/O queue. */
+                        double wave_t = now_s() * 1e3;
+                        if (!coli_apple8_metalio_moe_topk(
+                                ready_ex, ready_w, nready, x, acc,
+                                D, c->moe_inter)) {
+                            fprintf(stderr,
+                                    "qwen: ready-wave Apple8 top-k dispatch failed\n");
+                            exit(1);
+                        }
+                        m->t_moe_gpu += (now_s() * 1e3) - wave_t;
+
+                        /* Wave 1 has bought the pending loads some GPU-compute time.
+                         * Drain only what is still outstanding before binding wave 2. */
+                        for (int i = 0; i < K; i++) {
+                            Slot *s = slots[i];
+                            if (s->mio && s->mio_event > s->mio_waited)
+                                expert_wait_ready(m, s);
+                        }
+
+                        apple8_pending_acc =
+                            calloc((size_t)D, sizeof(float));
+                        if (!apple8_pending_acc) {
+                            fprintf(stderr, "OOM Apple8 pending-wave accumulator\n");
+                            exit(1);
+                        }
+
+                        /* Wave 2 remains split-phase so its GPU work still overlaps the
+                         * same-layer CPU shared expert exactly as the current path does. */
+                        if (!coli_apple8_metalio_moe_topk_begin(
+                                pending_ex, pending_w, npending, x,
+                                D, c->moe_inter, &apple8_pending)) {
+                            fprintf(stderr,
+                                    "qwen: pending-wave Apple8 top-k submit failed\n");
+                            exit(1);
+                        }
+
+                        m->prof_apple8_direct_blocks += 2;
+                        m->prof_apple8_direct_experts += (uint64_t)K;
+                        split_done = 1;
+                    }
+                }
+
+                if (!split_done) {
+                    /* Existing one-wave behavior, unchanged when the experiment is off
+                     * or when this layer is entirely ready / entirely pending. */
+                    for (int i = 0; i < K; i++)
+                        expert_wait_ready(m, slots[i]);
+
+                    if (qwen_apple8_overlap_enabled()) {
+                        if (!coli_apple8_metalio_moe_topk_begin(
+                                ex, w, K, x, D, c->moe_inter,
+                                &apple8_pending)) {
+                            fprintf(stderr,
+                                    "qwen: fused direct Apple8 top-k decode submit failed\n");
+                            exit(1);
+                        }
+                    } else if (!coli_apple8_metalio_moe_topk(
+                                   ex, w, K, x, acc, D, c->moe_inter)) {
+                        fprintf(stderr,
+                                "qwen: fused direct Apple8 top-k decode dispatch failed\n");
                         exit(1);
                     }
-                } else if (!coli_apple8_metalio_moe_topk(ex, w, K, x, acc,
-                                                         D, c->moe_inter)) {
-                    fprintf(stderr, "qwen: fused direct Apple8 top-k decode dispatch failed\n");
-                    exit(1);
+
+                    m->prof_apple8_direct_blocks++;
+                    m->prof_apple8_direct_experts += (uint64_t)K;
                 }
-                m->prof_apple8_direct_blocks++;
-                m->prof_apple8_direct_experts += (uint64_t)K;
             } else {
                 float *yd = falloc(D);
                 for (int i = 0; i < K; i++) {
@@ -2789,12 +2872,20 @@ routed_experts_done:
     /* Residual routed-GPU wait after the shared CPU work has overlapped it. */
     if (apple8_pending) {
         moe_t_w = now_s() * 1e3;
-        if (!coli_apple8_metalio_moe_topk_finish(apple8_pending, acc)) {
+        float *routed_dst = apple8_pending_acc ? apple8_pending_acc : acc;
+        if (!coli_apple8_metalio_moe_topk_finish(apple8_pending, routed_dst)) {
             fprintf(stderr, "qwen: fused direct Apple8 top-k decode completion failed\n");
             exit(1);
         }
         m->t_moe_gpu += (now_s() * 1e3) - moe_t_w;
         apple8_pending = NULL;
+
+        if (apple8_pending_acc) {
+            for (int d = 0; d < D; d++)
+                acc[d] += apple8_pending_acc[d];
+            free(apple8_pending_acc);
+            apple8_pending_acc = NULL;
+        }
     }
 #endif
 
