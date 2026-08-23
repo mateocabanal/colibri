@@ -266,12 +266,15 @@ kernel void qwen_gdn_input_bf16(
                 }
             }
         }
-        const int span = (D + 31) / 32;
-        const int begin = (int)lane * span;
-        const int end = min(begin + span, D);
+        /* Coalesced BF16 dot (CCBPLAN B, Hermes): SIMD lanes read x[w] and
+         * w[] at the SAME index i = lane + 32*g - contiguous per instruction.
+         * Reduction stays fixed-order: each lane's running acc, then lane 0
+         * combines partial[pb + 0..31] in ascending lane order - deterministic. */
         const long base = (long)o * D;
-        for (int i = begin; i < end; ++i)
-            acc += x[i] * qwen_bf16(w, base + i);
+        float laneacc = 0.0f;
+        for (int i = (int)lane; i < D; i += 32)
+            laneacc += x[i] * qwen_bf16(w, base + i);
+        acc = laneacc;
     }
     partial[tid] = acc;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -445,12 +448,12 @@ kernel void qwen_gdn_output_bf16(
     const uint o = tg * QWEN_GDN_ROWS_PER_TG + row_slot;
     float acc = 0.0f;
     if (o < (uint)O) {
-        const int span = (I + 31) / 32;
-        const int begin = (int)lane * span;
-        const int end = min(begin + span, I);
+        /* Coalesced BF16 dot (CCBPLAN B): lane reads index i = lane + 32*g. */
         const long base = (long)o * I;
-        for (int i = begin; i < end; ++i)
-            acc += x[i] * qwen_bf16(w, base + i);
+        float laneacc = 0.0f;
+        for (int i = (int)lane; i < I; i += 32)
+            laneacc += x[i] * qwen_bf16(w, base + i);
+        acc = laneacc;
     }
     partial[tid] = acc;
     threadgroup_barrier(mem_flags::mem_threadgroup);
