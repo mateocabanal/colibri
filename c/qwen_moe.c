@@ -87,16 +87,16 @@ extern int coli_apple8_metalio_gdn_token(
 
 /* Blocker: deterministic Metal GDN reduction is still >100 ms/tok; needs a faster deterministic block reduction plus overlapped recurrence before default-on. */
 static int qwen_gdn_metal_enabled(void){
-    static int initialized = 0, enabled = 0;
+    static int initialized = 0, enabled = 1;
     if (!initialized) {
         const char *v = getenv("QWEN_GDN_METAL");
-        if (v && v[0] && strcmp(v, "1") == 0) enabled = 1;
+        if (v && v[0] && strcmp(v, "0") == 0) enabled = 0;
         initialized = 1;
     }
     return g_apple8_direct && enabled;
 }
 
-/* Decode-only Metal seam.  QWEN_GDN_METAL defaults OFF; QWEN_GDN_METAL=1
+/* Decode-only Metal seam.  QWEN_GDN_METAL defaults ON (GPU reference); QWEN_GDN_METAL=0
  * opts into the deterministic Metal path when direct Apple8 is active.
  * rc==0 means Metal declined before commit and CPU fallback is safe.  A
  * negative rc is post-submit failure: recurrent state may have changed, so
