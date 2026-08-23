@@ -243,6 +243,34 @@ typedef struct QwenTokenDeviceLayout {
 typedef struct QwenTokenDeviceState QwenTokenDeviceState;
 
 /*
+ * Immutable packed-weight buffer used by the whole-token kernel.
+ *
+ * Static dense/vector spans are copied at creation time.  Routed-expert bank
+ * regions are part of blob_bytes but intentionally have no source span:
+ * Stage 5 populates those regions on demand and publishes the corresponding
+ * expert ID through the mutable state's resident-expert map.
+ */
+typedef struct QwenTokenWeightBlob QwenTokenWeightBlob;
+
+typedef struct QwenTokenBlobSpan {
+    const void *src;
+    uint64_t dst_offset;
+    uint64_t bytes;
+} QwenTokenBlobSpan;
+
+QwenTokenWeightBlob *qwen_token_weight_blob_create(
+    const QwenTokenKernelParams *p,
+    const QwenTokenBlobSpan *spans,
+    uint32_t span_count,
+    char *err,
+    uint64_t err_cap);
+
+void qwen_token_weight_blob_destroy(QwenTokenWeightBlob *blob);
+
+void *qwen_token_weight_blob_mtl_buffer(QwenTokenWeightBlob *blob);
+void *qwen_token_weight_blob_contents(QwenTokenWeightBlob *blob);
+
+/*
  * Pure layout builder: no Metal interaction.
  * Returns 1 on success, 0 on invalid geometry/overflow.
  */

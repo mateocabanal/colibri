@@ -143,6 +143,7 @@ static int g_cuda_compute = 0;
 
 #ifdef COLI_METAL
 #include "backend_metal.h"
+#include "qwen_token_kernel.h"
 /* QWEN_METAL_COMPUTE=1: route routed-expert gate/up/down matmuls to the
  * Apple-GPU (Metal) backend's batched moe_block kernel. Slabs must be
  * page-aligned so the backend can wrap them zero-copy (16K pages); any
@@ -341,6 +342,12 @@ typedef struct {
     double dense_load_s;
     ColiExecutor *coli; /* COLLACOLI: non-NULL = COLI package backend */
     int coli_load;
+#ifdef COLI_METAL
+    QwenTokenKernelParams token_params;
+    QwenTokenWeightBlob *token_blob;
+    QwenTokenDeviceState *token_state;
+    int token_metal_ready;
+#endif
 } Model;
 
 /* Generic inference profiler adapter. DeepSeek V4 and Qwen share profile.c;
@@ -3665,6 +3672,385 @@ coli_dense_done:
     m->dense_load_s = now_s() - t0;
 }
 
+#if defined(COLI_METAL) && defined(COLI_METALIO)
+
+#define QWEN_TOKEN_STAGE3_MAX_SPANS 1024u
+
+static int
+qwen_token_metal_requested(void)
+{
+    const char *v = getenv("QWEN_TOKEN_METAL");
+    return v && v[0] && strcmp(v, "0") != 0;
+}
+
+static int
+qwen_token_blob_reserve(uint64_t *cursor, uint64_t bytes, uint64_t *off)
+{
+    if (!cursor || !off || !bytes)
+        return 0;
+
+    uint64_t p = *cursor;
+    if (p > UINT64_MAX - (QWEN_TOKEN_BLOB_ALIGN - 1))
+        return 0;
+
+    p = (p + QWEN_TOKEN_BLOB_ALIGN - 1) &
+        ~(uint64_t)(QWEN_TOKEN_BLOB_ALIGN - 1);
+
+    if (bytes > UINT64_MAX - p)
+        return 0;
+
+    *off = p;
+    *cursor = p + bytes;
+    return 1;
+}
+
+static int
+qwen_token_blob_add(
+    QwenTokenBlobSpan *spans,
+    uint32_t *nspans,
+    uint64_t *cursor,
+    const void *src,
+    uint64_t bytes,
+    uint64_t *off)
+{
+    if (!src || !spans || !nspans ||
+        *nspans >= QWEN_TOKEN_STAGE3_MAX_SPANS)
+        return 0;
+
+    if (!qwen_token_blob_reserve(cursor, bytes, off))
+        return 0;
+
+    spans[*nspans] = (QwenTokenBlobSpan){
+        .src = src,
+        .dst_offset = *off,
+        .bytes = bytes,
+    };
+    (*nspans)++;
+    return 1;
+}
+
+static int
+qwen_token_stage3_build_descriptor(
+    Model *m,
+    QwenTokenKernelParams *p,
+    QwenTokenBlobSpan *spans,
+    uint32_t *span_count,
+    char *why,
+    size_t why_n)
+{
+    Cfg *c = &m->c;
+
+    if (!m->coli || !m->coli_load) {
+        snprintf(why, why_n,
+                 "whole-token path currently requires a COLI package");
+        return 0;
+    }
+    if (c->n_layers < 1 ||
+        c->n_layers > (int)QWEN_TOKEN_MAX_LAYERS ||
+        c->topk < 1 ||
+        c->topk > (int)QWEN_TOKEN_MAX_TOPK ||
+        m->max_t < 1) {
+        snprintf(why, why_n, "unsupported model geometry");
+        return 0;
+    }
+
+    const ColiRecordInfo *erec = coli_executor_expert(m->coli, 0, 0);
+    ColiExpertInfo ei;
+
+    if (!erec || erec->codec != COLI_CSF_CODEC_NONE ||
+        coli_executor_expert_info(m->coli, 0, 0, &ei, NULL, 0)) {
+        snprintf(why, why_n, "expert 0 metadata is not directly executable");
+        return 0;
+    }
+
+    int gi = coli_emx(&ei, 1);
+    int ui = coli_emx(&ei, 2);
+    int di = coli_emx(&ei, 3);
+
+    if (gi < 0 || ui < 0 || di < 0) {
+        snprintf(why, why_n, "expert is missing gate/up/down matrices");
+        return 0;
+    }
+
+    size_t gb = 0, ub = 0, db = 0;
+    if (!qwen_apple8_raw_matrix(
+            &ei.matrices[gi],
+            (uint64_t)c->moe_inter,
+            (uint64_t)c->hidden, &gb) ||
+        !qwen_apple8_raw_matrix(
+            &ei.matrices[ui],
+            (uint64_t)c->moe_inter,
+            (uint64_t)c->hidden, &ub) ||
+        !qwen_apple8_raw_matrix(
+            &ei.matrices[di],
+            (uint64_t)c->hidden,
+            (uint64_t)c->moe_inter, &db)) {
+        snprintf(why, why_n,
+                 "routed experts are not raw Apple8 MXFP4");
+        return 0;
+    }
+
+    size_t uoff = qwen_align16(gb);
+    size_t gu_end =
+        uoff && ub <= SIZE_MAX - uoff ? uoff + ub : 0;
+    size_t doff = gu_end ? qwen_align16(gu_end) : 0;
+    size_t raw_bytes =
+        doff && db <= SIZE_MAX - doff ? doff + db : 0;
+
+    if (!uoff || !doff || !raw_bytes ||
+        raw_bytes > UINT64_MAX - (QWEN_TOKEN_BLOB_ALIGN - 1)) {
+        snprintf(why, why_n, "Apple8 expert slot size overflow");
+        return 0;
+    }
+
+    uint64_t slot_stride =
+        ((uint64_t)raw_bytes + QWEN_TOKEN_BLOB_ALIGN - 1) &
+        ~(uint64_t)(QWEN_TOKEN_BLOB_ALIGN - 1);
+
+    memset(p, 0, sizeof(*p));
+    p->abi_version = QWEN_TOKEN_KERNEL_ABI;
+    p->n_layers = (uint32_t)c->n_layers;
+    p->hidden = (uint32_t)c->hidden;
+    p->max_t = (uint32_t)m->max_t;
+
+    p->n_heads = (uint32_t)c->n_heads;
+    p->n_kv_heads = (uint32_t)c->n_kv_heads;
+    p->head_dim = (uint32_t)c->head_dim;
+    p->rotary_dim = (uint32_t)c->rotary_dim;
+
+    p->lin_k_heads = (uint32_t)c->lin_k_heads;
+    p->lin_k_dim = (uint32_t)c->lin_k_dim;
+    p->lin_v_heads = (uint32_t)c->lin_v_heads;
+    p->lin_v_dim = (uint32_t)c->lin_v_dim;
+    p->conv_kernel = (uint32_t)c->conv_kernel;
+
+    p->n_experts = (uint32_t)c->n_experts;
+    p->topk = (uint32_t)c->topk;
+    p->moe_inter = (uint32_t)c->moe_inter;
+    p->shared_inter = (uint32_t)c->shared_inter;
+
+    p->eps = c->eps;
+    p->theta = c->theta;
+
+    p->expert_gate_rel = 0;
+    p->expert_gate_bytes = (uint64_t)gb;
+    p->expert_up_rel = (uint64_t)uoff;
+    p->expert_up_bytes = (uint64_t)ub;
+    p->expert_down_rel = (uint64_t)doff;
+    p->expert_down_bytes = (uint64_t)db;
+
+    uint64_t cursor = 0;
+    uint32_t ns = 0;
+
+#define QTK_F32(field_, ptr_, count_)                                      \
+    do {                                                                   \
+        uint64_t qtk_n = (uint64_t)(count_);                               \
+        if (!(ptr_) || qtk_n > UINT64_MAX / sizeof(float) ||               \
+            !qwen_token_blob_add(spans, &ns, &cursor, (ptr_),              \
+                                 qtk_n * sizeof(float),                     \
+                                 &b->field_)) {                            \
+            snprintf(why, why_n, "cannot pack " #field_);                  \
+            return 0;                                                      \
+        }                                                                  \
+    } while (0)
+
+#define QTK_BF16(field_, wt_, count_)                                      \
+    do {                                                                   \
+        uint64_t qtk_n = (uint64_t)(count_);                               \
+        if (!(wt_).bf16 || qtk_n > UINT64_MAX / sizeof(uint16_t) ||        \
+            !qwen_token_blob_add(spans, &ns, &cursor, (wt_).bf16,          \
+                                 qtk_n * sizeof(uint16_t),                  \
+                                 &b->field_)) {                            \
+            snprintf(why, why_n,                                           \
+                     "whole-token path requires BF16 " #field_);           \
+            return 0;                                                      \
+        }                                                                  \
+    } while (0)
+
+    for (int i = 0; i < c->n_layers; i++) {
+        Layer *l = &m->L[i];
+        QwenTokenLayerBlob *b = &p->layer[i];
+
+        memset(b, 0xff, sizeof(*b));
+        b->kind = c->layer_is_gdn[i]
+                    ? QWEN_TOKEN_LAYER_GDN
+                    : QWEN_TOKEN_LAYER_ATTN;
+
+        if (m->cache[i].cap < 1 ||
+            m->cache[i].cap > c->n_experts) {
+            snprintf(why, why_n, "invalid expert-bank capacity");
+            return 0;
+        }
+        b->expert_slots = (uint32_t)m->cache[i].cap;
+
+        QTK_F32(in_ln, l->in_ln, c->hidden);
+        QTK_F32(post_ln, l->post_ln, c->hidden);
+
+        if (c->layer_is_gdn[i]) {
+            uint64_t kdim =
+                (uint64_t)c->lin_k_heads * c->lin_k_dim;
+            uint64_t vdim =
+                (uint64_t)c->lin_v_heads * c->lin_v_dim;
+            uint64_t convdim = 2 * kdim + vdim;
+
+            QTK_F32(gdn_A_log, l->A_log, c->lin_v_heads);
+            QTK_F32(gdn_dt_bias, l->dt_bias, c->lin_v_heads);
+            QTK_F32(gdn_conv1d, l->conv1d,
+                     convdim * (uint64_t)c->conv_kernel);
+
+            QTK_BF16(gdn_in_a, l->in_a,
+                      (uint64_t)c->lin_v_heads * c->hidden);
+            QTK_BF16(gdn_in_b, l->in_b,
+                      (uint64_t)c->lin_v_heads * c->hidden);
+            QTK_BF16(gdn_in_qkv, l->in_qkv,
+                      convdim * (uint64_t)c->hidden);
+            QTK_BF16(gdn_in_z, l->in_z,
+                      vdim * (uint64_t)c->hidden);
+
+            QTK_F32(gdn_norm, l->gdn_norm, c->lin_v_dim);
+            QTK_BF16(gdn_out, l->gdn_out,
+                      (uint64_t)c->hidden * vdim);
+        } else {
+            uint64_t qrows =
+                2ull * c->n_heads * c->head_dim;
+            uint64_t kvrows =
+                (uint64_t)c->n_kv_heads * c->head_dim;
+            uint64_t orows =
+                (uint64_t)c->n_heads * c->head_dim;
+
+            QTK_BF16(attn_q, l->q,
+                      qrows * (uint64_t)c->hidden);
+            QTK_BF16(attn_k, l->k,
+                      kvrows * (uint64_t)c->hidden);
+            QTK_BF16(attn_v, l->v,
+                      kvrows * (uint64_t)c->hidden);
+            QTK_BF16(attn_o, l->o,
+                      (uint64_t)c->hidden * orows);
+            QTK_F32(attn_qn, l->qn, c->head_dim);
+            QTK_F32(attn_kn, l->kn, c->head_dim);
+        }
+
+        QTK_BF16(router, l->router,
+                  (uint64_t)c->n_experts * c->hidden);
+        QTK_BF16(se_gate, l->se_gate,
+                  (uint64_t)c->shared_inter * c->hidden);
+        QTK_BF16(se_up, l->se_up,
+                  (uint64_t)c->shared_inter * c->hidden);
+        QTK_BF16(se_down, l->se_down,
+                  (uint64_t)c->hidden * c->shared_inter);
+        QTK_BF16(se_g, l->se_g, c->hidden);
+    }
+
+#undef QTK_F32
+#undef QTK_BF16
+
+    for (int i = 0; i < c->n_layers; i++) {
+        QwenTokenLayerBlob *b = &p->layer[i];
+
+        if ((uint64_t)b->expert_slots >
+            UINT64_MAX / slot_stride) {
+            snprintf(why, why_n, "expert-bank size overflow");
+            return 0;
+        }
+
+        uint64_t bank_bytes =
+            (uint64_t)b->expert_slots * slot_stride;
+
+        if (!qwen_token_blob_reserve(
+                &cursor, bank_bytes, &b->expert_bank)) {
+            snprintf(why, why_n, "cannot reserve expert bank");
+            return 0;
+        }
+
+        b->expert_slot_stride = slot_stride;
+    }
+
+    if (cursor > UINT64_MAX - (QWEN_TOKEN_BLOB_ALIGN - 1)) {
+        snprintf(why, why_n, "final blob size overflow");
+        return 0;
+    }
+
+    p->blob_bytes =
+        (cursor + QWEN_TOKEN_BLOB_ALIGN - 1) &
+        ~(uint64_t)(QWEN_TOKEN_BLOB_ALIGN - 1);
+
+    *span_count = ns;
+    return 1;
+}
+
+static int
+qwen_token_stage3_init(Model *m)
+{
+    char why[512] = {0};
+
+    if (!(g_metal_compute &&
+          g_metal_io &&
+          g_apple8_direct &&
+          metalio_active())) {
+        fprintf(stderr,
+                "[QWEN-TOKEN] disabled: Metal/MetalIO/Apple8 direct backend unavailable; "
+                "using verified per-layer path\n");
+        return 0;
+    }
+
+    QwenTokenKernelParams p;
+    QwenTokenBlobSpan spans[QWEN_TOKEN_STAGE3_MAX_SPANS];
+    uint32_t span_count = 0;
+
+    if (!qwen_token_stage3_build_descriptor(
+            m, &p, spans, &span_count, why, sizeof(why))) {
+        fprintf(stderr,
+                "[QWEN-TOKEN] disabled: %s; using verified per-layer path\n",
+                why[0] ? why : "unsupported model");
+        return 0;
+    }
+
+    QwenTokenWeightBlob *blob =
+        qwen_token_weight_blob_create(
+            &p, spans, span_count, why, sizeof(why));
+
+    if (!blob) {
+        fprintf(stderr,
+                "[QWEN-TOKEN] disabled: %s; using verified per-layer path\n",
+                why[0] ? why : "weight-blob allocation failed");
+        return 0;
+    }
+
+    QwenTokenDeviceState *state =
+        qwen_token_device_state_create(&p, why, sizeof(why));
+
+    if (!state) {
+        qwen_token_weight_blob_destroy(blob);
+        fprintf(stderr,
+                "[QWEN-TOKEN] disabled: %s; using verified per-layer path\n",
+                why[0] ? why : "device-state allocation failed");
+        return 0;
+    }
+
+    m->token_params = p;
+    m->token_blob = blob;
+    m->token_state = state;
+    m->token_metal_ready = 1;
+
+    const QwenTokenDeviceLayout *layout =
+        qwen_token_device_state_layout(state);
+
+    fprintf(stderr,
+            "[QWEN-TOKEN] Stage 3 ready: blob=%.2fMiB state=%.2fMiB "
+            "layers=%u expert_slots/layer=%u; "
+            "dispatch remains on verified per-layer path\n",
+            (double)p.blob_bytes / (1024.0 * 1024.0),
+            layout
+                ? (double)layout->total_bytes / (1024.0 * 1024.0)
+                : 0.0,
+            p.n_layers,
+            p.layer[0].expert_slots);
+
+    return 1;
+}
+
+#endif
+
 /* ---------- modes ---------- */
 
 static int *parse_ids(const char *s, int *n_out){
@@ -4456,6 +4842,18 @@ int main(int argc, char **argv){
         }
     }
 #endif
+
+#if defined(COLI_METAL) && defined(COLI_METALIO)
+    /*
+     * Stage 3 only constructs the whole-token resources.  Until Stage 4
+     * publishes an executable kernel, forward_token() remains untouched.
+     *
+     * Unset/0 => absolutely no Stage-3 allocations.
+     */
+    if (qwen_token_metal_requested())
+        (void)qwen_token_stage3_init(&m);
+#endif
+
     qprof_startup_end(&m);
     const char *mode = getenv("QWENMOE_MODE");
     if (mode && !strcmp(mode, "teacher"))      rc = mode_teacher(&m);
@@ -4465,6 +4863,15 @@ int main(int argc, char **argv){
     else                                       rc = mode_selftest(&m, snap);
 
     save_usage(&m, snap);
+
+#if defined(COLI_METAL) && defined(COLI_METALIO)
+    qwen_token_device_state_destroy(m.token_state);
+    qwen_token_weight_blob_destroy(m.token_blob);
+    m.token_state = NULL;
+    m.token_blob = NULL;
+    m.token_metal_ready = 0;
+#endif
+
 #ifdef COLI_METALIO
     if (g_metal_io) {
         if (g_apple8_direct) coli_apple8_metalio_direct_shutdown();

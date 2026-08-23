@@ -14,6 +14,12 @@ struct QwenTokenDeviceState {
     QwenTokenDeviceLayout layout;
 };
 
+struct QwenTokenWeightBlob {
+    id<MTLDevice> device;
+    id<MTLBuffer> buffer;
+    uint64_t bytes;
+};
+
 static int
 qtk_fail(char *err, uint64_t cap, const char *msg)
 {
@@ -354,4 +360,97 @@ void *
 qwen_token_device_state_contents(QwenTokenDeviceState *s)
 {
     return s ? [s->buffer contents] : NULL;
+}
+
+QwenTokenWeightBlob *
+qwen_token_weight_blob_create(
+    const QwenTokenKernelParams *p,
+    const QwenTokenBlobSpan *spans,
+    uint32_t span_count,
+    char *err,
+    uint64_t err_cap)
+{
+    if (!p || !p->blob_bytes) {
+        qtk_fail(err, err_cap, "qwen token blob: empty parameters/blob");
+        return NULL;
+    }
+    if (span_count && !spans) {
+        qtk_fail(err, err_cap, "qwen token blob: null span table");
+        return NULL;
+    }
+    if (p->blob_bytes > (uint64_t)SIZE_MAX) {
+        qtk_fail(err, err_cap, "qwen token blob: size exceeds host address space");
+        return NULL;
+    }
+
+    for (uint32_t i = 0; i < span_count; i++) {
+        const QwenTokenBlobSpan *s = &spans[i];
+        if (!s->src || !s->bytes ||
+            s->dst_offset > p->blob_bytes ||
+            s->bytes > p->blob_bytes - s->dst_offset) {
+            qtk_fail(err, err_cap, "qwen token blob: invalid source span");
+            return NULL;
+        }
+    }
+
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    if (!device) {
+        qtk_fail(err, err_cap, "qwen token blob: no Metal device");
+        return NULL;
+    }
+
+    QwenTokenWeightBlob *b =
+        (QwenTokenWeightBlob *)calloc(1, sizeof(*b));
+    if (!b) {
+        qtk_fail(err, err_cap, "qwen token blob: OOM");
+        return NULL;
+    }
+
+    b->device = [device retain];
+    b->buffer =
+        [device newBufferWithLength:(NSUInteger)p->blob_bytes
+                            options:MTLResourceStorageModeShared];
+
+    if (!b->buffer) {
+        [b->device release];
+        free(b);
+        qtk_fail(err, err_cap, "qwen token blob: MTLBuffer allocation failed");
+        return NULL;
+    }
+
+    b->bytes = p->blob_bytes;
+
+    /*
+     * Do NOT memset the full buffer.  Expert-bank ranges may be multi-GB and
+     * are invalid until their expert-map entries are published anyway.
+     * Touch only immutable static weights here.
+     */
+    uint8_t *base = (uint8_t *)[b->buffer contents];
+    for (uint32_t i = 0; i < span_count; i++)
+        memcpy(base + spans[i].dst_offset, spans[i].src,
+               (size_t)spans[i].bytes);
+
+    return b;
+}
+
+void
+qwen_token_weight_blob_destroy(QwenTokenWeightBlob *b)
+{
+    if (!b)
+        return;
+    [b->buffer release];
+    [b->device release];
+    free(b);
+}
+
+void *
+qwen_token_weight_blob_mtl_buffer(QwenTokenWeightBlob *b)
+{
+    return b ? (void *)b->buffer : NULL;
+}
+
+void *
+qwen_token_weight_blob_contents(QwenTokenWeightBlob *b)
+{
+    return b ? [b->buffer contents] : NULL;
 }
