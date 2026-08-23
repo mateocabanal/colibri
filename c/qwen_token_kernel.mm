@@ -455,7 +455,7 @@ qwen_token_weight_blob_contents(QwenTokenWeightBlob *b)
     return b ? [b->buffer contents] : NULL;
 }
 
-// ---- Stage-4 runtime compile selfcheck (Hermes) ----
+// ---- Stage-5 runtime compile selfcheck (Hermes) ----
 extern "C" int qwen_token_kernel_selfcheck(char *err, uint64_t err_cap) {
     static const char *QTK_MSL = R"METAL(
 #include <metal_stdlib>
@@ -1438,6 +1438,639 @@ qtk_pre_moe_layer(device const uchar *blob,
  *
  * Exactly one 1024-thread threadgroup is dispatched for one token.
  */
+/* ========================================================================== */
+/* Stage 5: resident MoE + miss/resume                                         */
+/* ========================================================================== */
+
+static constant uint QTK_STATUS_OK             = 0u;
+static constant uint QTK_STATUS_NEED_EXPERTS   = 1u;
+
+static constant uint QTK_RESUME_NONE           = 0u;
+static constant uint QTK_RESUME_MOE            = 1u;
+
+static constant uint QTK_NO_EXPERT_SLOT        = 0xffffffffu;
+
+/*
+ * Canonical E2M1 values.  Apple8 is only a physical 8x32 tiling of the
+ * canonical MXFP4 values/scales:
+ *
+ *   tile[0..127]   = 8 rows x 16 packed nibble bytes
+ *   tile[128..135] = one E8M0 scale byte per output row
+ *
+ * Low nibble is the earlier/even K element.
+ */
+static constant float APPLE8_MX4[16] = {
+     0.0f,  0.5f,  1.0f,  1.5f,
+     2.0f,  3.0f,  4.0f,  6.0f,
+    -0.0f, -0.5f, -1.0f, -1.5f,
+    -2.0f, -3.0f, -4.0f, -6.0f
+};
+
+static inline device QwenTokenMissRecord *
+qtk_miss_record(device uchar *state,
+                QwenTokenDeviceLayout dl)
+{
+    return reinterpret_cast<device QwenTokenMissRecord *>(
+        state + dl.miss_off);
+}
+
+static inline device float *
+qtk_moe_input(device uchar *state,
+              QwenTokenDeviceLayout dl)
+{
+    return qtk_state_f32(state, dl.moe_input_off);
+}
+
+static inline void
+qtk_copy_f32(device const float *src,
+             device float *dst,
+             uint n,
+             uint tid)
+{
+    for (uint i = tid; i < n; i += QTK_THREADS)
+        dst[i] = src[i];
+
+    threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+}
+
+/*
+ * E8M0 scale.  Canonical MX convention:
+ *
+ *     scale = 2^(e - 127)
+ *
+ * No E8M0 zero/NaN scale is emitted by the Apple8 packer for real rows.
+ */
+static inline float
+qtk_e8m0(uchar e)
+{
+    return exp2((float)((int)e - 127));
+}
+
+/*
+ * Read one value from an Apple8 8x32 / 136-byte tiled matrix.
+ *
+ * Matrix is logically [rows, cols], row-major.  Physical tile order:
+ *
+ *     output_tile-major, then K-group-major
+ *
+ * Edge tiles are zero padded by the packer.
+ */
+static inline float
+qtk_apple8_get(device const uchar *matrix,
+               uint row,
+               uint col,
+               uint cols)
+{
+    const uint ng =
+        (cols + 31u) >> 5;
+
+    const uint otile =
+        row >> 3;
+
+    const uint orow =
+        row & 7u;
+
+    const uint g =
+        col >> 5;
+
+    const uint k =
+        col & 31u;
+
+    const ulong tile_index =
+        (ulong)otile * (ulong)ng + (ulong)g;
+
+    device const uchar *tile =
+        matrix + tile_index * 136ul;
+
+    const uchar packed =
+        tile[orow * 16u + (k >> 1)];
+
+    const uint code =
+        ((k & 1u) == 0u)
+            ? ((uint)packed & 0x0fu)
+            : ((uint)packed >> 4);
+
+    const float scale =
+        qtk_e8m0(tile[128u + orow]);
+
+    return APPLE8_MX4[code] * scale;
+}
+
+/*
+ * Deterministic Apple8 matvec.
+ *
+ * One thread owns an output row.  Its dot product walks input columns in
+ * strictly ascending order.
+ */
+static inline void
+qtk_apple8_matvec(device const uchar *matrix,
+                  device const float *x,
+                  device float *dst,
+                  uint rows,
+                  uint cols,
+                  uint tid)
+{
+    for (uint r = tid; r < rows; r += QTK_THREADS) {
+        float s = 0.0f;
+
+        for (uint c = 0u; c < cols; ++c)
+            s += qtk_apple8_get(matrix, r, c, cols) * x[c];
+
+        dst[r] = s;
+    }
+}
+
+/*
+ * Router:
+ *
+ *   logits[e] = router[e,:] . moe_input
+ *   p[e]      = softmax(logits)[e]
+ *
+ * Top-k is selected from the full softmax probabilities.  The selected
+ * probabilities are NOT renormalized.
+ *
+ * Tie behaviour is deterministic: strict '>' and ascending expert scan means
+ * the lower expert id wins exact ties.
+ */
+static inline void
+qtk_router(device const uchar *blob,
+           QwenTokenKernelParams p,
+           QwenTokenLayerBlob L,
+           device const float *moe_input,
+           device float *router_scratch,
+           device QwenTokenMissRecord *miss,
+           uint layer,
+           uint tid)
+{
+    qtk_bf16_matvec(blob,
+                    L.router,
+                    moe_input,
+                    router_scratch,
+                    p.n_experts,
+                    p.hidden,
+                    tid);
+
+    threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+
+    if (tid == 0u) {
+        float mx = -INFINITY;
+
+        for (uint e = 0u; e < p.n_experts; ++e)
+            mx = max(mx, router_scratch[e]);
+
+        float sum = 0.0f;
+
+        /*
+         * Convert logits to unnormalised probabilities in-place.
+         * Reduction order is ascending expert id.
+         */
+        for (uint e = 0u; e < p.n_experts; ++e) {
+            const float v =
+                exp(router_scratch[e] - mx);
+
+            router_scratch[e] = v;
+            sum += v;
+        }
+
+        const float inv_sum =
+            1.0f / sum;
+
+        for (uint e = 0u; e < p.n_experts; ++e)
+            router_scratch[e] *= inv_sum;
+
+        /*
+         * Repeated fixed-order argmax.  No mutation of probabilities, so
+         * routed_weight is the original full-softmax probability.
+         */
+        for (uint r = 0u; r < p.topk; ++r) {
+            uint best_id = QTK_NO_EXPERT_SLOT;
+            float best_p = -INFINITY;
+
+            for (uint e = 0u; e < p.n_experts; ++e) {
+                bool already_selected = false;
+
+                for (uint j = 0u; j < r; ++j) {
+                    if (miss->routed_expert[j] == e)
+                        already_selected = true;
+                }
+
+                const float pe =
+                    router_scratch[e];
+
+                if (!already_selected &&
+                    (best_id == QTK_NO_EXPERT_SLOT || pe > best_p)) {
+                    best_id = e;
+                    best_p = pe;
+                }
+            }
+
+            miss->routed_expert[r] = best_id;
+            miss->routed_weight[r] = best_p;
+        }
+
+        /*
+         * Persist the exact layer associated with this route before any
+         * possible NEED_EXPERTS return.
+         */
+        miss->layer = layer;
+        miss->missing_count = 0u;
+    }
+
+    threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+}
+
+/*
+ * Each layer map is an array indexed by bank slot:
+ *
+ *     map[slot] = resident expert id
+ *
+ * Thus the index of a matching map entry is the bank slot.
+ *
+ * Deliberately scans the full bounded map; no early break.
+ */
+static inline uint
+qtk_find_expert_slot(device const uint *map,
+                     uint map_slots,
+                     uint expert_id)
+{
+    uint found = QTK_NO_EXPERT_SLOT;
+
+    for (uint slot = 0u; slot < map_slots; ++slot) {
+        if (map[slot] == expert_id &&
+            found == QTK_NO_EXPERT_SLOT) {
+            found = slot;
+        }
+    }
+
+    return found;
+}
+
+/*
+ * Validate the complete routed set before launching ANY MoE arithmetic.
+ *
+ * Missing ids are recorded in routed-rank order.
+ *
+ * tg_u32[1] is the uniform "must return" flag consumed by the kernel.
+ */
+static inline void
+qtk_check_expert_residency(QwenTokenKernelParams p,
+                           QwenTokenDeviceLayout dl,
+                           device uchar *state,
+                           device QwenTokenMissRecord *miss,
+                           uint layer,
+                           uint tid,
+                           threadgroup uint *tg_u32)
+{
+    if (tid == 0u) {
+        device const uint *map =
+            reinterpret_cast<device const uint *>(
+                state + dl.expert_map_layer_off[layer]);
+
+        const uint map_slots =
+            dl.expert_map_slots[layer];
+
+        uint nmissing = 0u;
+
+        for (uint r = 0u; r < p.topk; ++r) {
+            const uint expert_id =
+                miss->routed_expert[r];
+
+            const uint slot =
+                qtk_find_expert_slot(map,
+                                     map_slots,
+                                     expert_id);
+
+            if (slot == QTK_NO_EXPERT_SLOT) {
+                miss->missing_expert[nmissing] =
+                    expert_id;
+
+                ++nmissing;
+            }
+        }
+
+        miss->missing_count = nmissing;
+
+        if (nmissing != 0u) {
+            /*
+             * Publish all resume information before the uniform kernel exit.
+             */
+            miss->layer = layer;
+            miss->resume_phase = QTK_RESUME_MOE;
+            miss->status = QTK_STATUS_NEED_EXPERTS;
+
+            tg_u32[1] = 1u;
+        } else {
+            tg_u32[1] = 0u;
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+}
+
+/*
+ * Routed experts.
+ *
+ * w0: gate / then SwiGLU intermediate
+ * w1: up
+ * w2: current expert down output
+ * acc: deterministic sum over routed experts
+ *
+ * Experts execute sequentially in routed-rank order.  Therefore each hidden
+ * output's accumulation order is exactly route[0], route[1], ... topk-1.
+ */
+static inline void
+qtk_routed_experts(device const uchar *blob,
+                   QwenTokenKernelParams p,
+                   QwenTokenLayerBlob L,
+                   QwenTokenDeviceLayout dl,
+                   device uchar *state,
+                   device const float *moe_input,
+                   device QwenTokenMissRecord *miss,
+                   uint layer,
+                   device float *w0,
+                   device float *w1,
+                   device float *w2,
+                   device float *acc,
+                   uint tid,
+                   threadgroup uint *tg_u32)
+{
+    for (uint d = tid; d < p.hidden; d += QTK_THREADS)
+        acc[d] = 0.0f;
+
+    threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+
+    device const uint *map =
+        reinterpret_cast<device const uint *>(
+            state + dl.expert_map_layer_off[layer]);
+
+    const uint map_slots =
+        dl.expert_map_slots[layer];
+
+    device const uchar *bank =
+        blob + L.expert_bank;
+
+    for (uint r = 0u; r < p.topk; ++r) {
+        /*
+         * Resolve once per expert and broadcast the slot through TG memory.
+         * Residency was already checked, so QTK_NO_EXPERT_SLOT is impossible
+         * unless the host violates the publish-before-dispatch contract.
+         */
+        if (tid == 0u) {
+            tg_u32[0] =
+                qtk_find_expert_slot(map,
+                                     map_slots,
+                                     miss->routed_expert[r]);
+        }
+
+        threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+
+        const uint bank_slot =
+            tg_u32[0];
+
+        device const uchar *slot_base =
+            bank +
+            (ulong)bank_slot *
+            (ulong)L.expert_slot_stride;
+
+        device const uchar *gate_w =
+            slot_base + p.expert_gate_rel;
+
+        device const uchar *up_w =
+            slot_base + p.expert_up_rel;
+
+        device const uchar *down_w =
+            slot_base + p.expert_down_rel;
+
+        /*
+         * [moe_inter, hidden]
+         */
+        qtk_apple8_matvec(gate_w,
+                          moe_input,
+                          w0,
+                          p.moe_inter,
+                          p.hidden,
+                          tid);
+
+        qtk_apple8_matvec(up_w,
+                          moe_input,
+                          w1,
+                          p.moe_inter,
+                          p.hidden,
+                          tid);
+
+        threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+
+        /*
+         * SwiGLU expert activation.
+         */
+        for (uint j = tid;
+             j < p.moe_inter;
+             j += QTK_THREADS) {
+            w0[j] =
+                qtk_silu(w0[j]) * w1[j];
+        }
+
+        threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+
+        /*
+         * [hidden, moe_inter]
+         */
+        qtk_apple8_matvec(down_w,
+                          w0,
+                          w2,
+                          p.hidden,
+                          p.moe_inter,
+                          tid);
+
+        threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+
+        const float routed_weight =
+            miss->routed_weight[r];
+
+        /*
+         * Crucially: this is the full-softmax probability.  There is no
+         * top-k renormalisation here.
+         */
+        for (uint d = tid;
+             d < p.hidden;
+             d += QTK_THREADS) {
+            acc[d] +=
+                routed_weight * w2[d];
+        }
+
+        threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+    }
+}
+
+/*
+ * Shared expert:
+ *
+ *   h = silu(se_gate*x) * (se_up*x)
+ *   sy = se_down*h
+ *   g = sigmoid(se_g*x)
+ *   sy *= g
+ *
+ * se_g is a BF16 [1, hidden] row.
+ */
+static inline void
+qtk_shared_expert(device const uchar *blob,
+                  QwenTokenKernelParams p,
+                  QwenTokenLayerBlob L,
+                  device const float *moe_input,
+                  device float *w0,
+                  device float *w1,
+                  device float *sy,
+                  uint tid,
+                  threadgroup float *tg_scalar)
+{
+    qtk_bf16_matvec(blob,
+                    L.se_gate,
+                    moe_input,
+                    w0,
+                    p.shared_inter,
+                    p.hidden,
+                    tid);
+
+    qtk_bf16_matvec(blob,
+                    L.se_up,
+                    moe_input,
+                    w1,
+                    p.shared_inter,
+                    p.hidden,
+                    tid);
+
+    threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+
+    for (uint j = tid;
+         j < p.shared_inter;
+         j += QTK_THREADS) {
+        w0[j] =
+            qtk_silu(w0[j]) * w1[j];
+    }
+
+    threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+
+    qtk_bf16_matvec(blob,
+                    L.se_down,
+                    w0,
+                    sy,
+                    p.hidden,
+                    p.shared_inter,
+                    tid);
+
+    threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+
+    /*
+     * Keep this scalar projection completely serial so its FP order matches
+     * the deterministic CPU definition.
+     */
+    if (tid == 0u) {
+        float g = 0.0f;
+
+        for (uint d = 0u; d < p.hidden; ++d)
+            g += qtk_bf16(blob, L.se_g, d) *
+                 moe_input[d];
+
+        tg_scalar[0] =
+            qtk_sigmoid(g);
+    }
+
+    threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+
+    const float sg =
+        tg_scalar[0];
+
+    for (uint d = tid;
+         d < p.hidden;
+         d += QTK_THREADS) {
+        sy[d] *= sg;
+    }
+
+    threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+}
+
+/*
+ * Complete post-router MoE half.
+ *
+ * Layout of the four existing Stage-4 work buffers:
+ *
+ *   w0 = expert/shared gate activation
+ *   w1 = expert/shared up activation
+ *   w2 = current expert down / final shared sy
+ *   w3 = routed MoE accumulator
+ */
+static inline void
+qtk_moe_execute(device const uchar *blob,
+                QwenTokenKernelParams p,
+                QwenTokenLayerBlob L,
+                QwenTokenDeviceLayout dl,
+                device uchar *state,
+                device const float *moe_input,
+                device QwenTokenMissRecord *miss,
+                uint layer,
+                uint tid,
+                threadgroup float *tg_scalar,
+                threadgroup uint *tg_u32)
+{
+    device float *w0 =
+        qtk_state_f32(state, dl.work_off[0]);
+
+    device float *w1 =
+        qtk_state_f32(state, dl.work_off[1]);
+
+    device float *w2 =
+        qtk_state_f32(state, dl.work_off[2]);
+
+    device float *moe_acc =
+        qtk_state_f32(state, dl.work_off[3]);
+
+    qtk_routed_experts(blob,
+                       p,
+                       L,
+                       dl,
+                       state,
+                       moe_input,
+                       miss,
+                       layer,
+                       w0,
+                       w1,
+                       w2,
+                       moe_acc,
+                       tid,
+                       tg_u32);
+
+    /*
+     * w0/w1/w2 are now free.  moe_acc in work3 must survive shared-expert
+     * execution.
+     */
+    qtk_shared_expert(blob,
+                      p,
+                      L,
+                      moe_input,
+                      w0,
+                      w1,
+                      w2,
+                      tid,
+                      tg_scalar);
+
+    device float *residual =
+        qtk_state_f32(state, dl.residual_off);
+
+    /*
+     * Exact model order:
+     *
+     *     residual += routed_moe + shared_expert
+     */
+    for (uint d = tid;
+         d < p.hidden;
+         d += QTK_THREADS) {
+        residual[d] +=
+            moe_acc[d] + w2[d];
+    }
+
+    threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+}
+
 kernel void
 qwen_token_whole(device const uchar *weights       [[buffer(0)]],
                  constant QwenTokenKernelParams *p [[buffer(1)]],
@@ -1463,54 +2096,178 @@ qwen_token_whole(device const uchar *weights       [[buffer(0)]],
 
     threadgroup float tg_scalar[1];
 
-    for (uint layer = 0u; layer < p->n_layers; ++layer) {
+        device QwenTokenMissRecord *miss =
+        qtk_miss_record(state, dl);
+
+    /*
+     * Additional TG state used by Stage 5:
+     *
+     *   [0] current resolved expert-bank slot
+     *   [1] uniform NEED_EXPERTS return flag
+     */
+    threadgroup uint tg_u32[2];
+
+    /*
+     * A re-dispatch after NEED_EXPERTS begins at the exact layer that missed.
+     * resume_phase==MOE is the authority: the GDN/attention half for that
+     * layer has already committed recurrent/KV state and MUST NOT execute
+     * again.
+     */
+    uint first_layer = 0u;
+    bool resume_moe = false;
+
+    if (miss->resume_phase == QTK_RESUME_MOE) {
+        first_layer = miss->layer;
+        resume_moe = true;
+    }
+
+    threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+
+    for (uint layer = first_layer;
+         layer < p->n_layers;
+         ++layer) {
         const QwenTokenLayerBlob L =
             p->layer[layer];
 
-        qtk_pre_moe_layer(weights,
-                          *p,
-                          L,
-                          dl,
-                          state,
-                          layer,
-                          token_pos,
-                          tid,
-                          tg_scalar);
+        const bool this_is_moe_resume =
+            resume_moe && (layer == first_layer);
 
-        threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+        device float *moe_input =
+            qtk_moe_input(state, dl);
+
+        if (!this_is_moe_resume) {
+            /*
+             * Fresh layer:
+             *
+             *   RMS in
+             *   GDN or full attention
+             *   residual += attn
+             *   postnorm -> dl.normed_off
+             */
+            qtk_pre_moe_layer(weights,
+                              *p,
+                              L,
+                              dl,
+                              state,
+                              layer,
+                              token_pos,
+                              tid,
+                              tg_scalar);
+
+            /*
+             * The postnorm vector must survive a NEED_EXPERTS return.
+             * Persist it BEFORE routing/residency checking.
+             */
+            device const float *normed =
+                qtk_state_cf32(state,
+                               dl.normed_off);
+
+            qtk_copy_f32(normed,
+                         moe_input,
+                         p->hidden,
+                         tid);
+
+            /*
+             * Route exactly once.  The selected ids and original softmax
+             * probabilities are persisted in QwenTokenMissRecord.
+             *
+             * work0 is only router scratch here.  It is free once top-k has
+             * been persisted.
+             */
+            device float *router_scratch =
+                qtk_state_f32(state,
+                              dl.work_off[0]);
+
+            qtk_router(weights,
+                       *p,
+                       L,
+                       moe_input,
+                       router_scratch,
+                       miss,
+                       layer,
+                       tid);
+        } else {
+            /*
+             * Resume path:
+             *
+             *   - DO NOT rerun in-norm
+             *   - DO NOT rerun GDN recurrence
+             *   - DO NOT rewrite attention KV
+             *   - DO NOT residual-add attention again
+             *   - DO NOT rerun postnorm
+             *   - DO NOT rerun router/top-k
+             *
+             * moe_input + routed ids/weights are the persisted values from
+             * the miss-producing dispatch.
+             */
+            threadgroup_barrier(
+                mem_flags::mem_device_and_threadgroup);
+        }
 
         /*
-         * ================================================================
-         * STAGE-4 ROUTER / MoE SPLICE POINT
-         * ================================================================
+         * Both fresh and resumed paths converge here.
          *
-         * Current state here:
-         *
-         *   state + dl.residual_off
-         *       = residual after GDN/full-attention
-         *
-         *   state + dl.normed_off
-         *       = post-LN vector, i.e. this layer's exact MoE input
-         *
-         *   GDN conv/S or full-attention KV
-         *       = already committed for token_pos
-         *
-         * The next Stage-4 relay inserts:
-         *
-         *   router
-         *   -> NEED_EXPERTS miss/resume handling
-         *   -> routed experts
-         *   -> shared expert
-         *   -> residual += MoE output
-         *
-         * ONLY AFTER that update may this loop advance to layer+1.
-         *
-         * Do not insert a fake residual update here and do not allow this
-         * partial source to run end-to-end before the MoE splice lands.
-         * ================================================================
+         * Check the COMPLETE routed set before doing any routed/shared MoE
+         * compute.  If even one selected expert is absent, publish all missing
+         * ids and exit the entire threadgroup uniformly.
          */
+        qtk_check_expert_residency(*p,
+                                   dl,
+                                   state,
+                                   miss,
+                                   layer,
+                                   tid,
+                                   tg_u32);
 
-        /* STAGE4_MOE_SPLICE */
+        if (tg_u32[1] != 0u) {
+            /*
+             * Uniform condition written by tid 0 and observed only after a
+             * threadgroup/device barrier.  Safe whole-kernel return.
+             *
+             * Host contract:
+             *   status       = NEED_EXPERTS
+             *   resume_phase = MOE
+             *   layer        = current layer
+             *   moe_input    = persisted
+             *   route        = persisted
+             */
+            return;
+        }
+
+        /*
+         * Every routed expert is resident.  Execute routed experts in fixed
+         * top-k order, execute shared expert, then update residual.
+         */
+        qtk_moe_execute(weights,
+                        *p,
+                        L,
+                        dl,
+                        state,
+                        moe_input,
+                        miss,
+                        layer,
+                        tid,
+                        tg_scalar,
+                        tg_u32);
+
+        /*
+         * Only AFTER the residual update is committed is the resume record
+         * cleared.  From this point layer+1 may run normally.
+         */
+        if (tid == 0u) {
+            miss->missing_count = 0u;
+            miss->resume_phase = QTK_RESUME_NONE;
+            miss->status = QTK_STATUS_OK;
+        }
+
+        threadgroup_barrier(
+            mem_flags::mem_device_and_threadgroup);
+
+        /*
+         * A resumed layer has now fully caught up with the normal forward
+         * path.  Every later layer in this dispatch is fresh.
+         */
+        resume_moe = false;
     }
 }
 )METAL";
