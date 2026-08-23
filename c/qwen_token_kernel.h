@@ -304,6 +304,9 @@ void *qwen_token_device_state_mtl_buffer(QwenTokenDeviceState *state);
 /* Host-visible contents, primarily for the miss record and Stage-2 tests. */
 void *qwen_token_device_state_contents(QwenTokenDeviceState *state);
 
+/* Stage-4: runtime-compile the whole-token kernel; 1 on success. */
+int qwen_token_kernel_selfcheck(char *err, uint64_t err_cap);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
