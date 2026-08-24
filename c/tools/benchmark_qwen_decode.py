@@ -14,6 +14,7 @@ older commits too.
 
 Usage:
   benchmark_qwen_decode.py MODEL [CACHE] [--tokens N] [--prompt-ids "1 2 3"]
+                            [--config /path/to/HF/model]
   benchmark_qwen_decode.py --self-test
 """
 
@@ -24,7 +25,6 @@ import json
 import os
 import platform
 import re
-import shlex
 import subprocess
 import sys
 import time
@@ -122,23 +122,32 @@ def roofline_report(scopes: dict) -> dict:
     }
 
 
-def run_bench(model: str, cache: str, tokens: int, prompt_ids: str) -> dict:
+def run_bench(model: str, cache: str, tokens: int, prompt_ids: str,
+              config: str = "") -> dict:
     env = dict(os.environ)
     env["QWEN_PROFILE"] = "1"
     env["QWENMOE_MODE"] = "greedy"
     env["QWENMOE_PROMPT_IDS"] = prompt_ids
     env["QWENMOE_MAX_NEW"] = str(tokens)
+    if config:
+        env["COLI_CONFIG"] = config
     cmd = ["./c/qwen_moe", model]
     if cache:
         cmd.append(cache)
     t0 = time.time()
-    proc = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=600)
+    try:
+        proc = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=600)
+    except subprocess.TimeoutExpired:
+        return {"error": f"engine timed out after 600s", "exit_code": -1,
+                "stderr_tail": ""}
     wall = time.time() - t0
     scopes = parse_profile(proc.stderr)
     report = roofline_report(scopes)
     report["host"] = platform.machine()
     report["wall_s"] = wall
     report["exit_code"] = proc.returncode
+    if proc.returncode != 0:
+        report["stderr_tail"] = "\n".join(proc.stderr.splitlines()[-25:])
     return report
 
 
@@ -172,6 +181,7 @@ def main() -> int:
     ap.add_argument("cache", nargs="?", default="", help="expert cache slots (optional)")
     ap.add_argument("--tokens", type=int, default=40)
     ap.add_argument("--prompt-ids", default="1 2 3 4 5")
+    ap.add_argument("--config", default="", help="HF dir with config.json (COLI_CONFIG)")
     ap.add_argument("--json", action="store_true", help="emit JSON record")
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
@@ -179,12 +189,17 @@ def main() -> int:
         return self_test()
     if not args.model:
         ap.error("MODEL is required (or use --self-test)")
-    report = run_bench(args.model, args.cache, args.tokens, args.prompt_ids)
+    report = run_bench(args.model, args.cache, args.tokens, args.prompt_ids, args.config)
     if args.json:
         print(json.dumps(report, indent=2))
         return 0
+    exit_code = report.get("exit_code", -1)
     print(f"host={report.get('host')} wall_s={report.get('wall_s', 0):.1f} "
-          f"exit={report.get('exit_code')}")
+          f"exit={exit_code}")
+    if exit_code != 0:
+        print("ENGINE FAILED (exit %d) — stderr tail:" % exit_code)
+        print(report.get("stderr_tail", "(no stderr captured)"))
+        return exit_code
     if "error" in report:
         print("ERROR:", report["error"])
         return 1
