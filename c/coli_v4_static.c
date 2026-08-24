@@ -197,10 +197,47 @@ void coli_v4_dense_cache_configure(uint64_t budget_bytes) {
     }
 }
 
+/* #127: reclaim one inactive entry with the lowest stored-byte benefit per
+ * resident byte; ties prefer fewer hits. Returns 0 when nothing is reclaimable. */
+static int dense_cache_reclaim_one_locked(void) {
+    size_t victim = g_dense_cache.count;
+    for (size_t i = 0; i < g_dense_cache.count; i++) {
+        const DenseCacheEntry *entry = &g_dense_cache.entries[i];
+        if (entry->refs) continue;
+        if (victim == g_dense_cache.count) {
+            victim = i;
+            continue;
+        }
+        const DenseCacheEntry *current = &g_dense_cache.entries[victim];
+        int ratio = coli_resource_ratio_compare(
+            entry->stored_bytes_avoided, entry->resident_bytes,
+            current->stored_bytes_avoided, current->resident_bytes);
+        if (ratio < 0 || (ratio == 0 && entry->hits < current->hits))
+            victim = i;
+    }
+    if (victim == g_dense_cache.count) return 0;
+
+    DenseCacheEntry removed = g_dense_cache.entries[victim];
+    free(removed.data);
+    if (g_dense_cache.resident_bytes >= removed.resident_bytes)
+        g_dense_cache.resident_bytes -= removed.resident_bytes;
+    else
+        g_dense_cache.resident_bytes = 0;
+    g_dense_cache.count--;
+    if (victim != g_dense_cache.count)
+        g_dense_cache.entries[victim] = g_dense_cache.entries[g_dense_cache.count];
+    memset(&g_dense_cache.entries[g_dense_cache.count], 0,
+           sizeof(g_dense_cache.entries[g_dense_cache.count]));
+    return 1;
+}
+
 uint64_t coli_v4_dense_cache_set_budget(uint64_t budget_bytes) {
     pthread_mutex_lock(&g_dense_cache.mutex);
-    if (budget_bytes < g_dense_cache.pinned_bytes)
-        budget_bytes = g_dense_cache.pinned_bytes;
+    while (g_dense_cache.resident_bytes > budget_bytes &&
+           dense_cache_reclaim_one_locked()) {
+    }
+    if (budget_bytes < g_dense_cache.resident_bytes)
+        budget_bytes = g_dense_cache.resident_bytes;
     g_dense_cache.budget_bytes = budget_bytes;
     dense_cache_evict_unpinned_locked();
     pthread_mutex_unlock(&g_dense_cache.mutex);
@@ -253,6 +290,24 @@ void coli_v4_dense_cache_reset(void) {
                 snapshot.rejected_bytes / (1024.0 * 1024.0 * 1024.0),
                 copy_gib, copy_ms, copy_gib_s);
     }
+}
+
+void coli_v4_dense_cache_planner_stats(ColiV4DenseCacheStats *out) {
+    if (!out) return;
+    pthread_mutex_lock(&g_dense_cache.mutex);
+    *out = (ColiV4DenseCacheStats){
+        .budget_bytes = g_dense_cache.budget_bytes,
+        .resident_bytes = g_dense_cache.pinned_bytes,
+        .entries = g_dense_cache.count,
+        .hits = g_dense_cache.hits,
+        .misses = g_dense_cache.misses,
+        .admissions = g_dense_cache.admissions,
+        .rejected_bytes = g_dense_cache.rejected_bytes,
+        .bytes_avoided = g_dense_cache.bytes_avoided,
+        .copy_bytes = g_dense_cache.copy_bytes,
+        .copy_ns = g_dense_cache.copy_ns,
+    };
+    pthread_mutex_unlock(&g_dense_cache.mutex);
 }
 
 void coli_v4_dense_cache_stats(ColiV4DenseCacheStats *out) {

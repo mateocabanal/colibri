@@ -82,6 +82,7 @@ void coli_v4_dense_cache_configure(uint64_t budget_bytes);
 uint64_t coli_v4_dense_cache_set_budget(uint64_t budget_bytes);
 void coli_v4_dense_cache_reset(void);
 void coli_v4_dense_cache_stats(ColiV4DenseCacheStats *out);
+void coli_v4_dense_cache_planner_stats(ColiV4DenseCacheStats *out);
 
 #ifdef __cplusplus
 }
