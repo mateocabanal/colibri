@@ -3099,6 +3099,21 @@ class APIHandler(BaseHTTPRequestHandler):
         self.generation(body, prompt, request_id, False)
 
 
+def _next_free_port(host, port):
+    """First free port >= port. Mirrors HTTPServer's allow_reuse_address so
+    TIME_WAIT ports count as free. ponytail: probe-then-bind has a microsecond
+    TOCTOU window; fine for a dev server, hand the socket in if it ever bites."""
+    for p in range(port, 65536):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                s.bind((host, p))
+                return p
+            except OSError:
+                continue
+    raise OSError("no free port in %d..65535" % port)
+
+
 def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_key=None,
           cap=None, max_tokens=1024, engine=None, env=None, cors_origins=None,
           max_queue=8, queue_timeout=300, kv_slots=1, allowed_hosts=()):
@@ -3132,6 +3147,8 @@ def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_ke
     origins = DEFAULT_CORS_ORIGINS if cors_origins is None else tuple(cors_origins)
     # Bind before starting the 744B engine. A stale/occupied port must fail in
     # milliseconds rather than loading hundreds of GB and leaking a child.
+    # Occupied -> next free port (the user asked for a listener, not a fight).
+    port = _next_free_port(host, port)
     server = APIServer((host, port), None, model_id, api_key, max_tokens, origins,
                        max_queue, queue_timeout, kv_slots, allowed_hosts=allowed_hosts)
     runtime = None
