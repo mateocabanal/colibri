@@ -324,6 +324,20 @@ const void *coli_v4_layer_data(const ColiDeepSeekV4LayerWeights *weights,
 extern "C" {
 #endif
 
+typedef struct {
+    const float *window;
+    int window_count;
+    const float *compressed;
+    int compressed_count;
+} ColiDeepSeekV4SparseKVView;
+
+int coli_v4_sparse_attention_view_ref(
+    float *output, const float *queries,
+    const ColiDeepSeekV4SparseKVView *kv, const float *sinks,
+    const int *indices, int heads, int head_dimension, int topk,
+    float softmax_scale);
+
+/* Contiguous compatibility oracle used by unit tests and legacy helpers. */
 int coli_v4_sparse_attention_ref(float *output, const float *queries,
                                  const float *kv, const float *sinks,
                                  const int *indices, int heads,
