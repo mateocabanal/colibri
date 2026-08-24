@@ -784,6 +784,7 @@ int coli_v4_coli_expert_store_open(const ColiV4ColiExpertStoreOptions *o,
     ColiExpertStore *store = NULL;
     State *s = NULL;
     ColiExecutorOpenOptions xo = {0};
+    ColiRuntimeTarget apple8_runtime;
 
     if (out) *out = NULL;
     if (!o || !out || !o->package_dir || !o->required_profile ||
@@ -828,6 +829,32 @@ int coli_v4_coli_expert_store_open(const ColiV4ColiExpertStoreOptions *o,
                          atoi(getenv("COLI_VERIFY_RECORDS"))
         ? COLI_CSF_CHECKSUM_RECORD_ON_READ
         : COLI_CSF_CHECKSUM_MANIFEST_ONLY;
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+    /* Apple8 executor open requires a populated runtime target (fail-closed
+     * contract, #140/#141). Fill it when the store opens an Apple8 package. */
+    if (!xo.runtime_target && o->required_profile &&
+        !strcmp(o->required_profile,
+                COLI_TARGET_PROFILE_MACOS_ARM64_METAL_APPLE8_V1)) {
+        memset(&apple8_runtime, 0, sizeof(apple8_runtime));
+        apple8_runtime.profile_name = COLI_TARGET_PROFILE_MACOS_ARM64_METAL_APPLE8_V1;
+        apple8_runtime.target_os = COLI_TARGET_OS_MACOS;
+        apple8_runtime.target_arch = COLI_TARGET_ARCH_ARM64;
+        apple8_runtime.backend = COLI_TARGET_BACKEND_METAL;
+        apple8_runtime.gpu_kind = COLI_TARGET_GPU_APPLE_FAMILY;
+        apple8_runtime.cpu_feature_mask = COLI_TARGET_CPU_ARM64_ASIMD;
+        apple8_runtime.gpu_family = COLI_APPLE8_GPU_FAMILY_MIN;
+        apple8_runtime.runtime_features = COLI_TARGET_RUNTIME_APPLE_UNIFIED_MEMORY |
+                                          COLI_TARGET_RUNTIME_METAL_SHARED_STORAGE;
+        apple8_runtime.target_profile_abi = COLI_TARGET_PROFILE_ABI_APPLE8_V1;
+        apple8_runtime.execution_layout_abi = COLI_EXECUTION_LAYOUT_ABI_APPLE8_V1;
+        apple8_runtime.kernel_abi = COLI_KERNEL_ABI_APPLE8_MXFP4_TILE_V1;
+        apple8_runtime.target_class = COLI_TARGET_CLASS_APPLE8_METAL_V1;
+        apple8_runtime.max_record_alignment = COLI_APPLE8_RECORD_ALIGNMENT;
+        apple8_runtime.max_io_granularity = COLI_APPLE8_IO_GRANULARITY;
+        apple8_runtime.max_resident_alignment = COLI_APPLE8_RESIDENT_ALIGNMENT;
+        xo.runtime_target = &apple8_runtime;
+    }
+#endif
     if (coli_executor_open(&s->executor, o->package_dir, &xo, e, n))
         goto bad;
 

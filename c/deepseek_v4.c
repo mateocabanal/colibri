@@ -7384,8 +7384,34 @@ int coli_v4_engine_open(ColiV4Engine **output,
             ? COLI_CSF_CHECKSUM_RECORD_ON_READ : COLI_CSF_CHECKSUM_MANIFEST_ONLY;
     if (coli_dir && coli_checksum_policy == COLI_CSF_CHECKSUM_MANIFEST_ONLY)
         fprintf(stderr, "v4_coli integrity=manifest-and-shard record_crc=skipped reason=COLI_VERIFY_RECORDS-unset\n");
+    ColiRuntimeTarget apple8_runtime;
+    ColiExecutorOpenOptions coli_open_opts = {
+        "macos-arm64-metal-apple8-v1", coli_checksum_policy, 0};
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+    /* Apple8 executor open requires a populated runtime target (fail-closed
+     * contract, #140/#141). qwen fills it via qwen_coli_compat.h; V4 opens
+     * the executor directly, so fill it here. */
+    memset(&apple8_runtime, 0, sizeof(apple8_runtime));
+    apple8_runtime.profile_name = COLI_TARGET_PROFILE_MACOS_ARM64_METAL_APPLE8_V1;
+    apple8_runtime.target_os = COLI_TARGET_OS_MACOS;
+    apple8_runtime.target_arch = COLI_TARGET_ARCH_ARM64;
+    apple8_runtime.backend = COLI_TARGET_BACKEND_METAL;
+    apple8_runtime.gpu_kind = COLI_TARGET_GPU_APPLE_FAMILY;
+    apple8_runtime.cpu_feature_mask = COLI_TARGET_CPU_ARM64_ASIMD;
+    apple8_runtime.gpu_family = COLI_APPLE8_GPU_FAMILY_MIN;
+    apple8_runtime.runtime_features = COLI_TARGET_RUNTIME_APPLE_UNIFIED_MEMORY |
+                                      COLI_TARGET_RUNTIME_METAL_SHARED_STORAGE;
+    apple8_runtime.target_profile_abi = COLI_TARGET_PROFILE_ABI_APPLE8_V1;
+    apple8_runtime.execution_layout_abi = COLI_EXECUTION_LAYOUT_ABI_APPLE8_V1;
+    apple8_runtime.kernel_abi = COLI_KERNEL_ABI_APPLE8_MXFP4_TILE_V1;
+    apple8_runtime.target_class = COLI_TARGET_CLASS_APPLE8_METAL_V1;
+    apple8_runtime.max_record_alignment = COLI_APPLE8_RECORD_ALIGNMENT;
+    apple8_runtime.max_io_granularity = COLI_APPLE8_IO_GRANULARITY;
+    apple8_runtime.max_resident_alignment = COLI_APPLE8_RESIDENT_ALIGNMENT;
+    coli_open_opts.runtime_target = &apple8_runtime;
+#endif
     if (coli_dir && coli_executor_open(&engine->coli_static, coli_dir,
-            &(ColiExecutorOpenOptions){"macos-arm64-metal-apple8-v1", coli_checksum_policy, 0}, error, error_size)) goto fail;
+            &coli_open_opts, error, error_size)) goto fail;
     const ColiSafetensorsTensor *dspark_w1 = NULL, *dspark_w2 = NULL;
     int requested_full_dspark = v4_dspark_full_wanted(options);
     if (!engine->target_index && requested_full_dspark) {
@@ -9124,8 +9150,8 @@ static int v4_oracle_teacher_forcing(
         const int *full_ids, int full_count, const int *expected, int expect_count,
         ColiDeepSeekV4WindowAttentionState **attention,
         const ColiSafetensorsIndex *index, const ColiDeepSeekV4Config *config,
-        ColiExpertStore *experts, char *error, size_t error_size,
-        int *matched_out) {
+        ColiExpertStore *experts, ColiV4Engine *engine,
+        char *error, size_t error_size, int *matched_out) {
     size_t hd = (size_t)config->hc_mult * config->hidden_size;
     float *state = malloc((size_t)full_count * hd * sizeof(float));
     float *next = malloc((size_t)full_count * hd * sizeof(float));
@@ -9135,12 +9161,12 @@ static int v4_oracle_teacher_forcing(
         return -1;
     }
     for (int item = 0; item < full_count; item++)
-        if (load_embedding(state + (size_t)item * hd, index, config,
-                           full_ids[item])) {
+        if (load_embedding_engine(engine, state + (size_t)item * hd, index, config,
+                                  full_ids[item])) {
             free(state); free(next); free(hidden);
             return -1;
         }
-    if (target_batch(NULL, &state, &next, attention, index, config, experts,
+    if (target_batch(engine, &state, &next, attention, index, config, experts,
                      full_ids, 0, full_count, error, error_size)) {
         free(state); free(next); free(hidden);
         return -1;
@@ -9150,9 +9176,9 @@ static int v4_oracle_teacher_forcing(
     for (int pos = 0; pos < limit; pos++) {
         int pred = -1;
         float logit = 0.0f;
-        if (final_hidden(hidden, state + (size_t)pos * hd, index, config,
-                         error, error_size) ||
-            head_argmax(NULL, hidden, index, config, &pred, &logit)) {
+        if (final_hidden_engine(engine, hidden, state + (size_t)pos * hd, index, config,
+                                error, error_size) ||
+            head_argmax(engine, hidden, index, config, &pred, &logit)) {
             free(state); free(next); free(hidden);
             return -1;
         }
@@ -9171,7 +9197,8 @@ static int v4_oracle_greedy_from_prompt(
         const int *prompt_ids, int prompt_count, int *generated, int max_new,
         ColiDeepSeekV4WindowAttentionState **attention,
         const ColiSafetensorsIndex *index, const ColiDeepSeekV4Config *config,
-        ColiExpertStore *experts, char *error, size_t error_size) {
+        ColiExpertStore *experts, ColiV4Engine *engine,
+        char *error, size_t error_size) {
     size_t hd = (size_t)config->hc_mult * config->hidden_size;
     float *state = malloc((size_t)prompt_count * hd * sizeof(float));
     float *next = malloc((size_t)prompt_count * hd * sizeof(float));
@@ -9181,21 +9208,21 @@ static int v4_oracle_greedy_from_prompt(
         return -1;
     }
     for (int item = 0; item < prompt_count; item++)
-        if (load_embedding(state + (size_t)item * hd, index, config,
-                           prompt_ids[item])) {
+        if (load_embedding_engine(engine, state + (size_t)item * hd, index, config,
+                                  prompt_ids[item])) {
             free(state); free(next); free(hidden);
             return -1;
         }
-    if (target_batch(NULL, &state, &next, attention, index, config, experts,
+    if (target_batch(engine, &state, &next, attention, index, config, experts,
                      prompt_ids, 0, prompt_count, error, error_size)) {
         free(state); free(next); free(hidden);
         return -1;
     }
     int current = -1;
     float logit = 0.0f;
-    if (final_hidden(hidden, state + (size_t)(prompt_count - 1) * hd,
-                     index, config, error, error_size) ||
-        head_argmax(NULL, hidden, index, config, &current, &logit)) {
+    if (final_hidden_engine(engine, hidden, state + (size_t)(prompt_count - 1) * hd,
+                            index, config, error, error_size) ||
+        head_argmax(engine, hidden, index, config, &current, &logit)) {
         free(state); free(next); free(hidden);
         return -1;
     }
@@ -9203,10 +9230,10 @@ static int v4_oracle_greedy_from_prompt(
     generated[count++] = current;
     int position = prompt_count;
     while (count < max_new && current != 1) {
-        if (target_token(NULL, &state, &next, attention, index, config, experts,
+        if (target_token(engine, &state, &next, attention, index, config, experts,
                          current, position, error, error_size) ||
-            final_hidden(hidden, state, index, config, error, error_size) ||
-            head_argmax(NULL, hidden, index, config, &current, &logit)) {
+            final_hidden_engine(engine, hidden, state, index, config, error, error_size) ||
+            head_argmax(engine, hidden, index, config, &current, &logit)) {
             free(state); free(next); free(hidden);
             return -1;
         }
@@ -9692,7 +9719,7 @@ int main(int argc, char **argv) {
         if (tf_limit > full_count) tf_limit = full_count;
         int tf_matched = 0;
         if (v4_oracle_teacher_forcing(full_ids, full_count, tf_pred, tf_limit,
-                                      attention, index, &config, experts,
+                                      attention, index, &config, experts, engine,
                                       error, sizeof(error), &tf_matched)) {
             fprintf(stderr, "%s\n", error);
             goto cleanup;
@@ -9706,7 +9733,7 @@ int main(int argc, char **argv) {
         generated = malloc((size_t)(greedy_limit + 8) * sizeof(int));
         int got = v4_oracle_greedy_from_prompt(
             prompt_ids, prompt_count, generated, greedy_limit, attention,
-            index, &config, experts, error, sizeof(error));
+            index, &config, experts, engine, error, sizeof(error));
         if (got < 0) {
             fprintf(stderr, "%s\n", error);
             goto cleanup;
