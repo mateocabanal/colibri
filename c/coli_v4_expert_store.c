@@ -149,6 +149,67 @@ static int loader_lane_count(void) {
     return lanes;
 }
 
+/* #163: auto-tune loader concurrency from measured storage saturation.
+ * Probe the real executor path: one expert read sequentially vs the same
+ * read 4-way parallel. If parallel is ~4x faster the storage is
+ * queue-depth-starved and more lanes pay; if it is ~1x the device is
+ * saturated and extra lanes only add contention. V4_LOADER_LANES overrides.
+ * Ceiling 8: 10 crashes the batched-MoE union (see v4-spec-findings). */
+typedef struct {
+    const ColiExecutor *executor;
+    int32_t layer, expert;
+    size_t bytes;
+    int rc;
+} ProbeJob;
+
+static void *probe_read(void *arg) {
+    ProbeJob *j = arg;
+    void *buf = malloc(j->bytes);
+    char err[128];
+    j->rc = buf ? coli_executor_load_expert(j->executor, j->layer, j->expert,
+                                            buf, j->bytes, err, sizeof(err)) : -1;
+    free(buf);
+    return NULL;
+}
+
+static double probe_now(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (double)t.tv_sec + (double)t.tv_nsec * 1e-9;
+}
+
+static int loader_lane_autotune(const ColiExecutor *executor,
+                                int32_t layer, int32_t expert,
+                                size_t bytes) {
+    enum { PAR = 4, MAX_LANES = 8 };
+    ProbeJob seq = {executor, layer, expert, bytes, 0};
+    double t0 = probe_now();
+    probe_read(&seq);
+    double seq_s = probe_now() - t0;
+    if (seq.rc || seq_s <= 0.0) return COLI_V4_EXPERT_LOADER_COUNT;
+
+    pthread_t th[PAR];
+    ProbeJob jobs[PAR];
+    for (int i = 0; i < PAR; i++) jobs[i] = seq;
+    t0 = probe_now();
+    for (int i = 0; i < PAR; i++)
+        if (pthread_create(&th[i], NULL, probe_read, &jobs[i])) jobs[i].rc = -1;
+    for (int i = 0; i < PAR; i++) pthread_join(th[i], NULL);
+    double par_s = probe_now() - t0;
+    if (par_s <= 0.0) return COLI_V4_EXPERT_LOADER_COUNT;
+    for (int i = 0; i < PAR; i++)
+        if (jobs[i].rc) return COLI_V4_EXPERT_LOADER_COUNT;
+
+    double speedup = seq_s / par_s;   /* 1.0 = saturated, ~PAR = starved */
+    int lanes = (int)(COLI_V4_EXPERT_LOADER_COUNT * speedup + 0.5);
+    if (lanes < 1) lanes = 1;
+    if (lanes > MAX_LANES) lanes = MAX_LANES;
+    fprintf(stderr,
+            "v4_loader_autotune seq=%.1fms par4=%.1fms speedup=%.2fx lanes=%d\n",
+            seq_s * 1e3, par_s * 1e3, speedup, lanes);
+    return lanes;
+}
+
 static const char *tier_name(SlotTier tier) {
     return tier == SLOT_TIER_PERSISTENT ? "persistent" : "transient";
 }
@@ -904,6 +965,9 @@ int coli_v4_coli_expert_store_open(const ColiV4ColiExpertStoreOptions *o,
             }
         }
     }
+    if (!getenv("V4_LOADER_LANES"))
+        s->loader_lanes = loader_lane_autotune(s->executor, 0, 0,
+                                               s->record_bytes);
 
     if (s->record_bytes > UINT64_MAX - 16383u) {
         fail(e, n, "COLI expert slot size overflow");
