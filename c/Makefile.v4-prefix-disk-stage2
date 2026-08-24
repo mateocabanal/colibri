@@ -1,0 +1,11 @@
+.DEFAULT_GOAL := check
+
+include Makefile.deepseek-v4
+
+V4_PREFIX_DISK_TEST_BINARY := test_v4_prefix_disk_sessions
+
+.PHONY: check
+check: deepseek-v4-prefix-cache-test $(V4_PREFIX_DISK_TEST_BINARY)
+
+$(V4_PREFIX_DISK_TEST_BINARY): tests/test_v4_prefix_disk_sessions.c $(V4_PREFIX_TEST_OBJS)
+	$(CC) $(CFLAGS) tests/test_v4_prefix_disk_sessions.c $(V4_PREFIX_TEST_OBJS) -o $@ $(LDFLAGS)
