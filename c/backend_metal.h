@@ -20,6 +20,10 @@ typedef struct ColiMetalTensor ColiMetalTensor;
 
 /* Returns 1 if a Metal device is available and pipelines compiled, else 0. */
 int  coli_metal_init(void);
+/* #166: reusable standalone operators (rmsnorm / residual-add / silu-mul). */
+int  coli_metal_rmsnorm(float *x, const float *w, int n, int nrows, float eps);
+int  coli_metal_add(float *y, const float *a, int n);
+int  coli_metal_silu_mul(float *g, const float *u, int n);
 void coli_metal_shutdown(void);
 int  coli_metal_available(void);
 /* Bytes of unified memory in use by wrapped tensors, and their count. */

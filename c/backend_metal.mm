@@ -869,6 +869,72 @@ extern "C" int  coli_metal_mem_info(size_t *used, size_t *total) {
   return 1;
 }
 
+/* #166: reusable standalone operators. Thin wrappers over the existing
+ * a_rmsnorm / a_add / moe_silu kernels so engines can offload these ops
+ * without owning the dispatch details. Serialized on one mutex (Metal
+ * command queues are serial anyway); callers must keep buffers alive
+ * until the call returns (waitUntilCompleted). */
+static std::mutex g_op_mtx;
+
+extern "C" int coli_metal_rmsnorm(float *x, const float *w, int n, int nrows,
+                                   float eps) {
+  if (!g_dev || !x || !w || n <= 0 || nrows <= 0) return 0;
+  std::lock_guard<std::mutex> lk(g_op_mtx);
+  @autoreleasepool {
+    id<MTLBuffer> xb = [g_dev newBufferWithBytesNoCopy:x length:(size_t)n*nrows*sizeof(float)
+                       options:MTLResourceStorageModeShared deallocator:nil];
+    id<MTLBuffer> wb = [g_dev newBufferWithBytesNoCopy:(void*)w length:(size_t)n*sizeof(float)
+                       options:MTLResourceStorageModeShared deallocator:nil];
+    if (!xb || !wb) return 0;
+    id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+    id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+    [e setComputePipelineState:g_a_rms];
+    [e setBuffer:xb offset:0 atIndex:0]; [e setBuffer:wb offset:0 atIndex:1];
+    [e setBytes:&n length:4 atIndex:2]; [e setBytes:&eps length:4 atIndex:3];
+    [e dispatchThreadgroups:MTLSizeMake((size_t)nrows,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+    [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
+  }
+  return 1;
+}
+
+extern "C" int coli_metal_add(float *y, const float *a, int n) {
+  if (!g_dev || !y || !a || n <= 0) return 0;
+  std::lock_guard<std::mutex> lk(g_op_mtx);
+  @autoreleasepool {
+    id<MTLBuffer> yb = [g_dev newBufferWithBytesNoCopy:y length:(size_t)n*sizeof(float)
+                       options:MTLResourceStorageModeShared deallocator:nil];
+    id<MTLBuffer> ab = [g_dev newBufferWithBytesNoCopy:(void*)a length:(size_t)n*sizeof(float)
+                       options:MTLResourceStorageModeShared deallocator:nil];
+    if (!yb || !ab) return 0;
+    id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+    id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+    [e setComputePipelineState:g_a_add];
+    [e setBuffer:yb offset:0 atIndex:0]; [e setBuffer:ab offset:0 atIndex:1];
+    [e dispatchThreads:MTLSizeMake((size_t)n,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+    [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
+  }
+  return 1;
+}
+
+extern "C" int coli_metal_silu_mul(float *g, const float *u, int n) {
+  if (!g_dev || !g || !u || n <= 0) return 0;
+  std::lock_guard<std::mutex> lk(g_op_mtx);
+  @autoreleasepool {
+    id<MTLBuffer> gb = [g_dev newBufferWithBytesNoCopy:g length:(size_t)n*sizeof(float)
+                       options:MTLResourceStorageModeShared deallocator:nil];
+    id<MTLBuffer> ub = [g_dev newBufferWithBytesNoCopy:(void*)u length:(size_t)n*sizeof(float)
+                       options:MTLResourceStorageModeShared deallocator:nil];
+    if (!gb || !ub) return 0;
+    id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+    id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+    [e setComputePipelineState:g_moe_silu];
+    [e setBuffer:gb offset:0 atIndex:0]; [e setBuffer:ub offset:0 atIndex:1];
+    [e dispatchThreads:MTLSizeMake((size_t)n,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+    [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
+  }
+  return 1;
+}
+
 extern "C" int coli_metal_matmul(ColiMetalTensor **tp, float *y, const float *x,
                                  const void *weights, const float *scales,
                                  int fmt, int S, int I, int O, int gs) {
