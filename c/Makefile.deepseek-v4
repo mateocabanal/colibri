@@ -186,7 +186,7 @@ coli_profile_v4.o: profile.c profile.h
 	$(CC) $(CFLAGS) -c profile.c -o $@
 COLI_V4_UNIT_PROFILE.o: coli_v4_profile.c profile.h deepseek_v4_internal.h expert_store.h
 	$(CC) $(CFLAGS) -c coli_v4_profile.c -o $@
-coli_v4_prefix_cache.o: coli_v4_prefix_cache.c coli_v4_prefix_cache.h deepseek_v4_internal.h kv_prefix.h
+coli_v4_prefix_cache.o: coli_v4_prefix_cache.c coli_v4_prefix_cache.h coli_v4_output_cache.c coli_v4_output_cache.h prefix_cache_disk.h deepseek_v4_internal.h kv_prefix.h
 	$(CC) $(CFLAGS) -c coli_v4_prefix_cache.c -o $@
 coli_v4_expert_execute_trace.o: coli_v4_expert_execute_trace.c deepseek_v4_internal.h expert_store.h tensor.h
 	$(CC) $(CFLAGS) -c coli_v4_expert_execute_trace.c -o $@
@@ -209,9 +209,9 @@ COLI_V4_UNIT_RUNTIME.o: coli_v4_runtime_prefix_cache.c deepseek_v4.c deepseek_v4
 # Production SERVE behavior remains unchanged while the oracle uses the real API.
 $(V4_PREFIX_TEST_RUNTIME_OBJ): coli_v4_runtime_prefix_cache.c deepseek_v4.c deepseek_v4.h deepseek_v4_internal.h coli_v4_prefix_cache.h
 	$(CC) $(CFLAGS) -Dmain=coli_v4_runtime_main_unused -DCOLI_V4_UNIT_RUNTIME -c coli_v4_runtime_prefix_cache.c -o $@
-COLI_V4_UNIT_GENERATE_STATS.o: coli_v4_generate_stats_cache.c deepseek_v4.c deepseek_v4.h deepseek_v4_internal.h coli_v4_prefix_cache.h kv_prefix.h
+COLI_V4_UNIT_GENERATE_STATS.o: coli_v4_generate_stats_cache.c coli_v4_output_cache.h deepseek_v4.c deepseek_v4.h deepseek_v4_internal.h coli_v4_prefix_cache.h kv_prefix.h
 	$(CC) $(CFLAGS) -DCOLI_V4_UNIT_GENERATE_STATS -c coli_v4_generate_stats_cache.c -o $@
-$(V4_PREFIX_TEST_GENERATE_OBJ): coli_v4_generate_stats_cache.c deepseek_v4.c deepseek_v4.h deepseek_v4_internal.h coli_v4_prefix_cache.h kv_prefix.h
+$(V4_PREFIX_TEST_GENERATE_OBJ): coli_v4_generate_stats_cache.c coli_v4_output_cache.h deepseek_v4.c deepseek_v4.h deepseek_v4_internal.h coli_v4_prefix_cache.h kv_prefix.h
 	$(CC) $(CFLAGS) -Dmain=coli_v4_generate_main_unused -DCOLI_V4_UNIT_GENERATE_STATS -c coli_v4_generate_stats_cache.c -o $@
 
 ifeq ($(V4_TRACE_ROUTE),1)

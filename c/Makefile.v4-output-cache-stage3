@@ -1,0 +1,23 @@
+.DEFAULT_GOAL := check
+
+include Makefile.deepseek-v4
+
+# The tiny fixture has no COLI package, so only this acceptance composition
+# exposes the explicit synthetic-identity seam. Production builds do not define
+# COLI_V4_OUTPUT_CACHE_TESTING and remain package-fingerprint-only.
+CFLAGS += -DCOLI_V4_OUTPUT_CACHE_TESTING
+
+V4_OUTPUT_CACHE_TEST_BINARY := test_v4_output_cache_sessions
+V4_OUTPUT_TOKEN_MISS_BINARY := test_v4_output_cache_token_miss
+V4_OUTPUT_SHORT_PROMPT := <t005><t007><t009><t011><t013><t017><t019><t023>
+
+.PHONY: check
+check: $(V4_OUTPUT_CACHE_TEST_BINARY) $(V4_OUTPUT_TOKEN_MISS_BINARY)
+	./$(V4_OUTPUT_CACHE_TEST_BINARY) deepseek_v4_tiny '$(V4_OUTPUT_SHORT_PROMPT)'
+	./$(V4_OUTPUT_TOKEN_MISS_BINARY) deepseek_v4_tiny
+
+$(V4_OUTPUT_CACHE_TEST_BINARY): tests/test_v4_output_cache_sessions.c $(V4_PREFIX_TEST_OBJS)
+	$(CC) $(CFLAGS) tests/test_v4_output_cache_sessions.c $(V4_PREFIX_TEST_OBJS) -o $@ $(LDFLAGS)
+
+$(V4_OUTPUT_TOKEN_MISS_BINARY): tests/test_v4_output_cache_token_miss.c $(V4_PREFIX_TEST_OBJS)
+	$(CC) $(CFLAGS) tests/test_v4_output_cache_token_miss.c $(V4_PREFIX_TEST_OBJS) -o $@ $(LDFLAGS)
