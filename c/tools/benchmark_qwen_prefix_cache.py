@@ -90,6 +90,40 @@ def make_prompt(target_tokens: int, chars_per_token: float) -> bytes:
     return text.encode("utf-8")
 
 
+def count_tokens(text: str, tokenizer_path: Path) -> int | None:
+    """Exact token count via the model's tokenizer.json, when available."""
+    try:
+        from tokenizers import Tokenizer
+        return len(Tokenizer.from_file(str(tokenizer_path)).encode(text).ids)
+    except Exception:
+        return None
+
+
+def make_prompt_token_aware(
+    target_tokens: int, chars_per_token: float, tokenizer_path: Path | None
+) -> tuple[bytes, int]:
+    """Build a prompt with at least target_tokens actual tokens.
+
+    The chars-per-token heuristic undershoots (256 requested -> ~192 actual),
+    which fails prefix-cache admission.  When the model ships a tokenizer.json
+    the prompt is extended until the exact count reaches the target; otherwise
+    the heuristic stands and the caller records the estimated count.
+    """
+    if tokenizer_path is None or not tokenizer_path.is_file():
+        return make_prompt(target_tokens, chars_per_token), int(
+            target_tokens * chars_per_token
+        )
+    text = make_prompt(target_tokens, chars_per_token).decode("utf-8")
+    for _ in range(64):
+        count = count_tokens(text, tokenizer_path)
+        if count is None:
+            return text.encode("utf-8"), int(target_tokens * chars_per_token)
+        if count >= target_tokens:
+            return text.encode("utf-8"), count
+        text += BENCH_TEXT
+    return text.encode("utf-8"), count
+
+
 def git_sha(repo: Path) -> str | None:
     try:
         proc = subprocess.run(
@@ -678,8 +712,11 @@ def main() -> int:
 
     if args.prefix_file:
         prefix = Path(args.prefix_file).expanduser().read_bytes()
+        prefix_tokens_actual = None
     else:
-        prefix = make_prompt(args.prefix_tokens, args.chars_per_token)
+        prefix, prefix_tokens_actual = make_prompt_token_aware(
+            args.prefix_tokens, args.chars_per_token, model / "tokenizer.json"
+        )
     if args.tail_file:
         tail = Path(args.tail_file).expanduser().read_bytes()
     else:
@@ -731,6 +768,8 @@ def main() -> int:
             "min_prefix_tokens": args.min_prefix_tokens,
             "context": args.context,
             "max_tokens": args.max_tokens,
+            "prefix_tokens_requested": args.prefix_tokens,
+            "prefix_tokens_actual": prefix_tokens_actual,
             "prompt_bytes": len(prefix),
             "tail_bytes": len(tail),
             "error": error,
@@ -761,7 +800,9 @@ def main() -> int:
     execution_mode = "reused_processes" if args.reuse_processes else "fresh_process_pairs"
     progress(
         f"starting {execution_mode}: trials={args.trials}, "
-        f"prefix≈{args.prefix_tokens} tokens/{len(prefix)} bytes, "
+        f"prefix≈{args.prefix_tokens} tokens"
+        + (f" ({prefix_tokens_actual} actual)" if prefix_tokens_actual else "")
+        + f"/{len(prefix)} bytes, "
         f"model={model.name}"
     )
     if args.reuse_processes:
@@ -851,6 +892,8 @@ def main() -> int:
         "context": args.context,
         "max_tokens": args.max_tokens,
         "trials": args.trials,
+        "prefix_tokens_requested": args.prefix_tokens,
+        "prefix_tokens_actual": prefix_tokens_actual,
         "environment": {k: os.environ[k] for k in RELEVANT_ENV if k in os.environ},
         "prompt_bytes": len(prefix),
         "tail_bytes": len(tail),
