@@ -1,0 +1,43 @@
+# CI: compile every Metal path and run the backend contract tests on macOS.
+# A normal macOS CPU build does not compile the .mm Metal sources, so the
+# Metal backend can rot without any required workflow noticing. This job
+# builds the Metal-enabled engines and runs the backend contract suite
+# (metal-test) on real Apple Silicon runners.
+name: metal
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: metal-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos-metal:
+    name: macOS Metal
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install libomp
+        run: brew install libomp
+      - name: Build Metal-enabled engines
+        run: |
+          cd c
+          rc=0
+          # qwen_moe and deepseek-v4 both compile the Metal backend when
+          # METAL=1 (Makefile.deepseek-v4 defaults METAL=1 on Darwin; the
+          # main Makefile needs the explicit flag).
+          make METAL=1 qwen_moe || { echo "FAILED: qwen_moe"; rc=1; }
+          make -f Makefile.deepseek-v4 deepseek-v4 || { echo "FAILED: deepseek-v4"; rc=1; }
+          exit $rc
+      - name: Metal backend contract tests
+        run: make -C c metal-test
+      - name: MetalIO contract tests
+        run: make -C c metalio-test
