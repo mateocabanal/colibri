@@ -913,6 +913,37 @@ int main(void) {
   // reading (both kernels agree bitwise on a selection that requires that check to fire).
   fail |= run_rtop8(5, 4, 200, 0.0f,  1, 1.0f,   "top8 E=200 (lane straddles E boundary)");
   fail |= run_rtop8(0, 1, 257, 0.0f,  1, 1.0f,   "top8 E=257 (>256, auto-serial-fallback)");
+  // #166: standalone operator wrappers (rmsnorm / residual-add / silu-mul).
+  {
+    const int n = 64;
+    float x[64], w[64], y[64], a[64], g[64], u[64];
+    for (int i = 0; i < n; i++) { x[i] = (float)(i % 7) - 3.0f; w[i] = 0.5f + 0.01f * i; a[i] = 1.0f; g[i] = (float)(i - 32); u[i] = 2.0f; }
+    memcpy(y, x, sizeof(y));
+    float sum = 0; for (int i = 0; i < n; i++) sum += x[i]*x[i];
+    float r = 1.0f / sqrtf(sum / n + 1e-5f);
+    if (!coli_metal_rmsnorm(y, w, n, 1, 1e-5f)) { printf("rmsnorm wrapper: FAILED (rc=0)\n"); fail = 1; }
+    else {
+      int ok = 1;
+      for (int i = 0; i < n; i++) if (fabsf(y[i] - x[i]*r*w[i]) > 1e-4f) { ok = 0; break; }
+      printf("rmsnorm wrapper: %s\n", ok ? "ok" : "FAILED");
+      if (!ok) fail = 1;
+    }
+    if (!coli_metal_add(y, a, n)) { printf("add wrapper: FAILED (rc=0)\n"); fail = 1; }
+    else {
+      int ok = 1;
+      for (int i = 0; i < n; i++) if (fabsf(y[i] - (x[i]*r*w[i] + 1.0f)) > 1e-4f) { ok = 0; break; }
+      printf("add wrapper: %s\n", ok ? "ok" : "FAILED");
+      if (!ok) fail = 1;
+    }
+    float g0[64]; memcpy(g0, g, sizeof(g0));
+    if (!coli_metal_silu_mul(g, u, n)) { printf("silu_mul wrapper: FAILED (rc=0)\n"); fail = 1; }
+    else {
+      int ok = 1;
+      for (int i = 0; i < n; i++) { float s = g0[i] / (1.0f + expf(-g0[i])); if (fabsf(g[i] - s * 2.0f) > 1e-4f) { ok = 0; break; } }
+      printf("silu_mul wrapper: %s\n", ok ? "ok" : "FAILED");
+      if (!ok) fail = 1;
+    }
+  }
   printf(fail? "metal backend tests: FAILED\n" : "metal backend tests: ok\n");
   coli_metal_shutdown();
   return fail;
