@@ -478,6 +478,91 @@ kernel void r_top8_par(device const float* sig [[buffer(0)]], device const float
   if(normk){ float sm=0; for(int kk=0;kk<Ke;kk++) sm+=ww[kk]; sm+=1e-20f; for(int kk=0;kk<Ke;kk++) ww[kk]/=sm; }
   for(int kk=0;kk<Ke;kk++) ww[kk]*=rscale;
 }
+
+// ===== Kimi K3 KDA kernels (#168, adapted from upstream 4459b61) =====
+// depthwise causal conv1d + SiLU over the rolling window (window: oldest..newest)
+kernel void kda_conv_silu(
+    device float* conv_win  [[buffer(0)]],
+    device float* vec       [[buffer(1)]],
+    device const float* taps [[buffer(2)]],
+    constant int& P         [[buffer(3)]],
+    constant int& K         [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]) {
+  int d = (int)gid;
+  if (d >= P) return;
+  long base = (long)d * K;
+  for (int j = 0; j < K - 1; j++)
+    conv_win[base + j] = conv_win[base + j + 1];
+  conv_win[base + K - 1] = vec[d];
+  float acc = 0.f;
+  for (int j = 0; j < K; j++)
+    acc += taps[base + j] * conv_win[base + j];
+  vec[d] = acc / (1.f + exp(-acc));
+}
+
+// per-head L2 normalization with qscale applied to q only
+kernel void kda_l2_norm(
+    device float* q       [[buffer(0)]],
+    device float* k       [[buffer(1)]],
+    constant int& H       [[buffer(2)]],
+    constant int& hd      [[buffer(3)]],
+    constant float& qscale [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]) {
+  int h = (int)gid;
+  if (h >= H) return;
+  long base = (long)h * hd;
+  float sq = 0.f, sk = 0.f;
+  for (int i = 0; i < hd; i++) {
+    sq += q[base + i] * q[base + i];
+    sk += k[base + i] * k[base + i];
+  }
+  sq = 1.f / sqrt(sq + 1e-6f);
+  sk = 1.f / sqrt(sk + 1e-6f);
+  float qs = sq * qscale;
+  for (int i = 0; i < hd; i++) {
+    q[base + i] *= qs;
+    k[base + i] *= sk;
+  }
+}
+
+// KDA recurrent-state update: decay S, kS accumulate, expand + merge
+kernel void kda_state(
+    device float* S      [[buffer(0)]],
+    device const float* qn     [[buffer(1)]],
+    device const float* kn     [[buffer(2)]],
+    device const float* vh     [[buffer(3)]],
+    device const float* alpha  [[buffer(4)]],
+    device const float* beta   [[buffer(5)]],
+    device float* oh     [[buffer(6)]],
+    constant int& H      [[buffer(7)]],
+    constant int& hd     [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  int th = gid / hd;
+  int i = gid % hd;
+  if (th >= H) return;
+  long hS = (long)th * hd * hd;
+  long hq = (long)th * hd;
+  const device float* qn_h = qn + hq;
+  const device float* kn_h = kn + hq;
+  const device float* vh_h = vh + hq;
+  const device float* alpha_h = alpha + hq;
+  float kiS = 0.f;
+  for (int kk = 0; kk < hd; kk++) {
+    long row = hS + (long)kk * hd;
+    float al = alpha_h[kk];
+    S[row + i] *= al;
+    kiS += kn_h[kk] * S[row + i];
+  }
+  float vi = (vh_h[i] - kiS) * beta[th];
+  float oi = 0.f;
+  for (int kk = 0; kk < hd; kk++) {
+    long row = hS + (long)kk * hd;
+    float kv = kn_h[kk];
+    S[row + i] += kv * vi;
+    oi += qn_h[kk] * S[row + i];
+  }
+  oh[hq + i] = oi;
+}
 )METAL";
 
 struct ColiMetalTensor {
@@ -515,6 +600,7 @@ static id<MTLBuffer> fwht_signs(int n) {
 }
 static id<MTLComputePipelineState> g_a_rms, g_a_rope, g_a_copy, g_a_qabs, g_a_score, g_a_smax, g_a_clat, g_a_ctx;
 static id<MTLComputePipelineState> g_a_add, g_r_router, g_r_top8, g_r_top8p;
+static id<MTLComputePipelineState> g_kda_conv_silu, g_kda_l2_norm, g_kda_state;
 static int g_rtop8_par = 1;      // COLI_RTOP8 (default ON); COLI_RTOP8=0 opts out to the
                                   // serial kernel — see coli_metal_init.
 static int g_rtop8_width_ok = 1; // hardware fact, independent of the policy gate above:
@@ -732,7 +818,8 @@ extern "C" int coli_metal_init(void) {
     g_a_rms=P("a_rmsnorm"); g_a_rope=P("a_rope"); g_a_copy=P("a_copy");
     g_a_qabs=P("a_qabs"); g_a_score=P("a_score"); g_a_smax=P("a_smax"); g_a_clat=P("a_clat"); g_a_ctx=P("a_ctx");
     g_a_add=P("a_add"); g_r_router=P("r_router"); g_r_top8=P("r_top8"); g_r_top8p=P("r_top8_par");
-    if(!g_a_add||!g_r_router||!g_r_top8||!g_r_top8p){ fprintf(stderr,"[metal] tail pipelines failed\n"); g_dev=nil; return 0; }
+    g_kda_conv_silu=P("kda_conv_silu"); g_kda_l2_norm=P("kda_l2_norm"); g_kda_state=P("kda_state");
+    if(!g_a_add||!g_r_router||!g_r_top8||!g_r_top8p||!g_kda_conv_silu||!g_kda_l2_norm||!g_kda_state){ fprintf(stderr,"[metal] tail pipelines failed\n"); g_dev=nil; return 0; }
     // r_top8_par's reduction hardcodes SIMD width 32 (shuffle-down offsets 16..1, one
     // 32-thread threadgroup per row). True on all Apple Silicon shipped to date, but a
     // non-32-width device would reduce wrongly AND race multiple lane-0 writers, so this
@@ -930,6 +1017,90 @@ extern "C" int coli_metal_silu_mul(float *g, const float *u, int n) {
     [e setComputePipelineState:g_moe_silu];
     [e setBuffer:gb offset:0 atIndex:0]; [e setBuffer:ub offset:0 atIndex:1];
     [e dispatchThreads:MTLSizeMake((size_t)n,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+    [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
+  }
+  return 1;
+}
+
+/* #168: Kimi K3 KDA operators (adapted from upstream 4459b61). Same
+ * serialized-mutex + waitUntilCompleted contract as the #166 wrappers. */
+extern "C" int coli_metal_kda_conv_silu(float *conv_win, float *vec,
+                                         const float *taps, int P, int K) {
+  if (!g_dev || !conv_win || !vec || !taps || P <= 0 || K <= 0) return 0;
+  std::lock_guard<std::mutex> lk(g_op_mtx);
+  @autoreleasepool {
+    id<MTLBuffer> bwin = [g_dev newBufferWithBytesNoCopy:conv_win length:(size_t)P*K*sizeof(float)
+                       options:MTLResourceStorageModeShared deallocator:nil];
+    id<MTLBuffer> bvec = [g_dev newBufferWithBytesNoCopy:vec length:(size_t)P*sizeof(float)
+                       options:MTLResourceStorageModeShared deallocator:nil];
+    id<MTLBuffer> btap = [g_dev newBufferWithBytesNoCopy:(void*)taps length:(size_t)P*K*sizeof(float)
+                       options:MTLResourceStorageModeShared deallocator:nil];
+    if (!bwin || !bvec || !btap) return 0;
+    id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+    id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+    [e setComputePipelineState:g_kda_conv_silu];
+    [e setBuffer:bwin offset:0 atIndex:0]; [e setBuffer:bvec offset:0 atIndex:1];
+    [e setBuffer:btap offset:0 atIndex:2];
+    [e setBytes:&P length:4 atIndex:3]; [e setBytes:&K length:4 atIndex:4];
+    [e dispatchThreads:MTLSizeMake((size_t)P,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+    [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
+  }
+  return 1;
+}
+
+extern "C" int coli_metal_kda_l2_norm(float *q, float *k, int H, int hd,
+                                       float qscale) {
+  if (!g_dev || !q || !k || H <= 0 || hd <= 0) return 0;
+  std::lock_guard<std::mutex> lk(g_op_mtx);
+  @autoreleasepool {
+    id<MTLBuffer> bq = [g_dev newBufferWithBytesNoCopy:q length:(size_t)H*hd*sizeof(float)
+                       options:MTLResourceStorageModeShared deallocator:nil];
+    id<MTLBuffer> bk = [g_dev newBufferWithBytesNoCopy:k length:(size_t)H*hd*sizeof(float)
+                       options:MTLResourceStorageModeShared deallocator:nil];
+    if (!bq || !bk) return 0;
+    id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+    id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+    [e setComputePipelineState:g_kda_l2_norm];
+    [e setBuffer:bq offset:0 atIndex:0]; [e setBuffer:bk offset:0 atIndex:1];
+    [e setBytes:&H length:4 atIndex:2]; [e setBytes:&hd length:4 atIndex:3];
+    [e setBytes:&qscale length:4 atIndex:4];
+    [e dispatchThreads:MTLSizeMake((size_t)H,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+    [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
+  }
+  return 1;
+}
+
+extern "C" int coli_metal_kda_state(float *S, const float *qn, const float *kn,
+                                     const float *vh, const float *alpha,
+                                     const float *beta, float *oh, int H, int hd) {
+  if (!g_dev || !S || !qn || !kn || !vh || !alpha || !beta || !oh ||
+      H <= 0 || hd <= 0) return 0;
+  std::lock_guard<std::mutex> lk(g_op_mtx);
+  @autoreleasepool {
+    id<MTLBuffer> bS = [g_dev newBufferWithBytesNoCopy:S length:(size_t)H*hd*hd*sizeof(float)
+                       options:MTLResourceStorageModeShared deallocator:nil];
+    id<MTLBuffer> bqn = [g_dev newBufferWithBytesNoCopy:(void*)qn length:(size_t)H*hd*sizeof(float)
+                       options:MTLResourceStorageModeShared deallocator:nil];
+    id<MTLBuffer> bkn = [g_dev newBufferWithBytesNoCopy:(void*)kn length:(size_t)H*hd*sizeof(float)
+                       options:MTLResourceStorageModeShared deallocator:nil];
+    id<MTLBuffer> bvh = [g_dev newBufferWithBytesNoCopy:(void*)vh length:(size_t)H*hd*sizeof(float)
+                       options:MTLResourceStorageModeShared deallocator:nil];
+    id<MTLBuffer> bal = [g_dev newBufferWithBytesNoCopy:(void*)alpha length:(size_t)H*hd*sizeof(float)
+                       options:MTLResourceStorageModeShared deallocator:nil];
+    id<MTLBuffer> bbe = [g_dev newBufferWithBytesNoCopy:(void*)beta length:(size_t)H*sizeof(float)
+                       options:MTLResourceStorageModeShared deallocator:nil];
+    id<MTLBuffer> boh = [g_dev newBufferWithBytesNoCopy:oh length:(size_t)H*hd*sizeof(float)
+                       options:MTLResourceStorageModeShared deallocator:nil];
+    if (!bS || !bqn || !bkn || !bvh || !bal || !bbe || !boh) return 0;
+    id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+    id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+    [e setComputePipelineState:g_kda_state];
+    [e setBuffer:bS offset:0 atIndex:0]; [e setBuffer:bqn offset:0 atIndex:1];
+    [e setBuffer:bkn offset:0 atIndex:2]; [e setBuffer:bvh offset:0 atIndex:3];
+    [e setBuffer:bal offset:0 atIndex:4]; [e setBuffer:bbe offset:0 atIndex:5];
+    [e setBuffer:boh offset:0 atIndex:6];
+    [e setBytes:&H length:4 atIndex:7]; [e setBytes:&hd length:4 atIndex:8];
+    [e dispatchThreads:MTLSizeMake((size_t)H*hd,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
     [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
   }
   return 1;

@@ -24,6 +24,13 @@ int  coli_metal_init(void);
 int  coli_metal_rmsnorm(float *x, const float *w, int n, int nrows, float eps);
 int  coli_metal_add(float *y, const float *a, int n);
 int  coli_metal_silu_mul(float *g, const float *u, int n);
+/* #168: Kimi K3 KDA operators. */
+int  coli_metal_kda_conv_silu(float *conv_win, float *vec, const float *taps,
+                              int P, int K);
+int  coli_metal_kda_l2_norm(float *q, float *k, int H, int hd, float qscale);
+int  coli_metal_kda_state(float *S, const float *qn, const float *kn,
+                          const float *vh, const float *alpha,
+                          const float *beta, float *oh, int H, int hd);
 void coli_metal_shutdown(void);
 int  coli_metal_available(void);
 /* Bytes of unified memory in use by wrapped tensors, and their count. */
