@@ -1308,7 +1308,7 @@ static int v4_simd_hc_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
         const char *g = getenv("V4_SIMD_HC");
-        cached = g && atoi(g) != 0;
+        cached = !g || atoi(g) != 0;   /* default ON since #16; =0 opts out */
     }
     return cached;
 }
@@ -2985,6 +2985,24 @@ static int descending_score(const void *left, const void *right) {
     return a->index - b->index;
 }
 
+/* #8: exact top-K selection, same order as qsort(descending_score) but
+ * O(N*K) instead of O(N log N) — the indexer only ever reads index_topk
+ * (typically <= 16) of N candidates. Insertion into a K-buffer keeps the
+ * score-desc, index-asc tiebreak bit-identical to the sort. */
+static void indexer_select_topk(IndexScore *scores, int count, int keep) {
+    if (keep >= count) return;
+    for (int i = keep; i < count; i++) {
+        IndexScore s = scores[i];
+        int j = keep - 1;
+        while (j >= 0 && (scores[j].score < s.score ||
+               (scores[j].score == s.score && scores[j].index > s.index))) {
+            scores[j + 1] = scores[j];
+            j--;
+        }
+        scores[j + 1] = s;
+    }
+}
+
 int coli_v4_indexer_create(ColiDeepSeekV4Indexer **output,
                            const ColiDeepSeekV4LayerWeights *weights,
                            const ColiDeepSeekV4Config *config,
@@ -3142,7 +3160,7 @@ int coli_v4_indexer_step(ColiDeepSeekV4Indexer *state, int *indices,
         }
         scores[candidate] = (IndexScore){score, candidate};
     }
-    if (!result) qsort(scores, (size_t)state->count, sizeof(*scores), descending_score);
+    if (!result) indexer_select_topk(scores, state->count, state->config->index_topk);
     int selected = state->count;
     if (selected > state->config->index_topk) selected = state->config->index_topk;
     if (selected > index_capacity) selected = index_capacity;
@@ -3182,7 +3200,7 @@ static int v4_simd_attn_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
         const char *g = getenv("V4_SIMD_ATTN");
-        cached = g && atoi(g) != 0;
+        cached = !g || atoi(g) != 0;   /* default ON since #16; =0 opts out */
     }
     return cached;
 }
@@ -5025,6 +5043,24 @@ static int descending_score(const void *left, const void *right) {
     return a->index - b->index;
 }
 
+/* #8: exact top-K selection, same order as qsort(descending_score) but
+ * O(N*K) instead of O(N log N) — the indexer only ever reads index_topk
+ * (typically <= 16) of N candidates. Insertion into a K-buffer keeps the
+ * score-desc, index-asc tiebreak bit-identical to the sort. */
+static void indexer_select_topk(IndexScore *scores, int count, int keep) {
+    if (keep >= count) return;
+    for (int i = keep; i < count; i++) {
+        IndexScore s = scores[i];
+        int j = keep - 1;
+        while (j >= 0 && (scores[j].score < s.score ||
+               (scores[j].score == s.score && scores[j].index > s.index))) {
+            scores[j + 1] = scores[j];
+            j--;
+        }
+        scores[j + 1] = s;
+    }
+}
+
 int coli_v4_indexer_create(ColiDeepSeekV4Indexer **output,
                            const ColiDeepSeekV4LayerWeights *weights,
                            const ColiDeepSeekV4Config *config,
@@ -5182,7 +5218,7 @@ int coli_v4_indexer_step(ColiDeepSeekV4Indexer *state, int *indices,
         }
         scores[candidate] = (IndexScore){score, candidate};
     }
-    if (!result) qsort(scores, (size_t)state->count, sizeof(*scores), descending_score);
+    if (!result) indexer_select_topk(scores, state->count, state->config->index_topk);
     int selected = state->count;
     if (selected > state->config->index_topk) selected = state->config->index_topk;
     if (selected > index_capacity) selected = index_capacity;
@@ -7061,7 +7097,7 @@ static int v4_simd_route_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
         const char *g = getenv("V4_SIMD_ROUTE");
-        cached = g && atoi(g) != 0;
+        cached = !g || atoi(g) != 0;   /* default ON since #16; =0 opts out */
     }
     return cached;
 }
