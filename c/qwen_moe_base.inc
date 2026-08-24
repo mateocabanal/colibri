@@ -3418,7 +3418,7 @@ static void moe_token(Model *m, Layer *l, int layer, const float *x, float *out)
         fprintf(stderr, "[CPU-MOEIN] layer=%d moe_input[0..3]=%.6g %.6g %.6g %.6g\n",
                 layer, x[0], x[1], x[2], x[3]);
     m->prof_expert_requests += (uint64_t)K;
-    double moe_t_r = now_s() * 1e3, moe_t_i = 0, moe_t_g = 0, moe_t_w = 0;
+    double moe_t_r = now_s(), moe_t_i = 0, moe_t_g = 0, moe_t_w = 0;
     float *logits = falloc(E);
     wt_mul(logits, x, &l->router, 1, E, D);
     softmax_row(logits, E);
@@ -3449,8 +3449,8 @@ static void moe_token(Model *m, Layer *l, int layer, const float *x, float *out)
     float *w = malloc(size_mul_or_die((size_t)K, sizeof(float), "router top-k weights"));
     if (!w) { fprintf(stderr, "OOM router weights\n"); exit(1); }
     for (int i = 0; i < K; i++) w[i] = val[i] / wsum;
-    m->t_moe_route += (now_s() * 1e3) - moe_t_r;
-    moe_t_i = now_s() * 1e3;
+    m->t_moe_route += now_s() - moe_t_r;
+    moe_t_i = now_s();
 #ifdef COLI_METALIO
     /* A pending routed-MoE command may overlap only work that does not consume
      * its output. Adjacent layers depend on this layer residual, but the
@@ -3508,8 +3508,8 @@ static void moe_token(Model *m, Layer *l, int layer, const float *x, float *out)
     g_mio_async_issue = 0;
 #endif
     if (K <= 64) { memcpy(m->last_route, idx, (size_t)K * sizeof(int)); m->last_route_k = K; }
-    m->t_moe_io += (now_s() * 1e3) - moe_t_i;
-    moe_t_g = now_s() * 1e3;
+    m->t_moe_io += now_s() - moe_t_i;
+    moe_t_g = now_s();
     /* Early pipeline: layer l+1's guesses go in flight BEFORE the layer-l
      * expert GEMVs below — overlap I/O with compute (MetalIO only). The
      * old post-layer lookahead in forward_token is disabled in pipe mode. */
@@ -3576,7 +3576,7 @@ static void moe_token(Model *m, Layer *l, int layer, const float *x, float *out)
                     if (nready > 0 && npending > 0) {
                         /* Wave 1: compute known-ready experts immediately.  MetalIO keeps
                          * loading wave 2 concurrently on its independent I/O queue. */
-                        double wave_t = now_s() * 1e3;
+                        double wave_t = now_s();
                         if (!coli_apple8_metalio_moe_topk(
                                 ready_ex, ready_w, nready, x, acc,
                                 D, c->moe_inter)) {
@@ -3584,7 +3584,7 @@ static void moe_token(Model *m, Layer *l, int layer, const float *x, float *out)
                                     "qwen: ready-wave Apple8 top-k dispatch failed\n");
                             exit(1);
                         }
-                        m->t_moe_gpu += (now_s() * 1e3) - wave_t;
+                        m->t_moe_gpu += now_s() - wave_t;
 
                         /* Wave 1 has bought the pending loads some GPU-compute time.
                          * Drain only what is still outstanding before binding wave 2. */
@@ -3726,7 +3726,7 @@ routed_experts_done:
     ;
     /* shared expert: time ONLY the CPU shared-expert work.  Routed Apple8 may
      * already be in flight here, so this span intentionally overlaps GPU work. */
-    moe_t_g = now_s() * 1e3;
+    moe_t_g = now_s();
     float *sg = falloc(1);
     wt_mul(sg, x, &l->se_g, 1, 1, D);
     float gs = 1.f / (1.f + expf(-sg[0]));
@@ -3737,18 +3737,18 @@ routed_experts_done:
     for (int i = 0; i < c->shared_inter; i++) h[i] = silu(gv[i]) * h[i];
     float *sy = falloc(D);
     wt_mul(sy, h, &l->se_down, 1, D, c->shared_inter);
-    m->t_moe_shared += (now_s() * 1e3) - moe_t_g;
+    m->t_moe_shared += now_s() - moe_t_g;
 
 #ifdef COLI_METALIO
     /* Residual routed-GPU wait after the shared CPU work has overlapped it. */
     if (apple8_pending) {
-        moe_t_w = now_s() * 1e3;
+        moe_t_w = now_s();
         float *routed_dst = apple8_pending_acc ? apple8_pending_acc : acc;
         if (!coli_apple8_metalio_moe_topk_finish(apple8_pending, routed_dst)) {
             fprintf(stderr, "qwen: fused direct Apple8 top-k decode completion failed\n");
             exit(1);
         }
-        m->t_moe_gpu += (now_s() * 1e3) - moe_t_w;
+        m->t_moe_gpu += now_s() - moe_t_w;
         apple8_pending = NULL;
 
         if (apple8_pending_acc) {
@@ -3761,10 +3761,10 @@ routed_experts_done:
 #endif
 
     /* Final shared+routed accumulation only; do not double-count GPU wait. */
-    moe_t_w = now_s() * 1e3;
+    moe_t_w = now_s();
     for (int d = 0; d < D; d++) acc[d] += sy[d] * gs;
     memcpy(out, acc, (size_t)D * sizeof(float));
-    m->t_moe_fill += (now_s() * 1e3) - moe_t_w;
+    m->t_moe_fill += now_s() - moe_t_w;
 
     free(logits); free(idx); free(val); free(acc); free(w);
     free(sg); free(h); free(gv); free(sy);
