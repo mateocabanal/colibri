@@ -293,73 +293,6 @@ kernel void qwen_bf16_matmul(
     }
 }
 
-
-/* Phase-2 BF16 projection: multi-row ILP variant. One SIMDgroup computes
- * QWEN_BF16_ROWS_PER_SIMD output rows of the SAME x row: each x value is
- * loaded once and consumed by that many independent BF16 weight streams
- * (more memory-level parallelism), and each row-dot keeps 4 independent
- * accumulators to break the FMA dependency chain. The lane-strided
- * (lane + 32*g) traversal is preserved, so every memory instruction stays
- * contiguous across the SIMDgroup. Per-lane summation order changes
- * (4-way split, combined a0+a1+a2+a3 at the end); the fixed 0..31
- * cross-lane reduction is preserved. */
-constant uint QWEN_BF16_ROWS_PER_SIMD = 4u;
-constant uint QWEN_BF16_TG_ROWS = QWEN_BF16_ROWS_PER_SIMD * 8u;
-
-kernel void qwen_bf16_mr(
-    device const ushort *w [[buffer(0)]],
-    device const float *x  [[buffer(1)]],
-    device float *y        [[buffer(2)]],
-    constant int &S        [[buffer(3)]],
-    constant int &O        [[buffer(4)]],
-    constant int &I        [[buffer(5)]],
-    uint tg                [[threadgroup_position_in_grid]],
-    uint simd_row          [[simdgroup_index_in_threadgroup]],
-    uint lane              [[thread_index_in_simdgroup]])
-{
-    threadgroup float partial[256u * QWEN_BF16_ROWS_PER_SIMD];
-    const uint total = (uint)(S * O);
-    const uint row0 = tg * QWEN_BF16_TG_ROWS + simd_row * QWEN_BF16_ROWS_PER_SIMD;
-    for (uint r = 0; r < QWEN_BF16_ROWS_PER_SIMD; ++r) {
-        const uint row = row0 + r;
-        float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
-        if (row < total) {
-            const int s = (int)(row / (uint)O);
-            const int o = (int)(row % (uint)O);
-            device const float *xr = x + (long)s * I;
-            device const ushort *wr = w + (long)o * I;
-            int i = (int)lane;
-            for (; i + 96 < I; i += 128) {
-                const float x0 = xr[i + 0];
-                const float x1 = xr[i + 32];
-                const float x2 = xr[i + 64];
-                const float x3 = xr[i + 96];
-                a0 += x0 * qwen_bf16(wr, i + 0);
-                a1 += x1 * qwen_bf16(wr, i + 32);
-                a2 += x2 * qwen_bf16(wr, i + 64);
-                a3 += x3 * qwen_bf16(wr, i + 96);
-            }
-            for (; i < I; i += 32)
-                a0 += xr[i] * qwen_bf16(wr, i);
-            partial[r * 256u + simd_row * 32u + lane] = a0 + a1 + a2 + a3;
-        } else {
-            partial[r * 256u + simd_row * 32u + lane] = 0.0f;
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (simd_row < 8u && lane == 0) {
-        for (uint r = 0; r < QWEN_BF16_ROWS_PER_SIMD; ++r) {
-            const uint row = row0 + r;
-            if (row < total) {
-                float sum = 0.0f;
-                const uint pb = r * 256U + simd_row * 32u;
-                for (uint p = 0; p < 32u; ++p) sum += partial[pb + p];
-                y[row] = sum;
-            }
-        }
-    }
-}
-
 /* Merged top-k MoE layer. One 256-thread group now maps exactly to one
  * physical Apple8 8-row output tile: SIMDgroup r computes tile row r. This
  * reduces threadgroup scheduling by 8x versus the old one-row/32-thread grid
@@ -459,7 +392,6 @@ static id<MTLComputePipelineState> g_gu_pipeline = nil;
 static id<MTLComputePipelineState> g_down_pipeline = nil;
 static id<MTLComputePipelineState> g_reduce_pipeline = nil;
 static id<MTLComputePipelineState> g_bf16_matmul_pipeline = nil;
-static id<MTLComputePipelineState> g_bf16_mr_pipeline = nil;
 static id<MTLComputePipelineState> g_gu8_pipeline = nil;
 static id<MTLComputePipelineState> g_down8_pipeline = nil;
 static std::mutex g_lock;
@@ -488,8 +420,6 @@ struct Apple8MoePending {
 static const uint16_t *g_bf16_w = NULL;
 static id<MTLBuffer> g_bf16_wbuf = nil;
 static int g_bf16_O = 0, g_bf16_I = 0;
-static id<MTLBuffer> g_bf16_xb = nil, g_bf16_yb = nil;
-static size_t g_bf16_xb_cap = 0, g_bf16_yb_cap = 0;
 
 static uint64_t direct_now_ns(void) {
     using namespace std::chrono;
@@ -523,7 +453,6 @@ static void clear_locked(void) {
     g_down_pipeline = nil;
     g_reduce_pipeline = nil;
     g_bf16_matmul_pipeline = nil;
-    g_bf16_mr_pipeline = nil;
     g_bf16_wbuf = nil;
     g_bf16_w = NULL;
     g_bf16_O = g_bf16_I = 0;
@@ -1110,8 +1039,6 @@ extern "C" int coli_apple8_metalio_direct_init(void) {
     if (!g_reduce_pipeline) goto pipeline_fail;
     g_bf16_matmul_pipeline = make_pipeline(library, @"qwen_bf16_matmul", &error);
     if (!g_bf16_matmul_pipeline) goto pipeline_fail;
-    g_bf16_mr_pipeline = make_pipeline(library, @"qwen_bf16_mr", &error);
-    if (!g_bf16_mr_pipeline) goto pipeline_fail;
     g_gu8_pipeline = make_pipeline(library, @"apple8_moe_gu8", &error);
     if (!g_gu8_pipeline) goto pipeline_fail;
     g_down8_pipeline = make_pipeline(library, @"apple8_moe_down8", &error);
@@ -1267,48 +1194,27 @@ extern "C" int coli_apple8_metalio_bf16_matmul(
 
     const size_t x_bytes = (size_t)S * (size_t)I * sizeof(float);
     const size_t y_bytes = (size_t)S * (size_t)O * sizeof(float);
-    /* Reuse the input/output buffers across tokens: resize only when the
-     * shape grows. Avoids per-call Metal allocation on the decode path. */
-    if (x_bytes > g_bf16_xb_cap) {
-        g_bf16_xb = [g_device newBufferWithLength:x_bytes
-                                     options:MTLResourceStorageModeShared];
-        if (!g_bf16_xb) return 0;
-        g_bf16_xb_cap = x_bytes;
-    }
-    if (y_bytes > g_bf16_yb_cap) {
-        g_bf16_yb = [g_device newBufferWithLength:y_bytes
-                                     options:MTLResourceStorageModeShared];
-        if (!g_bf16_yb) return 0;
-        g_bf16_yb_cap = y_bytes;
-    }
-    memcpy(g_bf16_xb.contents, x, x_bytes);
+    id<MTLBuffer> xb = [g_device newBufferWithBytes:x length:x_bytes
+                                            options:MTLResourceStorageModeShared];
+    id<MTLBuffer> yb = [g_device newBufferWithLength:y_bytes
+                                             options:MTLResourceStorageModeShared];
+    if (!xb || !yb) return 0;
 
     uint64_t encode_begin = direct_now_ns();
     id<MTLCommandBuffer> cb = [g_queue commandBuffer];
     if (!cb) return 0;
     id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
     if (!enc) return 0;
-    static int use_mr = -1;
-    if (use_mr < 0) {
-        const char *v = getenv("QWEN_BF16_MR");
-        use_mr = !(v && v[0] && strcmp(v, "0") == 0);
-    }
-    [enc setComputePipelineState:use_mr ? g_bf16_mr_pipeline : g_bf16_matmul_pipeline];
+    [enc setComputePipelineState:g_bf16_matmul_pipeline];
     [enc setBuffer:g_bf16_wbuf offset:0 atIndex:0];
-    [enc setBuffer:g_bf16_xb offset:0 atIndex:1];
-    [enc setBuffer:g_bf16_yb offset:0 atIndex:2];
+    [enc setBuffer:xb offset:0 atIndex:1];
+    [enc setBuffer:yb offset:0 atIndex:2];
     [enc setBytes:&S length:sizeof(S) atIndex:3];
     [enc setBytes:&O length:sizeof(O) atIndex:4];
     [enc setBytes:&I length:sizeof(I) atIndex:5];
     const NSUInteger total_rows = (NSUInteger)S * (NSUInteger)O;
-    if (use_mr) {
-        /* 4 rows/SIMDgroup x 8 SIMDgroups = 32 output rows per threadgroup. */
-        [enc dispatchThreadgroups:MTLSizeMake((total_rows + 31u) / 32u, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-    } else {
-        [enc dispatchThreadgroups:MTLSizeMake((total_rows + 7u) / 8u, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-    }
+    [enc dispatchThreadgroups:MTLSizeMake((total_rows + 7u) / 8u, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     [enc endEncoding];
     uint64_t encode_ns = direct_now_ns() - encode_begin;
     uint64_t submit_begin = direct_now_ns();
@@ -1323,7 +1229,7 @@ extern "C" int coli_apple8_metalio_bf16_matmul(
         return -1;
     }
     profile_completed_locked(cb, encode_ns, submit_ns, wait_ns, 0);
-    memcpy(y, g_bf16_yb.contents, y_bytes);
+    memcpy(y, yb.contents, y_bytes);
     return 1;
 }
 
