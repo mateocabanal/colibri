@@ -1580,12 +1580,11 @@ def main():
     # the root parser.  Because every command accepts --model, that formerly
     # made the documented `coli --model MODEL run ...` silently lose MODEL.
     # Preserve a model supplied before the command while retaining the usual
-    # `coli run --model MODEL ...` form (whose later value correctly wins).
-    commands={"build","info","plan","mirror","doctor","tune","run","chat","serve","stop","web","bench","convert"}
+    # `coli run --model MODEL ...` form.  The LAST explicit --model on the
+    # command line wins, wherever it sits (before or after the subcommand).
     leading_model=None
     argv=sys.argv[1:]
     for index,arg in enumerate(argv):
-        if arg in commands: break
         if arg=="--model" and index+1<len(argv):
             leading_model=argv[index+1]
         elif arg.startswith("--model="):
