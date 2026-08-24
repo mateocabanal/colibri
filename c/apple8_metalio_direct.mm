@@ -34,24 +34,114 @@ inline float apple8_ue8m0(uchar e) {
     return as_type<float>((uint)e << 23);
 }
 
-/* One SIMD lane consumes one value from each 32-column MXFP4 group. */
+/*
+ * One SIMD lane consumes one value from each 32-column MXFP4 group.
+ *
+ * The old helper recomputed output_tile*groups+g, the 136-byte tile address,
+ * and a tail predicate for every group. Decode dimensions are overwhelmingly
+ * full 32-column groups, so walk the physical tile stream directly and handle
+ * at most one tail group separately. This keeps the exact accumulation order
+ * while removing integer/address work from the hot loop.
+ */
 inline float apple8_dot_partial(device const uchar *tiles,
                                 device const float *x,
                                 int I, int o, uint lane) {
-    const int groups = (I + 31) / 32;
+    const int groups = (I + 31) >> 5;
+    const int full_groups = I >> 5;
+    const int tail = I & 31;
     const int output_tile = o >> 3;
     const int tile_row = o & 7;
+    const int packed_off = tile_row * 16 + ((int)lane >> 1);
+    const int scale_off = 128 + tile_row;
+    device const uchar *tile = tiles + (long)output_tile * groups * 136;
     float acc = 0.0f;
-    for (int g = 0; g < groups; ++g) {
-        const int k = g * 32 + (int)lane;
-        if (k >= I) continue;
-        const long tile_index = (long)output_tile * groups + g;
-        device const uchar *tile = tiles + tile_index * 136;
-        const uchar packed = tile[tile_row * 16 + ((int)lane >> 1)];
+
+    int g = 0;
+    for (; g + 3 < full_groups; g += 4) {
+        device const uchar *t0 = tile;
+        device const uchar *t1 = t0 + 136;
+        device const uchar *t2 = t1 + 136;
+        device const uchar *t3 = t2 + 136;
+        const uchar p0 = t0[packed_off];
+        const uchar p1 = t1[packed_off];
+        const uchar p2 = t2[packed_off];
+        const uchar p3 = t3[packed_off];
+        const uchar c0 = ((lane & 1u) != 0u) ? (p0 >> 4) : (p0 & 15u);
+        const uchar c1 = ((lane & 1u) != 0u) ? (p1 >> 4) : (p1 & 15u);
+        const uchar c2 = ((lane & 1u) != 0u) ? (p2 >> 4) : (p2 & 15u);
+        const uchar c3 = ((lane & 1u) != 0u) ? (p3 >> 4) : (p3 & 15u);
+        acc += APPLE8_MX4[c0] * apple8_ue8m0(t0[scale_off]) * x[((g + 0) << 5) + (int)lane];
+        acc += APPLE8_MX4[c1] * apple8_ue8m0(t1[scale_off]) * x[((g + 1) << 5) + (int)lane];
+        acc += APPLE8_MX4[c2] * apple8_ue8m0(t2[scale_off]) * x[((g + 2) << 5) + (int)lane];
+        acc += APPLE8_MX4[c3] * apple8_ue8m0(t3[scale_off]) * x[((g + 3) << 5) + (int)lane];
+        tile += 4 * 136;
+    }
+    for (; g < full_groups; ++g, tile += 136) {
+        const uchar packed = tile[packed_off];
         const uchar code = ((lane & 1u) != 0u) ? (packed >> 4) : (packed & 15u);
-        acc += APPLE8_MX4[code] * apple8_ue8m0(tile[128 + tile_row]) * x[k];
+        acc += APPLE8_MX4[code] * apple8_ue8m0(tile[scale_off]) * x[(g << 5) + (int)lane];
+    }
+    if (tail && (int)lane < tail) {
+        const uchar packed = tile[packed_off];
+        const uchar code = ((lane & 1u) != 0u) ? (packed >> 4) : (packed & 15u);
+        acc += APPLE8_MX4[code] * apple8_ue8m0(tile[scale_off]) * x[(full_groups << 5) + (int)lane];
     }
     return acc;
+}
+
+/* Gate/up have identical geometry. Traverse the two tile streams together so
+ * x is fetched once per group and both projections have independent work in
+ * flight. Per-projection accumulation order is unchanged. */
+inline float2 apple8_dot_pair_partial(device const uchar *gate_tiles,
+                                      device const uchar *up_tiles,
+                                      device const float *x,
+                                      int I, int o, uint lane) {
+    const int groups = (I + 31) >> 5;
+    const int full_groups = I >> 5;
+    const int tail = I & 31;
+    const int output_tile = o >> 3;
+    const int tile_row = o & 7;
+    const int packed_off = tile_row * 16 + ((int)lane >> 1);
+    const int scale_off = 128 + tile_row;
+    device const uchar *gt = gate_tiles + (long)output_tile * groups * 136;
+    device const uchar *ut = up_tiles + (long)output_tile * groups * 136;
+    float ga = 0.0f, ua = 0.0f;
+
+    int g = 0;
+    for (; g + 3 < full_groups; g += 4) {
+        for (int j = 0; j < 4; ++j) {
+            device const uchar *gtt = gt + (long)j * 136;
+            device const uchar *utt = ut + (long)j * 136;
+            const float xv = x[((g + j) << 5) + (int)lane];
+            const uchar gp = gtt[packed_off];
+            const uchar up = utt[packed_off];
+            const uchar gc = ((lane & 1u) != 0u) ? (gp >> 4) : (gp & 15u);
+            const uchar uc = ((lane & 1u) != 0u) ? (up >> 4) : (up & 15u);
+            ga += APPLE8_MX4[gc] * apple8_ue8m0(gtt[scale_off]) * xv;
+            ua += APPLE8_MX4[uc] * apple8_ue8m0(utt[scale_off]) * xv;
+        }
+        gt += 4 * 136;
+        ut += 4 * 136;
+    }
+    for (; g < full_groups; ++g, gt += 136, ut += 136) {
+        const float xv = x[(g << 5) + (int)lane];
+        const uchar gp = gt[packed_off];
+        const uchar up = ut[packed_off];
+        const uchar gc = ((lane & 1u) != 0u) ? (gp >> 4) : (gp & 15u);
+        const uchar uc = ((lane & 1u) != 0u) ? (up >> 4) : (up & 15u);
+        ga += APPLE8_MX4[gc] * apple8_ue8m0(gt[scale_off]) * xv;
+        ua += APPLE8_MX4[uc] * apple8_ue8m0(ut[scale_off]) * xv;
+    }
+    if (tail && (int)lane < tail) {
+        const float xv = x[(full_groups << 5) + (int)lane];
+        const uchar gp = gt[packed_off];
+        const uchar up = ut[packed_off];
+        const uchar gc = ((lane & 1u) != 0u) ? (gp >> 4) : (gp & 15u);
+        const uchar uc = ((lane & 1u) != 0u) ? (up >> 4) : (up & 15u);
+        ga += APPLE8_MX4[gc] * apple8_ue8m0(gt[scale_off]) * xv;
+        ua += APPLE8_MX4[uc] * apple8_ue8m0(ut[scale_off]) * xv;
+    }
+    return float2(ga, ua);
 }
 
 kernel void apple8_mxfp4_matmul(
@@ -91,8 +181,9 @@ kernel void apple8_swiglu_gu(
     const int m = (int)(tg % (uint)M);
     const int s = (int)(tg / (uint)M);
     device const float *xr = x + (long)s * H;
-    float gv = simd_sum(apple8_dot_partial(gate, xr, H, m, lane));
-    float uv = simd_sum(apple8_dot_partial(up, xr, H, m, lane));
+    const float2 gu = apple8_dot_pair_partial(gate, up, xr, H, m, lane);
+    const float gv = simd_sum(gu.x);
+    const float uv = simd_sum(gu.y);
     if (lane == 0) {
         const float silu = gv / (1.0f + exp(-gv));
         mid[(long)s * M + m] = silu * uv;
@@ -136,16 +227,37 @@ kernel void apple8_moe_reduce(
     y[h] = acc;
 }
 
-/* Dense BF16 matmul (lm_head etc.): deterministic two-stage row dots, eight
- * rows per 256-thread threadgroup.  Each lane keeps a contiguous ascending
- * input slice; lane 0 combines the 32 partials strictly 0..31 — the same
- * deterministic pattern as the GDN input kernel. */
+/* Dense BF16 projection. Eight rows share a 256-thread group (one SIMDgroup
+ * per row). The critical difference from the regressed contiguous-span path
+ * is that lane N always reads element N+32*g, so every memory instruction
+ * touches a contiguous 128B x segment and 64B BF16 weight segment. The
+ * per-lane accumulation sequence and fixed lane-0 0..31 reduction are kept
+ * deterministic. */
 constant uint QWEN_HEAD_ROWS_PER_TG = 8u;
 constant uint QWEN_HEAD_DOT_LANES = 32u;
 constant uint QWEN_HEAD_DOT_THREADS = QWEN_HEAD_ROWS_PER_TG * QWEN_HEAD_DOT_LANES;
 
 inline float qwen_bf16(device const ushort *p, long i) {
     return as_type<float>((uint)p[i] << 16);
+}
+
+inline float qwen_bf16_dot_lane(device const ushort *wr,
+                                device const float *xr,
+                                int I,
+                                uint lane) {
+    float acc = 0.0f;
+    int i = (int)lane;
+    /* Explicit 4-way unroll keeps the same per-lane summation order while
+     * giving the compiler four coalesced memory instructions per loop body. */
+    for (; i + 96 < I; i += 128) {
+        acc += xr[i + 0]  * qwen_bf16(wr, i + 0);
+        acc += xr[i + 32] * qwen_bf16(wr, i + 32);
+        acc += xr[i + 64] * qwen_bf16(wr, i + 64);
+        acc += xr[i + 96] * qwen_bf16(wr, i + 96);
+    }
+    for (; i < I; i += 32)
+        acc += xr[i] * qwen_bf16(wr, i);
+    return acc;
 }
 
 kernel void qwen_bf16_matmul(
@@ -169,11 +281,7 @@ kernel void qwen_bf16_matmul(
         const int o = (int)(row % (uint)O);
         device const float *xr = x + (long)s * I;
         device const ushort *wr = w + (long)o * I;
-        const int span = (I + 31) / 32;
-        const int begin = (int)lane * span;
-        const int end = min(begin + span, I);
-        for (int i = begin; i < end; ++i)
-            acc += xr[i] * qwen_bf16(wr, i);
+        acc = qwen_bf16_dot_lane(wr, xr, I, lane);
     }
     partial[tid] = acc;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -185,12 +293,10 @@ kernel void qwen_bf16_matmul(
     }
 }
 
-/* Merged top-k MoE layer: ONE grid per stage with the expert slot buffers
- * bound at fixed indices 0..7 and a per-expert offset table (gate/up/down).
- * Grid = K*S*M threadgroups for gu (one SwiGLU mid element each), K*S*H for
- * down.  Per-row reduction order is unchanged (lane 0 combines 0..31), so
- * output is bit-identical to the per-expert dispatches — only the launch
- * count drops from 8 to 1 per stage. */
+/* Merged top-k MoE layer. One 256-thread group now maps exactly to one
+ * physical Apple8 8-row output tile: SIMDgroup r computes tile row r. This
+ * reduces threadgroup scheduling by 8x versus the old one-row/32-thread grid
+ * and keeps the eight row consumers of a 136-byte tile adjacent. */
 kernel void apple8_moe_gu8(
     device const uchar *e0 [[buffer(0)]],
     device const uchar *e1 [[buffer(1)]],
@@ -210,13 +316,15 @@ kernel void apple8_moe_gu8(
     constant int *up_off   [[buffer(15)]],
     constant int *down_off [[buffer(16)]],
     uint tg                [[threadgroup_position_in_grid]],
+    uint simd_row          [[simdgroup_index_in_threadgroup]],
     uint lane              [[thread_index_in_simdgroup]])
 {
-    const uint nt = (uint)(K * S * M);
-    if (tg >= nt || lane >= 32) return;
-    const int m = (int)(tg % (uint)M);
-    const int s = (int)((tg / (uint)M) % (uint)S);
-    const int e = (int)(tg / ((uint)M * (uint)S));
+    const int mtiles = (M + 7) >> 3;
+    const int mt = (int)(tg % (uint)mtiles);
+    const int s = (int)((tg / (uint)mtiles) % (uint)S);
+    const int e = (int)(tg / ((uint)mtiles * (uint)S));
+    const int m = (mt << 3) + (int)simd_row;
+    if (e >= K || simd_row >= 8u || m >= M || lane >= 32u) return;
     device const uchar *base = e0;
     if (e == 1) base = e1;
     else if (e == 2) base = e2;
@@ -226,8 +334,9 @@ kernel void apple8_moe_gu8(
     else if (e == 6) base = e6;
     else if (e == 7) base = e7;
     device const float *xr = x + (long)s * H;
-    float gv = simd_sum(apple8_dot_partial(base + gate_off[e], xr, H, m, lane));
-    float uv = simd_sum(apple8_dot_partial(base + up_off[e], xr, H, m, lane));
+    const float2 gu = apple8_dot_pair_partial(base + gate_off[e], base + up_off[e], xr, H, m, lane);
+    const float gv = simd_sum(gu.x);
+    const float uv = simd_sum(gu.y);
     if (lane == 0) {
         const float silu = gv / (1.0f + exp(-gv));
         mid[(long)(e * S + s) * M + m] = silu * uv;
@@ -253,13 +362,15 @@ kernel void apple8_moe_down8(
     constant int *up_off         [[buffer(15)]],
     constant int *down_off       [[buffer(16)]],
     uint tg                      [[threadgroup_position_in_grid]],
+    uint simd_row                [[simdgroup_index_in_threadgroup]],
     uint lane                    [[thread_index_in_simdgroup]])
 {
-    const uint nt = (uint)(K * S * H);
-    if (tg >= nt || lane >= 32) return;
-    const int h = (int)(tg % (uint)H);
-    const int s = (int)((tg / (uint)H) % (uint)S);
-    const int e = (int)(tg / ((uint)H * (uint)S));
+    const int htiles = (H + 7) >> 3;
+    const int ht = (int)(tg % (uint)htiles);
+    const int s = (int)((tg / (uint)htiles) % (uint)S);
+    const int e = (int)(tg / ((uint)htiles * (uint)S));
+    const int h = (ht << 3) + (int)simd_row;
+    if (e >= K || simd_row >= 8u || h >= H || lane >= 32u) return;
     device const uchar *base = e0;
     if (e == 1) base = e1;
     else if (e == 2) base = e2;
@@ -375,9 +486,26 @@ inline float qwen_bf16(device const ushort *p, long i) {
     return as_type<float>((uint)p[i] << 16);
 }
 
-/* Deterministic two-stage BF16 row dots packed eight rows per 256-thread
- * threadgroup. Each logical lane keeps the exact old contiguous ascending
- * input slice; lane 0 still combines the 32 partials strictly 0..31. */
+inline float qwen_gdn_bf16_dot_lane(device const ushort *wr,
+                                    device const float *x,
+                                    int I,
+                                    uint lane) {
+    float acc = 0.0f;
+    int i = (int)lane;
+    for (; i + 96 < I; i += 128) {
+        acc += x[i + 0]  * qwen_bf16(wr, i + 0);
+        acc += x[i + 32] * qwen_bf16(wr, i + 32);
+        acc += x[i + 64] * qwen_bf16(wr, i + 64);
+        acc += x[i + 96] * qwen_bf16(wr, i + 96);
+    }
+    for (; i < I; i += 32)
+        acc += x[i] * qwen_bf16(wr, i);
+    return acc;
+}
+
+/* Deterministic packed BF16 row dots. Lane N reads N+32*g so each GPU memory
+ * instruction is contiguous across the SIMDgroup. This restores the proven
+ * CCBPLAN-B access pattern while retaining the fixed 0..31 final reduction. */
 kernel void qwen_gdn_input_bf16(
     device const ushort *wqkv [[buffer(0)]],
     device const ushort *wz   [[buffer(1)]],
@@ -419,12 +547,7 @@ kernel void qwen_gdn_input_bf16(
                 }
             }
         }
-        const int span = (D + 31) / 32;
-        const int begin = (int)lane * span;
-        const int end = min(begin + span, D);
-        const long base = (long)o * D;
-        for (int i = begin; i < end; ++i)
-            acc += x[i] * qwen_bf16(w, base + i);
+        acc = qwen_gdn_bf16_dot_lane(w + (long)o * D, x, D, lane);
     }
     partial[tid] = acc;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -582,7 +705,7 @@ kernel void qwen_gdn_conv_recur_norm(
     normed[(long)h * vd + d] = norm_w[d] * (outv * norm_inv[local_head]) * silu_z;
 }
 
-/* Same deterministic packed-row projection as the input side. */
+/* Same deterministic coalesced projection as the input side. */
 kernel void qwen_gdn_output_bf16(
     device const ushort *w       [[buffer(0)]],
     device const float *x        [[buffer(1)]],
@@ -597,14 +720,8 @@ kernel void qwen_gdn_output_bf16(
     const uint lane = tid - row_slot * QWEN_GDN_DOT_LANES;
     const uint o = tg * QWEN_GDN_ROWS_PER_TG + row_slot;
     float acc = 0.0f;
-    if (o < (uint)O) {
-        const int span = (I + 31) / 32;
-        const int begin = (int)lane * span;
-        const int end = min(begin + span, I);
-        const long base = (long)o * I;
-        for (int i = begin; i < end; ++i)
-            acc += x[i] * qwen_bf16(w, base + i);
-    }
+    if (o < (uint)O)
+        acc = qwen_gdn_bf16_dot_lane(w + (long)o * I, x, I, lane);
     partial[tid] = acc;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (o < (uint)O && lane == 0) {
@@ -1282,8 +1399,8 @@ extern "C" int coli_apple8_metalio_moe_topk_begin(
     id<MTLComputeCommandEncoder> gu = [cb computeCommandEncoder];
     if (!gu) { delete pending; return 0; }
     if (expert_count <= 8) {
-        /* Merged dispatch: one grid for all experts, slot buffers at fixed
-         * indices 0..7, per-expert offset table.  Kills 7 of 8 launches. */
+        /* Merged tile dispatch: all experts in one grid and eight physical
+         * output rows per 256-thread group. */
         [gu setComputePipelineState:g_gu8_pipeline];
         for (int i = 0; i < 8; ++i)
             [gu setBuffer:weight_buffers[i < expert_count ? i : 0] offset:0 atIndex:i];
@@ -1296,8 +1413,9 @@ extern "C" int coli_apple8_metalio_moe_topk_begin(
         [gu setBytes:gate_off length:(NSUInteger)expert_count * sizeof(int) atIndex:14];
         [gu setBytes:up_off length:(NSUInteger)expert_count * sizeof(int) atIndex:15];
         [gu setBytes:down_off length:(NSUInteger)expert_count * sizeof(int) atIndex:16];
-        [gu dispatchThreadgroups:MTLSizeMake((NSUInteger)expert_count * (NSUInteger)S * (NSUInteger)intermediate, 1, 1)
-              threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        const NSUInteger mtiles = ((NSUInteger)intermediate + 7u) / 8u;
+        [gu dispatchThreadgroups:MTLSizeMake((NSUInteger)expert_count * (NSUInteger)S * mtiles, 1, 1)
+              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     } else {
         [gu setComputePipelineState:g_gu_pipeline];
         for (int i = 0; i < expert_count; ++i) {
@@ -1329,8 +1447,9 @@ extern "C" int coli_apple8_metalio_moe_topk_begin(
         [down setBytes:gate_off length:(NSUInteger)expert_count * sizeof(int) atIndex:14];
         [down setBytes:up_off length:(NSUInteger)expert_count * sizeof(int) atIndex:15];
         [down setBytes:down_off length:(NSUInteger)expert_count * sizeof(int) atIndex:16];
-        [down dispatchThreadgroups:MTLSizeMake((NSUInteger)expert_count * (NSUInteger)S * (NSUInteger)hidden, 1, 1)
-              threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        const NSUInteger htiles = ((NSUInteger)hidden + 7u) / 8u;
+        [down dispatchThreadgroups:MTLSizeMake((NSUInteger)expert_count * (NSUInteger)S * htiles, 1, 1)
+              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     } else {
         [down setComputePipelineState:g_down_pipeline];
         for (int i = 0; i < expert_count; ++i) {
