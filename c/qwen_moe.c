@@ -85,7 +85,9 @@ extern int coli_apple8_metalio_gdn_token(
     float *state, float *conv_state,
     int D, int kheads, int kd, int vheads, int vd, int kk, float eps);
 
-/* Blocker: deterministic Metal GDN reduction is still >100 ms/tok; needs a faster deterministic block reduction plus overlapped recurrence before default-on. */
+/* Measured 2026-08-24 (cool-box 2x2 A/B): Metal GDN ~55.7 vs CPU ~58 ms/tok
+ * (~5% faster), token-identical. Default ON when direct Apple8 is active;
+ * QWEN_GDN_METAL=0 opts out. */
 static int qwen_gdn_metal_enabled(void){
     static int initialized = 0, enabled = 1;
     if (!initialized) {
@@ -96,8 +98,7 @@ static int qwen_gdn_metal_enabled(void){
     return g_apple8_direct && enabled;
 }
 
-/* Decode-only Metal seam.  QWEN_GDN_METAL defaults ON (GPU reference); QWEN_GDN_METAL=0
- * opts into the deterministic Metal path when direct Apple8 is active.
+/* Decode-only Metal seam.  QWEN_GDN_METAL defaults ON; =0 opts out.
  * rc==0 means Metal declined before commit and CPU fallback is safe.  A
  * negative rc is post-submit failure: recurrent state may have changed, so
  * falling through would double-advance it and is therefore fatal. */
