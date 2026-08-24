@@ -294,6 +294,86 @@ kernel void qwen_bf16_matmul(
 }
 
 
+
+/* Phase-2 BF16 projection: wide-load variant. 2 rows per SIMDgroup; the x
+ * row is loaded once as float4 and each chunk feeds both rows via ushort4
+ * weight loads + fdot4. Every load is a 128B-wide SIMDgroup transaction
+ * (32 lanes x 16B x, 8B w). 4 chunk-accumulators per row keep FMA ILP.
+ * Per-row summation order changes vs the scalar kernels; token parity is
+ * the correctness gate. */
+constant uint QWEN_BF16_W4_ROWS = 2u;
+
+kernel void qwen_bf16_w4(
+    device const ushort *w [[buffer(0)]],
+    device const float *x  [[buffer(1)]],
+    device float *y        [[buffer(2)]],
+    constant int &S        [[buffer(3)]],
+    constant int &O        [[buffer(4)]],
+    constant int &I        [[buffer(5)]],
+    uint tg                [[threadgroup_position_in_grid]],
+    uint simd_row          [[simdgroup_index_in_threadgroup]],
+    uint lane              [[thread_index_in_simdgroup]])
+{
+    threadgroup float partial[256u * QWEN_BF16_W4_ROWS];
+    const uint total = (uint)(S * O);
+    const uint row0 = tg * (QWEN_BF16_W4_ROWS * 8u) + simd_row * QWEN_BF16_W4_ROWS;
+    for (uint r = 0; r < QWEN_BF16_W4_ROWS; ++r) {
+        const uint row = row0 + r;
+        float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+        if (row < total) {
+            const int s = (int)(row / (uint)O);
+            const int o = (int)(row % (uint)O);
+            device const float *xr = x + (long)s * I;
+            device const ushort *wr = w + (long)o * I;
+            int i = (int)lane * 4;
+            for (; i + 96 < I; i += 128) {
+                const float4 x0 = *((device const float4 *)(xr + i + 0));
+                const float4 x1 = *((device const float4 *)(xr + i + 32));
+                const float4 x2 = *((device const float4 *)(xr + i + 64));
+                const float4 x3 = *((device const float4 *)(xr + i + 96));
+                const float4 w0 = {
+                    qwen_bf16(wr, i + 0),  qwen_bf16(wr, i + 1),
+                    qwen_bf16(wr, i + 2),  qwen_bf16(wr, i + 3)};
+                const float4 w1 = {
+                    qwen_bf16(wr, i + 32), qwen_bf16(wr, i + 33),
+                    qwen_bf16(wr, i + 34), qwen_bf16(wr, i + 35)};
+                const float4 w2 = {
+                    qwen_bf16(wr, i + 64), qwen_bf16(wr, i + 65),
+                    qwen_bf16(wr, i + 66), qwen_bf16(wr, i + 67)};
+                const float4 w3 = {
+                    qwen_bf16(wr, i + 96), qwen_bf16(wr, i + 97),
+                    qwen_bf16(wr, i + 98), qwen_bf16(wr, i + 99)};
+                a0 += dot(x0, w0);
+                a1 += dot(x1, w1);
+                a2 += dot(x2, w2);
+                a3 += dot(x3, w3);
+            }
+            for (; i < I; i += 4) {
+                const float4 xv = *((device const float4 *)(xr + i));
+                const float4 wv = {
+                    qwen_bf16(wr, i + 0), qwen_bf16(wr, i + 1),
+                    qwen_bf16(wr, i + 2), qwen_bf16(wr, i + 3)};
+                a0 += dot(xv, wv);
+            }
+            partial[r * 256u + simd_row * 32u + lane] = a0 + a1 + a2 + a3;
+        } else {
+            partial[r * 256u + simd_row * 32u + lane] = 0.0f;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_row < 8u && lane == 0) {
+        for (uint r = 0; r < QWEN_BF16_W4_ROWS; ++r) {
+            const uint row = row0 + r;
+            if (row < total) {
+                float sum = 0.0f;
+                const uint pb = r * 256u + simd_row * 32u;
+                for (uint p = 0; p < 32u; ++p) sum += partial[pb + p];
+                y[row] = sum;
+            }
+        }
+    }
+}
+
 /* Phase-2 BF16 projection: multi-row ILP variant. One SIMDgroup computes
  * QWEN_BF16_ROWS_PER_SIMD output rows of the SAME x row: each x value is
  * loaded once and consumed by that many independent BF16 weight streams
@@ -460,6 +540,7 @@ static id<MTLComputePipelineState> g_down_pipeline = nil;
 static id<MTLComputePipelineState> g_reduce_pipeline = nil;
 static id<MTLComputePipelineState> g_bf16_matmul_pipeline = nil;
 static id<MTLComputePipelineState> g_bf16_mr_pipeline = nil;
+static id<MTLComputePipelineState> g_bf16_w4_pipeline = nil;
 static id<MTLComputePipelineState> g_gu8_pipeline = nil;
 static id<MTLComputePipelineState> g_down8_pipeline = nil;
 static std::mutex g_lock;
@@ -524,6 +605,7 @@ static void clear_locked(void) {
     g_reduce_pipeline = nil;
     g_bf16_matmul_pipeline = nil;
     g_bf16_mr_pipeline = nil;
+    g_bf16_w4_pipeline = nil;
     g_bf16_wbuf = nil;
     g_bf16_w = NULL;
     g_bf16_O = g_bf16_I = 0;
@@ -1112,6 +1194,8 @@ extern "C" int coli_apple8_metalio_direct_init(void) {
     if (!g_bf16_matmul_pipeline) goto pipeline_fail;
     g_bf16_mr_pipeline = make_pipeline(library, @"qwen_bf16_mr", &error);
     if (!g_bf16_mr_pipeline) goto pipeline_fail;
+    g_bf16_w4_pipeline = make_pipeline(library, @"qwen_bf16_w4", &error);
+    if (!g_bf16_w4_pipeline) goto pipeline_fail;
     g_gu8_pipeline = make_pipeline(library, @"apple8_moe_gu8", &error);
     if (!g_gu8_pipeline) goto pipeline_fail;
     g_down8_pipeline = make_pipeline(library, @"apple8_moe_down8", &error);
@@ -1292,8 +1376,12 @@ extern "C" int coli_apple8_metalio_bf16_matmul(
     if (use_mr < 0) {
         const char *v = getenv("QWEN_BF16_MR");
         use_mr = !(v && v[0] && strcmp(v, "0") == 0);
+        if (v && v[0] && strcmp(v, "2") == 0) use_mr = 2;
     }
-    [enc setComputePipelineState:use_mr ? g_bf16_mr_pipeline : g_bf16_matmul_pipeline];
+    id<MTLComputePipelineState> bf16_pipe = g_bf16_matmul_pipeline;
+    if (use_mr == 1) bf16_pipe = g_bf16_mr_pipeline;
+    else if (use_mr == 2) bf16_pipe = g_bf16_w4_pipeline;
+    [enc setComputePipelineState:bf16_pipe];
     [enc setBuffer:g_bf16_wbuf offset:0 atIndex:0];
     [enc setBuffer:g_bf16_xb offset:0 atIndex:1];
     [enc setBuffer:g_bf16_yb offset:0 atIndex:2];
@@ -1301,7 +1389,11 @@ extern "C" int coli_apple8_metalio_bf16_matmul(
     [enc setBytes:&O length:sizeof(O) atIndex:4];
     [enc setBytes:&I length:sizeof(I) atIndex:5];
     const NSUInteger total_rows = (NSUInteger)S * (NSUInteger)O;
-    if (use_mr) {
+    if (use_mr == 2) {
+        /* 2 rows/SIMDgroup x 8 = 16 rows per threadgroup. */
+        [enc dispatchThreadgroups:MTLSizeMake((total_rows + 15u) / 16u, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    } else if (use_mr == 1) {
         /* 4 rows/SIMDgroup x 8 SIMDgroups = 32 output rows per threadgroup. */
         [enc dispatchThreadgroups:MTLSizeMake((total_rows + 31u) / 32u, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
