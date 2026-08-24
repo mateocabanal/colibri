@@ -7,7 +7,7 @@ endif
 
 .PHONY: check clean
 
-check: test_record_io$(EXE) test_expert_representation$(EXE) test_expert_residency$(EXE) test_expert_multivariant$(EXE) test_expert_transform$(EXE) test_expert_dispatch$(EXE) test_expert_dispatch_output$(EXE) test_expert_derived_cache$(EXE) test_expert_activation$(EXE) test_expert_residency_policy$(EXE) test_expert_resource_bridge$(EXE) test_resource_planner$(EXE) test_speculative_cache$(EXE) test_speculative_cache_disk$(EXE)
+check: test_record_io$(EXE) test_record_io_backend$(EXE) test_expert_representation$(EXE) test_expert_residency$(EXE) test_expert_multivariant$(EXE) test_expert_transform$(EXE) test_expert_dispatch$(EXE) test_expert_dispatch_output$(EXE) test_expert_derived_cache$(EXE) test_expert_activation$(EXE) test_expert_residency_policy$(EXE) test_expert_resource_bridge$(EXE) test_resource_planner$(EXE) test_speculative_cache$(EXE) test_speculative_cache_disk$(EXE) test_expert_backing_pool$(EXE) test_qwen_adaptive_backing_pool$(EXE) test_reuse_projection$(EXE) test_moe_adaptive_residency$(EXE) test_moe_resource_budget$(EXE)
 	./test_record_io$(EXE)
 	./test_expert_representation$(EXE)
 	./test_expert_residency$(EXE)
@@ -20,6 +20,12 @@ check: test_record_io$(EXE) test_expert_representation$(EXE) test_expert_residen
 	./test_expert_residency_policy$(EXE)
 	./test_expert_resource_bridge$(EXE)
 	./test_resource_planner$(EXE)
+	./test_record_io_backend$(EXE)
+	./test_expert_backing_pool$(EXE)
+	./test_qwen_adaptive_backing_pool$(EXE)
+	./test_reuse_projection$(EXE)
+	./test_moe_adaptive_residency$(EXE)
+	./test_moe_resource_budget$(EXE)
 	./test_speculative_cache$(EXE)
 	./test_speculative_cache_disk$(EXE)
 
@@ -58,6 +64,24 @@ test_expert_resource_bridge$(EXE): tests/test_expert_resource_bridge.c expert_re
 
 test_resource_planner$(EXE): tests/test_resource_planner.c resource_planner.h
 	$(CC) $(CFLAGS) tests/test_resource_planner.c -o $@
+
+test_record_io_backend$(EXE): tests/test_record_io_backend.c record_io_backend.h
+	$(CC) $(CFLAGS) tests/test_record_io_backend.c -o $@
+
+test_expert_backing_pool$(EXE): tests/test_expert_backing_pool.c expert_backing_pool.h
+	$(CC) $(CFLAGS) tests/test_expert_backing_pool.c -o $@
+
+test_qwen_adaptive_backing_pool$(EXE): tests/test_qwen_adaptive_backing_pool.c qwen_adaptive_backing_pool_adapter.h expert_backing_pool.h
+	$(CC) $(CFLAGS) tests/test_qwen_adaptive_backing_pool.c -o $@
+
+test_reuse_projection$(EXE): tests/test_reuse_projection.c reuse_projection.h
+	$(CC) $(CFLAGS) tests/test_reuse_projection.c -o $@
+
+test_moe_adaptive_residency$(EXE): tests/test_moe_adaptive_residency.c moe_adaptive_residency.h expert_residency_policy.h expert_activation.h expert_store.h resource_planner.h reuse_projection.h
+	$(CC) $(CFLAGS) tests/test_moe_adaptive_residency.c -o $@
+
+test_moe_resource_budget$(EXE): tests/test_moe_resource_budget.c moe_resource_budget.h
+	$(CC) $(CFLAGS) tests/test_moe_resource_budget.c -o $@
 
 test_speculative_cache$(EXE): tests/test_speculative_cache.c speculative_cache.h
 	$(CC) $(CFLAGS) tests/test_speculative_cache.c -o $@
