@@ -361,6 +361,84 @@ static void test_slot_resident_bytes(void){
           "q8 slot residency bytes mismatch");
 }
 
+/* #109: batched GDN must treat a/b gates per-token per-head
+ * (a[g*vheads+h], b[g*vheads+h]), NOT one scalar shared by every value
+ * head. Build a 2-head GDN layer with distinct per-head gates and compare
+ * gdn_batch against the token reference on the same inputs. */
+static void test_batched_gdn_per_head_gates(void){
+	Model m;
+	Layer l;
+	int8_t is_gdn[] = { 1 };
+	/* hidden=2, kd=1, kheads=1, vd=1, vheads=2, conv_k=1 (no conv state) */
+	float in_qkv[] = { 1.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 0.f };   /* [Cdim=4] x 2 tokens */
+	float in_a[] = { 0.f, 0.f }, in_b[] = { 0.f, 0.f };  /* per-head gates, 2 tokens x 2 heads */
+	float in_z[] = { 1.f, 1.f };
+	float A_log[] = { -2.f, -2.f }, dt_bias[] = { 0.f, 0.f };
+	float conv1d[] = { 1.f, 1.f, 1.f, 1.f };   /* Cdim=4 channels x kk=1 */
+	float norm[] = { 1.f, 1.f }, out_proj[] = { 1.f, 0.f, 0.f, 1.f };
+	float xs[4] = { 1.f, 0.f, 0.f, 1.f };
+	float batch_out[4] = { 0 }, token_out[4] = { 0 };
+	memset(&m, 0, sizeof(m)); memset(&l, 0, sizeof(l));
+	m.c.hidden = 2; m.c.n_layers = 1; m.c.eps = 1e-6f;
+	m.c.lin_k_heads = 1; m.c.lin_k_dim = 1;
+	m.c.lin_v_heads = 2; m.c.lin_v_dim = 1; m.c.conv_kernel = 1;
+	m.c.layer_is_gdn = is_gdn; m.max_t = 2;
+	m.K = calloc(1, sizeof(float*)); m.V = calloc(1, sizeof(float*));
+	m.gdn_S = calloc(1, sizeof(float*)); m.gdn_conv = calloc(1, sizeof(float*));
+	m.gdn_S[0] = calloc(2, sizeof(float));
+	m.gdn_conv[0] = calloc(2, sizeof(float));
+	l.in_qkv.f = in_qkv; l.in_a.f = in_a; l.in_b.f = in_b; l.in_z.f = in_z;
+	l.A_log = A_log; l.dt_bias = dt_bias; l.conv1d = conv1d;
+	l.gdn_norm = norm; l.gdn_out.f = out_proj;
+	/* Distinct per-head gates: head 0 open (a=+10 -> decay ~0), head 1 shut
+	 * (a=-10 -> decay ~1). If the batched path shared one scalar across heads,
+	 * both heads would see the same decay and the outputs would diverge from
+	 * the token reference. */
+	in_a[0] = 10.f; in_a[1] = -10.f;
+	in_b[0] = 10.f; in_b[1] = -10.f;
+	gdn_batch(&m, &l, 0, xs, 2, batch_out);
+	memset(m.gdn_S[0], 0, 2 * sizeof(float));
+	gdn_token(&m, &l, 0, xs, token_out);
+	gdn_token(&m, &l, 0, xs + 2, token_out + 2);
+	for (int i = 0; i < 4; i++)
+		CHECK(fabsf(batch_out[i] - token_out[i]) < 1e-5f,
+		      "batched GDN out[%d]=%g != token ref %g (per-head gates broken)", i, batch_out[i], token_out[i]);
+	free(m.gdn_S[0]); free(m.gdn_conv[0]);
+	free(m.gdn_S); free(m.gdn_conv); free(m.K); free(m.V);
+}
+
+/* #109: batched continuation must use absolute positions (pos_base + j),
+ * not restart at 0. RoPE makes position observable: run attention_batch
+ * with pos0=5 and compare against attention_token at the same absolute
+ * positions. */
+static void test_batched_absolute_positions(void){
+	Model m;
+	Layer l;
+	float q[8] = { 0 }, k[] = { 1.f, 0.f, 0.f, 1.f }, v[] = { 1.f, 0.f, 0.f, 1.f };
+	float o[] = { 1.f, 0.f, 0.f, 1.f }, norm[] = { 0.f, 0.f };
+	float x[] = { 1.f, 0.f };
+	float batch_out[2] = { 0 }, token_out[2] = { 0 };
+	memset(&m, 0, sizeof(m)); memset(&l, 0, sizeof(l));
+	g_kv_f16 = 0;
+	m.c.hidden = 2; m.c.n_layers = 1; m.c.n_heads = 1; m.c.n_kv_heads = 1;
+	m.c.head_dim = 2; m.c.rotary_dim = 2; m.c.theta = 10000.f; m.c.eps = 1e-6f;
+	m.max_t = 8;
+	m.K = calloc(1, sizeof(float*)); m.V = calloc(1, sizeof(float*));
+	m.gdn_S = calloc(1, sizeof(float*)); m.gdn_conv = calloc(1, sizeof(float*));
+	m.K[0] = calloc(8, sizeof(float)); m.V[0] = calloc(8, sizeof(float));
+	l.q.f = q; l.k.f = k; l.v.f = v; l.o.f = o; l.qn = norm; l.kn = norm;
+	/* Batch of 1 at absolute position 5. */
+	attention_batch(&m, &l, 0, x, 1, 5, batch_out);
+	memset(m.K[0], 0, 8 * sizeof(float)); memset(m.V[0], 0, 8 * sizeof(float));
+	attention_token(&m, &l, 0, x, 5, token_out);
+	CHECK(fabsf(batch_out[0] - token_out[0]) < 1e-5f &&
+	      fabsf(batch_out[1] - token_out[1]) < 1e-5f,
+	      "batched attention at pos0=5 out=(%g,%g) != token ref (%g,%g) (absolute positions broken)",
+	      batch_out[0], batch_out[1], token_out[0], token_out[1]);
+	free(m.K[0]); free(m.V[0]); free(m.K); free(m.V);
+	free(m.gdn_S); free(m.gdn_conv);
+}
+
 int main(void){
     test_slot_resident_bytes();
     test_mxfp4_expert_dispatch();
@@ -368,6 +446,8 @@ int main(void){
 	test_lifetime_exits();
 	test_hostile_shapes();
 	test_gdn_recurrence_conv_and_reset();
+	test_batched_gdn_per_head_gates();
+	test_batched_absolute_positions();
 	test_gated_attention();
 	test_request_reset_and_stop_feedback();
 	test_packed_expert_size_math();
