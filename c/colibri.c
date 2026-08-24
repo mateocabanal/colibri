@@ -2630,6 +2630,16 @@ static int uring_load_add(UringBatch *b,Model *m,int layer,int eid,ESlot *s,int 
         s->fslab_cap=ftot;
 #endif
     }
+    /* DUAL-SSD (#1165): pick this expert's replica exactly as the blocking
+     * path does. The uring path used the primary fd unconditionally, so
+     * URING=1 read every expert from drive 0 and COLI_MODEL_MIRROR bought
+     * nothing -- visible as an idle mirror in iostat while URING=0 lit it up.
+     * Same deterministic hash of (layer,eid), so an expert always comes from
+     * the same drive and PILOT's readahead lands where the demand read will.
+     * Partial mirrors fall back to the primary per shard, as at the blocking
+     * site. */
+    int rep=expert_route(layer,eid);
+    if(rep && st_fd_rep(&m->S,l->tw[0]->fd,rep)<0) rep=0;
     int ord[3]={0,1,2};
     for(int a=0;a<3;a++) for(int z=a+1;z<3;z++) if(l->tw[ord[z]]->off<l->tw[ord[a]]->off){int t=ord[a];ord[a]=ord[z];ord[z]=t;}
     int contig=l->tw[ord[0]]->fd==l->tw[ord[1]]->fd && l->tw[ord[1]]->fd==l->tw[ord[2]]->fd
@@ -2637,7 +2647,7 @@ static int uring_load_add(UringBatch *b,Model *m,int layer,int eid,ESlot *s,int 
         && l->tw[ord[1]]->off+l->tw[ord[1]]->nbytes==l->tw[ord[2]]->off;
     if(contig){
         int64_t off0=l->tw[ord[0]]->off;
-        int dfd=g_direct?st_direct_fd(&m->S,l->tw[ord[0]]->fd):-1;
+        int dfd=g_direct?st_direct_fd_rep(&m->S,l->tw[ord[0]]->fd,rep):-1;
         if(dfd>=0){
             int64_t base=off0&~4095LL,need=(off0-base)+wtot,len=(need+4095)&~4095LL;
             l->pos[ord[0]]=off0-base; l->pos[ord[1]]=l->pos[ord[0]]+l->tw[ord[0]]->nbytes;
@@ -2647,20 +2657,20 @@ static int uring_load_add(UringBatch *b,Model *m,int layer,int eid,ESlot *s,int 
         }else{
             l->pos[ord[0]]=0; l->pos[ord[1]]=l->tw[ord[0]]->nbytes;
             l->pos[ord[2]]=l->pos[ord[1]]+l->tw[ord[1]]->nbytes;
-            if(uring_add_read(b,li,l->tw[ord[0]]->fd,s->slab,(size_t)wtot,off0,(size_t)wtot))
+            if(uring_add_read(b,li,rep_bfd(&m->S,l->tw[ord[0]]->fd,rep),s->slab,(size_t)wtot,off0,(size_t)wtot))
                 return uring_load_error(l,errno,"io_uring expert read"),li;
         }
     }else{
         int64_t o=0;
         for(int a=0;a<3;a++){ int k=ord[a]; l->pos[k]=o;
-            if(uring_add_read(b,li,l->tw[k]->fd,s->slab+o,(size_t)l->tw[k]->nbytes,l->tw[k]->off,(size_t)l->tw[k]->nbytes))
+            if(uring_add_read(b,li,rep_bfd(&m->S,l->tw[k]->fd,rep),s->slab+o,(size_t)l->tw[k]->nbytes,l->tw[k]->off,(size_t)l->tw[k]->nbytes))
                 return uring_load_error(l,errno,"io_uring expert read"),li;
             o+=l->tw[k]->nbytes;
         }
     }
     int64_t fo=0;
     for(int k=0;k<3;k++){
-        if(uring_add_read(b,li,l->tq[k]->fd,s->fslab+fo,(size_t)l->tq[k]->nbytes,l->tq[k]->off,(size_t)l->tq[k]->nbytes))
+        if(uring_add_read(b,li,rep_bfd(&m->S,l->tq[k]->fd,rep),s->fslab+fo,(size_t)l->tq[k]->nbytes,l->tq[k]->off,(size_t)l->tq[k]->nbytes))
             return uring_load_error(l,errno,"io_uring expert scale read"),li;
         fo+=l->tq[k]->nbytes/4;
     }

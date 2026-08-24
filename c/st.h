@@ -449,6 +449,28 @@ static void st_scan_dir(const char *dir, char files[][1024], int *nf, int *added
 static void st_init_multi(shards *S, const char *snap_dir, const char *extra_dirs) {
     memset(S, 0, sizeof(*S));
     S->cap = 4096; S->t = calloc(S->cap, sizeof(st_tensor));
+    /* Duplicate-tensor-name detector, indexed-shard scope.
+     * st_find()/S->hidx (below) aren't built until every shard has been read, so a
+     * duplicate name across two shards would otherwise go unnoticed until AFTER both are
+     * already appended to S->t -- by then the collision has already happened silently:
+     * st_find() would return whichever shard was appended first, while a container-wide
+     * __metadata__["colibri.fmt"] stamp for that name (st_fmt_stamp_ingest above) would
+     * still apply uniformly. A directory blending two containers under the same tensor
+     * names (e.g. an FP8 copy and an int8 copy of the same o_proj) would then silently read
+     * one shard's bytes labeled with a format that describes the other's -- no error, no
+     * warning, plausible numbers. This is a DIFFERENT concern from st_fmt_stamp_ingest's
+     * own duplicate check a few lines above: that dedups format CLAIMS keyed by name (and
+     * already refuses on a disagreeing claim); this dedups the tensor DATA entries
+     * themselves, the actual byte ranges a read resolves to. Kept as its own temporary
+     * open-addressing table (same probe scheme st_hash()/S->hidx use below) rather than a
+     * linear rescan, because a real container indexes on the order of 1e5 tensors and an
+     * O(n^2) scan at that scale is not a rounding error. Grown in lockstep with S->cap
+     * (below) and freed at the end of this function, just before S->hidx is built. */
+    int dup_cap = 1; while (dup_cap < S->cap * 2) dup_cap <<= 1;
+    int *dup_idx = (int*)malloc(dup_cap * sizeof(int));
+    if (!dup_idx) { fprintf(stderr, "OOM allocating duplicate-tensor-name detector (%d entries)\n",
+                dup_cap); exit(1); }
+    for (int di = 0; di < dup_cap; di++) dup_idx[di] = -1;
     /* raccoglie ordinatamente i nomi dei file shard */
     static char files[ST_MAX_SHARDS][1024]; int nf = 0;
     int c0 = 0; st_scan_dir(snap_dir, files, &nf, &c0);
@@ -537,17 +559,56 @@ static void st_init_multi(shards *S, const char *snap_dir, const char *extra_dir
             if (bad_shape) {
                 fprintf(stderr, "%s: tensor '%s' shape overflows int64 — refusing (hostile or corrupt file)\n",
                         files[fi], name); exit(1); }
+            /* Refuse if `name` was already indexed from an earlier shard (see the
+             * detector's block comment near the top of this function). Must run before
+             * this tensor is appended, and is intentionally NOT the same check as
+             * st_fmt_stamp_ingest's -- that one only ever sees the small subset of names a
+             * stamping tool chose to annotate; this one sees every tensor. */
+            {
+                uint64_t dh = st_hash(name) & (dup_cap - 1);
+                while (dup_idx[dh] >= 0) {
+                    if (!strcmp(S->t[dup_idx[dh]].name, name)) {
+                        int prev_fidx = st_fidx(S, S->t[dup_idx[dh]].fd);
+                        fprintf(stderr, "%s: tensor '%s' is also indexed from shard '%s' -- duplicate "
+                                "tensor name across indexed shards, refusing (a directory holding both "
+                                "would silently read one shard's bytes for this name while any "
+                                "__metadata__[\"colibri.fmt\"] stamp for it still applies uniformly)\n",
+                                files[fi], name, prev_fidx >= 0 ? S->paths[prev_fidx] : "<unknown>");
+                        exit(1);
+                    }
+                    dh = (dh + 1) & (dup_cap - 1);
+                }
+            }
             if (S->n == S->cap) {
                 S->cap *= 2;
                 st_tensor *nt = (st_tensor*)realloc(S->t, S->cap * sizeof(st_tensor));
                 if (!nt) { fprintf(stderr, "OOM reallocating shard tensor array\n"); exit(1); }
                 S->t = nt;
+                /* keep the duplicate-name detector's load factor low as S->t grows;
+                 * rehash into a table twice the new capacity. */
+                int new_dup_cap = dup_cap * 2;
+                int *ndup = (int*)malloc(new_dup_cap * sizeof(int));
+                if (!ndup) { fprintf(stderr, "OOM growing duplicate-tensor-name detector (%d entries)\n",
+                            new_dup_cap); exit(1); }
+                for (int di = 0; di < new_dup_cap; di++) ndup[di] = -1;
+                for (int di = 0; di < dup_cap; di++) {
+                    if (dup_idx[di] < 0) continue;
+                    uint64_t h = st_hash(S->t[dup_idx[di]].name) & (new_dup_cap - 1);
+                    while (ndup[h] >= 0) h = (h + 1) & (new_dup_cap - 1);
+                    ndup[h] = dup_idx[di];
+                }
+                free(dup_idx); dup_idx = ndup; dup_cap = new_dup_cap;
             }
             st_tensor *t = &S->t[S->n++];
             memset(t, 0, sizeof(*t));
             t->name = strdup(name); t->fd = fd; t->off = data_start + a0;
             t->nbytes = b0 - a0; t->dtype = st_dtype_code(dt->str); t->numel = numel;
             t->rank = shp->len;
+            /* Register this name in the duplicate detector now that t->name is
+             * stable, so the next shard's scan (above) sees it. */
+            { uint64_t dh = st_hash(t->name) & (dup_cap - 1);
+              while (dup_idx[dh] >= 0) dh = (dh + 1) & (dup_cap - 1);
+              dup_idx[dh] = S->n - 1; }
             for (int k = 0; k < t->rank; k++) t->shape[k] = (int64_t)shp->kids[k]->num;
             /* cross-check the declared element count against the byte span for FLOAT
              * dtypes: st_read_f32 writes `numel` floats (BF16/F16 loop or F32 memcpy)
@@ -562,6 +623,7 @@ static void st_init_multi(shards *S, const char *snap_dir, const char *extra_dir
         free(arena); /* i jval restano leakati: ok, una tantum all'avvio */
         free(hdr);
     }
+    free(dup_idx);  /* duplicate detector: one-time-startup scratch, superseded by S->hidx below */
     /* indice hash costruito a fine indicizzazione (gli indici restano validi dopo i realloc) */
     S->hcap = 1; while (S->hcap < S->n * 2) S->hcap <<= 1;
     S->hidx = malloc(S->hcap * sizeof(int));

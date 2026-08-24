@@ -1097,8 +1097,7 @@ static int usage_save(Model *m, const char *snap) {
     (void)m;                              /* the counters live in route_trace.h now */
     char up[2048];
     const char *env = getenv("PIN");
-    const char *sv = getenv("USAGE_SAVE");
-    if (sv && *sv == '0') return 0;
+    /* USAGE_SAVE=0 is honoured inside rt_save itself (#1039) */
     if (env && (!strcmp(env, "off") || !strcmp(env, "0"))) return 0;
     if (env) snprintf(up, sizeof(up), "%s", env);
     else snprintf(up, sizeof(up), "%s/.coli_usage", snap);
