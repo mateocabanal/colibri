@@ -10,4 +10,5 @@
 #include "qwen_prefix_cache_global_5.inc"
 #include "qwen_prefix_cache_global_6.inc"
 #include "qwen_prefix_cache_global_7.inc"
+#include "qwen_prefix_hot_planner.inc"
 #endif /* QWEN_PREFIX_CACHE_GLOBAL_WRAPPER_H */

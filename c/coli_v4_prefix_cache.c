@@ -3,6 +3,7 @@
  * Keeping the cache tiers together avoids a second engine-lifetime registry and
  * leaves the normal V4 link graph unchanged. */
 #include "coli_v4_prefix_cache_impl.inc"
+#include "coli_v4_prefix_hot_planner.inc"
 #include "coli_v4_prefix_disk_shared.inc"
 
 /*
