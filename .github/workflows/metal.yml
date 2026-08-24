@@ -37,6 +37,8 @@ jobs:
           make METAL=1 qwen_moe || { echo "FAILED: qwen_moe"; rc=1; }
           make -f Makefile.deepseek-v4 deepseek-v4 || { echo "FAILED: deepseek-v4"; rc=1; }
           exit $rc
+      - name: Compile embedded Metal shaders
+        run: python3 c/tests/check_embedded_metal.py
       - name: Metal backend contract tests
         run: make -C c metal-test
       - name: MetalIO contract tests
