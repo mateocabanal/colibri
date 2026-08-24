@@ -7383,8 +7383,34 @@ int coli_v4_engine_open(ColiV4Engine **output,
             ? COLI_CSF_CHECKSUM_RECORD_ON_READ : COLI_CSF_CHECKSUM_MANIFEST_ONLY;
     if (coli_dir && coli_checksum_policy == COLI_CSF_CHECKSUM_MANIFEST_ONLY)
         fprintf(stderr, "v4_coli integrity=manifest-and-shard record_crc=skipped reason=COLI_VERIFY_RECORDS-unset\n");
+    ColiRuntimeTarget apple8_runtime;
+    ColiExecutorOpenOptions coli_open_opts = {
+        "macos-arm64-metal-apple8-v1", coli_checksum_policy, 0};
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+    /* Apple8 executor open requires a populated runtime target (fail-closed
+     * contract, #140/#141). qwen fills it via qwen_coli_compat.h; V4 opens
+     * the executor directly, so fill it here. */
+    memset(&apple8_runtime, 0, sizeof(apple8_runtime));
+    apple8_runtime.profile_name = COLI_TARGET_PROFILE_MACOS_ARM64_METAL_APPLE8_V1;
+    apple8_runtime.target_os = COLI_TARGET_OS_MACOS;
+    apple8_runtime.target_arch = COLI_TARGET_ARCH_ARM64;
+    apple8_runtime.backend = COLI_TARGET_BACKEND_METAL;
+    apple8_runtime.gpu_kind = COLI_TARGET_GPU_APPLE_FAMILY;
+    apple8_runtime.cpu_feature_mask = COLI_TARGET_CPU_ARM64_ASIMD;
+    apple8_runtime.gpu_family = COLI_APPLE8_GPU_FAMILY_MIN;
+    apple8_runtime.runtime_features = COLI_TARGET_RUNTIME_APPLE_UNIFIED_MEMORY |
+                                      COLI_TARGET_RUNTIME_METAL_SHARED_STORAGE;
+    apple8_runtime.target_profile_abi = COLI_TARGET_PROFILE_ABI_APPLE8_V1;
+    apple8_runtime.execution_layout_abi = COLI_EXECUTION_LAYOUT_ABI_APPLE8_V1;
+    apple8_runtime.kernel_abi = COLI_KERNEL_ABI_APPLE8_MXFP4_TILE_V1;
+    apple8_runtime.target_class = COLI_TARGET_CLASS_APPLE8_METAL_V1;
+    apple8_runtime.max_record_alignment = COLI_APPLE8_RECORD_ALIGNMENT;
+    apple8_runtime.max_io_granularity = COLI_APPLE8_IO_GRANULARITY;
+    apple8_runtime.max_resident_alignment = COLI_APPLE8_RESIDENT_ALIGNMENT;
+    coli_open_opts.runtime_target = &apple8_runtime;
+#endif
     if (coli_dir && coli_executor_open(&engine->coli_static, coli_dir,
-            &(ColiExecutorOpenOptions){"macos-arm64-metal-apple8-v1", coli_checksum_policy, 0}, error, error_size)) goto fail;
+            &coli_open_opts, error, error_size)) goto fail;
     const ColiSafetensorsTensor *dspark_w1 = NULL, *dspark_w2 = NULL;
     int requested_full_dspark = v4_dspark_full_wanted(options);
     if (!engine->target_index && requested_full_dspark) {
