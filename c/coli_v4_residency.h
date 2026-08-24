@@ -76,13 +76,10 @@ static inline int coli_v4_residency_select(
 }
 
 void coli_v4_dense_cache_configure(uint64_t budget_bytes);
-<<<<<<< HEAD
 /* Change the dense admission ceiling and reclaim idle entries immediately.
  * Active borrowed entries are pinned until their layer/session releases them;
  * lowering below pinned_bytes therefore clamps only to that live-borrow floor. */
 uint64_t coli_v4_dense_cache_set_budget(uint64_t budget_bytes);
-=======
->>>>>>> origin/feat/sequence-state-core
 void coli_v4_dense_cache_reset(void);
 void coli_v4_dense_cache_stats(ColiV4DenseCacheStats *out);
 

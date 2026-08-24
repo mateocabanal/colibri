@@ -7,8 +7,8 @@ endif
 
 .PHONY: check clean
 
-<<<<<<< HEAD
-check: test_record_io$(EXE) test_expert_representation$(EXE) test_expert_residency$(EXE) test_expert_multivariant$(EXE) test_expert_transform$(EXE) test_expert_dispatch$(EXE) test_expert_dispatch_output$(EXE) test_expert_derived_cache$(EXE) test_expert_activation$(EXE) test_expert_residency_policy$(EXE) test_expert_resource_bridge$(EXE) test_resource_planner$(EXE) test_speculative_cache$(EXE) test_speculative_cache_disk$(EXE)
+check: test_kv_alloc$(EXE) test_record_io$(EXE) test_expert_representation$(EXE) test_expert_residency$(EXE) test_expert_multivariant$(EXE) test_expert_transform$(EXE) test_expert_dispatch$(EXE) test_expert_dispatch_output$(EXE) test_expert_derived_cache$(EXE) test_expert_activation$(EXE) test_expert_residency_policy$(EXE) test_expert_resource_bridge$(EXE) test_resource_planner$(EXE) test_speculative_cache$(EXE) test_speculative_cache_disk$(EXE)
+	./test_kv_alloc$(EXE)
 	./test_record_io$(EXE)
 	./test_expert_representation$(EXE)
 	./test_expert_residency$(EXE)
@@ -23,16 +23,13 @@ check: test_record_io$(EXE) test_expert_representation$(EXE) test_expert_residen
 	./test_resource_planner$(EXE)
 	./test_speculative_cache$(EXE)
 	./test_speculative_cache_disk$(EXE)
-=======
-check: test_record_io$(EXE) test_expert_residency$(EXE)
-	./test_record_io$(EXE)
-	./test_expert_residency$(EXE)
->>>>>>> origin/feat/sequence-state-core
+
+test_kv_alloc$(EXE): tests/test_kv_alloc.c sequence_state.h
+	$(CC) $(CFLAGS) -Wno-unused-parameter -Wno-unused-function tests/test_kv_alloc.c -o $@
 
 test_record_io$(EXE): tests/test_record_io.c record_io.h
 	$(CC) $(CFLAGS) tests/test_record_io.c -o $@
 
-<<<<<<< HEAD
 test_expert_representation$(EXE): tests/test_expert_representation.c expert_representation.h coli_format.h
 	$(CC) $(CFLAGS) tests/test_expert_representation.c -o $@
 
@@ -87,10 +84,3 @@ clean:
 		test_resource_planner test_resource_planner.exe \
 		test_speculative_cache test_speculative_cache.exe \
 		test_speculative_cache_disk test_speculative_cache_disk.exe
-=======
-test_expert_residency$(EXE): tests/test_expert_residency.c expert_residency.h expert_store.h
-	$(CC) $(CFLAGS) tests/test_expert_residency.c -o $@
-
-clean:
-	rm -f test_record_io test_record_io.exe test_expert_residency test_expert_residency.exe
->>>>>>> origin/feat/sequence-state-core
