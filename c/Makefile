@@ -760,7 +760,7 @@ QMOE_LDFLAGS = $(if $(QMOE_GPU_ENABLED),$(LDFLAGS),$(NOCUDA_LDFLAGS))
 qwen_coli_executor.o: coli_executor.c coli_executor.h coli_format.h
 	$(CC) $(QMOE_CFLAGS) -c coli_executor.c -o $@
 
-qwen_coli_format.o: coli_format.c coli_format.h compat.h
+qwen_coli_format.o: coli_format.c coli_format.h compat.h record_io_backend.h
 	$(CC) $(QMOE_CFLAGS) -c coli_format.c -o $@
 
 qwen_profile.o: profile.c profile.h
