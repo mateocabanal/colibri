@@ -14,6 +14,31 @@ int coli_v4_attention_snapshot_restore_fresh(
     const ColiV4AttentionSnapshot *snapshot,
     const ColiDeepSeekV4Config *config, int layer);
 
+typedef struct {
+    int ids[16];
+    float logits[16];
+    int count;
+} TokenCapture;
+
+static int capture_token(void *user_data, int token, float logit,
+                         int position, int ordinal) {
+    (void)position;
+    (void)ordinal;
+    TokenCapture *capture = (TokenCapture *)user_data;
+    if (!capture || capture->count >= (int)(sizeof(capture->ids) /
+                                            sizeof(capture->ids[0])))
+        return 1;
+    capture->ids[capture->count] = token;
+    capture->logits[capture->count] = logit;
+    capture->count++;
+    return 0;
+}
+
+static int same_tokens(const TokenCapture *a, const TokenCapture *b) {
+    return a && b && a->count == b->count && a->count > 0 &&
+           memcmp(a->ids, b->ids, (size_t)a->count * sizeof(a->ids[0])) == 0;
+}
+
 static int decode_token_string(const ColiV4Session *session,
                                const int *ids, int count,
                                char **output) {
@@ -103,14 +128,18 @@ static int open_session(ColiV4Session **session, ColiV4Engine *engine,
 }
 
 static int run_generation(ColiV4Session *session, const char *prompt,
+                          TokenCapture *capture,
+                          ColiV4SessionGenerateStats *stats,
                           char *error, size_t error_size) {
     ColiV4SessionGenerateOptions options = {
         .max_new_tokens = 4,
         .no_dspark = 1,
     };
-    ColiV4SessionGenerateStats stats = {0};
+    if (capture) memset(capture, 0, sizeof(*capture));
+    if (stats) memset(stats, 0, sizeof(*stats));
     return coli_v4_session_generate(session, prompt, strlen(prompt), &options,
-                                    NULL, NULL, &stats, error, error_size);
+                                    capture_token, capture, stats,
+                                    error, error_size);
 }
 
 /* The persistent codec must preserve every byte that the existing native
@@ -166,6 +195,66 @@ layer_done:
     return 0;
 }
 
+static int check_disabled_mode(const char *model, const char *prompt,
+                               char *error, size_t error_size) {
+    ColiV4Engine *engine = NULL;
+    ColiV4Session *session = NULL;
+    TokenCapture first = {0}, second = {0};
+    ColiV4SessionGenerateStats first_stats = {0}, second_stats = {0};
+    int status = 1;
+
+    if (open_engine(&engine, model, error, error_size) ||
+        open_session(&session, engine, error, error_size)) {
+        fprintf(stderr, "disabled-mode open failed: %s\n", error);
+        goto cleanup;
+    }
+    if (run_generation(session, prompt, &first, &first_stats,
+                       error, error_size) ||
+        run_generation(session, prompt, &second, &second_stats,
+                       error, error_size)) {
+        fprintf(stderr, "disabled-mode generation failed: %s\n", error);
+        goto cleanup;
+    }
+    if (session->prefix_reused || first_stats.prefix_reused_tokens ||
+        second_stats.prefix_reused_tokens || first_stats.prefix_ram_hits ||
+        second_stats.prefix_ram_hits || first_stats.prefix_ram_restore_bytes ||
+        second_stats.prefix_ram_restore_bytes) {
+        fprintf(stderr,
+                "disabled cache reused state: session=%d first=%d second=%d hits=%llu/%llu bytes=%llu/%llu\n",
+                session->prefix_reused,
+                first_stats.prefix_reused_tokens,
+                second_stats.prefix_reused_tokens,
+                (unsigned long long)first_stats.prefix_ram_hits,
+                (unsigned long long)second_stats.prefix_ram_hits,
+                (unsigned long long)first_stats.prefix_ram_restore_bytes,
+                (unsigned long long)second_stats.prefix_ram_restore_bytes);
+        goto cleanup;
+    }
+    if (!same_tokens(&first, &second)) {
+        fprintf(stderr, "disabled cache changed deterministic token ids\n");
+        goto cleanup;
+    }
+    ColiV4PrefixCacheStats cache = {0};
+    coli_v4_prefix_cache_stats(&cache);
+    if (cache.budget_bytes || cache.hits || cache.stores || cache.entries ||
+        cache.resident_bytes) {
+        fprintf(stderr,
+                "disabled cache retained resources: budget=%zu hits=%llu stores=%llu entries=%zu resident=%zu\n",
+                cache.budget_bytes, (unsigned long long)cache.hits,
+                (unsigned long long)cache.stores, cache.entries,
+                cache.resident_bytes);
+        goto cleanup;
+    }
+    printf("PASS cache-disabled parity: first_token=%d generated=%d reuse=0 budget=0\n",
+           first.ids[0], first.count);
+    status = 0;
+
+cleanup:
+    if (session) coli_v4_session_destroy(session);
+    if (engine) coli_v4_engine_destroy(engine);
+    return status;
+}
+
 int main(int argc, char **argv) {
     if (argc != 3) {
         fprintf(stderr, "usage: %s MODEL_DIR INITIAL_PROMPT\n", argv[0]);
@@ -174,36 +263,54 @@ int main(int argc, char **argv) {
     const char *model = argv[1];
     const char *initial_prompt = argv[2];
     char error[1024] = {0};
-    ColiV4Engine *shared_engine = NULL, *cold_engine = NULL, *rejected_engine = NULL;
+    uint64_t reserve = (uint64_t)coli_v4_prefix_cache_budget_bytes();
+    if (!reserve) {
+        const char *mode = getenv("COLI_PREFIX_CACHE");
+        if (mode && !strcmp(mode, "off"))
+            return check_disabled_mode(model, initial_prompt,
+                                       error, sizeof(error));
+        fprintf(stderr,
+                "set V4_PREFIX_CACHE_MB positive for enabled test, or COLI_PREFIX_CACHE=off for disabled test\n");
+        return 2;
+    }
+
+    ColiV4Engine *shared_engine = NULL, *cold_engine = NULL;
+    ColiV4Engine *rejected_engine = NULL;
     ColiV4Session *first = NULL, *equal = NULL, *extended = NULL, *codec = NULL;
-    ColiV4Session *longest = NULL, *cold = NULL;
+    ColiV4Session *longest = NULL, *cold = NULL, *miss = NULL;
     char *extension_token = NULL, *prompt_plus_one = NULL, *prompt_plus_two = NULL;
     char *longest_text = NULL, *cold_text = NULL;
-    uint64_t reserve = (uint64_t)coli_v4_prefix_cache_budget_bytes();
+    int *divergent_ids = NULL;
+    TokenCapture first_tokens = {0}, equal_tokens = {0};
+    TokenCapture extended_capture = {0}, warm_tokens = {0}, cold_tokens = {0};
+    ColiV4SessionGenerateStats first_stats = {0}, equal_stats = {0};
+    ColiV4SessionGenerateStats extended_stats = {0};
+    ColiV4SessionGenerateStats warm_stats = {0}, cold_stats = {0};
     const uint64_t explicit_limit = 3ULL * 1024ULL * 1024ULL * 1024ULL;
     int status = 1;
-
-    if (!reserve) {
-        fprintf(stderr, "V4_PREFIX_CACHE_MB must be positive for this test\n");
-        goto cleanup;
-    }
 
     if (open_engine(&shared_engine, model, error, sizeof(error)) ||
         open_session(&first, shared_engine, error, sizeof(error)) ||
         open_session(&equal, shared_engine, error, sizeof(error)) ||
         open_session(&extended, shared_engine, error, sizeof(error)) ||
         open_session(&codec, shared_engine, error, sizeof(error)) ||
-        open_session(&longest, shared_engine, error, sizeof(error))) {
+        open_session(&longest, shared_engine, error, sizeof(error)) ||
+        open_session(&miss, shared_engine, error, sizeof(error))) {
         fprintf(stderr, "shared engine/session open failed: %s\n", error);
         goto cleanup;
     }
 
-    if (run_generation(first, initial_prompt, error, sizeof(error))) {
+    if (run_generation(first, initial_prompt, &first_tokens, &first_stats,
+                       error, sizeof(error))) {
         fprintf(stderr, "first generation failed: %s\n", error);
         goto cleanup;
     }
-    if (!first->prompt_ids || first->prompt_count <= 0) {
-        fprintf(stderr, "first session did not retain tokenized prompt\n");
+    if (!first->prompt_ids || first->prompt_count < 2 ||
+        first_stats.prefix_reused_tokens || first_stats.prefix_ram_hits) {
+        fprintf(stderr,
+                "first session invalid: prompt=%d reused=%d hits=%llu\n",
+                first->prompt_count, first_stats.prefix_reused_tokens,
+                (unsigned long long)first_stats.prefix_ram_hits);
         goto cleanup;
     }
     if (check_wire_roundtrip(first, codec)) goto cleanup;
@@ -218,15 +325,23 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
 
-    /* Exact equality is deliberately not a hit: the generation contract always
-     * executes at least one fresh prompt token, so only strict prefixes qualify. */
-    if (run_generation(equal, initial_prompt, error, sizeof(error))) {
+    /* Equal length cannot restore an end-of-prefill attention snapshot because
+     * generation still needs the final prompt hidden row. It must cold-prefill
+     * and remain token-identical. The exact same request is tested warm below by
+     * restoring a strict cached prefix and comparing its next argmax to cold. */
+    if (run_generation(equal, initial_prompt, &equal_tokens, &equal_stats,
+                       error, sizeof(error))) {
         fprintf(stderr, "equal-prompt generation failed: %s\n", error);
         goto cleanup;
     }
-    if (equal->prefix_reused != 0) {
-        fprintf(stderr, "equal prompt unexpectedly reused %d tokens\n",
-                equal->prefix_reused);
+    if (equal->prefix_reused != 0 || equal_stats.prefix_reused_tokens != 0 ||
+        equal_stats.prefix_ram_hits != 0 ||
+        !same_tokens(&first_tokens, &equal_tokens)) {
+        fprintf(stderr,
+                "equal prompt fallback failed: reused=%d stats=%d hits=%llu token_identity=%d\n",
+                equal->prefix_reused, equal_stats.prefix_reused_tokens,
+                (unsigned long long)equal_stats.prefix_ram_hits,
+                same_tokens(&first_tokens, &equal_tokens));
         goto cleanup;
     }
 
@@ -242,14 +357,23 @@ int main(int argc, char **argv) {
         fprintf(stderr, "out of memory building first extension\n");
         goto cleanup;
     }
-    if (run_generation(extended, prompt_plus_one, error, sizeof(error))) {
+    if (run_generation(extended, prompt_plus_one,
+                       &extended_capture, &extended_stats,
+                       error, sizeof(error))) {
         fprintf(stderr, "first extension generation failed: %s\n", error);
         goto cleanup;
     }
-    if (extended->prefix_reused != base_tokens) {
+    if (extended->prefix_reused != base_tokens ||
+        extended_stats.prefix_reused_tokens != base_tokens ||
+        extended_stats.prefix_ram_hits != 1 ||
+        !extended_stats.prefix_ram_restore_bytes ||
+        !(extended_stats.prefix_ram_restore_sec > 0.0)) {
         fprintf(stderr,
-                "cross-session cache did not restore base prefix: got=%d expected=%d\n",
-                extended->prefix_reused, base_tokens);
+                "cross-session restore stats invalid: session=%d stats=%d hits=%llu bytes=%llu sec=%.9f expected=%d\n",
+                extended->prefix_reused, extended_stats.prefix_reused_tokens,
+                (unsigned long long)extended_stats.prefix_ram_hits,
+                (unsigned long long)extended_stats.prefix_ram_restore_bytes,
+                extended_stats.prefix_ram_restore_sec, base_tokens);
         goto cleanup;
     }
     if (!extended->prompt_ids || extended->prompt_count <= base_tokens) {
@@ -275,18 +399,49 @@ int main(int argc, char **argv) {
         fprintf(stderr, "out of memory building second extension\n");
         goto cleanup;
     }
-    if (run_generation(longest, prompt_plus_two, error, sizeof(error))) {
+    if (run_generation(longest, prompt_plus_two, &warm_tokens, &warm_stats,
+                       error, sizeof(error))) {
         fprintf(stderr, "longest-prefix generation failed: %s\n", error);
         goto cleanup;
     }
-    if (longest->prefix_reused != extended_tokens) {
+    if (longest->prefix_reused != extended_tokens ||
+        warm_stats.prefix_reused_tokens != extended_tokens ||
+        warm_stats.prefix_ram_hits != 1) {
         fprintf(stderr,
-                "longest-prefix selection failed: got=%d expected=%d base=%d\n",
-                longest->prefix_reused, extended_tokens, base_tokens);
+                "longest-prefix selection failed: session=%d stats=%d hits=%llu expected=%d base=%d\n",
+                longest->prefix_reused, warm_stats.prefix_reused_tokens,
+                (unsigned long long)warm_stats.prefix_ram_hits,
+                extended_tokens, base_tokens);
         goto cleanup;
     }
     if (generated_text(longest, &longest_text)) {
         fprintf(stderr, "cannot decode longest-prefix output\n");
+        goto cleanup;
+    }
+
+    /* Mismatch and rewind are fail-closed misses. Use the exact token arrays so
+     * tokenizer round-tripping cannot weaken either matching assertion. */
+    divergent_ids = malloc((size_t)longest->prompt_count * sizeof(*divergent_ids));
+    if (!divergent_ids) {
+        fprintf(stderr, "out of memory building divergent token probe\n");
+        goto cleanup;
+    }
+    memcpy(divergent_ids, longest->prompt_ids,
+           (size_t)longest->prompt_count * sizeof(*divergent_ids));
+    int pivot = base_tokens / 2;
+    int replacement = divergent_ids[pivot] + 1;
+    if (replacement >= longest->config.vocab_size) replacement = 0;
+    if (replacement == divergent_ids[pivot] && longest->config.vocab_size > 1)
+        replacement = 1;
+    divergent_ids[pivot] = replacement;
+    if (coli_v4_prefix_cache_restore(miss, divergent_ids,
+                                     longest->prompt_count) != 0) {
+        fprintf(stderr, "one-token divergence unexpectedly restored a prefix\n");
+        goto cleanup;
+    }
+    if (coli_v4_prefix_cache_restore(miss, first->prompt_ids,
+                                     base_tokens - 1) != 0) {
+        fprintf(stderr, "shorter/rewind request unexpectedly restored a prefix\n");
         goto cleanup;
     }
 
@@ -312,13 +467,29 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
 
-    if (run_generation(cold, prompt_plus_two, error, sizeof(error))) {
+    /* Same exact request prompt on the warm and cold sessions. The warm run has
+     * restored P+X and prefilled only Y; its very first generated token is the
+     * next-token argmax acceptance gate, then every generated token must match. */
+    if (run_generation(cold, prompt_plus_two, &cold_tokens, &cold_stats,
+                       error, sizeof(error))) {
         fprintf(stderr, "cold generation failed: %s\n", error);
         goto cleanup;
     }
-    if (cold->prefix_reused != 0) {
-        fprintf(stderr, "different engine unexpectedly reused %d tokens\n",
-                cold->prefix_reused);
+    if (cold->prefix_reused != 0 || cold_stats.prefix_reused_tokens != 0 ||
+        cold_stats.prefix_ram_hits != 0) {
+        fprintf(stderr,
+                "different engine unexpectedly reused: session=%d stats=%d hits=%llu\n",
+                cold->prefix_reused, cold_stats.prefix_reused_tokens,
+                (unsigned long long)cold_stats.prefix_ram_hits);
+        goto cleanup;
+    }
+    if (!same_tokens(&warm_tokens, &cold_tokens) ||
+        warm_tokens.ids[0] != cold_tokens.ids[0]) {
+        fprintf(stderr,
+                "warm/cold token identity failed: warm_first=%d cold_first=%d warm_count=%d cold_count=%d\n",
+                warm_tokens.count ? warm_tokens.ids[0] : -1,
+                cold_tokens.count ? cold_tokens.ids[0] : -1,
+                warm_tokens.count, cold_tokens.count);
         goto cleanup;
     }
     if (generated_text(cold, &cold_text)) {
@@ -351,19 +522,21 @@ int main(int argc, char **argv) {
     coli_v4_prefix_cache_stats(&cache);
     uint64_t expected_matched = (uint64_t)base_tokens + (uint64_t)extended_tokens;
     if (cache.hits < 2 || cache.matched_tokens < expected_matched ||
-        !cache.restore_bytes || !cache.restore_ns) {
+        !cache.restore_bytes || !cache.restore_ns || cache.resident_bytes > reserve) {
         fprintf(stderr,
-                "prefix-cache telemetry incomplete: hits=%llu matched=%llu expected_matched=%llu bytes=%llu ns=%llu\n",
+                "prefix-cache telemetry incomplete: hits=%llu matched=%llu expected=%llu bytes=%llu ns=%llu resident=%zu reserve=%llu\n",
                 (unsigned long long)cache.hits,
                 (unsigned long long)cache.matched_tokens,
                 (unsigned long long)expected_matched,
                 (unsigned long long)cache.restore_bytes,
-                (unsigned long long)cache.restore_ns);
+                (unsigned long long)cache.restore_ns,
+                cache.resident_bytes, (unsigned long long)reserve);
         goto cleanup;
     }
 
-    printf("PASS cross-session prefix cache: base=%d extended=%d longest=%d prompt tokens, %.3f MiB restored in %.3f ms, output identical to cold prefill; persistent wire round-trip exact; memory projected=%.3fGiB reserve=%.3fGiB limit=%.3fGiB\n",
+    printf("PASS Stage1 V4 prefix cache: base=%d extended=%d warm_reuse=%d first_argmax=%d token_identity=exact divergence=miss rewind=miss restore=%.3fMiB/%.3fms memory=%.3fGiB+%.3fGiB<=%.3fGiB\n",
            base_tokens, extended_tokens, longest->prefix_reused,
+           warm_tokens.ids[0],
            cache.restore_bytes / (1024.0 * 1024.0),
            cache.restore_ns / 1.0e6,
            memory.projected_bytes / 1073741824.0,
@@ -377,12 +550,14 @@ cleanup:
     free(prompt_plus_two);
     free(longest_text);
     free(cold_text);
+    free(divergent_ids);
     if (first) coli_v4_session_destroy(first);
     if (equal) coli_v4_session_destroy(equal);
     if (extended) coli_v4_session_destroy(extended);
     if (codec) coli_v4_session_destroy(codec);
     if (longest) coli_v4_session_destroy(longest);
     if (cold) coli_v4_session_destroy(cold);
+    if (miss) coli_v4_session_destroy(miss);
     if (shared_engine) coli_v4_engine_destroy(shared_engine);
     if (cold_engine) coli_v4_engine_destroy(cold_engine);
     if (rejected_engine) coli_v4_engine_destroy(rejected_engine);
