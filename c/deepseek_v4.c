@@ -1308,7 +1308,7 @@ static int v4_simd_hc_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
         const char *g = getenv("V4_SIMD_HC");
-        cached = g && atoi(g) != 0;
+        cached = !g || atoi(g) != 0;   /* default ON since #16; =0 opts out */
     }
     return cached;
 }
@@ -3182,7 +3182,7 @@ static int v4_simd_attn_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
         const char *g = getenv("V4_SIMD_ATTN");
-        cached = g && atoi(g) != 0;
+        cached = !g || atoi(g) != 0;   /* default ON since #16; =0 opts out */
     }
     return cached;
 }
@@ -7061,7 +7061,7 @@ static int v4_simd_route_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
         const char *g = getenv("V4_SIMD_ROUTE");
-        cached = g && atoi(g) != 0;
+        cached = !g || atoi(g) != 0;   /* default ON since #16; =0 opts out */
     }
     return cached;
 }
