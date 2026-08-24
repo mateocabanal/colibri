@@ -206,7 +206,9 @@ kernel void apple8_moe_gu8(
     constant int &H        [[buffer(11)]],
     constant int &M        [[buffer(12)]],
     constant int &K        [[buffer(13)]],
-    constant int3 *offs    [[buffer(14)]],
+    constant int *gate_off [[buffer(14)]],
+    constant int *up_off   [[buffer(15)]],
+    constant int *down_off [[buffer(16)]],
     uint tg                [[threadgroup_position_in_grid]],
     uint lane              [[thread_index_in_simdgroup]])
 {
@@ -223,10 +225,9 @@ kernel void apple8_moe_gu8(
     else if (e == 5) base = e5;
     else if (e == 6) base = e6;
     else if (e == 7) base = e7;
-    const int3 off = offs[e];
     device const float *xr = x + (long)s * H;
-    float gv = simd_sum(apple8_dot_partial(base + off.x, xr, H, m, lane));
-    float uv = simd_sum(apple8_dot_partial(base + off.y, xr, H, m, lane));
+    float gv = simd_sum(apple8_dot_partial(base + gate_off[e], xr, H, m, lane));
+    float uv = simd_sum(apple8_dot_partial(base + up_off[e], xr, H, m, lane));
     if (lane == 0) {
         const float silu = gv / (1.0f + exp(-gv));
         mid[(long)(e * S + s) * M + m] = silu * uv;
@@ -248,7 +249,9 @@ kernel void apple8_moe_down8(
     constant int &H              [[buffer(11)]],
     constant int &M              [[buffer(12)]],
     constant int &K              [[buffer(13)]],
-    constant int3 *offs          [[buffer(14)]],
+    constant int *gate_off       [[buffer(14)]],
+    constant int *up_off         [[buffer(15)]],
+    constant int *down_off       [[buffer(16)]],
     uint tg                      [[threadgroup_position_in_grid]],
     uint lane                    [[thread_index_in_simdgroup]])
 {
@@ -265,9 +268,8 @@ kernel void apple8_moe_down8(
     else if (e == 5) base = e5;
     else if (e == 6) base = e6;
     else if (e == 7) base = e7;
-    const int3 off = offs[e];
     device const float *mr = mid + (long)(e * S + s) * M;
-    float acc = simd_sum(apple8_dot_partial(base + off.z, mr, M, h, lane));
+    float acc = simd_sum(apple8_dot_partial(base + down_off[e], mr, M, h, lane));
     if (lane == 0) expert_y[(long)(e * S + s) * H + h] = acc;
 }
 )METAL";
@@ -1270,11 +1272,11 @@ extern "C" int coli_apple8_metalio_moe_topk_begin(
     id<MTLCommandBuffer> cb = [g_queue commandBuffer];
     if (!cb) { delete pending; return 0; }
 
-    struct { int gate, up, down; } offs[8] = {};
+    int gate_off[8] = {}, up_off[8] = {}, down_off[8] = {};
     for (int i = 0; i < expert_count && i < 8; ++i) {
-        offs[i].gate = (int)experts[i].gate_offset;
-        offs[i].up = (int)experts[i].up_offset;
-        offs[i].down = (int)experts[i].down_offset;
+        gate_off[i] = (int)experts[i].gate_offset;
+        up_off[i] = (int)experts[i].up_offset;
+        down_off[i] = (int)experts[i].down_offset;
     }
 
     id<MTLComputeCommandEncoder> gu = [cb computeCommandEncoder];
@@ -1291,7 +1293,9 @@ extern "C" int coli_apple8_metalio_moe_topk_begin(
         [gu setBytes:&hidden length:sizeof(hidden) atIndex:11];
         [gu setBytes:&intermediate length:sizeof(intermediate) atIndex:12];
         [gu setBytes:&expert_count length:sizeof(expert_count) atIndex:13];
-        [gu setBytes:offs length:(NSUInteger)expert_count * sizeof(offs[0]) atIndex:14];
+        [gu setBytes:gate_off length:(NSUInteger)expert_count * sizeof(int) atIndex:14];
+        [gu setBytes:up_off length:(NSUInteger)expert_count * sizeof(int) atIndex:15];
+        [gu setBytes:down_off length:(NSUInteger)expert_count * sizeof(int) atIndex:16];
         [gu dispatchThreadgroups:MTLSizeMake((NSUInteger)expert_count * (NSUInteger)S * (NSUInteger)intermediate, 1, 1)
               threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
     } else {
@@ -1322,7 +1326,9 @@ extern "C" int coli_apple8_metalio_moe_topk_begin(
         [down setBytes:&hidden length:sizeof(hidden) atIndex:11];
         [down setBytes:&intermediate length:sizeof(intermediate) atIndex:12];
         [down setBytes:&expert_count length:sizeof(expert_count) atIndex:13];
-        [down setBytes:offs length:(NSUInteger)expert_count * sizeof(offs[0]) atIndex:14];
+        [down setBytes:gate_off length:(NSUInteger)expert_count * sizeof(int) atIndex:14];
+        [down setBytes:up_off length:(NSUInteger)expert_count * sizeof(int) atIndex:15];
+        [down setBytes:down_off length:(NSUInteger)expert_count * sizeof(int) atIndex:16];
         [down dispatchThreadgroups:MTLSizeMake((NSUInteger)expert_count * (NSUInteger)S * (NSUInteger)hidden, 1, 1)
               threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
     } else {
