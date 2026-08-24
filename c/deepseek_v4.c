@@ -6291,6 +6291,10 @@ static void hot_usage_save(const V4HotPolicy *policy,
     if (!policy || !state || !policy->history_path || !policy->usage) return;
     const char *enabled = getenv("COLI_V4_SAVE_USAGE");
     if (enabled && atoi(enabled) == 0) return;
+    /* USAGE_SAVE=0: read-only run — the history is loaded but never written
+     * back (same switch rt_save honours for every other engine). */
+    { const char *sv = getenv("USAGE_SAVE");
+      if (sv && atoi(sv) == 0) return; }
     size_t tmp_length = strlen(policy->history_path) + sizeof(".tmp");
     char *tmp = malloc(tmp_length);
     if (!tmp) return;

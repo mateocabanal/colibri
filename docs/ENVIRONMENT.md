@@ -349,6 +349,17 @@ Read **only** by `c/inkling.c`.
 | `GPU_DEV` | `0` | CUDA device index for the inkling CUDA backend. |
 | `NOGPU` | unset | If set, skip GPU init entirely (both CUDA and Metal), regardless of the other GPU variables. |
 
+## DeepSeek V4 engine (`deepseek_v4`)
+
+The V4 engine has its own knob set (~70 variables: GPU tier, prefill segments/
+chunks, prefix checkpoints, expert I/O, speculative decoding, profilers). It is
+documented with defaults in
+[deepseek-v4.md — Environment reference](deepseek-v4.md#environment-reference-v4-engine);
+the ones you are most likely to set: `DSV4_CUDA` (GPU tier on/off),
+`COLI_CUDA_ATTN_BATCH=1`, `COLI_CUDA_MOE_BATCH=1`, `DSV4_CUDA_EXPERT_MIRRORS`,
+`V4_MOE_REFILL_GROUP`, `V4_PREFILL_SEGMENT`, `V4_PREFIX_CKPT*`, `CTX`.
+`COLI_V4_SAVE_USAGE=0` is an engine-specific alias that disables only V4's
+usage rewrite; the shared `USAGE_SAVE=0` covers this engine too.
 ## OLMoE engine (`olmoe`)
 
 Read **only** by `c/olmoe.c`. This is the sister engine used for streaming-cache research, so most of these are experiment knobs.

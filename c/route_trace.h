@@ -321,6 +321,12 @@ static void rt_decay(void){
 
 static int rt_save(const char *path, int quiet){
     if(!rt_c || !path || !*path) return 0;
+    /* USAGE_SAVE=0: read-only run — the history is loaded but never written back
+     * (#1039: benchmark loops must not skew the very profile they are measuring).
+     * Checked HERE so every engine honours the same switch with the same
+     * truthiness; a requested skip is a success, not a save failure. */
+    { const char *sv = getenv("USAGE_SAVE");
+      if(sv && atoi(sv)==0) return 1; }
     rt_decay();
     int64_t tot = 0, nz = 0;
     for(int i = 0; i <= rt_nl; i++){
