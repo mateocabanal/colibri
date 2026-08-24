@@ -588,6 +588,12 @@ int coli_v4_expert_forward_ref(float *output, const ColiExpertView *expert,
                                const float *input, float route_weight,
                                float swiglu_limit);
 
+/* #162: batched routed-expert forward (one expert, N matching routes). */
+int coli_v4_expert_forward_batch_ref(
+    float *outputs, const ColiExpertView *expert,
+    const float *const *inputs, const float *route_weights, int count,
+    float swiglu_limit);
+
 int coli_v4_shared_expert_forward_ref(float *output,
                                       const ColiTensorView *gate,
                                       const ColiTensorView *down,

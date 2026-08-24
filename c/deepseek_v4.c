@@ -4450,18 +4450,29 @@ static int v4_moe_batch_union(
         uint64_t compute_began = g_coli_v4_profile_on
             ? coli_v4_profile_now() : 0;
         int expert = view.key.expert;
-        for (int item = 0; !result && item < batch; item++)
-            for (int rank = 0; !result && rank < topk; rank++) {
-                if (indices[(size_t)item * topk + rank] != expert) continue;
-                result = coli_v4_expert_forward_ref(
-                    expert_output, &view, inputs + (size_t)item * d,
-                    route_weights[(size_t)item * topk + rank],
+        /* #162: batch every matching route for this expert into one call
+         * (scratch hoisted, weights hot across items; per-item numerics
+         * identical to the scalar loop). */
+        {
+            const float *batch_inputs[64];
+            float batch_weights[64];
+            int n = 0;
+            for (int item = 0; !result && item < batch; item++)
+                for (int rank = 0; !result && rank < topk; rank++) {
+                    if (indices[(size_t)item * topk + rank] != expert) continue;
+                    if (n < 64) {
+                        batch_inputs[n] = inputs + (size_t)item * d;
+                        batch_weights[n] = route_weights[(size_t)item * topk + rank];
+                        n++;
+                    } else {
+                        result = -1;
+                    }
+                }
+            if (!result && n > 0)
+                result = coli_v4_expert_forward_batch_ref(
+                    outputs, &view, batch_inputs, batch_weights, n,
                     config->swiglu_limit);
-                if (!result)
-                    for (int column = 0; column < d; column++)
-                        outputs[(size_t)item * d + column] +=
-                            expert_output[column];
-            }
+        }
         if (compute_began)
             coli_v4_profile_add(COLI_V4_PROF_EXPERT_COMPUTE,
                                 coli_v4_profile_now() - compute_began);
@@ -6931,6 +6942,93 @@ int coli_v4_expert_forward_ref(float *output, const ColiExpertView *expert,
     }
     if (!result) coli_bf16_round_array(output, output_size);
     free(activated); free(up); free(gate);
+    return result ? -1 : 0;
+#endif
+}
+
+/* #162: batched routed-expert forward. One expert, N matching routes.
+ * Hoists the per-call scratch into one allocation and keeps the weight
+ * rows hot across items; every per-item kernel call is IDENTICAL to the
+ * scalar path (same dual matvec, same bf16 rounds, same swiglu, same
+ * down matvec), so results are bit-identical to the per-(item,rank)
+ * loop. Accumulates expert_output * route_weight into outputs[item]. */
+int coli_v4_expert_forward_batch_ref(
+    float *outputs, const ColiExpertView *expert,
+    const float *const *inputs, const float *route_weights, int count,
+    float swiglu_limit) {
+#ifndef COLI_FP4_ROWS16_KERNEL
+    {
+        size_t output_size = (size_t)expert->down.rows;
+        float *expert_output = malloc(output_size * sizeof(*expert_output));
+        if (!expert_output) return -1;
+        int result = 0;
+        for (int i = 0; !result && i < count; i++) {
+            result = coli_v4_expert_forward_v17_fallback(
+                expert_output, expert, inputs[i], route_weights[i],
+                swiglu_limit);
+            if (!result)
+                for (size_t j = 0; j < output_size; j++)
+                    outputs[(size_t)i * output_size + j] += expert_output[j];
+        }
+        free(expert_output);
+        return result ? -1 : 0;
+    }
+#else
+    if (!outputs || !expert || !inputs || !route_weights || count < 1)
+        return -1;
+    if (expert->gate.block_rows != 16 ||
+        expert->down.block_rows != 16 || expert->up.block_rows != 16) {
+        /* Non-rows16 expert: scalar fallback, same per-item semantics. */
+        size_t output_size = (size_t)expert->down.rows;
+        float *expert_output = malloc(output_size * sizeof(*expert_output));
+        if (!expert_output) return -1;
+        int result = 0;
+        for (int i = 0; !result && i < count; i++) {
+            result = coli_v4_expert_forward_v17_fallback(
+                expert_output, expert, inputs[i], route_weights[i],
+                swiglu_limit);
+            if (!result)
+                for (size_t j = 0; j < output_size; j++)
+                    outputs[(size_t)i * output_size + j] += expert_output[j];
+        }
+        free(expert_output);
+        return result ? -1 : 0;
+    }
+    size_t intermediate = (size_t)expert->gate.rows;
+    size_t output_size = (size_t)expert->down.rows;
+    float *gate = malloc(intermediate * sizeof(*gate));
+    float *up = malloc(intermediate * sizeof(*up));
+    float *activated = malloc(intermediate * sizeof(*activated));
+    if (!gate || !up || !activated) {
+        free(activated); free(up); free(gate); return -1;
+    }
+    float *expert_output = malloc(output_size * sizeof(*expert_output));
+    if (!expert_output) {
+        free(activated); free(up); free(gate); return -1;
+    }
+    int result = 0;
+    for (int i = 0; !result && i < count; i++) {
+        result = coli_fp4_dual_matvec_rows16_v10(
+            gate, up, &expert->gate, &expert->up, inputs[i]);
+        if (!result) {
+            coli_bf16_round_array(gate, intermediate);
+            coli_bf16_round_array(up, intermediate);
+            result = coli_v4_swiglu(activated, gate, up,
+                                    (int)intermediate, swiglu_limit);
+        }
+        if (!result) {
+            for (size_t j = 0; j < intermediate; j++)
+                activated[j] = coli_bf16_round(activated[j] * route_weights[i]);
+            result = coli_fp4_matvec_rows16_v10(
+                expert_output, &expert->down, activated);
+        }
+        if (!result) {
+            coli_bf16_round_array(expert_output, output_size);
+            for (size_t j = 0; j < output_size; j++)
+                outputs[(size_t)i * output_size + j] += expert_output[j];
+        }
+    }
+    free(expert_output); free(activated); free(up); free(gate);
     return result ? -1 : 0;
 #endif
 }
