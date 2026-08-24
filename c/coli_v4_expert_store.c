@@ -90,6 +90,10 @@ typedef struct {
      * layers * loader width. */
     Slot *slots;
     int persistent_slots_per_layer;
+    /* #161: O(1) resident/in-flight lookup. Direct map (layer,expert) ->
+     * flat slot index into slots[], -1 = not resident/loading. Maintained
+     * under s->mutex at prepare/evict/fail, so it can never go stale. */
+    int *slot_by_expert;
     int transient_slots;
     int total_slots;
     int legacy_layout;
@@ -193,6 +197,18 @@ static Slot *persistent_for(State *s, int layer) {
 
 static Slot *transient_base(State *s) {
     return s->slots + (size_t)s->layers * s->persistent_slots_per_layer;
+}
+
+static int slot_flat_index(const State *s, const Slot *slot) {
+    return (int)(slot - s->slots);
+}
+
+static void index_set_locked(State *s, ColiExpertKey key, Slot *slot) {
+    if (key.layer < 0 || key.layer >= s->layers ||
+        key.expert < 0 || key.expert >= s->experts)
+        return;
+    s->slot_by_expert[(size_t)key.layer * s->experts + key.expert] =
+        slot ? slot_flat_index(s, slot) : -1;
 }
 
 static int same_key(const Slot *slot, ColiExpertKey key) {
@@ -429,23 +445,19 @@ static int fill(ColiExpertView *v, ColiExpertKey k, const Record *r,
 }
 
 static Slot *find_exact_locked(State *s, ColiExpertKey key) {
-    Slot *resident = NULL;
-    Slot *loading = NULL;
-    Slot *persistent = persistent_for(s, key.layer);
-    for (int i = 0; persistent && i < s->persistent_slots_per_layer; i++) {
-        Slot *slot = &persistent[i];
-        if (!same_key(slot, key)) continue;
-        if (slot->state == SLOT_RESIDENT) resident = slot;
-        else if (slot->state == SLOT_LOADING) loading = slot;
-    }
-    Slot *transient = transient_base(s);
-    for (int i = 0; i < s->transient_slots; i++) {
-        Slot *slot = &transient[i];
-        if (!same_key(slot, key)) continue;
-        if (slot->state == SLOT_RESIDENT) resident = slot;
-        else if (slot->state == SLOT_LOADING) loading = slot;
-    }
-    return resident ? resident : loading;
+    /* #161: O(1) direct-map lookup. The index is maintained under the same
+     * mutex as every slot transition, so a hit is authoritative; the
+     * same_key re-check is a cheap invariant guard, not a scan. */
+    if (key.layer < 0 || key.layer >= s->layers ||
+        key.expert < 0 || key.expert >= s->experts)
+        return NULL;
+    int idx = s->slot_by_expert[(size_t)key.layer * s->experts + key.expert];
+    if (idx < 0 || idx >= s->persistent_slots_per_layer * s->layers +
+                            s->transient_slots)
+        return NULL;
+    Slot *slot = s->slots + idx;
+    if (!same_key(slot, key)) return NULL;
+    return slot;
 }
 
 static Slot *choose_persistent_locked(State *s, ColiExpertKey key) {
@@ -509,12 +521,17 @@ static int prepare_slot_locked(State *s, Slot *slot, ColiExpertKey key) {
         s->stats.evictions++;
         trace_add_locked(s, TRACE_EVICT, old, slot, s->record_bytes);
     }
+    if (slot->layer >= 0) {
+        ColiExpertKey old = {slot->layer, slot->expert};
+        index_set_locked(s, old, NULL);
+    }
     slot->generation++;
     if (!slot->generation) slot->generation = 1; /* wrap away from sentinel 0 */
     slot->layer = key.layer;
     slot->expert = key.expert;
     slot->state = SLOT_LOADING;
     slot->last_use = ++s->clock;
+    index_set_locked(s, key, slot);
     io_begin_locked(s, key);
     trace_add_locked(s, TRACE_LOAD_BEGIN, key, slot, s->record_bytes);
     return 0;
@@ -638,6 +655,7 @@ retry:
         slot->state = SLOT_EMPTY;
         slot->layer = -1;
         slot->expert = -1;
+        index_set_locked(s, key, NULL);
         fprintf(stderr,
                 "v4_coli expert-load failed layer=%d expert=%d: %s\n",
                 key.layer, key.expert, error);
@@ -770,6 +788,7 @@ static void destroy(ColiExpertStore *store) {
         free(s->usage);
         free(s->slots);
         free(s->records);
+        free(s->slot_by_expert);
         free(s);
     }
     free(store);
@@ -863,7 +882,8 @@ int coli_v4_coli_expert_store_open(const ColiV4ColiExpertStoreOptions *o,
     s->offered_cache_bytes = o->cache_bytes;
     s->records = calloc((size_t)s->layers * s->experts, sizeof(*s->records));
     s->usage = calloc((size_t)s->layers * s->experts, sizeof(*s->usage));
-    if (!s->records || !s->usage) {
+    s->slot_by_expert = malloc((size_t)s->layers * s->experts * sizeof(int));
+    if (!s->records || !s->usage || !s->slot_by_expert) {
         fail(e, n, "out of memory indexing COLI experts");
         goto bad;
     }
@@ -965,6 +985,8 @@ int coli_v4_coli_expert_store_open(const ColiV4ColiExpertStoreOptions *o,
         fail(e, n, "out of memory creating COLI residency slots");
         goto bad;
     }
+    for (int i = 0; i < s->layers * s->experts; i++)
+        s->slot_by_expert[i] = -1;   /* calloc zeroes; -1 is the empty sentinel */
 
     for (int layer = 0; layer < s->layers; layer++) {
         Slot *slots = persistent_for(s, layer);
