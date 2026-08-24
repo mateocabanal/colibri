@@ -1023,6 +1023,20 @@ def server_probe(base, api_key=None, timeout=1.5):
     except Exception:
         return None
 
+def find_server(host="127.0.0.1", start=8000, span=11, api_key=None):
+    """First live coli serve at host:start..start+span-1, else (None, None).
+    The server binds the next free port when the requested one is taken
+    (openai_server._next_free_port), so the client scans a small window
+    instead of hardcoding one port. ponytail: span=11 covers any realistic
+    collision chain; a non-coli service squatting inside the window would
+    be misattached, acceptable for a dev server."""
+    for port in range(start, start + span):
+        base = f"http://{host}:{port}"
+        mid = server_probe(base, api_key)
+        if mid:
+            return base, mid
+    return None, None
+
 def chat_attached(a, base, model_id):
     """The chat REPL over HTTP against a running `coli serve`.
 
@@ -1164,8 +1178,11 @@ def cmd_chat(a):
     # wins; otherwise probe localhost quietly and use it if it's there. --no-attach
     # forces the old behaviour. The probe costs ~1 ms when nothing is listening.
     if not getattr(a,"no_attach",False):
-        base=getattr(a,"attach",None) or "http://127.0.0.1:8000"
-        mid=server_probe(base, getattr(a,"api_key",None))
+        base=getattr(a,"attach",None)
+        if base:
+            mid=server_probe(base, getattr(a,"api_key",None))
+        else:
+            base, mid=find_server(api_key=getattr(a,"api_key",None))
         if mid:
             banner(f"chat · {mid} · attached")
             chat_attached(a, base, mid); return
@@ -1198,9 +1215,10 @@ def cmd_chat(a):
             for _ in range(1800):
                 if p.poll() is not None:
                     sp.stop(); sys.exit(f"{model_id} server exited while loading")
-                if server_probe("http://127.0.0.1:8000",a.api_key,timeout=1.0):
+                base, mid=find_server(api_key=a.api_key)
+                if mid:
                     sp.stop()
-                    chat_attached(a,"http://127.0.0.1:8000",model_id)
+                    chat_attached(a,base,mid)
                     return
                 time.sleep(1)
             sp.stop(); sys.exit(f"timed out loading {model_id}")
@@ -1462,16 +1480,15 @@ def cmd_web(a):
             waited = 0
             while True:
                 time.sleep(2); waited += 2
-                try:
-                    urllib.request.urlopen(f"http://{a.host}:{a.port}/health", timeout=5)
-                except OSError:
+                base, _ = find_server(a.host, a.port, api_key=a.api_key)
+                if not base:
                     # Say something once, rather than looking hung. A 93-layer K3 load
                     # is 40+ minutes and the user has no way to tell waiting from stuck.
                     if waited == 300:
                         print(f"still loading; the dashboard will open at {url} when the "
                               f"engine is ready (Ctrl-C to stop, or --no-browser to skip)")
                     continue
-                webbrowser.open(url); return
+                webbrowser.open(base); return
         threading.Thread(target=opener, daemon=True).start()
     print(f"dashboard: {url}  (opens automatically when the engine is ready)")
     cmd_serve(a)
