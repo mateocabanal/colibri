@@ -944,6 +944,65 @@ int main(void) {
       if (!ok) fail = 1;
     }
   }
+  // #168: Kimi K3 KDA operators vs CPU references.
+  {
+    const int P = 8, K = 3, H = 4, hd = 8;
+    float win[P*K], vec[P], taps[P*K], win0[P*K], vec0[P];
+    for (int i = 0; i < P*K; i++) { win[i] = 0.01f * i; taps[i] = 0.5f - 0.01f * i; }
+    for (int i = 0; i < P; i++) vec[i] = (float)(i + 1);
+    memcpy(win0, win, sizeof(win)); memcpy(vec0, vec, sizeof(vec));
+    if (!coli_metal_kda_conv_silu(win, vec, taps, P, K)) { printf("kda_conv_silu: FAILED (rc=0)\n"); fail = 1; }
+    else {
+      int ok = 1;
+      for (int d = 0; d < P; d++) {
+        for (int j = 0; j < K-1; j++) win0[d*K+j] = win0[d*K+j+1];
+        win0[d*K+K-1] = vec0[d];
+        float acc = 0; for (int j = 0; j < K; j++) acc += taps[d*K+j] * win0[d*K+j];
+        float want = acc / (1.0f + expf(-acc));
+        if (fabsf(vec[d] - want) > 1e-4f) { ok = 0; break; }
+      }
+      printf("kda_conv_silu: %s\n", ok ? "ok" : "FAILED");
+      if (!ok) fail = 1;
+    }
+    float q[H*hd], k[H*hd], q0[H*hd], k0[H*hd];
+    for (int i = 0; i < H*hd; i++) { q[i] = 0.1f * (i % 5) + 0.3f; k[i] = 0.2f * (i % 3) - 0.1f; }
+    memcpy(q0, q, sizeof(q)); memcpy(k0, k, sizeof(k));
+    float qscale = 0.5f;
+    if (!coli_metal_kda_l2_norm(q, k, H, hd, qscale)) { printf("kda_l2_norm: FAILED (rc=0)\n"); fail = 1; }
+    else {
+      int ok = 1;
+      for (int h = 0; h < H; h++) {
+        float sq = 0, sk = 0;
+        for (int i = 0; i < hd; i++) { sq += q0[h*hd+i]*q0[h*hd+i]; sk += k0[h*hd+i]*k0[h*hd+i]; }
+        float qs = (1.0f / sqrtf(sq + 1e-6f)) * qscale, ks = 1.0f / sqrtf(sk + 1e-6f);
+        for (int i = 0; i < hd; i++)
+          if (fabsf(q[h*hd+i] - q0[h*hd+i]*qs) > 1e-4f || fabsf(k[h*hd+i] - k0[h*hd+i]*ks) > 1e-4f) { ok = 0; break; }
+      }
+      printf("kda_l2_norm: %s\n", ok ? "ok" : "FAILED");
+      if (!ok) fail = 1;
+    }
+    float S[H*hd*hd], S0[H*hd*hd], qn[H*hd], kn[H*hd], vh[H*hd], alpha[H*hd], beta[H], oh[H*hd];
+    for (int i = 0; i < H*hd*hd; i++) S[i] = 0.01f * (i % 7);
+    memcpy(S0, S, sizeof(S));
+    for (int i = 0; i < H*hd; i++) { qn[i] = 0.05f*i; kn[i] = 0.03f*i; vh[i] = 0.02f*i; alpha[i] = 0.9f + 0.001f*i; }
+    for (int i = 0; i < H; i++) beta[i] = 0.5f + 0.1f*i;
+    if (!coli_metal_kda_state(S, qn, kn, vh, alpha, beta, oh, H, hd)) { printf("kda_state: FAILED (rc=0)\n"); fail = 1; }
+    else {
+      int ok = 1;
+      for (int h = 0; h < H; h++) {
+        for (int i = 0; i < hd; i++) {
+          float kiS = 0;
+          for (int kk = 0; kk < hd; kk++) { S0[h*hd*hd + kk*hd + i] *= alpha[h*hd+kk]; kiS += kn[h*hd+kk] * S0[h*hd*hd + kk*hd + i]; }
+          float vi = (vh[h*hd+i] - kiS) * beta[h];
+          float oi = 0;
+          for (int kk = 0; kk < hd; kk++) { S0[h*hd*hd + kk*hd + i] += kn[h*hd+kk] * vi; oi += qn[h*hd+kk] * S0[h*hd*hd + kk*hd + i]; }
+          if (fabsf(oh[h*hd+i] - oi) > 1e-4f) { ok = 0; break; }
+        }
+      }
+      printf("kda_state: %s\n", ok ? "ok" : "FAILED");
+      if (!ok) fail = 1;
+    }
+  }
   printf(fail? "metal backend tests: FAILED\n" : "metal backend tests: ok\n");
   coli_metal_shutdown();
   return fail;

@@ -71,6 +71,9 @@
 #include <sys/resource.h>
 #include <sys/select.h>
 #include <unistd.h>
+#ifdef COLI_METAL
+#include "backend_metal.h"   /* #168: KDA operators declared here (extern-C guarded) */
+#endif
 #endif
 #include <pthread.h>
 #include <stdatomic.h>
@@ -813,6 +816,18 @@ static void res_mix(float *out, const float *prefix, const float *bres, int nb, 
 
 /* ---------- KDA layer (chunk of C tokens; projections batched, recurrence
  * sequential per token, AVX2 on the state sweeps) ---------- */
+#ifdef COLI_METAL
+static int kda_metal_enabled(void) {
+    static int initialized = 0, enabled = 0;
+    if (!initialized) {
+        const char *v = getenv("K3_METAL");
+        if (v && v[0] && strcmp(v, "0") != 0) enabled = 1;
+        initialized = 1;
+    }
+    return enabled && coli_metal_available();
+}
+#endif
+
 static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float *out){
     Cfg *c=&m->c; Kda *a=&l->a;
     int P=c->kda_proj, H=c->kda_heads, hd=c->kda_hd, K=c->conv_k;
@@ -825,6 +840,9 @@ static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float
     matmul(graw,t1,a->fb,C,c->kda_hd,P);
     matmul(braw,x,a->bp,C,c->hidden,H);
     float qscale=1.f/sqrtf((float)hd);
+#ifdef COLI_METAL
+    const int kda_metal = kda_metal_enabled();
+#endif
     for(int t=0;t<C;t++){
         float *qt=q+(int64_t)t*P, *kt=k+(int64_t)t*P, *tv=v+(int64_t)t*P;
         float *gpt=gp+(int64_t)t*P, *ont=on+(int64_t)t*P;
@@ -832,6 +850,17 @@ static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float
         /* depthwise causal conv (window: oldest..newest) + SiLU, rolls forward */
         float *wins[3]={m->cwq[li],m->cwk[li],m->cwv[li]};
         float *vecs[3]={qt,kt,tv}; float *taps[3]={a->conv_q,a->conv_k,a->conv_v};
+#ifdef COLI_METAL
+        if (kda_metal) {
+            /* #168: one Metal call per conv stream; the kernels shift the
+             * window, apply taps, and write back vec — identical semantics
+             * to the CPU loop below. */
+            for (int w2 = 0; w2 < 3; w2++)
+                if (!coli_metal_kda_conv_silu(wins[w2], vecs[w2], taps[w2], P, K))
+                    goto kda_cpu;
+        } else
+#endif
+        {
         for(int w2=0;w2<3;w2++){
             float *win=wins[w2], *vec=vecs[w2]; const float *cw=taps[w2];
             #pragma omp parallel for schedule(static)
@@ -844,6 +873,38 @@ static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float
                 vec[d]=siluf_(acc);
             }
         }
+        }
+#ifdef COLI_METAL
+        if (kda_metal) {
+            /* l2-norm + state recurrence on the GPU; alpha/beta computed on
+             * the CPU (cheap, per-head scalars). The state kernel writes raw
+             * oi into a scratch buffer; the per-head RMSNorm * sigmoid(gate)
+             * epilogue stays on the CPU (identical to the reference path). */
+            float alpha[H*hd], beta[H], oh_metal[H*hd];
+            for (int h = 0; h < H; h++) {
+                for (int i = 0; i < hd; i++) {
+                    float z = rgt[(int64_t)h*hd+i] + a->dt[(int64_t)h*hd+i];
+                    alpha[h*hd+i] = expf(c->gate_lb*sigmoidf_(a->A[h]*z));
+                }
+                beta[h] = sigmoidf_(bt[h]);
+            }
+            if (!coli_metal_kda_l2_norm(qt, kt, H, hd, qscale) ||
+                !coli_metal_kda_state(m->kstate[li], qt, kt, tv, alpha, beta,
+                                       oh_metal, H, hd))
+                goto kda_cpu;
+            for (int h = 0; h < H; h++) {
+                const float *ohh = oh_metal + (int64_t)h*hd;
+                double ms = 0;
+                for (int vv = 0; vv < hd; vv++) ms += (double)ohh[vv]*ohh[vv];
+                float r = 1.f/sqrtf((float)(ms/hd)+c->eps);
+                float *dst = ont + (int64_t)h*hd;
+                for (int vv = 0; vv < hd; vv++)
+                    dst[vv] = ohh[vv]*r*a->onw[vv]*sigmoidf_(gpt[(int64_t)h*hd+vv]);
+            }
+            continue;
+        }
+kda_cpu:
+#endif
         #pragma omp parallel for schedule(static)
         for(int h=0;h<H;h++){
             const float *qh=qt+(int64_t)h*hd, *kh=kt+(int64_t)h*hd, *vh=tv+(int64_t)h*hd;
