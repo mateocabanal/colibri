@@ -373,5 +373,46 @@ class OmpThreadsForEveryEngineTest(unittest.TestCase):
                     self.assertNotIn(key, env)
 
 
+class ModelFlagPlacementTest(unittest.TestCase):
+    """The LAST explicit --model on the command line wins, before or after the
+    subcommand (#61).  `info` prints the resolved model path as its model row."""
+
+    def run_info(self, *args):
+        return subprocess.run(
+            [sys.executable, str(CLI), *args],
+            cwd=HERE,
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
+
+    def fake_model(self):
+        directory = tempfile.TemporaryDirectory()
+        with open(os.path.join(directory.name, "config.json"), "w", encoding="utf-8") as f:
+            json.dump({"model_type": "glm"}, f)
+        return directory
+
+    def test_model_before_subcommand_wins(self):
+        with self.fake_model() as model:
+            result = self.run_info("--model", model, "info")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(model, result.stdout)
+
+    def test_model_after_subcommand_wins(self):
+        with self.fake_model() as model:
+            result = self.run_info("info", "--model", model)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(model, result.stdout)
+
+    def test_later_model_after_subcommand_overrides_earlier(self):
+        with self.fake_model() as model_b, self.fake_model() as model_a:
+            result = self.run_info("--model", model_a, "info", "--model", model_b)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(model_b, result.stdout)
+        self.assertNotIn(model_a, result.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()
