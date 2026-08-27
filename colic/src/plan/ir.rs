@@ -311,6 +311,8 @@ pub struct PhysicalPlan {
     /// Planner + cost-model versions for reproducibility (#201).
     pub planner_version: u64,
     pub cost_model_version: u64,
+    /// Source checkpoint fingerprint the plan was built from (replay pin).
+    pub source_fingerprint: Option<String>,
 }
 
 pub const PLAN_SCHEMA_VERSION: u64 = 1;
@@ -353,6 +355,7 @@ impl PhysicalPlan {
             "plan_schema_version": self.plan_schema_version,
             "planner_version": self.planner_version,
             "cost_model_version": self.cost_model_version,
+            "source_fingerprint": self.source_fingerprint,
             "objective": self.objective,
             "context_tokens": self.context_tokens,
             "machine": self.machine.to_json(),
@@ -459,6 +462,7 @@ mod tests {
             context_tokens: 32768,
             planner_version: PLANNER_VERSION,
             cost_model_version: COST_MODEL_VERSION,
+            source_fingerprint: None,
         }
     }
 

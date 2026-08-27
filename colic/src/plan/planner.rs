@@ -48,6 +48,7 @@ pub fn build_plan(
     machine: &MachineProfile,
     config: Option<&Value>,
     request: &PlanRequest,
+    source_fingerprint: Option<String>,
 ) -> Result<PhysicalPlan> {
     let objective = request.objective;
 
@@ -196,6 +197,7 @@ pub fn build_plan(
         context_tokens: budgets.context_tokens,
         planner_version: PLANNER_VERSION,
         cost_model_version: COST_MODEL_VERSION,
+        source_fingerprint,
     })
 }
 
@@ -332,8 +334,8 @@ mod tests {
             batch: 1,
             target_profile: None,
         };
-        let first = build_plan(&model, &box64(), None, &request).unwrap();
-        let second = build_plan(&model, &box64(), None, &request).unwrap();
+        let first = build_plan(&model, &box64(), None, &request, None).unwrap();
+        let second = build_plan(&model, &box64(), None, &request, None).unwrap();
         assert_eq!(first, second);
         first.validate().expect("plan must validate");
     }
@@ -347,7 +349,7 @@ mod tests {
             batch: 1,
             target_profile: None,
         };
-        let plan = build_plan(&model, &box64(), None, &request).unwrap();
+        let plan = build_plan(&model, &box64(), None, &request, None).unwrap();
         let expert_math: Vec<_> = plan
             .tensors
             .iter()
@@ -377,6 +379,7 @@ mod tests {
                 batch: 1,
                 target_profile: None,
             },
+            None,
         )
         .unwrap();
         // Synthetic state treats all layers as full attention; larger context
@@ -391,6 +394,7 @@ mod tests {
                 batch: 1,
                 target_profile: None,
             },
+            None,
         )
         .unwrap();
         let cache_of = |plan: &PhysicalPlan| {

@@ -15,8 +15,7 @@ pub enum Command {
     Help,
 }
 
-pub const USAGE: &str = "Usage:\n  colic inspect-source MODEL_DIR\n  colic verify PACKAGE_DIR\n  colic probe [--json]
-  colic plan MODEL_DIR [--objective O] [--context N] [--machine-profile F] [--json] [-o FILE]\n  colic compile MODEL_DIR --target native|PROFILE --quant exact|PROFILE --codec none|auto|PROFILE --opt default|size|latency -o OUTPUT [--dry-run] [--verify] [--force]";
+pub const USAGE: &str = "Usage:\n  colic inspect-source MODEL_DIR\n  colic verify PACKAGE_DIR\n  colic probe [--json]\n  colic plan MODEL_DIR [--objective O] [--context N] [--machine-profile F] [--json] [-o FILE]\n  colic compile MODEL_DIR --target native|auto|PROFILE --quant exact|PROFILE --codec none|auto|PROFILE --opt default|size|latency -o OUTPUT [--dry-run] [--verify] [--force] [--plan FILE]";
 
 pub fn parse<I>(args: I) -> Result<Command>
 where
@@ -161,6 +160,9 @@ where
             "--dry-run" => request.dry_run = true,
             "--verify" => request.verify = true,
             "--force" => request.force = true,
+            "--plan" => {
+                request.plan = Some(PathBuf::from(value(&mut args, "--plan")?));
+            }
             other => {
                 return Err(ColicError::Usage(format!(
                     "unknown compile option `{other}`"

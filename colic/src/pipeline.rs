@@ -22,6 +22,8 @@ pub struct CompileRequest {
     pub dry_run: bool,
     pub verify: bool,
     pub force: bool,
+    /// `--plan FILE` (#201): replay a saved plan manifest.
+    pub plan: Option<PathBuf>,
 }
 
 impl CompileRequest {
@@ -36,6 +38,7 @@ impl CompileRequest {
             dry_run: false,
             verify: false,
             force: false,
+            plan: None,
         }
     }
 }
@@ -43,12 +46,18 @@ impl CompileRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TargetRequest {
     Native,
+    /// `--target auto` (#201): the inline planner resolves quant + profile
+    /// from the probed machine before emission.
+    Auto,
     Profile(String),
 }
 impl TargetRequest {
     pub fn parse(value: &str) -> Result<Self> {
         if value == "native" {
             return Ok(Self::Native);
+        }
+        if value == "auto" {
+            return Ok(Self::Auto);
         }
         if value.starts_with("portable") {
             return Err(ColicError::Usage(
@@ -236,6 +245,68 @@ fn reject_incompatible_target(
     Ok(())
 }
 
+/// Resolve `--target auto` (#201): run the inline planner on the probed
+/// machine and translate its routed-expert decision into the concrete target
+/// profile + quantization for emission.
+fn resolve_auto_target(
+    request: &CompileRequest,
+    model: &SemanticModel,
+    inventory: &source::SourceInventory,
+) -> Result<(target::TargetProfile, ExpertQuantization)> {
+    use crate::plan::{
+        cost::Objective,
+        ir::{BackendKind, MathFormat, TensorRole},
+        machine::MachineProfile,
+        planner::{build_plan, PlanRequest},
+    };
+    let machine = MachineProfile::probe();
+    let config = source::config(&inventory.root)?;
+    let plan = build_plan(
+        model,
+        &machine,
+        config.as_ref(),
+        &PlanRequest {
+            objective: Objective::Balanced,
+            context_tokens: 8192,
+            batch: 1,
+            target_profile: None,
+        },
+        Some(inventory.source_fingerprint.clone()),
+    )?;
+    let expert_math = plan
+        .tensors
+        .iter()
+        .find(|tensor| tensor.role == TensorRole::RoutedExpert)
+        .map(|tensor| (tensor.math, tensor.backend));
+    match expert_math {
+        Some((MathFormat::Int4G32, BackendKind::Cpu)) => {
+            Ok((target::LINUX_X86_64_AVX2_V1, ExpertQuantization::Int4))
+        }
+        Some((MathFormat::Mxfp4, BackendKind::Metal)) => {
+            Ok((target::MACOS_ARM64_METAL_APPLE8_V1, ExpertQuantization::Mxfp4))
+        }
+        Some((MathFormat::Mxfp4, BackendKind::Cuda)) => {
+            Ok((target::LINUX_X86_64_AVX2_V1, ExpertQuantization::Int4))
+        }
+        _ => Ok((target::LINUX_X86_64_AVX2_V1, ExpertQuantization::Exact)),
+    }
+}
+
+/// Resolve the concrete (profile, quantization) pair for a request.
+fn resolve_plan_options(
+    request: &CompileRequest,
+    model: &SemanticModel,
+    inventory: &source::SourceInventory,
+) -> Result<(target::TargetProfile, ExpertQuantization)> {
+    if request.target == TargetRequest::Auto {
+        return resolve_auto_target(request, model, inventory);
+    }
+    let quantization = resolve_expert_quantization(request, model)?;
+    let target_profile = target::resolve(&request.target, target::HostCapabilities::current())?;
+    reject_incompatible_target(quantization, target_profile)?;
+    Ok((target_profile, quantization))
+}
+
 pub fn dry_run(request: &CompileRequest) -> Result<DryRunSummary> {
     validate_supported_options(request)?;
     let inventory = source::discover(&request.source)?;
@@ -245,10 +316,9 @@ pub fn dry_run(request: &CompileRequest) -> Result<DryRunSummary> {
             "no supported architecture frontend matched this source model",
         )
     })?;
-    let quantization = resolve_expert_quantization(request, &model)?;
-    let target_profile = target::resolve(&request.target, target::HostCapabilities::current())?;
-    reject_incompatible_target(quantization, target_profile)?;
-    let records = record_inventory(&model, quantization, target_profile)?;
+    let (target_profile, expert_quantization) =
+        resolve_plan_options(request, &model, &inventory)?;
+    let records = record_inventory(&model, expert_quantization, target_profile)?;
     let plan = storage::plan_records(&records, target_profile, 4 * 1024 * 1024 * 1024)?;
     Ok(DryRunSummary {
         target_name: target_profile.name,
@@ -559,6 +629,75 @@ fn copy_package_json_metadata(
     Ok(())
 }
 
+/// Validate a saved plan manifest against the source inventory + request
+/// before emission (#201). Replay validates; it never re-runs policy.
+fn validate_plan_replay(
+    plan_path: &std::path::Path,
+    inventory: &source::SourceInventory,
+    request: &CompileRequest,
+) -> Result<()> {
+    let bytes = std::fs::read(plan_path).map_err(|error| ColicError::Io {
+        path: plan_path.to_path_buf(),
+        source: error,
+    })?;
+    let plan: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|error| ColicError::Usage(format!(
+            "plan manifest {} is not valid JSON: {error}",
+            plan_path.display()
+        )))?;
+    let schema = plan
+        .get("plan_schema_version")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    if schema != crate::plan::ir::PLAN_SCHEMA_VERSION {
+        return Err(ColicError::Usage(format!(
+            "plan schema version {schema} unsupported (expected {})",
+            crate::plan::ir::PLAN_SCHEMA_VERSION
+        )));
+    }
+    let pinned = plan
+        .get("source_fingerprint")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            ColicError::Usage("plan manifest is missing `source_fingerprint`".into())
+        })?;
+    if pinned != inventory.source_fingerprint {
+        return Err(ColicError::Usage(format!(
+            "plan manifest was built for source fingerprint {pinned}, but this source hashes to {}; re-run `colic plan` on this checkpoint",
+            inventory.source_fingerprint
+        )));
+    }
+    // v1 replay contract: the plan's routed-expert math must match the
+    // requested quantization (the only per-record format the current
+    // emission path varies). Non-expert families are emitted exact.
+    let expert_math = plan
+        .get("tensors")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|tensors| {
+            tensors
+                .iter()
+                .find(|tensor| tensor.get("role").and_then(serde_json::Value::as_str) == Some("routed_expert"))
+        })
+        .and_then(|tensor| tensor.get("math"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("bf16");
+    let requested = match &request.quant {
+        QuantRequest::Exact => "bf16",
+        QuantRequest::Profile(profile) => match profile.as_str() {
+            "int4" | "int4-g32" => "int4_g32",
+            "mxfp4" => "mxfp4",
+            "nvfp4" | "nvfp4-1d" => "nvfp4",
+            other => other,
+        },
+    };
+    if expert_math != requested {
+        return Err(ColicError::Usage(format!(
+            "plan manifest expects expert math `{expert_math}` but --quant `{requested}` was requested; replay the plan with matching options"
+        )));
+    }
+    Ok(())
+}
+
 pub fn compile(request: &CompileRequest, progress: &mut dyn ProgressSink) -> Result<()> {
     if request.dry_run {
         let _summary = dry_run(request)?;
@@ -569,6 +708,12 @@ pub fn compile(request: &CompileRequest, progress: &mut dyn ProgressSink) -> Res
     let inventory = source::discover_with_progress(&request.source, &mut |update| {
         progress.source_file(&update);
     })?;
+    // Plan replay (#201): validate the saved manifest against this source and
+    // the requested options BEFORE emission. Replay validates; it never
+    // re-runs policy.
+    if let Some(plan_path) = &request.plan {
+        validate_plan_replay(plan_path, &inventory, request)?;
+    }
     progress.stage(Stage::SemanticIr);
     let model = build_semantic_ir(&inventory)?.ok_or_else(|| {
         ColicError::unsupported(
@@ -576,10 +721,9 @@ pub fn compile(request: &CompileRequest, progress: &mut dyn ProgressSink) -> Res
             "no supported architecture frontend matched this source model",
         )
     })?;
-    let expert_quantization = resolve_expert_quantization(request, &model)?;
+    let (target_profile, expert_quantization) =
+        resolve_plan_options(request, &model, &inventory)?;
     progress.stage(Stage::TargetPlanning);
-    let target_profile = target::resolve(&request.target, target::HostCapabilities::current())?;
-    reject_incompatible_target(expert_quantization, target_profile)?;
     let output = request
         .output
         .as_ref()

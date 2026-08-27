@@ -57,7 +57,13 @@ pub fn run(options: &PlanOptions) -> Result<String> {
         batch: options.batch,
         target_profile: None,
     };
-    let plan = build_plan(&model, &machine, config.as_ref(), &request)?;
+    let plan = build_plan(
+        &model,
+        &machine,
+        config.as_ref(),
+        &request,
+        Some(inventory.source_fingerprint.clone()),
+    )?;
     plan.validate().map_err(|reason| ColicError::unsupported("target planning", reason))?;
     let json = plan.to_json();
     let text = if options.json {
