@@ -77,13 +77,17 @@ pub fn quantize_matrix(matrix: &Matrix) -> Result<PackedMatrix> {
     let mut weights = Vec::with_capacity(weight_capacity);
     let mut scales = Vec::with_capacity(scale_capacity);
     let mut source_row = vec![0_u8; row_bytes];
-    for _ in 0..matrix.rows {
-        file.read_exact(&mut source_row)
-            .map_err(|source| ColicError::Io {
-                path: matrix.source.source.clone(),
-                source,
-            })?;
-        quantize_bf16_row(&source_row, &mut weights, &mut scales)?;
+    if matrix.source.dtype == "F8_E4M3" {
+        quantize_fp8_matrix(matrix, &mut file, &mut weights, &mut scales)?;
+    } else {
+        for _ in 0..matrix.rows {
+            file.read_exact(&mut source_row)
+                .map_err(|source| ColicError::Io {
+                    path: matrix.source.source.clone(),
+                    source,
+                })?;
+            quantize_bf16_row(&source_row, &mut weights, &mut scales)?;
+        }
     }
 
     debug_assert_eq!(weights.len(), weight_capacity);
@@ -96,25 +100,109 @@ pub fn quantize_matrix(matrix: &Matrix) -> Result<PackedMatrix> {
     })
 }
 
-fn validate_source(matrix: &Matrix) -> Result<()> {
-    if matrix.source.dtype != "BF16" {
-        return Err(ColicError::unsupported(
-            "INT4 quantization",
-            format!(
-                "matrix at {} has dtype `{}`; grouped INT4 lowering currently requires BF16 source weights",
-                matrix.source.source.display(),
-                matrix.source.dtype
-            ),
+/// FP8 E4M3 block-scaled path (Qwen3.8-Next experts): read each row, dequant
+/// through the per-128×128-block `weight_scale_inv` BF16 scales into BF16
+/// bytes, then feed the same BF16→INT4 row quantizer.
+fn quantize_fp8_matrix(
+    matrix: &Matrix,
+    file: &mut File,
+    packed_weights: &mut Vec<u8>,
+    scales: &mut Vec<f32>,
+) -> Result<()> {
+    let Some(scale_ref) = &matrix.scale else {
+        return Err(ColicError::Usage(
+            "F8_E4M3 source matrix is missing its weight_scale_inv block-scale tensor".into(),
         ));
+    };
+    if scale_ref.dtype != "BF16" {
+        return Err(ColicError::Usage(format!(
+            "weight_scale_inv dtype is {} (expected BF16)",
+            scale_ref.dtype
+        )));
     }
-    if matrix.scale.is_some() {
+    let block_rows = matrix.rows.div_ceil(super::fp8::FP8_BLOCK as u32);
+    let block_columns = matrix.columns.div_ceil(super::fp8::FP8_BLOCK as u32);
+    let expected_scale_len = u64::from(block_rows) * u64::from(block_columns) * 2;
+    if scale_ref.len != expected_scale_len {
+        return Err(ColicError::Usage(format!(
+            "weight_scale_inv is {} bytes, expected {expected_scale_len} for {block_rows}x{block_columns} blocks",
+            scale_ref.len
+        )));
+    }
+    let mut scale_file = File::open(&scale_ref.source).map_err(|source| ColicError::Io {
+        path: scale_ref.source.clone(),
+        source,
+    })?;
+    scale_file
+        .seek(SeekFrom::Start(scale_ref.offset))
+        .map_err(|source| ColicError::Io {
+            path: scale_ref.source.clone(),
+            source,
+        })?;
+
+    let fp8_row_bytes = matrix.columns as usize; // 1 byte per element
+    let bf16_row_bytes = matrix.columns as usize * 2;
+    let scale_row_bytes = block_columns as usize * 2;
+    let mut fp8_row = vec![0_u8; fp8_row_bytes];
+    let mut bf16_row = vec![0_u8; bf16_row_bytes];
+    let mut scale_row = vec![0_u8; scale_row_bytes];
+    for row in 0..matrix.rows {
+        file.read_exact(&mut fp8_row)
+            .map_err(|source| ColicError::Io {
+                path: matrix.source.source.clone(),
+                source,
+            })?;
+        scale_file
+            .read_exact(&mut scale_row)
+            .map_err(|source| ColicError::Io {
+                path: scale_ref.source.clone(),
+                source,
+            })?;
+        let block_row = row / super::fp8::FP8_BLOCK as u32;
+        for column in 0..matrix.columns as usize {
+            let block_col = column / super::fp8::FP8_BLOCK;
+            let scale_bits = u16::from_le_bytes([
+                scale_row[block_col * 2],
+                scale_row[block_col * 2 + 1],
+            ]);
+            let scale = f32::from_bits(u32::from(scale_bits) << 16);
+            let value = super::fp8::decode_e4m3(fp8_row[column]) * scale;
+            if !value.is_finite() {
+                return Err(ColicError::Usage(format!(
+                    "FP8 dequant produced non-finite value at row {row} column {column}"
+                )));
+            }
+            let bits = super::fp8::f32_to_bf16_bits(value);
+            bf16_row[column * 2] = (bits & 0xff) as u8;
+            bf16_row[column * 2 + 1] = (bits >> 8) as u8;
+        }
+        quantize_bf16_row(&bf16_row, packed_weights, scales)?;
+    }
+    Ok(())
+}
+
+fn validate_source(matrix: &Matrix) -> Result<()> {
+    let element_bytes = match matrix.source.dtype.as_str() {
+        "BF16" => 2_u64,
+        "F8_E4M3" => 1,
+        other => {
+            return Err(ColicError::unsupported(
+                "INT4 quantization",
+                format!(
+                    "matrix at {} has dtype `{other}`; grouped INT4 lowering requires BF16 or F8_E4M3 source weights",
+                    matrix.source.source.display(),
+                ),
+            ));
+        }
+    };
+    if matrix.scale.is_some() && matrix.source.dtype != "F8_E4M3" {
         return Err(ColicError::unsupported(
             "INT4 quantization",
             "pre-scaled matrices are not accepted by the BF16 -> grouped INT4 pass",
         ));
     }
     let row_bytes = u64::from(matrix.columns)
-        .checked_mul(2)
+        .checked_mul(element_bytes)
         .ok_or_else(|| ColicError::Usage("INT4 source row size overflows u64".into()))?;
     let expected = u64::from(matrix.rows)
         .checked_mul(row_bytes)
@@ -123,8 +211,8 @@ fn validate_source(matrix: &Matrix) -> Result<()> {
         return Err(ColicError::InvalidSource {
             path: matrix.source.source.clone(),
             detail: format!(
-                "BF16 matrix payload is {} bytes, expected {expected} for {}x{}",
-                matrix.source.len, matrix.rows, matrix.columns
+                "{} matrix payload is {} bytes, expected {expected} for {}x{}",
+                matrix.source.dtype, matrix.source.len, matrix.rows, matrix.columns
             ),
         });
     }
@@ -256,5 +344,53 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("non-finite"));
+    }
+
+    #[test]
+    fn fp8_block_scaled_matrix_roundtrips_through_int4() {
+        use crate::source::TensorRef;
+        // 1 row x 64 cols of constant value 1.0 in FP8 (code 0x38), block
+        // scale 2.0. Dequant = 2.0 everywhere -> INT4 scale = 2/7, max code.
+        let dir = std::env::temp_dir();
+        let weight_path = dir.join(format!("colic-i4-fp8-w-{}", std::process::id()));
+        let scale_path = dir.join(format!("colic-i4-fp8-s-{}", std::process::id()));
+        std::fs::write(&weight_path, vec![0x38_u8; 64]).unwrap();
+        let scale_bits = super::super::fp8::f32_to_bf16_bits(2.0) as u16;
+        std::fs::write(&scale_path, scale_bits.to_le_bytes()).unwrap();
+        let matrix = Matrix {
+            source: TensorRef {
+                source: weight_path.clone(),
+                offset: 0,
+                len: 64,
+                dtype: "F8_E4M3".into(),
+                shape: vec![1, 64],
+            },
+            rows: 1,
+            columns: 64,
+            scale: Some(TensorRef {
+                source: scale_path.clone(),
+                offset: 0,
+                len: 2,
+                dtype: "BF16".into(),
+                shape: vec![1, 1],
+            }),
+        };
+        let packed = quantize_matrix(&matrix).unwrap();
+        assert_eq!(packed.scales, vec![2.0 / 7.0, 2.0 / 7.0]);
+        for index in 0..4 {
+            let byte = packed.weights[index / 2];
+            let code = if index & 1 == 0 {
+                byte & 0x0f
+            } else {
+                byte >> 4
+            };
+            assert_eq!(
+                (code as i32) - 8,
+                7,
+                "constant 2.0 must quantize to the max code"
+            );
+        }
+        let _ = std::fs::remove_file(&weight_path);
+        let _ = std::fs::remove_file(&scale_path);
     }
 }

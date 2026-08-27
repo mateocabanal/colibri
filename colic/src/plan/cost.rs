@@ -105,10 +105,10 @@ pub fn choose_candidate(
         if avx2 {
             candidates.push(Candidate {
                 math: MathFormat::Int4G32,
-                layout: PhysicalLayout::Rows16,
+                layout: PhysicalLayout::Canonical,
                 backend: BackendKind::Cpu,
                 score: 10.0 + size_penalty(bytes_at(MathFormat::Int4G32), objective),
-                reason: "avx2 cpu: grouped int4-g32 rows16 kernel (4-bit storage, simd matvec)".into(),
+                reason: "avx2 cpu: grouped int4-g32 canonical kernel (4-bit storage, simd matvec)".into(),
             });
             candidates.push(Candidate {
                 math: MathFormat::Mxfp4,
@@ -276,7 +276,7 @@ mod tests {
             |_| 30 * 1024 * 1024 * 1024,
         )
         .unwrap();
-        assert_eq!(decision.chosen, "int4_g32 rows16");
+        assert_eq!(decision.chosen, "int4_g32 canonical");
         // DP4A was not even offered: the expert set does not fit VRAM.
         assert!(decision
             .rejected
@@ -308,7 +308,7 @@ mod tests {
             |_| 30 * 1024 * 1024 * 1024,
         )
         .unwrap();
-        assert_eq!(decision.chosen, "int4_g32 rows16");
+        assert_eq!(decision.chosen, "int4_g32 canonical");
     }
 
     #[test]
@@ -334,7 +334,7 @@ mod tests {
             |_| 30 * 1024 * 1024 * 1024,
         )
         .unwrap();
-        assert_eq!(decision.chosen, "int4_g32 rows16");
+        assert_eq!(decision.chosen, "int4_g32 canonical");
         assert!(decision
             .rejected
             .iter()
@@ -357,7 +357,7 @@ mod tests {
         )
         .unwrap();
         // int4_g32 (30 GiB) beats mxfp4 (31 GiB) purely on size.
-        assert_eq!(decision.chosen, "int4_g32 rows16");
+        assert_eq!(decision.chosen, "int4_g32 canonical");
     }
 
     #[test]
