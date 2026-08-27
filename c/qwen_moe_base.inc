@@ -58,6 +58,76 @@
 #include <pthread.h>
 #include "coli_executor.h"   /* COLLACOLI: COLI package backend */
 #include "mxfp4_expert.h"
+
+/* Native FP8 (F8_E4M3) decode + matmul, lifted from quant.h
+ * (GLM read path; qwen_moe does not include quant.h). */
+static const float E4M3_LUT[256] = {
+    0x0.0p+0f,0x1.0000000000000p-9f,0x1.0000000000000p-8f,0x1.8000000000000p-8f,0x1.0000000000000p-7f,0x1.4000000000000p-7f,0x1.8000000000000p-7f,0x1.c000000000000p-7f,
+    0x1.0000000000000p-6f,0x1.2000000000000p-6f,0x1.4000000000000p-6f,0x1.6000000000000p-6f,0x1.8000000000000p-6f,0x1.a000000000000p-6f,0x1.c000000000000p-6f,0x1.e000000000000p-6f,
+    0x1.0000000000000p-5f,0x1.2000000000000p-5f,0x1.4000000000000p-5f,0x1.6000000000000p-5f,0x1.8000000000000p-5f,0x1.a000000000000p-5f,0x1.c000000000000p-5f,0x1.e000000000000p-5f,
+    0x1.0000000000000p-4f,0x1.2000000000000p-4f,0x1.4000000000000p-4f,0x1.6000000000000p-4f,0x1.8000000000000p-4f,0x1.a000000000000p-4f,0x1.c000000000000p-4f,0x1.e000000000000p-4f,
+    0x1.0000000000000p-3f,0x1.2000000000000p-3f,0x1.4000000000000p-3f,0x1.6000000000000p-3f,0x1.8000000000000p-3f,0x1.a000000000000p-3f,0x1.c000000000000p-3f,0x1.e000000000000p-3f,
+    0x1.0000000000000p-2f,0x1.2000000000000p-2f,0x1.4000000000000p-2f,0x1.6000000000000p-2f,0x1.8000000000000p-2f,0x1.a000000000000p-2f,0x1.c000000000000p-2f,0x1.e000000000000p-2f,
+    0x1.0000000000000p-1f,0x1.2000000000000p-1f,0x1.4000000000000p-1f,0x1.6000000000000p-1f,0x1.8000000000000p-1f,0x1.a000000000000p-1f,0x1.c000000000000p-1f,0x1.e000000000000p-1f,
+    0x1.0000000000000p+0f,0x1.2000000000000p+0f,0x1.4000000000000p+0f,0x1.6000000000000p+0f,0x1.8000000000000p+0f,0x1.a000000000000p+0f,0x1.c000000000000p+0f,0x1.e000000000000p+0f,
+    0x1.0000000000000p+1f,0x1.2000000000000p+1f,0x1.4000000000000p+1f,0x1.6000000000000p+1f,0x1.8000000000000p+1f,0x1.a000000000000p+1f,0x1.c000000000000p+1f,0x1.e000000000000p+1f,
+    0x1.0000000000000p+2f,0x1.2000000000000p+2f,0x1.4000000000000p+2f,0x1.6000000000000p+2f,0x1.8000000000000p+2f,0x1.a000000000000p+2f,0x1.c000000000000p+2f,0x1.e000000000000p+2f,
+    0x1.0000000000000p+3f,0x1.2000000000000p+3f,0x1.4000000000000p+3f,0x1.6000000000000p+3f,0x1.8000000000000p+3f,0x1.a000000000000p+3f,0x1.c000000000000p+3f,0x1.e000000000000p+3f,
+    0x1.0000000000000p+4f,0x1.2000000000000p+4f,0x1.4000000000000p+4f,0x1.6000000000000p+4f,0x1.8000000000000p+4f,0x1.a000000000000p+4f,0x1.c000000000000p+4f,0x1.e000000000000p+4f,
+    0x1.0000000000000p+5f,0x1.2000000000000p+5f,0x1.4000000000000p+5f,0x1.6000000000000p+5f,0x1.8000000000000p+5f,0x1.a000000000000p+5f,0x1.c000000000000p+5f,0x1.e000000000000p+5f,
+    0x1.0000000000000p+6f,0x1.2000000000000p+6f,0x1.4000000000000p+6f,0x1.6000000000000p+6f,0x1.8000000000000p+6f,0x1.a000000000000p+6f,0x1.c000000000000p+6f,0x1.e000000000000p+6f,
+    0x1.0000000000000p+7f,0x1.2000000000000p+7f,0x1.4000000000000p+7f,0x1.6000000000000p+7f,0x1.8000000000000p+7f,0x1.a000000000000p+7f,0x1.c000000000000p+7f,0x1.e000000000000p+7f,
+    0x1.0000000000000p+8f,0x1.2000000000000p+8f,0x1.4000000000000p+8f,0x1.6000000000000p+8f,0x1.8000000000000p+8f,0x1.a000000000000p+8f,0x1.c000000000000p+8f,       NAN,
+     -0x0.0p+0f,-0x1.0000000000000p-9f,-0x1.0000000000000p-8f,-0x1.8000000000000p-8f,-0x1.0000000000000p-7f,-0x1.4000000000000p-7f,-0x1.8000000000000p-7f,-0x1.c000000000000p-7f,
+    -0x1.0000000000000p-6f,-0x1.2000000000000p-6f,-0x1.4000000000000p-6f,-0x1.6000000000000p-6f,-0x1.8000000000000p-6f,-0x1.a000000000000p-6f,-0x1.c000000000000p-6f,-0x1.e000000000000p-6f,
+    -0x1.0000000000000p-5f,-0x1.2000000000000p-5f,-0x1.4000000000000p-5f,-0x1.6000000000000p-5f,-0x1.8000000000000p-5f,-0x1.a000000000000p-5f,-0x1.c000000000000p-5f,-0x1.e000000000000p-5f,
+    -0x1.0000000000000p-4f,-0x1.2000000000000p-4f,-0x1.4000000000000p-4f,-0x1.6000000000000p-4f,-0x1.8000000000000p-4f,-0x1.a000000000000p-4f,-0x1.c000000000000p-4f,-0x1.e000000000000p-4f,
+    -0x1.0000000000000p-3f,-0x1.2000000000000p-3f,-0x1.4000000000000p-3f,-0x1.6000000000000p-3f,-0x1.8000000000000p-3f,-0x1.a000000000000p-3f,-0x1.c000000000000p-3f,-0x1.e000000000000p-3f,
+    -0x1.0000000000000p-2f,-0x1.2000000000000p-2f,-0x1.4000000000000p-2f,-0x1.6000000000000p-2f,-0x1.8000000000000p-2f,-0x1.a000000000000p-2f,-0x1.c000000000000p-2f,-0x1.e000000000000p-2f,
+    -0x1.0000000000000p-1f,-0x1.2000000000000p-1f,-0x1.4000000000000p-1f,-0x1.6000000000000p-1f,-0x1.8000000000000p-1f,-0x1.a000000000000p-1f,-0x1.c000000000000p-1f,-0x1.e000000000000p-1f,
+    -0x1.0000000000000p+0f,-0x1.2000000000000p+0f,-0x1.4000000000000p+0f,-0x1.6000000000000p+0f,-0x1.8000000000000p+0f,-0x1.a000000000000p+0f,-0x1.c000000000000p+0f,-0x1.e000000000000p+0f,
+    -0x1.0000000000000p+1f,-0x1.2000000000000p+1f,-0x1.4000000000000p+1f,-0x1.6000000000000p+1f,-0x1.8000000000000p+1f,-0x1.a000000000000p+1f,-0x1.c000000000000p+1f,-0x1.e000000000000p+1f,
+    -0x1.0000000000000p+2f,-0x1.2000000000000p+2f,-0x1.4000000000000p+2f,-0x1.6000000000000p+2f,-0x1.8000000000000p+2f,-0x1.a000000000000p+2f,-0x1.c000000000000p+2f,-0x1.e000000000000p+2f,
+    -0x1.0000000000000p+3f,-0x1.2000000000000p+3f,-0x1.4000000000000p+3f,-0x1.6000000000000p+3f,-0x1.8000000000000p+3f,-0x1.a000000000000p+3f,-0x1.c000000000000p+3f,-0x1.e000000000000p+3f,
+    -0x1.0000000000000p+4f,-0x1.2000000000000p+4f,-0x1.4000000000000p+4f,-0x1.6000000000000p+4f,-0x1.8000000000000p+4f,-0x1.a000000000000p+4f,-0x1.c000000000000p+4f,-0x1.e000000000000p+4f,
+    -0x1.0000000000000p+5f,-0x1.2000000000000p+5f,-0x1.4000000000000p+5f,-0x1.6000000000000p+5f,-0x1.8000000000000p+5f,-0x1.a000000000000p+5f,-0x1.c000000000000p+5f,-0x1.e000000000000p+5f,
+    -0x1.0000000000000p+6f,-0x1.2000000000000p+6f,-0x1.4000000000000p+6f,-0x1.6000000000000p+6f,-0x1.8000000000000p+6f,-0x1.a000000000000p+6f,-0x1.c000000000000p+6f,-0x1.e000000000000p+6f,
+    -0x1.0000000000000p+7f,-0x1.2000000000000p+7f,-0x1.4000000000000p+7f,-0x1.6000000000000p+7f,-0x1.8000000000000p+7f,-0x1.a000000000000p+7f,-0x1.c000000000000p+7f,-0x1.e000000000000p+7f,
+    -0x1.0000000000000p+8f,-0x1.2000000000000p+8f,-0x1.4000000000000p+8f,-0x1.6000000000000p+8f,-0x1.8000000000000p+8f,-0x1.a000000000000p+8f,-0x1.c000000000000p+8f,       NAN,
+};
+static inline float e4m3_decode(uint8_t b){ return E4M3_LUT[b]; }
+
+#define FP8_BLOCK 128
+static inline int64_t fp8_nblk(int n){ return ((int64_t)n + FP8_BLOCK - 1) / FP8_BLOCK; }
+
+/* y[S,O] = x[S,I] @ W^T, W raw e4m3 bytes (byte-identical layout to fmt=1) +
+ * per-128x128-BLOCK f32 scale [ceil(O/128),ceil(I/128)]. Scalar reference path
+ * (no SIMD in v1 -- BW-bound like the Metal kernel, and this format's hot path
+ * is the GPU one; a vectorized CPU kernel is future work if measured needed).
+ * Mirrors matmul_i3's double-accumulate-across-groups / float-within-group
+ * convention so cross-block cancellation doesn't cost precision unfairly. */
+static void matmul_fp8(float *y, const float *x, const uint8_t *q8, const float *bscale,
+                       int S, int I, int O){
+    int64_t nblkI = fp8_nblk(I);
+    int o;
+    #pragma omp parallel for schedule(static)
+    for(o=0;o<O;o++){
+        const uint8_t *w = q8 + (int64_t)o*I;
+        int64_t blkO = o / FP8_BLOCK;
+        const float *scl = bscale + blkO*nblkI;
+        for(int s=0;s<S;s++){
+            const float *xs = x + (int64_t)s*I;
+            double a=0;
+            for(int64_t bi=0; bi*FP8_BLOCK<I; bi++){
+                int base=(int)(bi*FP8_BLOCK); int blen=FP8_BLOCK; if(base+blen>I) blen=I-base;
+                float sc=scl[bi]; float acc=0;
+                for(int i=base;i<base+blen;i++) acc += e4m3_decode(w[i])*xs[i];
+                a += (double)acc*sc;
+            }
+            y[(int64_t)s*O+o]=(float)a;
+        }
+    }
+}
 #include "mxfp4_runtime.h"
 #ifdef COLI_CUDA
 #include "backend_cuda.h"
@@ -194,6 +264,22 @@ typedef struct {
     int n_stop, stop_ids[8];        /* sample.h stop contract (empty = none) */
     int8_t *layer_is_gdn;           /* 1 = linear_attention (GDN), 0 = full */
     int mtp_layers;                 /* speculative MTP head layers (0 = none) */
+    /* Qwen4 (Qwen4Exp) opt-in features. ALL default to OFF so qwen3.5/3.6
+     * checkpoints load exactly as before (verified against the reference
+     * modeling_qwen4_exp.py + configuration_qwen4_exp.py). */
+    int8_t *layer_is_qsa;           /* 1 = QSA indexer on this layer (full-attn
+                                     * layers only; config indexer_* keys) */
+    int idx_n_heads, idx_kv_heads, idx_head_dim, idx_budget, idx_ratio;
+    int hc_count, hc_lowrank;       /* hyper connections (0 = qwen3.5/3.6 path) */
+    int ple_layer;                  /* PLE n-gram layer, -1 = off (M5, not yet
+                                     * implemented — parsed for forward compat) */
+    int ple_embed_dim, ple_conv_kernel, ngram_size, ngram_heads, ngram_parts,
+        ngram_vocab_base, ngram_div;
+    int out_gate_sigmoid;           /* 1 = GDN output gate = sigmoid (qwen4),
+                                     0 = silu (qwen3.5/3.6 default) */
+    int64_t seed;                  /* PLE n-gram hash seed (config "seed") */
+    int qwen4_no_final_norm;        /* 1 = skip final_rmsnorm (qwen4: mixer out
+                                     * feeds lm_head directly) */
 } Cfg;
 
 #include "tok.h"
@@ -201,6 +287,7 @@ typedef struct {
 
 static int cfg_validate(const Cfg *c, char *why, size_t why_n){
 #define CFG_BAD(...) do { snprintf(why, why_n, __VA_ARGS__); return 0; } while (0)
+    size_t tmp, bytes;
     if (c->hidden < 1 || c->hidden > (1 << 20) ||
         c->n_layers < 1 || c->n_layers > 4096 ||
         c->n_heads < 1 || c->n_heads > (1 << 16) ||
@@ -234,8 +321,53 @@ static int cfg_validate(const Cfg *c, char *why, size_t why_n){
     if (c->lin_v_heads < c->lin_k_heads || c->lin_v_heads % c->lin_k_heads)
         CFG_BAD("GDN value heads %d must be a multiple of key heads %d",
                 c->lin_v_heads, c->lin_k_heads);
+    /* Qwen4 opt-in geometry (config indexer_* / hc_* / ple_* keys) */
+    if (c->idx_n_heads < 0 || c->idx_n_heads > (1 << 16) ||
+        c->idx_kv_heads < 0 || c->idx_kv_heads > (1 << 16) ||
+        c->idx_head_dim < 0 || c->idx_head_dim > (1 << 20) ||
+        c->idx_budget < 0 || c->idx_budget > (1 << 24) ||
+        c->idx_ratio < 0 || c->idx_ratio > (1 << 12))
+        CFG_BAD("QSA indexer dimension out of range");
+    if (c->idx_n_heads > 0) {
+        if (!c->idx_kv_heads || !c->idx_head_dim || !c->idx_budget || !c->idx_ratio)
+            CFG_BAD("QSA indexer requires indexer_n_heads/kv_heads/head_dim/budget/compress_ratio");
+        if (c->idx_kv_heads != 1)
+            CFG_BAD("QSA indexer requires indexer_kv_heads=1 (reference constraint)");
+        if (c->idx_budget % c->idx_ratio)
+            CFG_BAD("QSA indexer budget must be divisible by compress_ratio");
+        if (c->rotary_dim > c->idx_head_dim)
+            CFG_BAD("QSA indexer: rotary dim %d exceeds indexer_head_dim %d",
+                    c->rotary_dim, c->idx_head_dim);
+        if (!size_mul_ok((size_t)c->idx_kv_heads, c->idx_head_dim, &tmp) ||
+            !size_mul_ok(tmp, (size_t)c->max_pos, &tmp) ||
+            !size_mul_ok(tmp, sizeof(float), &bytes))
+            CFG_BAD("QSA indexer cache allocation overflows size_t");
+    }
+    if (c->hc_count < 0 || c->hc_count > 1024 ||
+        c->hc_lowrank < 0 || c->hc_lowrank > (1 << 20))
+        CFG_BAD("hyper-connection dimension out of range");
+    if (c->hc_count > 0) {
+        if (c->hc_lowrank < 1)
+            CFG_BAD("hc_lowrank must be positive when hc_count > 0");
+        if (!size_mul_ok((size_t)c->hc_count, c->hidden, &tmp) ||
+            !size_mul_ok(tmp, sizeof(float), &bytes))
+            CFG_BAD("hyper-connection residual allocation overflows size_t");
+    }
+    if (c->ple_layer < -1 || c->ple_layer >= c->n_layers)
+        CFG_BAD("ple_layer_ids: layer %d outside [1,%d] (1-based)", c->ple_layer + 1, c->n_layers);
+    if (c->ple_layer >= 0) {
+        if (c->ple_embed_dim < 1 || c->ple_embed_dim > (1 << 20) ||
+            c->ple_conv_kernel < 1 || c->ple_conv_kernel > 64 ||
+            c->ngram_size < 2 || c->ngram_size > 8 ||
+            c->ngram_heads < 1 || c->ngram_heads > (1 << 16) ||
+            c->ngram_vocab_base < 1 || c->ngram_vocab_base > (1LL << 40) ||
+            c->ngram_div < 1 || c->ngram_div > (1 << 20))
+            CFG_BAD("PLE n-gram dimension out of range");
+        if (c->ple_embed_dim % c->ngram_heads)
+            CFG_BAD("ple_embed_dim must be divisible by ngram_heads");
+    }
 
-    size_t qdim, kdim, vdim, conv, tmp, expert, bytes;
+    size_t qdim, kdim, vdim, conv, expert;
     if (!size_mul_ok((size_t)c->n_heads, c->head_dim, &qdim) ||
         qdim > (size_t)INT_MAX / 2)
         CFG_BAD("attention query projection rows overflow int");
@@ -277,11 +409,24 @@ typedef struct {
     float *in_ln, *post_ln;
     /* full attention */
     WT q, k, v, o; float *qn, *kn;
+    /* QSA indexer (qwen4, layer_is_qsa) */
+    WT index_qk; float *idx_qn, *idx_kn;
     /* gated deltanet (linear_attn.*) */
     float *A_log, *dt_bias, *conv1d;    /* conv1d [C, 1, k] = [C, k] flat */
     WT in_a, in_b, in_qkv, in_z, gdn_out; float *gdn_norm;
     /* moe */
     WT router, se_gate, se_up, se_down, se_g;  /* shared expert */
+    /* hyper connections (qwen4, GatedResidual). Loaded only when
+     * cfg.hc_count > 0 AND the snapshot carries them; NULL otherwise. */
+    float *hc_norm;                     /* [hc_count*D] */
+    WT hc_mix_down, hc_mix_up;          /* [hc_lowrank, hc_count*D] / [hc_count*D, hc_lowrank] */
+    WT hc_inject;                       /* [hc_count, hc_count*D] (NULL for the global mixer) */
+    /* mlp_hyper_connection side: each layer carries TWO GatedResiduals
+     * (attn + mlp); the fields above serve attn_hyper_connection, these
+     * serve mlp_hyper_connection. Same geometry. */
+    float *hc_mlp_norm;                 /* [hc_count*D] */
+    WT hc_mlp_mix_down, hc_mlp_mix_up;
+    WT hc_mlp_inject;                   /* [hc_count, hc_count*D] */
 } Layer;
 
 /* ---------- expert cache (STREAMED from disk) ---------- */
@@ -322,6 +467,22 @@ typedef struct {
     Layer *MTP;                    /* speculative MTP head (mtp_layers rows) */
     WT mtp_fc;                     /* MTP fc: [D, 2D] */
     float *mtp_norm, *mtp_pre_fc_norm_embedding, *mtp_pre_fc_norm_hidden;
+    /* Qwen4 global hyper-connection mixer (use_combine=False: mixed only) */
+    Layer hc_global;
+    WT ple_ngram, ple_key_proj, ple_value_proj;      /* PLE n-gram (M5) */
+    float *ple_norm_key, *ple_norm_query, *ple_norm_conv, *ple_conv1d;
+    /* FP8 (real ckpt): 128 shards of [rps, hd_per] e4m3 + one global BF16
+     * scale. 51 GB table — streamed per row, never resident. */
+    int64_t ple_f8_rps;             /* rows per shard (0 = f32 mode) */
+    float ple_f8_scale;             /* global BF16 scale */
+    uint64_t *ple_mult;               /* [ns] odd hash multipliers */
+    int64_t *ple_offsets, *ple_sizes; /* [total heads] */
+    int64_t *ple_ring;                /* [ns] last ns-1 ids + current */
+    float *ple_conv_state;            /* [hcd * (k-1)*dil] taps */
+    /* QSA indexer token-key cache + length: [n_layers][idx_kv_heads *
+     * idx_head_dim * max_t] f32. One kv stream (idx_kv_heads == 1); all
+     * indexer q heads share it. */
+    float **idx_cache; int *idx_len;
     LCache *cache;                 /* [n_layers] */
     uint64_t clock, hits, miss;
     float **K, **V;                /* [n_layers][kv_heads*max_t*head_dim] (f32 KV) */
@@ -788,7 +949,7 @@ static double req_num(jval *r, const char *k){
 }
 static double opt_num(jval *r, const char *k, double dflt){
     jval *v = json_get(r, k);
-    if (!v) return dflt;
+    if (!v || v->t == J_NULL) return dflt;
     if (v->t != J_NUM || !isfinite(v->num)) {
         fprintf(stderr, "config.json: non-numeric or non-finite \"%s\"\n", k);
         exit(1);
@@ -809,6 +970,16 @@ static int opt_int(jval *r, const char *k, int dflt){
     jval *v = json_get(r, k);
     return v ? num_to_int(opt_num(r, k, dflt), k) : dflt;
 }
+/* optional string; NULL when absent */ 
+static const char *opt_str(jval *r, const char *k){
+    jval *v = json_get(r, k);
+    if (!v) return NULL;
+    if (v->t != J_STR) {
+        fprintf(stderr, "config.json: \"%s\" must be a string\n", k);
+        exit(1);
+    }
+    return v->str;
+}
 
 /* Qwen3.5/3.6 checkpoints carry the text config inside "text_config"
  * (vision-language wrapper). The tiny fixtures write it flat. Handle both. */
@@ -828,7 +999,12 @@ static int parse_layer_types(jval *r, int n_layers, int8_t *out){
         jval *e = lt->kids[i];
         if (e->t != J_STR) return -1;
         if (!strcmp(e->str, "linear_attention")) out[i] = 1;
-        else if (!strcmp(e->str, "full_attention")) out[i] = 0;
+        else if (!strcmp(e->str, "full_attention") ||
+                 /* Qwen4 rewrites full_attention -> qwen_sparse_attention in
+                  * the config; the C side marks QSA later by probing the
+                  * layer's self_attn.indexer weights (load_cfg has no st
+                  * access), so both tokens are plain full-attention here. */
+                 !strcmp(e->str, "qwen_sparse_attention")) out[i] = 0;
         else { fprintf(stderr, "config.json: unknown layer type \"%s\"\n", e->str); return -1; }
     }
     return 0;
@@ -865,6 +1041,36 @@ static void load_cfg(Cfg *c, const char *snap){
     c->eps       = (float)opt_num(root, "rms_norm_eps", 1e-6);
     c->eos       = opt_int(root, "eos_token_id", 248044);
     c->mtp_layers = opt_int(root, "mtp_num_hidden_layers", 0);
+    /* Qwen4 opt-in keys (absent on qwen3.5/3.6 -> defaults OFF) */
+    c->idx_n_heads = opt_int(root, "indexer_n_heads", 0);
+    c->idx_kv_heads = opt_int(root, "indexer_kv_heads", 0);
+    c->idx_head_dim = opt_int(root, "indexer_head_dim", 0);
+    c->idx_budget   = opt_int(root, "indexer_budget", 0);
+    c->idx_ratio    = opt_int(root, "indexer_compress_ratio", 0);
+    c->hc_count     = opt_int(root, "hc_count", 0);
+    c->hc_lowrank   = opt_int(root, "hc_lowrank", 0);
+    c->ple_layer    = -1;
+    jval *ple_ids = json_get(root, "ple_layer_ids");
+    if (ple_ids && ple_ids->t == J_ARR && ple_ids->len > 0) {
+        /* 1-based layer ids; the engine implements the first one only (the
+         * reference sorts/dedupes the list). */
+        if (ple_ids->kids[0]->t != J_NUM ||
+            !isfinite(ple_ids->kids[0]->num) ||
+            trunc(ple_ids->kids[0]->num) != ple_ids->kids[0]->num)
+            { fprintf(stderr, "config.json: ple_layer_ids[0] must be an integer\n"); exit(1); }
+        c->ple_layer = num_to_int(ple_ids->kids[0]->num, "ple_layer_ids[0]") - 1;
+    }
+    c->ple_embed_dim  = opt_int(root, "ple_embed_dim", c->hidden);
+    c->ple_conv_kernel = opt_int(root, "ple_conv_kernel_size", 4);
+    c->ngram_size     = opt_int(root, "ngram_size", 3);
+    c->ngram_heads    = opt_int(root, "heads_per_ngram", 8) * (opt_int(root, "ngram_size", 3) - 1);
+    c->ngram_parts    = opt_int(root, "ple_parts", 0);
+    c->ngram_vocab_base = opt_int(root, "ngram_vocab_size_base", 20000000);
+    c->ngram_div      = opt_int(root, "make_ngram_vocab_size_divisible_by", 128);
+    const char *ogt = opt_str(root, "output_gate_type");
+    c->out_gate_sigmoid = (ogt && !strcmp(ogt, "sigmoid")) ? 1 : 0;
+    c->seed = (int64_t)opt_num(root, "seed", 42);
+    c->qwen4_no_final_norm = 0;
 
     jval *rp = json_get(root, "rope_parameters");
     c->theta = (rp && rp->t == J_OBJ) ? (float)opt_num(rp, "rope_theta", 10000000.0)
@@ -887,6 +1093,8 @@ static void load_cfg(Cfg *c, const char *snap){
     c->n_stop = 0;
     c->layer_is_gdn = malloc((size_t)c->n_layers);
     if (!c->layer_is_gdn) { fprintf(stderr, "OOM layer_types\n"); exit(1); }
+    c->layer_is_qsa = calloc((size_t)c->n_layers, 1);
+    if (!c->layer_is_qsa) { fprintf(stderr, "OOM layer_is_qsa\n"); exit(1); }
     if (parse_layer_types(root, c->n_layers, c->layer_is_gdn) != 0) exit(1);
     free(buf); free(arena);
 }
@@ -938,6 +1146,10 @@ static const char *coli_native_profile(void){
 #if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
     return COLI_CSF_PROFILE_MACOS_ARM64_METAL_APPLE8_V1;
 #elif defined(__linux__) && defined(__x86_64__) && defined(__AVX2__)
+    return COLI_CSF_PROFILE_LINUX_X86_64_AVX2_V1;
+#elif defined(_WIN32) && defined(__AVX2__) && (defined(_M_X64) || defined(_M_AMD64))
+    /* Windows/MSVC port: colic has no Windows profile; the canonical
+     * AVX2 x86-64 profile is the right package for this build. */
     return COLI_CSF_PROFILE_LINUX_X86_64_AVX2_V1;
 #else
     return NULL;
@@ -1333,6 +1545,16 @@ static float *load_t_named(Model *m, const char *name, int64_t want){
 static void mtp_load(Model *m){
     Cfg *c = &m->c;
     if (c->mtp_layers <= 0) return;
+    /* Probe: some configs declare mtp_layers without shipping MTP weights
+     * (qwen4 tiny fixture). Disable cleanly instead of failing the load. */
+    if (!m->coli_load) {
+        char probe[512];
+        snprintf(probe, sizeof(probe), "%smtp.layers.0.self_attn.q_proj.weight", g_prefix);
+        if (!st_have(m, probe)) {
+            c->mtp_layers = 0;
+            return;
+        }
+    }
     int D = c->hidden, H = c->n_heads, hd = c->head_dim, kv = c->n_kv_heads;
     m->MTP = calloc((size_t)c->mtp_layers, sizeof(Layer));
     if (!m->MTP) { fprintf(stderr, "OOM MTP layers\n"); exit(1); }
@@ -1384,42 +1606,87 @@ static WT load_wt(Model *m, const char *name, int64_t O, int64_t I){
 /* ---------- kernels ---------- */
 
 static void matmul(float *y, const float *x, const float *w, int S, int O, int I){
+    int so;
     #pragma omp parallel for schedule(static)
-    for (int so = 0; so < S * O; so++) {
+    for(so=0; so < S * O; so++){ 
         int s = so / O, o = so % O;
         const float *xs = x + (int64_t)s * I;
         const float *wr = w + (int64_t)o * I;
         float acc = 0.f;
+        int i;
         #pragma omp simd reduction(+:acc)
-        for (int i = 0; i < I; i++) acc += xs[i] * wr[i];
+        for(i=0; i < I; i++) acc += xs[i] * wr[i];
         y[(int64_t)so] = acc;
     }
 }
 
+
+#if defined(__AVX2__)
+#include <immintrin.h>
+/* GDN BF16 dot, AVX2 FMA. BF16 decode is bit-exact (v << 16 as float, same
+ * as coli_bf16_decode); only the fp summation order differs from scalar.
+ * MSVC compiles the omp simd reduction loop scalar (C4849) — this is the
+ * real vectorized path on x64. QWEN_BF16_AVX2=0 opts out. */
+static int qwen_bf16_avx2_opt(void){
+    static int c = -1;
+    if (c < 0) { const char *g = getenv("QWEN_BF16_AVX2"); c = !(g && atoi(g) == 0); }
+    return c;
+}
+#endif
+
 /* int8 weights + per-row f32 scales (dequant on use) */
 static void matmul_bf16(float *y, const float *x, const uint16_t *w, int S, int O, int I){
+    int so;
     #pragma omp parallel for schedule(static)
-    for (int so = 0; so < S * O; so++) {
+    for(so=0; so < S * O; so++){ 
         int s = so / O, o = so % O;
         const float *xs = x + (int64_t)s * I;
         const uint16_t *wr = w + (int64_t)o * I;
+#if defined(__AVX2__)
         float acc = 0.f;
+        if (qwen_bf16_avx2_opt()) {
+            int i = 0;
+            __m256 va = _mm256_setzero_ps();
+            for (; i + 16 <= I; i += 16) {
+                __m256i b0 = _mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i *)(wr + i)));
+                __m256i b1 = _mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i *)(wr + i + 8)));
+                va = _mm256_fmadd_ps(_mm256_castsi256_ps(_mm256_slli_epi32(b0, 16)), _mm256_loadu_ps(xs + i), va);
+                va = _mm256_fmadd_ps(_mm256_castsi256_ps(_mm256_slli_epi32(b1, 16)), _mm256_loadu_ps(xs + i + 8), va);
+            }
+            for (; i + 8 <= I; i += 8) {
+                __m256i b = _mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i *)(wr + i)));
+                va = _mm256_fmadd_ps(_mm256_castsi256_ps(_mm256_slli_epi32(b, 16)), _mm256_loadu_ps(xs + i), va);
+            }
+            float f[8]; _mm256_storeu_ps(f, va);
+            acc = (f[0] + f[1] + f[2] + f[3]) + (f[4] + f[5] + f[6] + f[7]);
+            for (; i < I; i++) acc += xs[i] * coli_bf16_decode(wr[i]);
+        } else {
+            int i;
+            #pragma omp simd reduction(+:acc)
+            for(i=0; i < I; i++) acc += xs[i] * coli_bf16_decode(wr[i]) ;
+        }
+#else
+        float acc = 0.f;
+        int i;
         #pragma omp simd reduction(+:acc)
-        for (int i = 0; i < I; i++) acc += xs[i] * coli_bf16_decode(wr[i]);
+        for(i=0; i < I; i++) acc += xs[i] * coli_bf16_decode(wr[i]) ;
+#endif
         y[(int64_t)so] = acc;
     }
 }
 
 static void matmul_q8(float *y, const float *x, const int8_t *q, const float *sc,
                       int S, int O, int I){
+    int so;
     #pragma omp parallel for schedule(static)
-    for (int so = 0; so < S * O; so++) {
+    for(so=0; so < S * O; so++){ 
         int s = so / O, o = so % O;
         const float *xs = x + (int64_t)s * I;
         const int8_t *wr = q + (int64_t)o * I;
         float acc = 0;
+        int i;
         #pragma omp simd reduction(+:acc)
-        for (int i = 0; i < I; i++) acc += xs[i] * (float)wr[i];
+        for(i=0; i < I; i++) acc += xs[i] * (float) wr[i];
         y[(int64_t)so] = acc * sc[o];
     }
 }
@@ -1486,8 +1753,9 @@ static inline float qm_hsum256(__m256 v){
 static void matmul_i4_grouped(float *y, const float *x, const uint8_t *q4, const float *scale,
                               int S, int I, int O, int gs){
     int rb=(I+1)/2; int ng=(I+gs-1)/gs;
+    int o;
     #pragma omp parallel for schedule(static)
-    for(int o=0;o<O;o++){
+    for(o=0;o<O;o++){ 
         const uint8_t *w=q4+(int64_t)o*rb;
         const float *scl=scale+(int64_t)o*ng;
         for(int s=0;s<S;s++){
@@ -1567,8 +1835,9 @@ static void matmul_i4_grouped_pair(float *yg, float *yu,
      * legal when every group is a whole number of 16-value SIMD chunks
      * (no scalar tail inside any group). S==1 decode caller. */
     if (qwen_i4_rowreduce_enabled() && (I % 16) == 0 && (gs % 16) == 0) {
+        int o;
         #pragma omp parallel for schedule(static)
-        for (int o = 0; o < O; o++) {
+        for(o=0; o < O; o++){ 
             const float *scg = sg + (int64_t)o * ng;
             const float *scu = su + (int64_t)o * ng;
             const uint8x8_t m4v = vdup_n_u8(0x0F), b8v = vdup_n_s8(8);
@@ -1604,8 +1873,9 @@ static void matmul_i4_grouped_pair(float *yg, float *yu,
         return;
     }
 #endif
+    int o;
     #pragma omp parallel for schedule(static)
-    for (int o = 0; o < O; o++) {
+    for(o=0; o < O; o++){ 
         const uint8_t *wg = qg + (int64_t)o * rb;
         const uint8_t *wu = qu + (int64_t)o * rb;
         const float *scg = sg + (int64_t)o * ng;
@@ -1669,8 +1939,9 @@ static inline int64_t qm_i3_groups(int I){ return ((int64_t)I + QM_I3_GROUP - 1)
 static inline int64_t qm_i3_rowbytes(int I){ return qm_i3_groups(I) * QM_I3_GBYTES; }
 static void matmul_i3(float *y, const float *x, const uint8_t *q3, const float *scale, int S, int I, int O){
     int64_t ng=qm_i3_groups(I), rb=qm_i3_rowbytes(I);
+    int o;
     #pragma omp parallel for schedule(static)
-    for(int o=0;o<O;o++){
+    for(o=0;o<O;o++){ 
         const uint8_t *wrow=q3+(int64_t)o*rb;
         const float *srow=scale+(int64_t)o*ng;
         for(int s=0;s<S;s++){
@@ -1744,6 +2015,7 @@ static void matmul_i3(float *y, const float *x, const uint8_t *q3, const float *
 static void rmsnorm_row(float *out, const float *x, const float *w, int D, float eps){
     double ms = 0; for (int i = 0; i < D; i++) ms += (double)x[i] * x[i];
     float r = 1.f / sqrtf((float)(ms / D) + eps);
+    if (!w) { memcpy(out, x, (size_t)D * sizeof(float)); return; }  /* qwen4: no final norm == identity */
     for (int i = 0; i < D; i++) out[i] = x[i] * r * (1.f + w[i]);
 }
 
@@ -1804,7 +2076,7 @@ static void slot_alloc_mxfp4(Slot *s, const ColiMxfp4ExpertLayout *layout){
      * every interior pointer. Keep a conservative padding guard so arbitrary
      * valid COLIEXPT records still use the generic two-slab/six-read path. */
     if (layout->record_span_bytes >= layout->resident_bytes &&
-        layout->record_span_bytes - layout->resident_bytes <= 4096) {
+        layout->record_span_bytes - layout->resident_bytes <= (1u << 20)) {
         size_t span_alloc = moe_slab_bytes(layout->record_span_bytes);
         s->mxbase = moe_slab_alloc(span_alloc);
         s->mxg  = s->mxbase + layout->gate_weight_span_offset;
@@ -2058,6 +2330,48 @@ static void load_expert(Model *m, int layer, int eid, Slot *s){
         st_read_raw(&m->S, nm, s->g4, g_expert_drop);
         st_read_f32(&m->S, qsnm, s->g4s, g_expert_drop);
         return;
+    }
+    /* Native FP8 (F8_E4M3) experts: separate gate/up/down + per-128x128
+     * block scales (weight_scale_inv, BF16 -> f32 via st_read_f32). fmt=9. */
+    {
+        char g[512], u[512], d[512], gs[512], us[512], ds[512];
+        snprintf(g, sizeof(g), "%slayers.%d.mlp.experts.%d.gate_proj.weight", g_prefix, layer, eid);
+        snprintf(u, sizeof(u), "%slayers.%d.mlp.experts.%d.up_proj.weight", g_prefix, layer, eid);
+        snprintf(d, sizeof(d), "%slayers.%d.mlp.experts.%d.down_proj.weight", g_prefix, layer, eid);
+        snprintf(gs, sizeof(gs), "%slayers.%d.mlp.experts.%d.gate_proj.weight_scale_inv", g_prefix, layer, eid);
+        snprintf(us, sizeof(us), "%slayers.%d.mlp.experts.%d.up_proj.weight_scale_inv", g_prefix, layer, eid);
+        snprintf(ds, sizeof(ds), "%slayers.%d.mlp.experts.%d.down_proj.weight_scale_inv", g_prefix, layer, eid);
+        st_tensor *tg = st_find(&m->S, g), *tu = st_find(&m->S, u), *td = st_find(&m->S, d);
+        if (tg && tu && td) {
+            int64_t ngi = (int64_t)cc->moe_inter * cc->hidden;
+            int64_t ndi = (int64_t)cc->hidden * cc->moe_inter;
+            if (!tensor_numel_ok(tg->nbytes, ngi) || !tensor_numel_ok(tu->nbytes, ngi) ||
+                !tensor_numel_ok(td->nbytes, ndi)) {
+                fprintf(stderr, "%s: FP8 expert size mismatch\n", g); exit(1);
+            }
+            if (!s->g) {
+                int64_t two, total;
+                if (!i64_mul_ok(ng, 2, &two) || !i64_add_ok(two, nd, &total)) {
+                    fprintf(stderr, "FP8 expert allocation overflows\n"); exit(1);
+                }
+                s->g = malloc((size_t)total);
+                if (!s->g) { fprintf(stderr, "OOM FP8 expert\n"); exit(1); }
+                s->u = s->g + ng; s->dd = s->g + 2 * ng;
+                int64_t nbg = fp8_nblk(cc->moe_inter) * fp8_nblk(cc->hidden);
+                int64_t nbd = fp8_nblk(cc->hidden) * fp8_nblk(cc->moe_inter);
+                s->gs = malloc((size_t)(2 * nbg + nbd) * sizeof(float));
+                if (!s->gs) { fprintf(stderr, "OOM FP8 scales\n"); exit(1); }
+                s->us = s->gs + nbg; s->ds = s->gs + 2 * nbg;
+            }
+            s->fmt = 9;
+            st_read_raw(&m->S, g, s->g, g_expert_drop);
+            st_read_raw(&m->S, u, s->u, g_expert_drop);
+            st_read_raw(&m->S, d, s->dd, g_expert_drop);
+            st_read_f32(&m->S, gs, s->gs, g_expert_drop);
+            st_read_f32(&m->S, us, s->us, g_expert_drop);
+            st_read_f32(&m->S, ds, s->ds, g_expert_drop);
+            return;
+        }
     }
     /* f32 per-expert format (fixture / --bits 32 converter output) */
     snprintf(nm, sizeof(nm), "%slayers.%d.mlp.experts.%d.gate_up_proj", g_prefix, layer, eid);
@@ -2558,8 +2872,214 @@ static void gdn_token(Model *m, Layer *l, int layer, const float *x, float *out)
     free(qh); free(kh); free(vh); free(Snew); free(kv_mem); free(normed);
 }
 
-/* ---------- MoE ---------- */
+/* ---------- Qwen4 hyper connections + QSA indexer ---------- */
 
+/* Grouped RMSNorm over hc_count D-blocks: variance per D-block of the
+ * hc_count*D vector, weight [hc_count*D] applied as (1+w) — mirrors
+ * Qwen4ExpTextRMSNorm(group_size=hidden_size). */
+static void rmsnorm_grouped(float *out, const float *x, const float *w,
+                            int hc, int D, float eps){
+    for (int g = 0; g < hc; g++) {
+        const float *xg = x + (int64_t)g * D;
+        const float *wg = w + (int64_t)g * D;
+        float *og = out + (int64_t)g * D;
+        double ms = 0; for (int d = 0; d < D; d++) ms += (double)xg[d] * xg[d];
+        float r = 1.f / sqrtf((float)(ms / D) + eps);
+        for (int d = 0; d < D; d++) og[d] = xg[d] * r * (1.f + wg[d]);
+    }
+}
+
+/* Qwen4ExpTextGatedResidual.forward, VERIFIED against the reference:
+ *   norm = RMSNorm_grouped(hc*D, D-blocks, (1+w))
+ *   mix  = sigmoid(up(silu(down(norm)/hc)))          [hc*D]
+ *   mixed = mean_g(D)( mix[D-block] * norm[D-block] ) [D]
+ *   injection (per-layer only, block_inject != NULL):
+ *       inj = 2 * sigmoid(block_inject(norm)/hc)     [hc]
+ * Outputs: mixed [D] always; *hyper stays the input [hc*D];
+ * *inject [hc] only when the layer has block_inject weights.
+ * Matmul-free scalar path; hc_count is tiny (<= 16 in practice). */
+static void hc_mix(const float *hc_norm, const WT *hc_down, const WT *hc_up,
+                   const WT *hc_inj, int hc, int D, int lr,
+                   const float *hx, float *out,
+                   float *inject, float eps){
+    float *normed = falloc((int64_t)hc * D);
+    rmsnorm_grouped(normed, hx, hc_norm, hc, D, eps);
+    float *lo = falloc(lr);
+    wt_mul(lo, normed, hc_down, 1, lr, hc * D);
+    for (int i = 0; i < lr; i++) lo[i] = silu(lo[i] / (float)hc);
+    float *hi = falloc((int64_t)hc * D);
+    wt_mul(hi, lo, hc_up, 1, hc * D, lr);
+    for (int i = 0; i < hc * D; i++)
+        hi[i] = 1.f / (1.f + expf(-hi[i]));
+    for (int i = 0; i < hc * D; i++)
+        out[i % D] += (hi[i] * normed[i]) * (1.f / (float)hc);
+    if (inject) {
+        float *bi = falloc(hc);
+        wt_mul(bi, normed, hc_inj, 1, hc, hc * D);
+        for (int g = 0; g < hc; g++)
+            inject[g] = 2.f / (1.f + expf(-bi[g] / (float)hc));
+        free(bi);
+    }
+    free(normed); free(lo); free(hi);
+}
+
+/* QSA indexer token selection, hc-free scalar mirror of
+ * Qwen4ExpTextQSAIndexer.forward for the token path (pos == len).
+ * `cache` holds the RAW (un-normed, un-rotated) indexer k per position,
+ * stored by sparse_attn_token before selection; `len` = positions cached.
+ * sel (len <= budget+ratio-1) holds selected positions for the main
+ * attention; tail positions are appended (reference behavior). */
+static void qsa_select(Model *m, Layer *l, int layer, const float *x,
+                       int pos, int *sel, int *nsel){
+    Cfg *c = &m->c;
+    int ih = c->idx_head_dim, in = c->idx_n_heads, ik = c->idx_kv_heads;
+    int ratio = c->idx_ratio, budget = c->idx_budget;
+    int nq = ih * in, nk = ih * ik;
+    float *qk = falloc((int64_t)nq + nk);
+    wt_mul(qk, x, &l->index_qk, 1, nq + nk, c->hidden);
+    float *q = falloc(nq);
+    memcpy(q, qk, (size_t)nq * sizeof(float));
+    /* q: (in, ih); norm + partial RoPE at pos */
+    for (int h = 0; h < in; h++)
+        rmsnorm_row(q + (int64_t)h * ih, q + (int64_t)h * ih, l->idx_qn, ih, c->eps);
+    for (int h = 0; h < in; h++)
+        rope_partial(q + (int64_t)h * ih, pos, c);
+    /* store the raw k for this position (indexer cache, f32) */
+    float *cached = m->idx_cache[layer];
+    memcpy(cached + (int64_t)pos * nk, qk + nq, (size_t)nk * sizeof(float));
+    int len = pos + 1;
+    /* blocks of `ratio` consecutive positions 0..len-1 */
+    int nblk = len / ratio;
+    int sel_n = 0;
+    if (nblk > 0) {
+        float *pool = falloc((int64_t)nblk * ih);
+        int *starts = malloc(size_mul_or_die((size_t)nblk, sizeof(int), "qsa block starts"));
+        if (!starts) { fprintf(stderr, "OOM qsa starts\n"); exit(1); }
+        for (int b = 0; b < nblk; b++) {
+            starts[b] = b * ratio;
+            for (int d = 0; d < ih; d++) {
+                double acc = 0;
+                for (int r = 0; r < ratio; r++)
+                    acc += cached[((int64_t)(b * ratio + r)) * nk + d];
+                pool[(int64_t)b * ih + d] = (float)(acc / ratio);
+            }
+        }
+        for (int b = 0; b < nblk; b++)
+            rmsnorm_row(pool + (int64_t)b * ih, pool + (int64_t)b * ih, l->idx_kn, ih, c->eps);
+        for (int b = 0; b < nblk; b++)
+            rope_partial(pool + (int64_t)b * ih, starts[b], c);
+        int topk = budget / ratio;
+        if (topk > nblk) topk = nblk;
+        float *sc = malloc(size_mul_or_die((size_t)nblk, sizeof(float), "qsa scores"));
+        int *ord = malloc(size_mul_or_die((size_t)nblk, sizeof(int), "qsa order"));
+        if (!sc || !ord) { fprintf(stderr, "OOM qsa scores\n"); exit(1); }
+        for (int b = 0; b < nblk; b++) {
+            float acc = 0;
+            for (int h = 0; h < in; h++) {
+                const float *qh = q + (int64_t)h * ih;
+                const float *kb = pool + (int64_t)b * ih;
+                float dot = 0;
+                for (int d = 0; d < ih; d++) dot += qh[d] * kb[d];
+                acc += dot > 0.f ? dot : 0.f;
+            }
+            sc[b] = acc / sqrtf((float)ih);
+            ord[b] = b;
+        }
+        /* selection sort desc, lower block index wins exact ties */
+        for (int i = 0; i < topk; i++) {
+            int best = i;
+            for (int j = i + 1; j < nblk; j++)
+                if (sc[j] > sc[best] || (sc[j] == sc[best] && ord[j] < ord[best])) best = j;
+            int ti = ord[i]; ord[i] = ord[best]; ord[best] = ti;
+            float tv = sc[i]; sc[i] = sc[best]; sc[best] = tv;
+        }
+        for (int i = 0; i < topk; i++) {
+            for (int r = 0; r < ratio; r++) sel[sel_n++] = starts[ord[i]] + r;
+        }
+        free(pool); free(starts); free(sc); free(ord);
+    }
+    /* tail = positions after the last complete block (always attended) */
+    for (int p = nblk * ratio; p < len; p++) sel[sel_n++] = p;
+    *nsel = sel_n;
+    free(qk); free(q);
+}
+
+/* QSA full-attention token path: indexer selects the visible positions,
+ * then the MAIN attention (q_norm/k_norm + partial RoPE + KV cache + gate)
+ * attends ONLY over the selected set (reference: indexer mask ANDed into
+ * the causal mask). K/V of the current token are stored at pos first. */
+static void sparse_attn_token(Model *m, Layer *l, int layer, const float *x, int pos, float *out){
+    Cfg *c = &m->c; int H = c->n_heads, hd = c->head_dim, D = c->hidden;
+    int kv = c->n_kv_heads, groups = H / kv;
+    float *qg = falloc((int64_t)2 * H * hd);        /* per head: [q hd | gate hd] */
+    float *k = falloc((int64_t)kv * hd), *vv = falloc((int64_t)kv * hd);
+    wt_mul(qg, x, &l->q, 1, 2 * H * hd, D);
+    wt_mul(k, x, &l->k, 1, kv * hd, D);
+    wt_mul(vv, x, &l->v, 1, kv * hd, D);
+    for (int h = 0; h < H; h++)
+        rmsnorm_row(qg + (int64_t)h * 2 * hd, qg + (int64_t)h * 2 * hd, l->qn, hd, c->eps);
+    for (int g = 0; g < kv; g++)
+        rmsnorm_row(k + (int64_t)g * hd, k + (int64_t)g * hd, l->kn, hd, c->eps);
+    for (int h = 0; h < H; h++)
+        rope_partial(qg + (int64_t)h * 2 * hd, pos, c);
+    for (int g = 0; g < kv; g++)
+        rope_partial(k + (int64_t)g * hd, pos, c);
+    for (int g = 0; g < kv; g++) {
+        kv_store_row(m, layer, g, pos, k + (int64_t)g * hd, hd);
+        kv_store_row_v(m, layer, g, pos, vv + (int64_t)g * hd, hd);
+    }
+    /* indexer: raw k stored into m->idx_cache[layer], positions selected */
+    int *sel = malloc(size_mul_or_die((size_t)(c->idx_budget + c->idx_ratio), sizeof(int), "qsa selection"));
+    int nsel = 0;
+    if (!sel) { fprintf(stderr, "OOM qsa selection\n"); exit(1); }
+    qsa_select(m, l, layer, x, pos, sel, &nsel);
+    float *scores = falloc((int64_t)nsel);
+    float *attn_out = falloc((int64_t)H * hd);
+    float krow[512], vrow[512];
+    if (hd > 512) { fprintf(stderr, "head_dim %d > 512\n", hd); exit(1); }
+    float scale = 1.f / sqrtf((float)hd);
+    for (int h = 0; h < H; h++) {
+        const float *qh = qg + (int64_t)h * 2 * hd;
+        int hg = h / groups;
+        float mx = -1e30f;
+        for (int s = 0; s < nsel; s++) {
+            kv_load_row(m, layer, hg, sel[s], krow, hd);
+            float acc = 0;
+            for (int d = 0; d < hd; d++) acc += qh[d] * krow[d];
+            scores[s] = acc * scale;
+            if (scores[s] > mx) mx = scores[s];
+        }
+        float ssum = 0;
+        for (int s = 0; s < nsel; s++) { scores[s] = expf(scores[s] - mx); ssum += scores[s]; }
+        float *oh = attn_out + (int64_t)h * hd;
+        for (int d = 0; d < hd; d++) oh[d] = 0;
+        for (int s = 0; s < nsel; s++) {
+            kv_load_row_v(m, layer, hg, sel[s], vrow, hd);
+            float w = scores[s] / ssum;
+            for (int d = 0; d < hd; d++) oh[d] += w * vrow[d];
+        }
+        const float *gh = qg + (int64_t)(2 * h + 1) * hd;
+        for (int d = 0; d < hd; d++) oh[d] *= 1.f / (1.f + expf(-gh[d]));
+    }
+    wt_mul(out, attn_out, &l->o, 1, D, H * hd);
+    free(sel); free(scores); free(attn_out);
+    free(qg); free(k); free(vv);
+}
+
+/* Batched QSA path: same per-token order as attention_batch; the indexer
+ * runs per token (positions are strictly increasing inside the chunk). */
+static void sparse_attn_batch(Model *m, Layer *l, int layer, const float *xs, int C,
+                              int pos0, float *out){
+    for (int g = 0; g < C; g++) {
+        float *tmp = falloc(m->c.hidden);
+        sparse_attn_token(m, l, layer, xs + (int64_t)g * m->c.hidden, pos0 + g, tmp);
+        for (int d = 0; d < m->c.hidden; d++)
+            out[(int64_t)g * m->c.hidden + d] += tmp[d];
+        free(tmp);
+    }
+}
+
+/* ---------- MoE ---------- */
 /* Drain a slot's pending MetalIO load at use time (exact-async issue and
  * speculative prefetch both publish with the load in flight). No-op when
  * the data is already waited, pread-loaded, or MetalIO is off. */
@@ -2600,7 +3120,15 @@ static void expert_apply(Model *m, Slot *s, const float *x, float *acc){
         return;
     }
 #endif
-    if (s->fmt == 7) {
+    if (s->fmt == 9) {
+        float *gate = falloc(I), *up = falloc(I), *h = falloc(I), *y = falloc(D);
+        matmul_fp8(gate, x, (const uint8_t *)s->g, s->gs, 1, D, I);
+        matmul_fp8(up,   x, (const uint8_t *)s->u, s->us, 1, D, I);
+        for (int i = 0; i < I; i++) h[i] = silu(gate[i]) * up[i];
+        matmul_fp8(y, h, (const uint8_t *)s->dd, s->ds, 1, I, D);
+        for (int d = 0; d < D; d++) acc[d] += y[d];
+        free(gate); free(up); free(h); free(y);
+    } else if (s->fmt == 7) {
 #ifdef COLI_CUDA
         if (g_cuda_compute && coli_cuda_expert_mlp_mxfp4(acc, x,
                 s->mxg, s->mxgs, s->mxu, s->mxus, s->mxd, s->mxds,
@@ -3503,7 +4031,22 @@ static void moe_token(Model *m, Layer *l, int layer, const float *x, float *out)
 #ifdef COLI_METALIO
     g_mio_async_issue = g_metal_io && metalio_active();
 #endif
+#if defined(_OPENMP)
+    /* Parallel pread+detile: expert_get is concurrency-safe by design
+     * (loading_eid dedup, publish under g_mx, LRU skips in-flight slots).
+     * QWEN_PARALLEL_LOAD=0 forces the serial path (debug/race A/B). */
+    if (getenv("QWEN_PARALLEL_LOAD") && !strcmp(getenv("QWEN_PARALLEL_LOAD"), "0")) {
+        int i;
+        for (i = 0; i < K; i++) expert_get(m, layer, idx[i], &slots[i]);
+    } else {
+        int kk = K;
+        int i;
+        _Pragma("omp parallel for schedule(static, 1)")
+        for (i = 0; i < kk; i++) expert_get(m, layer, idx[i], &slots[i]);
+    }
+#else
     for (int i = 0; i < K; i++) expert_get(m, layer, idx[i], &slots[i]);
+#endif
 #ifdef COLI_METALIO
     g_mio_async_issue = 0;
 #endif
@@ -4399,8 +4942,166 @@ static float *step_batched_h(Model *m, const int *ids, int n, int pos_base,
 /* ---------- forward ---------- */
 
 /* process one token at position `pos`, return output hidden state in out */
+
+/* ---------------- Qwen4 PLE n-gram + hyper-connection forward (M5) --------
+ * Mirrors c/tools/qwen4_oracle.py forward() L388-419 + _ple + _gated_residual.
+ * hc*D stream; per layer: gated_residual(attn) -> mixed[D] -> attn/sparse/gdn
+ * -> stream = hyper + inj[g]*a_out ; same for mlp -> moe; global mixer -> [D]. */
+static int m5_dbg(void){ static int v = -1; if (v < 0) { const char *s = getenv("QWEN_M5_DEBUG"); v = s ? atoi(s) : 0; } return v; }
+
+static void ple_forward(Model *m, float *stream){
+    Cfg *c = &m->c;
+    if (c->ple_layer < 0 || !m->ple_ngram.f) return;
+    int D = c->hidden, hc = c->hc_count, hcd = hc * D;
+    int ns = c->ngram_size, hpn = c->ngram_heads / (ns - 1), heads = c->ngram_heads;
+    int hd_per = c->ple_embed_dim / heads;
+    int kk = c->ple_conv_kernel, dil = ns, pad = (kk - 1) * dil;
+    int ctx = ns - 1, T = ctx + 1;
+    /* history = last ctx ids (ring 0..ctx-1) + current (ring[ctx]); push in caller */
+    int64_t hist[16];
+    for (int i = 0; i < ctx; i++) hist[i] = m->ple_ring[i];
+    hist[ctx] = m->ple_ring[ctx];
+    int64_t shifted[8][16];
+    for (int s = 0; s < ns; s++) {
+        int seg = 0;
+        for (int p = 0; p < T; p++) {
+            int64_t v = c->eos;
+            int src = p - s;
+            if (src >= 0 && p - seg >= s) v = hist[src];
+            shifted[s][p] = v;
+            if (hist[p] == c->eos) seg = p + 1;
+        }
+    }
+    uint64_t rows[16]; int n = 0;
+    for (int ng = 2; ng <= ns; ng++)
+        for (int k = 0; k < hpn; k++) {
+            int h = (ng - 2) * hpn + k;
+            uint64_t mixed = 0;
+            for (int j = 0; j < ng; j++)
+                mixed ^= (uint64_t)shifted[j][T - 1] * m->ple_mult[j];
+            rows[n++] = (mixed % (uint64_t)m->ple_sizes[h]) + (uint64_t)m->ple_offsets[h];
+        }
+    float emb[256];
+    if (m->ple_f8_rps > 0) {
+        /* streamed decode: shard = row / rps, within = row % rps; one 160-byte
+         * pread per row (page-cache friendly: rows cluster per token). */
+        uint8_t raw[256];
+        char rn[512];
+        for (int h = 0; h < heads; h++) {
+            int64_t r = (int64_t)rows[h];
+            int sh = (int)(r / m->ple_f8_rps);
+            snprintf(rn, sizeof(rn), "%sple.ple_embedding.ngram_embedding.shard_%d.weight", g_prefix, sh);
+            st_tensor *t = st_find(&m->S, rn);
+            if (!t) { fprintf(stderr, "ple: missing shard %d\n", sh); exit(1); }
+            st_pread_full(t->fd, raw, (int64_t)hd_per, t->off + (r % m->ple_f8_rps) * hd_per, "ple row");
+            for (int d = 0; d < hd_per; d++)
+                emb[h * hd_per + d] = e4m3_decode(raw[d]) * m->ple_f8_scale;
+        }
+    } else {
+        for (int h = 0; h < heads; h++) {
+            const float *row = m->ple_ngram.f + (int64_t)rows[h] * hd_per;
+            memcpy(emb + h * hd_per, row, (size_t)hd_per * sizeof(float));
+        }
+    }
+    float key[1024], value[256], qn[1024];
+    wt_mul(key, emb, &m->ple_key_proj, 1, hcd, c->ple_embed_dim);
+    wt_mul(value, emb, &m->ple_value_proj, 1, D, c->ple_embed_dim);
+    rmsnorm_grouped(key, key, m->ple_norm_key, hc, D, c->eps);
+    rmsnorm_grouped(qn, stream, m->ple_norm_query, hc, D, c->eps);
+    float gated[1024], conv_in[1024];
+    float rD = 1.f / sqrtf((float)D);
+    for (int g = 0; g < hc; g++) {
+        float acc = 0.f;
+        for (int d = 0; d < D; d++) acc += key[g * D + d] * qn[g * D + d];
+        float t = acc * rD, mag = fabsf(t);
+        if (mag < 1e-6f) mag = 1e-6f;
+        float sg = (t >= 0.f ? 1.f : -1.f) * sqrtf(mag);
+        float sig = 1.f / (1.f + expf(-sg));
+        for (int d = 0; d < D; d++) gated[g * D + d] = sig * value[d];
+    }
+    rmsnorm_grouped(conv_in, gated, m->ple_norm_conv, hc, D, c->eps);
+    /* dilated causal conv: out = silu(sum_j w[j] * x[t - j*dil]); state ring
+     * slot s = sample s steps back (samples at lag 1..pad). */
+    int st = pad + 1;
+    for (int i = 0; i < hcd; i++) {
+        const float *w = m->ple_conv1d + (int64_t)i * kk;
+        float acc = 0.f;
+        for (int j = 0; j < kk; j++) {
+            int lag = j * dil;
+            /* slot s = sample s steps back (slot 0 = current after insert);
+             * fetch gated[t-lag] at step t+1 = slot lag-1 */
+            float xj = (lag == 0) ? conv_in[i] : m->ple_conv_state[i * st + (lag - 1)];
+            acc += w[j] * xj;
+        }
+        for (int s = st - 1; s >= 1; s--) m->ple_conv_state[i * st + s] = m->ple_conv_state[i * st + s - 1];
+        m->ple_conv_state[i * st] = conv_in[i];
+        stream[i] += gated[i] + silu(acc);
+    }
+    if (m5_dbg()) {
+        fprintf(stderr, "PLE %f,%f,%f,%f,%f,%f,%f,%f\n", stream[0], stream[1], stream[2], stream[3], stream[4], stream[5], stream[6], stream[7]);
+    }
+}
+
+static void forward_token_hc(Model *m, int token, int pos, float *out){
+    Cfg *c = &m->c; int D = c->hidden, hc = c->hc_count, hcd = hc * D;
+    float *stream = falloc(hcd);
+    /* embed row -> repeated hc times; f32 / bf16 / q8 rows (real ckpt = bf16) */
+    if (m->embed.q) {
+        const int8_t *row = m->embed.q + (int64_t)token * D;
+        float sc = m->embed.s[token];
+        for (int g = 0; g < hc; g++)
+            for (int d = 0; d < D; d++) stream[g * D + d] = (float)row[d] * sc;
+    } else if (m->embed.bf16) {
+        const uint16_t *row = m->embed.bf16 + (int64_t)token * D;
+        for (int g = 0; g < hc; g++)
+            for (int d = 0; d < D; d++) stream[g * D + d] = coli_bf16_decode(row[d]);
+    } else {
+        for (int g = 0; g < hc; g++)
+            memcpy(stream + g * D, m->embed.f + (int64_t)token * D, (size_t)D * sizeof(float));
+    }
+    for (int i = 0; i < c->ngram_size - 1; i++) m->ple_ring[i] = m->ple_ring[i + 1];
+    m->ple_ring[c->ngram_size - 1] = token;
+    if (m5_dbg())
+        fprintf(stderr, "EMB %f,%f,%f,%f\n", stream[0], stream[1], stream[2], stream[3]);
+    for (int l = 0; l < c->n_layers; l++) {
+        Layer *L = &m->L[l];
+        float *mixed = falloc(D), *attn = falloc(D);
+        memset(mixed, 0, (size_t)D * sizeof(float));   /* hc_mix ACCUMULATES */
+        if (c->ple_layer == l) ple_forward(m, stream);
+        float *inj = falloc(hc);
+        hc_mix(L->hc_norm, &L->hc_mix_down, &L->hc_mix_up, &L->hc_inject,
+               hc, D, c->hc_lowrank, stream, mixed, inj, c->eps);
+        if (c->layer_is_gdn[l]) gdn_token(m, L, l, mixed, attn);
+        else if (c->layer_is_qsa[l]) sparse_attn_token(m, L, l, mixed, pos, attn);
+        else attention_token(m, L, l, mixed, pos, attn);
+        if (m5_dbg())
+            fprintf(stderr, "MIX%d %f,%f,%f,%f INJ %f,%f\n", l, mixed[0], mixed[1], mixed[2], mixed[3], inj[0], inj[1]);
+        for (int g = 0; g < hc; g++)
+            for (int d = 0; d < D; d++) stream[g * D + d] += inj[g] * attn[d];
+        if (m5_dbg())
+            fprintf(stderr, "GDN %f,%f,%f,%f\n", attn[0], attn[1], attn[2], attn[3]);
+        float *m2 = falloc(D), *moe = falloc(D);
+        memset(m2, 0, (size_t)D * sizeof(float));
+        hc_mix(L->hc_mlp_norm, &L->hc_mlp_mix_down, &L->hc_mlp_mix_up, &L->hc_mlp_inject,
+               hc, D, c->hc_lowrank, stream, m2, inj, c->eps);
+        moe_token(m, L, l, m2, moe);
+        if (m5_dbg())
+            fprintf(stderr, "MOE %f,%f,%f,%f\n", moe[0], moe[1], moe[2], moe[3]);
+        for (int g = 0; g < hc; g++)
+            for (int d = 0; d < D; d++) stream[g * D + d] += inj[g] * moe[d];
+        free(mixed); free(attn); free(m2); free(moe); free(inj);
+    }
+    memset(out, 0, (size_t)D * sizeof(float));          /* hc_mix accumulates */
+    hc_mix(m->hc_global.hc_norm, &m->hc_global.hc_mix_down, &m->hc_global.hc_mix_up,
+           NULL, hc, D, c->hc_lowrank, stream, out, NULL, c->eps);
+    if (m5_dbg())
+        fprintf(stderr, "FINAL %f,%f,%f,%f\n", out[0], out[1], out[2], out[3]);
+    free(stream);
+}
+
 static void forward_token(Model *m, int token, int pos, float *out){
     Cfg *c = &m->c; int D = c->hidden;
+    if (c->hc_count > 0) { forward_token_hc(m, token, pos, out); return; }
     if (token < 0 || token >= c->vocab) {
         fprintf(stderr, "token id %d outside [0,%d)\n", token, c->vocab);
         exit(1);
@@ -4514,7 +5215,7 @@ static float *step_h(Model *m, const int *ids, int n, int pos_base, float **h_ou
                 pos_base, pos_base + n, m->max_t);
         exit(1);
     }
-    if (n > 1 && g_chunk > 1) return step_batched_h(m, ids, n, pos_base, NULL, h_out);
+    if (n > 1 && g_chunk > 1 && c->hc_count == 0) return step_batched_h(m, ids, n, pos_base, NULL, h_out);
     float *h = falloc(D);
     for (int i = 0; i < n; i++) forward_token(m, ids[i], pos_base + i, h);
     float *normed = falloc(D);
@@ -4529,6 +5230,35 @@ static float *step_h(Model *m, const int *ids, int n, int pos_base, float **h_ou
 }
 
 /* ---------- model init ---------- */
+
+
+/* PLE n-gram hash helpers (M5): mirrors c/tools/qwen4_oracle.py exactly —
+ * splitmix64 with the pinned gamma, nth-prime-after for per-head vocab sizes. */
+#define PLE_GAMMA 0x9E3779B97F4A7C15ULL
+#define PLE_M1    0xBF58476D1CE4E5B9ULL
+#define PLE_M2    0x94D049BB133111EBULL
+static uint64_t ple_splitmix64(uint64_t v){
+    v = (v + PLE_GAMMA) & UINT64_MAX;
+    v = ((v ^ (v >> 30)) * PLE_M1) & UINT64_MAX;
+    v = ((v ^ (v >> 27)) * PLE_M2) & UINT64_MAX;
+    return (v ^ (v >> 31)) & UINT64_MAX;
+}
+static int64_t nth_prime_after(int64_t start, int count){
+    int64_t p = start;
+    for (int i = 0; i < count; i++) {
+        p += 1;
+        for (;;) {
+            int prime = p >= 2;
+            if (prime && p % 2 == 0) prime = (p == 2);
+            if (prime)
+                for (int64_t d = 3; d * d <= p && d <= 46340; d += 2)
+                    if (p % d == 0) { prime = 0; break; }
+            if (prime) break;
+            p += 1;
+        }
+    }
+    return p;
+}
 
 static void model_init(Model *m, const char *snap, int cap){
     memset(m, 0, sizeof(*m));
@@ -4577,7 +5307,12 @@ static void model_init(Model *m, const char *snap, int cap){
         if (!st_have(m, nm)) snprintf(nm, sizeof(nm), "%slm_head.weight", g_prefix);
         m->lm_head = load_wt_named(m, nm, c->vocab, c->hidden);
     }
-    m->final_norm = load_t(m, "norm.weight", c->hidden);
+    /* Qwen4 has NO final norm: the hyper-connection mixer output feeds
+     * lm_head directly (verified against the reference TextModel.forward).
+     * qwen3.5/3.6 always carry norm.weight. */
+    c->qwen4_no_final_norm = c->hc_count > 0 && !st_have(m, "norm.weight");
+    if (c->qwen4_no_final_norm) m->final_norm = NULL;
+    else m->final_norm = load_t(m, "norm.weight", c->hidden);
     m->L = calloc(c->n_layers, sizeof(Layer));
     if (!m->L) { fprintf(stderr, "OOM layers\n"); exit(1); }
     for (int i = 0; i < c->n_layers; i++) {
@@ -4589,8 +5324,38 @@ static void model_init(Model *m, const char *snap, int cap){
         /* load_t prepends g_prefix and reads f32; LDW probes <name>_q8/_qs */
         #define LD(field, suffix, N) snprintf(nm, sizeof(nm), "layers.%d." suffix, i); l->field = load_t(m, nm, N)
         #define LDW(field, suffix, O, I) snprintf(nm, sizeof(nm), "layers.%d." suffix, i); l->field = load_wt(m, nm, O, I)
-        LD(in_ln, "input_layernorm.weight", D);
-        LD(post_ln, "post_attention_layernorm.weight", D);
+        /* Qwen4 decoder layers carry NO input/post layernorms (the residual
+         * stream is hc_count*D and the GatedResidual blocks do the gating);
+         * qwen3.5/3.6 always have both. Guard via st_have so one loader
+         * serves both families. */
+        {
+            char probe[512];
+            snprintf(probe, sizeof(probe), "%slayers.%d.input_layernorm.weight", g_prefix, i);
+            if (st_have(m, probe)) {
+                snprintf(nm, sizeof(nm), "layers.%d.input_layernorm.weight", i);
+                l->in_ln = load_t(m, nm, D);
+            } else l->in_ln = NULL;
+            snprintf(probe, sizeof(probe), "%slayers.%d.post_attention_layernorm.weight", g_prefix, i);
+            if (st_have(m, probe)) {
+                snprintf(nm, sizeof(nm), "layers.%d.post_attention_layernorm.weight", i);
+                l->post_ln = load_t(m, nm, D);
+            } else l->post_ln = NULL;
+        }
+        /* QSA indexer probe (qwen4): layer_is_qsa + indexer weights. The
+         * st_have guard takes the FULL prefixed name; load_t prepends
+         * g_prefix itself, so the load name is unprefixed. */
+        if (c->idx_n_heads > 0) {
+            char probe[512];
+            snprintf(probe, sizeof(probe),
+                     "%slayers.%d.self_attn.indexer.index_qk_proj.weight", g_prefix, i);
+            c->layer_is_qsa[i] = st_have(m, probe) ? 1 : 0;
+            if (c->layer_is_qsa[i]) {
+                LDW(index_qk, "self_attn.indexer.index_qk_proj.weight",
+                    (c->idx_n_heads + c->idx_kv_heads) * c->idx_head_dim, D);
+                LD(idx_qn, "self_attn.indexer.q_layernorm.weight", c->idx_head_dim);
+                LD(idx_kn, "self_attn.indexer.k_layernorm.weight", c->idx_head_dim);
+            }
+        }
         if (c->layer_is_gdn[i]) {
             LD(A_log, "linear_attn.A_log", c->lin_v_heads);
             LD(dt_bias, "linear_attn.dt_bias", c->lin_v_heads);
@@ -4614,8 +5379,141 @@ static void model_init(Model *m, const char *snap, int cap){
         LDW(se_up, "mlp.shared_expert.up_proj.weight", c->shared_inter, D);
         LDW(se_down, "mlp.shared_expert.down_proj.weight", D, c->shared_inter);
         LDW(se_g, "mlp.shared_expert_gate.weight", 1, D);
+        /* hyper connections: attn_hyper_connection + mlp_hyper_connection
+         * per layer (both required when hc_count > 0; qwen4 always has
+         * both), then the GLOBAL hyper_connection_mixer on the Model.
+         * st_have guard = FULL prefixed name; load_t/load_wt prepend
+         * g_prefix themselves, so the loader names are unprefixed. */
+        if (c->hc_count > 0) {
+            int hcd = c->hc_count * D, lr = c->hc_lowrank;
+            char probe[512];
+            snprintf(probe, sizeof(probe), "%slayers.%d.attn_hyper_connection.hc_norm.weight", g_prefix, i);
+            if (!st_have(m, probe)) {
+                fprintf(stderr, "layers.%d.attn_hyper_connection: missing (hc_count>0)\n", i);
+                exit(1);
+            }
+            snprintf(nm, sizeof(nm), "layers.%d.attn_hyper_connection.hc_norm.weight", i);
+            l->hc_norm = load_t(m, nm, hcd);
+            snprintf(nm, sizeof(nm), "layers.%d.attn_hyper_connection.input_mix_weight_down.weight", i);
+            l->hc_mix_down = load_wt(m, nm, lr, hcd);
+            snprintf(nm, sizeof(nm), "layers.%d.attn_hyper_connection.input_mix_weight_up.weight", i);
+            l->hc_mix_up = load_wt(m, nm, hcd, lr);
+            snprintf(nm, sizeof(nm), "layers.%d.attn_hyper_connection.block_inject_weight.weight", i);
+            l->hc_inject = load_wt(m, nm, c->hc_count, hcd);
+            snprintf(nm, sizeof(nm), "layers.%d.mlp_hyper_connection.hc_norm.weight", i);
+            l->hc_mlp_norm = load_t(m, nm, hcd);
+            snprintf(nm, sizeof(nm), "layers.%d.mlp_hyper_connection.input_mix_weight_down.weight", i);
+            l->hc_mlp_mix_down = load_wt(m, nm, lr, hcd);
+            snprintf(nm, sizeof(nm), "layers.%d.mlp_hyper_connection.input_mix_weight_up.weight", i);
+            l->hc_mlp_mix_up = load_wt(m, nm, hcd, lr);
+            snprintf(nm, sizeof(nm), "layers.%d.mlp_hyper_connection.block_inject_weight.weight", i);
+            l->hc_mlp_inject = load_wt(m, nm, c->hc_count, hcd);
+        }
         #undef LD
         #undef LDW
+    }
+    /* global hyper-connection mixer (use_combine=False: NO block_inject) */
+    if (c->hc_count > 0) {
+        int D = c->hidden, hcd = c->hc_count * D, lr = c->hc_lowrank;
+        char nm[512];
+        snprintf(nm, sizeof(nm), "hyper_connection_mixer.hc_norm.weight");
+        m->hc_global.hc_norm = load_t(m, nm, hcd);
+        snprintf(nm, sizeof(nm), "hyper_connection_mixer.input_mix_weight_down.weight");
+        m->hc_global.hc_mix_down = load_wt(m, nm, lr, hcd);
+        snprintf(nm, sizeof(nm), "hyper_connection_mixer.input_mix_weight_up.weight");
+        m->hc_global.hc_mix_up = load_wt(m, nm, hcd, lr);
+    }
+    /* QSA indexer caches (raw token_k per position) */
+    m->idx_cache = calloc_checked((size_t)(c->n_layers + c->mtp_layers), sizeof(float*), "idx cache rows");
+    m->idx_len   = calloc_checked((size_t)(c->n_layers + c->mtp_layers), sizeof(int), "idx len rows");
+    for (int i = 0; i < c->n_layers + c->mtp_layers; i++)
+        if (c->layer_is_qsa[i])
+            m->idx_cache[i] = calloc_checked((size_t)((int64_t)c->idx_kv_heads * c->idx_head_dim * c->max_pos), sizeof(float), "idx cache");
+    /* PLE n-gram loader (plain f32 snapshot; no shard/F8 path) */
+    if (c->ple_layer >= 0) {
+        int D = c->hidden, hc = c->hc_count > 0 ? c->hc_count : 1, hcd = hc * D;
+        int ns = c->ngram_size, heads = c->ngram_heads, hpn = heads / (ns - 1);
+        int hd_per = c->ple_embed_dim / heads;
+        char probe[512], nm[512];
+        snprintf(probe, sizeof(probe), "%sple.ple_embedding.ngram_embedding.weight", g_prefix);
+        if (st_have(m, probe)) {
+            int64_t total = 0;
+            m->ple_offsets = malloc(size_mul_or_die((size_t)heads, sizeof(int64_t), "ple offsets"));
+            m->ple_sizes   = malloc(size_mul_or_die((size_t)heads, sizeof(int64_t), "ple sizes"));
+            if (!m->ple_offsets || !m->ple_sizes) { fprintf(stderr, "OOM ple geom\n"); exit(1); }
+            for (int h = 0; h < heads; h++) {
+                m->ple_sizes[h] = nth_prime_after((int64_t)c->ngram_vocab_base - 1, h + 1);
+                m->ple_offsets[h] = total;
+                total += m->ple_sizes[h];
+            }
+            int64_t padded = (total + c->ngram_div - 1) / c->ngram_div * c->ngram_div;
+            snprintf(nm, sizeof(nm), "ple.ple_embedding.ngram_embedding.weight");
+            m->ple_ngram = load_wt(m, nm, padded, hd_per);
+            snprintf(nm, sizeof(nm), "ple.key_proj.weight");
+            m->ple_key_proj = load_wt(m, nm, hcd, c->ple_embed_dim);
+            snprintf(nm, sizeof(nm), "ple.value_proj.weight");
+            m->ple_value_proj = load_wt(m, nm, D, c->ple_embed_dim);
+            snprintf(nm, sizeof(nm), "ple.norm_key.weight");
+            m->ple_norm_key = load_t(m, nm, hcd);
+            snprintf(nm, sizeof(nm), "ple.norm_query.weight");
+            m->ple_norm_query = load_t(m, nm, hcd);
+            snprintf(nm, sizeof(nm), "ple.norm_conv.weight");
+            m->ple_norm_conv = load_t(m, nm, hcd);
+            snprintf(nm, sizeof(nm), "ple.conv1d.weight");
+            m->ple_conv1d = load_t(m, nm, (int64_t)hcd * c->ple_conv_kernel);
+            int64_t max_long = INT64_MAX;
+            int64_t mult_max = max_long / (c->vocab > 0 ? c->vocab : 1);
+            int64_t half = mult_max / 2; if (half < 1) half = 1;
+            uint64_t base = (uint64_t)c->seed + 10007ULL * (uint64_t)c->ple_layer;
+            m->ple_mult = malloc(size_mul_or_die((size_t)ns, sizeof(uint64_t), "ple mult"));
+            if (!m->ple_mult) { fprintf(stderr, "OOM ple mult\n"); exit(1); }
+            for (int i = 0; i < ns; i++)
+                m->ple_mult[i] = 2 * (ple_splitmix64(base + PLE_GAMMA * (uint64_t)(i + 1)) % (uint64_t)half) + 1;
+            m->ple_ring = malloc(size_mul_or_die((size_t)ns, sizeof(int64_t), "ple ring"));
+            m->ple_conv_state = calloc_checked((size_t)hcd * ((size_t)(c->ple_conv_kernel - 1) * ns + 1), sizeof(float), "ple conv");
+            if (!m->ple_ring) { fprintf(stderr, "OOM ple ring\n"); exit(1); }
+            for (int i = 0; i < ns; i++) m->ple_ring[i] = c->eos;
+        } else {
+            /* Real checkpoint: ngram table is 128 FP8 shards + global scale. */
+            char sp[512], sn[512], scn[512];
+            snprintf(sp, sizeof(sp), "%sple.ple_embedding.ngram_embedding.shard_0.weight", g_prefix);
+            if (st_have(m, sp)) {
+                snprintf(sn, sizeof(sn), "%sple.ple_embedding.ngram_embedding.shard_0.weight", g_prefix);
+                st_tensor *t0 = st_find(&m->S, sn);
+                if (!t0 || t0->numel <= 0 || t0->numel % hd_per != 0) {
+                    fprintf(stderr, "ple: bad shard_0 numel %lld (hd_per %d)\n",
+                            (long long)(t0 ? t0->numel : -1), hd_per); exit(1);
+                }
+                m->ple_f8_rps = t0->numel / hd_per;
+                snprintf(scn, sizeof(scn), "%sple.ple_embedding.ngram_embedding.weight_scale", g_prefix);
+                st_read_f32(&m->S, scn, &m->ple_f8_scale, 0);
+                /* geometry (primes/offsets/multipliers/ring/conv) still needed */
+                int64_t total = 0;
+                m->ple_offsets = malloc(size_mul_or_die((size_t)heads, sizeof(int64_t), "ple offsets"));
+                m->ple_sizes   = malloc(size_mul_or_die((size_t)heads, sizeof(int64_t), "ple sizes"));
+                if (!m->ple_offsets || !m->ple_sizes) { fprintf(stderr, "OOM ple geom\n"); exit(1); }
+                for (int h = 0; h < heads; h++) {
+                    m->ple_sizes[h] = nth_prime_after((int64_t)c->ngram_vocab_base - 1, h + 1);
+                    m->ple_offsets[h] = total;
+                    total += m->ple_sizes[h];
+                }
+                int64_t max_long = INT64_MAX;
+                int64_t mult_max = max_long / (c->vocab > 0 ? c->vocab : 1);
+                int64_t half = mult_max / 2; if (half < 1) half = 1;
+                uint64_t base = (uint64_t)c->seed + 10007ULL * (uint64_t)c->ple_layer;
+                m->ple_mult = malloc(size_mul_or_die((size_t)ns, sizeof(uint64_t), "ple mult"));
+                if (!m->ple_mult) { fprintf(stderr, "OOM ple mult\n"); exit(1); }
+                for (int i = 0; i < ns; i++)
+                    m->ple_mult[i] = 2 * (ple_splitmix64(base + PLE_GAMMA * (uint64_t)(i + 1)) % (uint64_t)half) + 1;
+                m->ple_ring = malloc(size_mul_or_die((size_t)ns, sizeof(int64_t), "ple ring"));
+                m->ple_conv_state = calloc_checked((size_t)hcd * ((size_t)(c->ple_conv_kernel - 1) * ns + 1), sizeof(float), "ple conv");
+                if (!m->ple_ring) { fprintf(stderr, "OOM ple ring\n"); exit(1); }
+                for (int i = 0; i < ns; i++) m->ple_ring[i] = c->eos;
+            } else {
+                fprintf(stderr, "ple_layer_ids=%d but no ngram_embedding.weight (disabling PLE)\n", c->ple_layer + 1);
+                c->ple_layer = -1;
+            }
+        }
     }
 coli_dense_done:
     mtp_load(m);
@@ -5226,6 +6124,15 @@ static int tok_sp_id(Tok *T, const char *s){
  * intentionally retained: a position-zero prefill overwrites every position
  * that causal attention can read for the new request. */
 static void request_state_reset(Model *m){
+    Cfg *c = &m->c;
+    if (m->ple_ring && c->ngram_size > 0)
+        for (int i = 0; i < c->ngram_size; i++) m->ple_ring[i] = c->eos;
+    if (m->ple_conv_state && c->ple_layer >= 0) {
+        int hcd = (c->hc_count > 0 ? c->hc_count : 1) * c->hidden;
+        memset(m->ple_conv_state, 0, size_mul_or_die((size_t)hcd * ((c->ple_conv_kernel - 1) * c->ngram_size + 1), sizeof(float), "PLE conv reset"));
+    }
+    if (m->idx_len)
+        for (int i = 0; i < c->n_layers + c->mtp_layers; i++) m->idx_len[i] = 0;
     for (int i = 0; i < m->c.n_layers; i++) {
         if (m->gdn_S && m->gdn_S[i])
             memset(m->gdn_S[i], 0, size_mul_or_die(gdn_state_count(&m->c), sizeof(float), "GDN recurrence reset"));
