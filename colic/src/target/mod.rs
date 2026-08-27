@@ -90,6 +90,11 @@ impl HostCapabilities {
 pub fn resolve(request: &TargetRequest, host: HostCapabilities) -> Result<TargetProfile> {
     let profile = match request {
         TargetRequest::Native => native(host)?,
+        TargetRequest::Auto => {
+            return Err(ColicError::Usage(
+                "`--target auto` is resolved by the inline planner before target resolution; use `colic plan` or `colic compile --target auto`".into(),
+            ));
+        }
         TargetRequest::Profile(name) => PROFILES
             .iter()
             .find(|profile| profile.name == name)
