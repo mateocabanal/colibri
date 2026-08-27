@@ -172,6 +172,8 @@ pub fn inspect_source(source_path: &std::path::Path) -> Result<source::SourceInv
 pub fn build_semantic_ir(inventory: &source::SourceInventory) -> Result<Option<SemanticModel>> {
     if DeepSeekV4Frontend::probe(inventory)? {
         Ok(Some(DeepSeekV4Frontend::build(inventory)?))
+    } else if crate::model::qwen4_exp::Qwen4ExpFrontend::probe(inventory)? {
+        Ok(Some(crate::model::qwen4_exp::Qwen4ExpFrontend::build(inventory)?))
     } else if QwenMoeFrontend::probe(inventory)? {
         Ok(Some(QwenMoeFrontend::build(inventory)?))
     } else {
