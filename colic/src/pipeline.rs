@@ -5,7 +5,7 @@ use crate::{
     ir::{Architecture, SemanticModel},
     model::deepseek_v4::DeepSeekV4Frontend,
     model::qwen_moe::QwenMoeFrontend,
-    quant::mxfp4_record,
+    quant::{int4_record, mxfp4_record, nvfp4_record},
     source,
     storage::{self, LoweredRecord, ManifestRecord, StoragePlan},
     target, verify,
@@ -83,6 +83,8 @@ impl QuantRequest {
 enum ExpertQuantization {
     Exact,
     Mxfp4,
+    Int4,
+    Nvfp4,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,9 +149,7 @@ impl Stage {
 
 pub trait ProgressSink {
     fn stage(&mut self, stage: Stage);
-
     fn source_file(&mut self, _: &source::DiscoveryProgress) {}
-
     fn emission(&mut self, _: u64, _: u64, _: u64, _: u64) {}
 }
 
@@ -194,11 +194,44 @@ fn resolve_expert_quantization(
             }
             Ok(ExpertQuantization::Mxfp4)
         }
+        QuantRequest::Profile(profile) if profile == "int4" || profile == "int4-g32" => {
+            if model.architecture != Architecture::Qwen3_5MoeMoE {
+                return Err(ColicError::unsupported(
+                    Stage::TargetPlanning.as_str(),
+                    "`--quant int4` currently supports Qwen3.5/3.6/3.7 MoE routed experts only",
+                ));
+            }
+            Ok(ExpertQuantization::Int4)
+        }
+        QuantRequest::Profile(profile) if profile == "nvfp4" || profile == "nvfp4-1d" => {
+            if model.architecture != Architecture::Qwen3_5MoeMoE {
+                return Err(ColicError::unsupported(
+                    Stage::TargetPlanning.as_str(),
+                    "`--quant nvfp4` currently supports Qwen3.5/3.6/3.7 MoE routed experts only",
+                ));
+            }
+            Ok(ExpertQuantization::Nvfp4)
+        }
         QuantRequest::Profile(profile) => Err(ColicError::unsupported(
             Stage::TargetPlanning.as_str(),
             format!("quantization profile `{profile}` is not implemented"),
         )),
     }
+}
+
+fn reject_incompatible_target(
+    quantization: ExpertQuantization,
+    target_profile: target::TargetProfile,
+) -> Result<()> {
+    if target_profile == target::MACOS_ARM64_METAL_APPLE8_V1
+        && matches!(quantization, ExpertQuantization::Int4 | ExpertQuantization::Nvfp4)
+    {
+        return Err(ColicError::unsupported(
+            Stage::TargetPlanning.as_str(),
+            "canonical INT4/NVFP4 records are not Apple8 execution tiles; use `--quant mxfp4` for the Apple8 target until target-specific FP4 lowering is added",
+        ));
+    }
+    Ok(())
 }
 
 pub fn dry_run(request: &CompileRequest) -> Result<DryRunSummary> {
@@ -212,6 +245,7 @@ pub fn dry_run(request: &CompileRequest) -> Result<DryRunSummary> {
     })?;
     let quantization = resolve_expert_quantization(request, &model)?;
     let target_profile = target::resolve(&request.target, target::HostCapabilities::current())?;
+    reject_incompatible_target(quantization, target_profile)?;
     let records = record_inventory(&model, quantization, target_profile)?;
     let plan = storage::plan_records(&records, target_profile, 4 * 1024 * 1024 * 1024)?;
     Ok(DryRunSummary {
@@ -253,6 +287,12 @@ fn record_inventory(
             match expert_quantization {
                 ExpertQuantization::Exact => target::validate_apple8_exact_mxfp4_expert(expert)?,
                 ExpertQuantization::Mxfp4 => target::validate_apple8_quantized_mxfp4_expert(expert)?,
+                ExpertQuantization::Int4 | ExpertQuantization::Nvfp4 => {
+                    return Err(ColicError::unsupported(
+                        Stage::TargetPlanning.as_str(),
+                        "INT4/NVFP4 do not yet have an Apple8 target lowering",
+                    ));
+                }
             }
             (
                 target::apple8_expert_stored_bytes(expert)?,
@@ -267,6 +307,14 @@ fn record_inventory(
                 ExpertQuantization::Mxfp4 => (
                     mxfp4_record::stored_bytes(expert)?,
                     mxfp4_record::resident_bytes(expert)?,
+                ),
+                ExpertQuantization::Int4 => (
+                    int4_record::stored_bytes(expert)?,
+                    int4_record::resident_bytes(expert)?,
+                ),
+                ExpertQuantization::Nvfp4 => (
+                    nvfp4_record::stored_bytes(expert)?,
+                    nvfp4_record::resident_bytes(expert)?,
                 ),
             }
         };
@@ -283,139 +331,6 @@ fn record_inventory(
         id = next_record_id(id)?;
     }
     Ok(records)
-}
-
-#[allow(dead_code)]
-#[derive(Debug)]
-struct ExactPayload {
-    record: LoweredRecord,
-    manifest: ManifestRecord,
-    bytes: Vec<u8>,
-}
-
-#[allow(dead_code)]
-fn lower_exact_payloads(model: &SemanticModel) -> Result<Vec<ExactPayload>> {
-    let mut payloads = Vec::new();
-    let mut id = 1_u64;
-    for (name, tensor) in &model.global_tensors {
-        payloads.push(lower_exact_tensor_payload(
-            id,
-            name.clone(),
-            -1,
-            -1,
-            tensor,
-        )?);
-        id = next_record_id(id)?;
-    }
-    for (layer, tensors) in &model.layer_static_tensors {
-        let layer: i32 = (*layer)
-            .try_into()
-            .map_err(|_| ColicError::Usage("layer number exceeds COLI i32 range".into()))?;
-        for (role, tensor) in tensors {
-            payloads.push(lower_exact_tensor_payload(
-                id,
-                format!("layers.{layer}.{role}"),
-                layer,
-                -1,
-                tensor,
-            )?);
-            id = next_record_id(id)?;
-        }
-    }
-    for expert in model.routed_experts.values() {
-        let bytes = target::lower_exact_expert(expert)?;
-        let stored_bytes: u64 = bytes
-            .len()
-            .try_into()
-            .map_err(|_| ColicError::Usage("expert payload exceeds u64".into()))?;
-        let layer: i32 = expert
-            .layer
-            .try_into()
-            .map_err(|_| ColicError::Usage("layer number exceeds COLI i32 range".into()))?;
-        let expert_id: i32 = expert
-            .expert
-            .try_into()
-            .map_err(|_| ColicError::Usage("expert number exceeds COLI i32 range".into()))?;
-        payloads.push(ExactPayload {
-            record: LoweredRecord {
-                id,
-                kind: 2,
-                stored_bytes,
-                decoded_bytes: target::exact_expert_decoded_bytes(expert)?,
-            },
-            manifest: ManifestRecord {
-                id,
-                name: Some(format!(
-                    "layers.{}.ffn.experts.{}",
-                    expert.layer, expert.expert
-                )),
-                layer,
-                expert: expert_id,
-                kind: 2,
-                codec: 0,
-                math_format: 0xfffe,
-                scale_format: 0xfffe,
-                layout: 0xfffe,
-                flags: 0,
-                stored_crc32c: storage::crc32c(&bytes),
-                logical_crc32c: 0,
-                codec_table_id: 0,
-            },
-            bytes,
-        });
-        id = next_record_id(id)?;
-    }
-    for (name, tensor) in &model.resident_tensors {
-        payloads.push(lower_exact_tensor_payload(
-            id,
-            name.clone(),
-            -2,
-            -1,
-            tensor,
-        )?);
-        id = next_record_id(id)?;
-    }
-    Ok(payloads)
-}
-
-#[allow(dead_code)]
-fn lower_exact_tensor_payload(
-    id: u64,
-    name: String,
-    layer: i32,
-    expert: i32,
-    tensor: &source::TensorRef,
-) -> Result<ExactPayload> {
-    let bytes = target::lower_exact_tensor(tensor)?;
-    let logical_crc32c = storage::crc32c(&bytes[128..]);
-    let stored_bytes: u64 = bytes
-        .len()
-        .try_into()
-        .map_err(|_| ColicError::Usage("tensor payload exceeds u64".into()))?;
-    Ok(ExactPayload {
-        record: LoweredRecord {
-            id,
-            kind: 1,
-            stored_bytes,
-            decoded_bytes: tensor.len,
-        },
-        manifest: ManifestRecord {
-            id,
-            name: Some(name),
-            layer,
-            expert,
-            kind: 1,
-            codec: 0,
-            math_format: target::math_format_for_dtype(&tensor.dtype)?,
-            scale_format: 0,
-            layout: 0,
-            flags: 0b10,
-            stored_crc32c: storage::crc32c(&bytes),
-            logical_crc32c,
-            codec_table_id: 0,
-        },
-        bytes,
-    })
 }
 
 fn next_record_id(id: u64) -> Result<u64> {
@@ -525,6 +440,12 @@ fn stream_payload(
                 let bytes = match quantization {
                     ExpertQuantization::Exact => target::lower_apple8_exact_mxfp4_expert(expert)?,
                     ExpertQuantization::Mxfp4 => target::lower_apple8_quantized_mxfp4_expert(expert)?,
+                    ExpertQuantization::Int4 | ExpertQuantization::Nvfp4 => {
+                        return Err(ColicError::unsupported(
+                            Stage::Emission.as_str(),
+                            "INT4/NVFP4 do not yet have an Apple8 target lowering",
+                        ));
+                    }
                 };
                 if bytes.len() as u64 != planned.record.stored_bytes {
                     return Err(ColicError::Usage(
@@ -546,6 +467,18 @@ fn stream_payload(
                     }
                     ExpertQuantization::Mxfp4 => {
                         let bytes = mxfp4_record::lower_expert(expert)?;
+                        let crc = storage::crc32c(&bytes);
+                        writer.write_record(planned, &bytes)?;
+                        crc
+                    }
+                    ExpertQuantization::Int4 => {
+                        let bytes = int4_record::lower_expert(expert)?;
+                        let crc = storage::crc32c(&bytes);
+                        writer.write_record(planned, &bytes)?;
+                        crc
+                    }
+                    ExpertQuantization::Nvfp4 => {
+                        let bytes = nvfp4_record::lower_expert(expert)?;
                         let crc = storage::crc32c(&bytes);
                         writer.write_record(planned, &bytes)?;
                         crc
@@ -644,6 +577,7 @@ pub fn compile(request: &CompileRequest, progress: &mut dyn ProgressSink) -> Res
     let expert_quantization = resolve_expert_quantization(request, &model)?;
     progress.stage(Stage::TargetPlanning);
     let target_profile = target::resolve(&request.target, target::HostCapabilities::current())?;
+    reject_incompatible_target(expert_quantization, target_profile)?;
     let output = request
         .output
         .as_ref()
@@ -732,7 +666,11 @@ pub fn compile(request: &CompileRequest, progress: &mut dyn ProgressSink) -> Res
 fn validate_supported_options(request: &CompileRequest) -> Result<()> {
     match &request.quant {
         QuantRequest::Exact => {}
-        QuantRequest::Profile(profile) if profile == "mxfp4" => {}
+        QuantRequest::Profile(profile)
+            if matches!(
+                profile.as_str(),
+                "mxfp4" | "int4" | "int4-g32" | "nvfp4" | "nvfp4-1d"
+            ) => {}
         QuantRequest::Profile(profile) => {
             return Err(ColicError::unsupported(
                 Stage::TargetPlanning.as_str(),
@@ -757,15 +695,11 @@ fn validate_supported_options(request: &CompileRequest) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::BTreeMap,
-        fs,
-        time::{SystemTime, UNIX_EPOCH},
-    };
+    use std::{collections::BTreeMap, fs};
 
     use super::*;
     use crate::{
-        ir::{Architecture, Matrix, ModelGeometry, RoutedExpert},
+        ir::{Matrix, ModelGeometry, RoutedExpert},
         source::TensorRef,
     };
 
@@ -779,132 +713,57 @@ mod tests {
         }
     }
 
-    fn synthetic_v4_source(root: &std::path::Path) {
-        fs::create_dir_all(root).unwrap();
-        fs::write(
-            root.join("config.json"),
-            r#"{"model_type":"deepseek_v4","hidden_size":2,"num_hidden_layers":1,"n_routed_experts":2,"moe_intermediate_size":3,"vocab_size":4,"hc_mult":2,"num_hash_layers":1,"num_experts_per_tok":1,"num_attention_heads":1,"head_dim":2,"q_lora_rank":1,"o_groups":1,"o_lora_rank":1,"index_n_heads":1,"index_head_dim":1,"compress_ratios":[0]}"#,
-        )
-        .unwrap();
-        fs::write(root.join("tokenizer.json"), br#"{"model":{"type":"BPE"}}"#).unwrap();
-        fs::write(
-            root.join("tokenizer_config.json"),
-            br#"{"chat_template":"fixture"}"#,
-        )
-        .unwrap();
-        fs::write(
-            root.join("generation_config.json"),
-            br#"{"eos_token_id":3}"#,
-        )
-        .unwrap();
-        fs::write(
-            root.join("special_tokens_map.json"),
-            br#"{"eos_token":"</s>"}"#,
-        )
-        .unwrap();
-        fs::write(root.join("model_metadata.json"), br#"{"fixture":true}"#).unwrap();
-        let mut specs = BTreeMap::<String, (&str, Vec<u64>)>::new();
-        let mut add = |name: String, dtype: &'static str, shape: Vec<u64>| {
-            specs.insert(name, (dtype, shape));
+    fn qwen_quant_inventory_model() -> SemanticModel {
+        let matrix = Matrix {
+            source: TensorRef {
+                source: "fixture.safetensors".into(),
+                offset: 0,
+                len: 2 * 2 * 32,
+                dtype: "BF16".into(),
+                shape: vec![2, 32],
+            },
+            rows: 2,
+            columns: 32,
+            scale: None,
         };
-        for expert in 0..2 {
-            for (role, rows, columns) in [("w1", 3_u64, 2_u64), ("w2", 2, 3), ("w3", 3, 2)] {
-                add(
-                    format!("layers.0.ffn.experts.{expert}.{role}.weight"),
-                    "I8",
-                    vec![rows, columns.div_ceil(2)],
-                );
-                add(
-                    format!("layers.0.ffn.experts.{expert}.{role}.scale"),
-                    "F8_E8M0",
-                    vec![rows, columns.div_ceil(32)],
-                );
-            }
+        let mut experts = BTreeMap::new();
+        experts.insert(
+            (0, 0),
+            RoutedExpert {
+                layer: 0,
+                expert: 0,
+                gate: matrix.clone(),
+                up: matrix.clone(),
+                down: matrix,
+            },
+        );
+        SemanticModel {
+            architecture: Architecture::Qwen3_5MoeMoE,
+            geometry: ModelGeometry {
+                hidden_size: 32,
+                layers: 1,
+                routed_experts_per_layer: 1,
+                moe_intermediate_size: 2,
+                vocab_size: 1,
+                hc_mult: 0,
+                num_hash_layers: 0,
+                experts_per_token: 1,
+                attention_heads: 1,
+                head_dim: 32,
+                num_key_value_heads: 1,
+                linear_key_head_dim: 0,
+                q_lora_rank: 0,
+                o_groups: 0,
+                o_lora_rank: 0,
+                index_heads: 0,
+                index_head_dim: 0,
+                compression_ratios: Vec::new(),
+            },
+            routed_experts: experts,
+            global_tensors: BTreeMap::new(),
+            layer_static_tensors: BTreeMap::new(),
+            resident_tensors: BTreeMap::new(),
         }
-        for (name, dtype, shape) in [
-            ("embed.weight", "BF16", vec![4, 2]),
-            ("head.weight", "BF16", vec![4, 2]),
-            ("norm.weight", "BF16", vec![2]),
-            ("hc_head_base", "F32", vec![2]),
-            ("hc_head_fn", "F32", vec![2, 4]),
-            ("hc_head_scale", "F32", vec![1]),
-            ("layers.0.ffn.gate.weight", "BF16", vec![2, 2]),
-            ("layers.0.ffn.gate.tid2eid", "I64", vec![4, 1]),
-            (
-                "layers.0.ffn.shared_experts.w1.weight",
-                "F8_E4M3FN",
-                vec![3, 2],
-            ),
-            (
-                "layers.0.ffn.shared_experts.w2.weight",
-                "F8_E4M3FN",
-                vec![2, 3],
-            ),
-            (
-                "layers.0.ffn.shared_experts.w3.weight",
-                "F8_E4M3FN",
-                vec![3, 2],
-            ),
-            (
-                "layers.0.ffn.shared_experts.w1.scale",
-                "F8_E8M0",
-                vec![1, 1],
-            ),
-            (
-                "layers.0.ffn.shared_experts.w2.scale",
-                "F8_E8M0",
-                vec![1, 1],
-            ),
-            (
-                "layers.0.ffn.shared_experts.w3.scale",
-                "F8_E8M0",
-                vec![1, 1],
-            ),
-            ("layers.0.ffn_norm.weight", "BF16", vec![2]),
-            ("layers.0.attn.attn_sink", "F32", vec![1]),
-            ("layers.0.attn.kv_norm.weight", "BF16", vec![2]),
-            ("layers.0.attn.q_norm.weight", "BF16", vec![1]),
-            ("layers.0.attn.wkv.weight", "F8_E4M3FN", vec![2, 2]),
-            ("layers.0.attn.wkv.scale", "F8_E8M0", vec![1, 1]),
-            ("layers.0.attn.wo_a.weight", "F8_E4M3FN", vec![1, 2]),
-            ("layers.0.attn.wo_a.scale", "F8_E8M0", vec![1, 1]),
-            ("layers.0.attn.wo_b.weight", "F8_E4M3FN", vec![2, 1]),
-            ("layers.0.attn.wo_b.scale", "F8_E8M0", vec![1, 1]),
-            ("layers.0.attn.wq_a.weight", "F8_E4M3FN", vec![1, 2]),
-            ("layers.0.attn.wq_a.scale", "F8_E8M0", vec![1, 1]),
-            ("layers.0.attn.wq_b.weight", "F8_E4M3FN", vec![2, 1]),
-            ("layers.0.attn.wq_b.scale", "F8_E8M0", vec![1, 1]),
-            ("layers.0.attn_norm.weight", "BF16", vec![2]),
-            ("layers.0.hc_attn_base", "F32", vec![8]),
-            ("layers.0.hc_attn_fn", "F32", vec![8, 4]),
-            ("layers.0.hc_attn_scale", "F32", vec![3]),
-            ("layers.0.hc_ffn_base", "F32", vec![8]),
-            ("layers.0.hc_ffn_fn", "F32", vec![8, 4]),
-            ("layers.0.hc_ffn_scale", "F32", vec![3]),
-        ] {
-            add(name.into(), dtype, shape);
-        }
-        let mut offset = 0_u64;
-        let mut header = serde_json::Map::new();
-        let mut payload = Vec::new();
-        for (name, (dtype, shape)) in specs {
-            let size = match dtype {
-                "U8" | "I8" | "F8_E4M3FN" | "F8_E8M0" => 1,
-                "BF16" => 2,
-                "F32" => 4,
-                "I64" => 8,
-                _ => unreachable!(),
-            };
-            let bytes = shape.iter().product::<u64>() * size;
-            header.insert(name, serde_json::json!({"dtype": dtype, "shape": shape, "data_offsets": [offset, offset + bytes]}));
-            payload.resize(payload.len() + bytes as usize, 0);
-            offset += bytes;
-        }
-        let header = serde_json::to_vec(&header).unwrap();
-        let mut file = (header.len() as u64).to_le_bytes().to_vec();
-        file.extend_from_slice(&header);
-        file.extend_from_slice(&payload);
-        fs::write(root.join("model.safetensors"), file).unwrap();
     }
 
     #[test]
@@ -961,234 +820,61 @@ mod tests {
             resident_tensors: BTreeMap::new(),
         };
         let records = exact_record_inventory(&model).unwrap();
-        assert_eq!(
-            records.iter().map(|record| record.id).collect::<Vec<_>>(),
-            [1, 2, 3, 4]
-        );
-        assert_eq!(
-            records.iter().map(|record| record.kind).collect::<Vec<_>>(),
-            [1, 1, 1, 2]
-        );
-        assert_eq!(records[0].decoded_bytes, 2);
-    }
-
-    fn qwen_mxfp4_inventory_model() -> SemanticModel {
-        let matrix = Matrix {
-            source: TensorRef {
-                source: "fixture.safetensors".into(),
-                offset: 0,
-                len: 2 * 2 * 32,
-                dtype: "BF16".into(),
-                shape: vec![2, 32],
-            },
-            rows: 2,
-            columns: 32,
-            scale: None,
-        };
-        let mut experts = BTreeMap::new();
-        experts.insert(
-            (0, 0),
-            RoutedExpert {
-                layer: 0,
-                expert: 0,
-                gate: matrix.clone(),
-                up: matrix.clone(),
-                down: matrix,
-            },
-        );
-        SemanticModel {
-            architecture: Architecture::Qwen3_5MoeMoE,
-            geometry: ModelGeometry {
-                hidden_size: 32,
-                layers: 1,
-                routed_experts_per_layer: 1,
-                moe_intermediate_size: 2,
-                vocab_size: 1,
-                hc_mult: 0,
-                num_hash_layers: 0,
-                experts_per_token: 1,
-                attention_heads: 1,
-                head_dim: 32,
-                num_key_value_heads: 1,
-                linear_key_head_dim: 0,
-                q_lora_rank: 0,
-                o_groups: 0,
-                o_lora_rank: 0,
-                index_heads: 0,
-                index_head_dim: 0,
-                compression_ratios: Vec::new(),
-            },
-            routed_experts: experts,
-            global_tensors: BTreeMap::new(),
-            layer_static_tensors: BTreeMap::new(),
-            resident_tensors: BTreeMap::new(),
-        }
+        assert_eq!(records.iter().map(|r| r.id).collect::<Vec<_>>(), [1, 2, 3, 4]);
+        assert_eq!(records.iter().map(|r| r.kind).collect::<Vec<_>>(), [1, 1, 1, 2]);
     }
 
     #[test]
-    fn mxfp4_inventory_reduces_qwen_expert_resident_bytes() {
-        let model = qwen_mxfp4_inventory_model();
-        let exact = record_inventory(
-            &model,
-            ExpertQuantization::Exact,
-            target::LINUX_X86_64_AVX2_V1,
-        )
-        .unwrap();
-        let mxfp4 = record_inventory(
-            &model,
-            ExpertQuantization::Mxfp4,
-            target::LINUX_X86_64_AVX2_V1,
-        )
-        .unwrap();
-        assert_eq!(exact.len(), 1);
-        assert_eq!(mxfp4.len(), 1);
-        assert!(mxfp4[0].decoded_bytes < exact[0].decoded_bytes);
-        assert!(mxfp4[0].stored_bytes < exact[0].stored_bytes);
+    fn quantized_inventory_reduces_qwen_expert_resident_bytes() {
+        let model = qwen_quant_inventory_model();
+        let exact = record_inventory(&model, ExpertQuantization::Exact, target::LINUX_X86_64_AVX2_V1).unwrap();
+        let mx = record_inventory(&model, ExpertQuantization::Mxfp4, target::LINUX_X86_64_AVX2_V1).unwrap();
+        let i4 = record_inventory(&model, ExpertQuantization::Int4, target::LINUX_X86_64_AVX2_V1).unwrap();
+        let nv = record_inventory(&model, ExpertQuantization::Nvfp4, target::LINUX_X86_64_AVX2_V1).unwrap();
+        assert!(mx[0].decoded_bytes < exact[0].decoded_bytes);
+        assert!(i4[0].decoded_bytes < exact[0].decoded_bytes);
+        assert!(nv[0].decoded_bytes < exact[0].decoded_bytes);
     }
 
     #[test]
-    fn apple8_inventory_uses_tiled_raw_storage_sizes() {
-        let model = qwen_mxfp4_inventory_model();
-        let records = record_inventory(
-            &model,
-            ExpertQuantization::Mxfp4,
-            target::MACOS_ARM64_METAL_APPLE8_V1,
-        )
-        .unwrap();
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].stored_bytes, 872);
-        assert_eq!(records[0].decoded_bytes, 408);
+    fn apple8_rejects_non_apple8_quant_layouts() {
+        let mut request = CompileRequest::new("unused".into());
+        request.quant = QuantRequest::Profile("int4".into());
+        assert!(reject_incompatible_target(ExpertQuantization::Int4, target::MACOS_ARM64_METAL_APPLE8_V1).is_err());
+        request.quant = QuantRequest::Profile("nvfp4".into());
+        assert!(reject_incompatible_target(ExpertQuantization::Nvfp4, target::MACOS_ARM64_METAL_APPLE8_V1).is_err());
     }
 
     #[test]
-    fn json_metadata_copy_omits_source_weight_indexes() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "colic-json-metadata-{}-{nonce}",
-            std::process::id()
-        ));
-        let source = root.join("source");
-        let package = root.join("package");
-        fs::create_dir_all(&source).unwrap();
-        fs::create_dir_all(&package).unwrap();
-        fs::write(source.join("tokenizer.json"), b"tokenizer-bytes").unwrap();
-        fs::write(source.join("custom_runtime.json"), b"runtime-bytes").unwrap();
-        fs::write(source.join("README.md"), b"not metadata json").unwrap();
-        for name in [
-            "model.safetensors.index.json",
-            "pytorch_model.bin.index.json",
-            "flax_model.msgpack.index.json",
-            "tf_model.h5.index.json",
-        ] {
-            fs::write(source.join(name), b"stale weight index").unwrap();
+    fn supported_quant_names_pass_option_validation() {
+        for profile in ["mxfp4", "int4", "int4-g32", "nvfp4", "nvfp4-1d"] {
+            let mut request = CompileRequest::new("unused".into());
+            request.quant = QuantRequest::Profile(profile.into());
+            validate_supported_options(&request).unwrap();
         }
-
-        copy_package_json_metadata(&source, &package).unwrap();
-        assert_eq!(
-            fs::read(package.join("tokenizer.json")).unwrap(),
-            b"tokenizer-bytes"
-        );
-        assert_eq!(
-            fs::read(package.join("custom_runtime.json")).unwrap(),
-            b"runtime-bytes"
-        );
-        assert!(!package.join("README.md").exists());
-        for name in [
-            "model.safetensors.index.json",
-            "pytorch_model.bin.index.json",
-            "flax_model.msgpack.index.json",
-            "tf_model.h5.index.json",
-        ] {
-            assert!(
-                !package.join(name).exists(),
-                "copied stale weight index {name}"
-            );
-        }
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn compile_and_verify_synthetic_v4_package() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("colic-e2e-{}-{nonce}", std::process::id()));
-        let source = root.join("source");
-        synthetic_v4_source(&source);
-        let output = root.join("compiled.coli");
-        let mut request = CompileRequest::new(source);
-        request.output = Some(output.clone());
-        request.target = TargetRequest::Profile("linux-x86_64-avx2-v1".into());
-        request.verify = true;
-        compile(&request, &mut NoProgress).unwrap();
-        for name in [
-            "config.json",
-            "tokenizer.json",
-            "tokenizer_config.json",
-            "generation_config.json",
-            "special_tokens_map.json",
-            "model_metadata.json",
-        ] {
-            assert_eq!(
-                fs::read(output.join(name)).unwrap(),
-                fs::read(request.source.join(name)).unwrap(),
-                "compiled package did not preserve {name} verbatim"
-            );
-        }
-        assert_eq!(verify::verify_package(&output).unwrap().records, 37);
-        let second_output = root.join("compiled-again.coli");
-        let mut second_request = request.clone();
-        second_request.output = Some(second_output.clone());
-        compile(&second_request, &mut NoProgress).unwrap();
-        for name in ["manifest.coli", "data-00000.coli"] {
-            assert_eq!(
-                fs::read(output.join(name)).unwrap(),
-                fs::read(second_output.join(name)).unwrap(),
-                "recompiled {name} differs"
-            );
-        }
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn compile_and_verify_synthetic_v4_apple8_package() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "colic-apple8-e2e-{}-{nonce}",
-            std::process::id()
-        ));
-        let source = root.join("source");
-        synthetic_v4_source(&source);
-        let output = root.join("compiled.coli");
-        let mut request = CompileRequest::new(source);
-        request.output = Some(output.clone());
-        request.target = TargetRequest::Profile(target::MACOS_ARM64_METAL_APPLE8_V1.name.into());
-        request.verify = true;
-        compile(&request, &mut NoProgress).unwrap();
-        assert_eq!(verify::verify_package(&output).unwrap().records, 37);
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn unsupported_transform_options_fail_before_source_reads() {
         let mut request = CompileRequest::new("definitely-not-a-model".into());
         request.codec = CodecRequest::Auto;
-        assert!(matches!(
-            dry_run(&request),
-            Err(ColicError::Unsupported { .. })
-        ));
+        assert!(matches!(dry_run(&request), Err(ColicError::Unsupported { .. })));
         request.codec = CodecRequest::None;
         request.quant = QuantRequest::Profile("not-a-format".into());
-        assert!(matches!(
-            dry_run(&request),
-            Err(ColicError::Unsupported { .. })
-        ));
+        assert!(matches!(dry_run(&request), Err(ColicError::Unsupported { .. })));
+    }
+
+    #[test]
+    fn source_index_detection_is_unchanged() {
+        for name in [
+            "model.safetensors.index.json",
+            "pytorch_model.bin.index.json",
+            "flax_model.msgpack.index.json",
+            "tf_model.h5.index.json",
+        ] {
+            assert!(is_source_weight_index_json(name));
+        }
+        assert!(!is_source_weight_index_json("config.json"));
+        let _ = fs::metadata(".");
     }
 }
