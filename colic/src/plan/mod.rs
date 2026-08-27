@@ -9,3 +9,4 @@ pub mod ir;
 pub mod machine;
 pub mod cost;
 pub mod memory;
+pub mod placement;
