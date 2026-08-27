@@ -7,6 +7,7 @@
 
 pub mod ir;
 pub mod machine;
+pub mod calibration;
 pub mod cost;
 pub mod memory;
 pub mod placement;
