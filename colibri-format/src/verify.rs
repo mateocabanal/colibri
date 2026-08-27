@@ -284,7 +284,7 @@ pub fn verify_package_with_progress(
     Ok(VerificationSummary { shards, records })
 }
 
-fn variable_region(
+pub(crate) fn variable_region(
     bytes: &[u8],
     offset_field: usize,
     bytes_field: usize,
@@ -304,7 +304,7 @@ fn variable_region(
     Ok(offset as usize..end as usize)
 }
 
-fn validate_string_id(
+pub(crate) fn validate_string_id(
     manifest: &[u8],
     string_table: &std::ops::Range<usize>,
     count: u32,
@@ -333,7 +333,36 @@ fn validate_string_id(
     Ok(())
 }
 
-fn verify_tensor_record(
+/// Resolves a validated string ID to its UTF-8 contents. The descriptor must
+/// already have passed [`validate_string_id`].
+pub(crate) fn string_at<'m>(
+    manifest: &'m [u8],
+    string_table: &std::ops::Range<usize>,
+    count: u32,
+    id: u32,
+) -> Result<&'m str> {
+    if id >= count {
+        return invalid("manifest refers to an invalid string ID");
+    }
+    let desc = string_table.start + id as usize * 16;
+    let offset = u64_at(manifest, desc)? as usize;
+    let bytes = u32_at(manifest, desc + 8)? as usize;
+    let data_start = string_table
+        .start
+        .checked_add(offset)
+        .ok_or_else(|| usage("string offset overflows"))?;
+    let data_end = data_start
+        .checked_add(bytes)
+        .ok_or_else(|| usage("string length overflows"))?;
+    std::str::from_utf8(
+        manifest
+            .get(data_start..data_end)
+            .ok_or_else(|| usage("string outside manifest"))?,
+    )
+    .map_err(|_| usage("invalid UTF-8"))
+}
+
+pub(crate) fn verify_tensor_record(
     path: &Path,
     offset: u64,
     stored: u64,
@@ -373,7 +402,7 @@ fn verify_tensor_record(
     Ok(())
 }
 
-fn verify_expert_record(
+pub(crate) fn verify_expert_record(
     path: &Path,
     offset: u64,
     stored: u64,
@@ -401,7 +430,7 @@ fn verify_expert_record(
     Ok(())
 }
 
-fn read_file_range(path: &Path, offset: u64, length: u64) -> Result<Vec<u8>> {
+pub(crate) fn read_file_range(path: &Path, offset: u64, length: u64) -> Result<Vec<u8>> {
     let mut file = fs::File::open(path).map_err(|source| FormatError::Io {
         path: path.to_owned(),
         source,
@@ -451,7 +480,7 @@ fn crc32c_file_range(path: &Path, offset: u64, length: u64) -> Result<u32> {
     Ok(!state)
 }
 
-fn region(
+pub(crate) fn region(
     bytes: &[u8],
     offset_field: usize,
     bytes_field: usize,
@@ -472,7 +501,7 @@ fn region(
     Ok(offset as usize..end as usize)
 }
 
-fn u32_at(bytes: &[u8], offset: usize) -> Result<u32> {
+pub(crate) fn u32_at(bytes: &[u8], offset: usize) -> Result<u32> {
     bytes
         .get(offset..offset + 4)
         .and_then(|value| value.try_into().ok())
@@ -480,7 +509,7 @@ fn u32_at(bytes: &[u8], offset: usize) -> Result<u32> {
         .ok_or_else(|| usage("truncated COLI structure"))
 }
 
-fn u16_at(bytes: &[u8], offset: usize) -> Result<u16> {
+pub(crate) fn u16_at(bytes: &[u8], offset: usize) -> Result<u16> {
     bytes
         .get(offset..offset + 2)
         .and_then(|value| value.try_into().ok())
@@ -488,7 +517,7 @@ fn u16_at(bytes: &[u8], offset: usize) -> Result<u16> {
         .ok_or_else(|| usage("truncated COLI structure"))
 }
 
-fn i32_at(bytes: &[u8], offset: usize) -> Result<i32> {
+pub(crate) fn i32_at(bytes: &[u8], offset: usize) -> Result<i32> {
     bytes
         .get(offset..offset + 4)
         .and_then(|value| value.try_into().ok())
@@ -496,7 +525,7 @@ fn i32_at(bytes: &[u8], offset: usize) -> Result<i32> {
         .ok_or_else(|| usage("truncated COLI structure"))
 }
 
-fn u64_at(bytes: &[u8], offset: usize) -> Result<u64> {
+pub(crate) fn u64_at(bytes: &[u8], offset: usize) -> Result<u64> {
     bytes
         .get(offset..offset + 8)
         .and_then(|value| value.try_into().ok())
@@ -504,16 +533,16 @@ fn u64_at(bytes: &[u8], offset: usize) -> Result<u64> {
         .ok_or_else(|| usage("truncated COLI structure"))
 }
 
-fn usage(detail: impl Into<String>) -> FormatError {
+pub(crate) fn usage(detail: impl Into<String>) -> FormatError {
     FormatError::Invalid(detail.into())
 }
 
-fn invalid<T>(detail: impl Into<String>) -> Result<T> {
+pub(crate) fn invalid<T>(detail: impl Into<String>) -> Result<T> {
     Err(usage(format!("invalid COLI package: {}", detail.into())))
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{align_up, crc32c};
 
@@ -540,7 +569,7 @@ mod tests {
     /// Builds a minimal fully-valid COLI v1 package in a fresh tempdir:
     /// one shard (expert record kind=2) and a manifest whose CRC32C is
     /// computed over the manifest with its CRC field zeroed.
-    fn write_valid_package() -> std::path::PathBuf {
+    pub(crate) fn write_valid_package() -> std::path::PathBuf {
         let package = std::env::temp_dir().join(format!(
             "colibri-format-{}-{}",
             std::process::id(),
@@ -604,8 +633,8 @@ mod tests {
         manifest[80..88].copy_from_slice(&(STRING_TABLE_OFFSET as u64).to_le_bytes());
         manifest[88..96].copy_from_slice(&STRING_TABLE_BYTES.to_le_bytes());
         manifest[112..144].copy_from_slice(&fingerprint);
-        manifest[148..152].copy_from_slice(&0_u32.to_le_bytes()); // profile string
-        manifest[152..156].copy_from_slice(&1_u32.to_le_bytes()); // compiler string
+        manifest[148..152].copy_from_slice(&1_u32.to_le_bytes()); // profile string (id 1)
+        manifest[152..156].copy_from_slice(&0_u32.to_le_bytes()); // compiler string (id 0)
 
         // shard table @256: id 0, name string 0, file bytes, header crc
         manifest[256..260].copy_from_slice(&0_u32.to_le_bytes());
