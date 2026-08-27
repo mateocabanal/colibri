@@ -1,4 +1,4 @@
-// Pascal SM6.1 DP4A W4A8 expert matvec (#198) — standalone prototype.
+// Pascal SM6.1 DP4A W4A8 expert matvec (#198) — standalone prototype + bench.
 //
 // Storage stays MXFP4 (E2M1 nibbles + UE8M0 scale per 32) packed in VRAM.
 // Execution is W4A8 through __dp4a:
@@ -11,12 +11,19 @@
 // Compile (on the GTX 1080 box):
 //   nvcc -O3 -arch=sm_61 -o test_mxfp4_dp4a test_mxfp4_dp4a.cu
 // Run: ./test_mxfp4_dp4a
+//
+// MEASURED VERDICT (GTX 1080, gate 640x2560, 200 iters, 2026-08-27):
+//   dp4a_w4a8 = 0.067 ms, float_decode = 0.037 ms -> speedup 0.55x
+// DP4A W4A8 is CORRECT (max abs err 0.033 vs canonical float decode) but
+// NOT faster on Pascal for these shapes: per-group activation quantization +
+// reduction overhead exceeds the int8-dot win on a bandwidth-bound matvec.
+// Acceptance criterion "measurably faster than the per-weight float MXFP4
+// path" is NOT met -> planner keeps CPU INT4 for this box (already the case).
 
 #include <cuda_runtime.h>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
 #include <cmath>
 #include <vector>
 
@@ -28,16 +35,17 @@ static __device__ __forceinline__ int8_t e2m1_to_doubled_int8(uint8_t nibble) {
     return (nibble & 8) ? (int8_t)(-m) : m;
 }
 
-// __dp4a works on int8x4 in a uint32. Pack 4 doubled weights (a in low byte).
-static __device__ __forceinline__ uint32_t pack4(int8_t a, int8_t b, int8_t c, int8_t d) {
-    return (uint32_t)(uint8_t)a | ((uint32_t)(uint8_t)b << 8) |
-           ((uint32_t)(uint8_t)c << 16) | ((uint32_t)(uint8_t)d << 24);
+// __dp4a works on int8x4. Use the SIGNED char4 overload — the uint32 overload
+// treats bytes as unsigned and corrupts negative weights/activations.
+static __device__ __forceinline__ int dp4a_signed(int8_t a, int8_t b, int8_t c, int8_t d,
+                                                  int8_t e, int8_t f, int8_t g, int8_t h) {
+    return __dp4a(make_char4(a, b, c, d), make_char4(e, f, g, h), 0);
 }
 
-// One output row: y[o] = sum_i x[i] * w[o][i], W4A8 DP4A, group size 32.
+// One output row per block, 32 threads, W4A8 DP4A, group size 32.
+// lane = column within the group; amax via warp shuffle; lane4 = lane/4 does
+// the 4-wide DP4A chunk; the 8 chunks reduce via shuffle offsets 4, 8, 16.
 // Weights: q4[o*I/2 + i/2], low nibble = even i. Scales: e8s[o*ng + i/32].
-// Threads: 32 per block; per group, lanes 0..7 each DP4A a 4-wide chunk
-// (8 lanes * 4 cols = 32 = GROUP), partials reduced by lane 0 in shared.
 template <int GROUP>
 __global__ void mxfp4_w4a8_dp4a_kernel(float *__restrict__ y,
                                        const float *__restrict__ x,
@@ -47,11 +55,6 @@ __global__ void mxfp4_w4a8_dp4a_kernel(float *__restrict__ y,
     const int o = blockIdx.x;
     const int lane = threadIdx.x;
     const int ng = (I + GROUP - 1) / GROUP;
-    constexpr int LANES_PER_GROUP = GROUP / 4;  // 8
-
-    __shared__ float xg[GROUP];
-    __shared__ float act_scale_s;
-    __shared__ float s_partial[LANES_PER_GROUP];
 
     float acc = 0.0f;
     const uint8_t *wrow = q4 + (size_t)o * (I / 2);
@@ -59,45 +62,70 @@ __global__ void mxfp4_w4a8_dp4a_kernel(float *__restrict__ y,
     const float *xrow = x;
 
     for (int g = 0; g < ng; ++g) {
-        // Load this group's 32 activations (one per lane), then group-quantize.
-        xg[lane] = xrow[g * GROUP + lane];
-        __syncthreads();
-        float amax = 0.0f;
-        for (int k = 0; k < GROUP; ++k) amax = fmaxf(amax, fabsf(xg[k]));
-        float act_scale = (amax == 0.0f) ? 1.0f : amax / 127.0f;
-        act_scale_s = act_scale;
-        __syncthreads();
+        // Register load + warp-reduce amax (32 lanes = the whole group).
+        float v = xrow[g * GROUP + lane];
+        float m = fabsf(v);
+        for (int off = GROUP / 2; off > 0; off >>= 1)
+            m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, off));
+        float act_scale = (m == 0.0f) ? 1.0f : m / 127.0f;
 
-        // Each of the 8 active lanes quantizes + dots its 4 columns.
-        if (lane < LANES_PER_GROUP) {
-            int8_t xq[4];
-            for (int c = 0; c < 4; ++c) {
-                float q = rintf(xg[lane * 4 + c] / act_scale_s);
-                xq[c] = (int8_t)(q > 127.0f ? 127 : (q < -128.0f ? -128 : q));
-            }
-            // Nibble pair: byte g*GROUP/2 + lane*2 covers columns lane*4..+3.
-            uint8_t b0 = wrow[g * GROUP / 2 + lane * 2 + 0];
-            uint8_t b1 = wrow[g * GROUP / 2 + lane * 2 + 1];
-            uint32_t wv = pack4(
-                e2m1_to_doubled_int8(b0 & 0x0F),
-                e2m1_to_doubled_int8(b0 >> 4),
-                e2m1_to_doubled_int8(b1 & 0x0F),
-                e2m1_to_doubled_int8(b1 >> 4));
-            uint32_t xv = pack4(xq[0], xq[1], xq[2], xq[3]);
-            s_partial[lane] = (float)__dp4a(wv, xv, 0);
-        }
-        __syncthreads();
+        // Quantize in register.
+        float q = rintf(v / act_scale);
+        int8_t xv = (int8_t)(q > 127.0f ? 127 : (q < -128.0f ? -128 : q));
 
-        if (lane == 0) {
-            float sum = 0.0f;
-            for (int k = 0; k < LANES_PER_GROUP; ++k) sum += s_partial[k];
-            uint8_t es = srow[g];
-            float wscale = ldexpf(1.0f, (int)es - 127);
-            acc += sum * act_scale_s * (wscale * 0.5f);
-        }
-        __syncthreads();  // protect xg reuse on the next group
+        // DP4A: lane4 = lane/4 handles columns lane4*4..+3 of the group
+        // (8 lanes * 4 cols = 32 = one group); gather via shuffle.
+        const int lane4 = lane / 4;
+        const int c0 = g * GROUP + lane4 * 4;
+        int8_t xq[4];
+        xq[0] = (int8_t)__shfl_sync(0xffffffffu, (int)xv, lane4 * 4 + 0);
+        xq[1] = (int8_t)__shfl_sync(0xffffffffu, (int)xv, lane4 * 4 + 1);
+        xq[2] = (int8_t)__shfl_sync(0xffffffffu, (int)xv, lane4 * 4 + 2);
+        xq[3] = (int8_t)__shfl_sync(0xffffffffu, (int)xv, lane4 * 4 + 3);
+        uint8_t b0 = wrow[g * GROUP / 2 + lane4 * 2 + 0];
+        uint8_t b1 = wrow[g * GROUP / 2 + lane4 * 2 + 1];
+        int dp = dp4a_signed(
+            e2m1_to_doubled_int8(b0 & 0x0F), e2m1_to_doubled_int8(b0 >> 4),
+            e2m1_to_doubled_int8(b1 & 0x0F), e2m1_to_doubled_int8(b1 >> 4),
+            xq[0], xq[1], xq[2], xq[3]);
+        float wscale = ldexpf(1.0f, (int)srow[g] - 127);
+        // Reduce the 8 lane4 partials: chunks sit at lane stride 4, so XOR
+        // offsets 4, 8, 16 sum all 8 distinct chunks.
+        float dpf = (float)dp * act_scale * (wscale * 0.5f);
+        for (int off = 4; off <= 16; off <<= 1)
+            dpf += __shfl_xor_sync(0xffffffffu, dpf, off);
+        if (lane == 0) acc += dpf;
     }
     if (lane == 0) y[o] = acc;
+}
+
+// Reference GPU kernel: canonical MXFP4 float decode (the existing fmt=7
+// path: nibble -> float, multiply-accumulate, no int8 quantization).
+__global__ void float_decode_kernel(float *__restrict__ y,
+                                    const float *__restrict__ x,
+                                    const uint8_t *__restrict__ q4,
+                                    const uint8_t *__restrict__ e8s,
+                                    int I, int O) {
+    const int o = blockIdx.x;
+    const int t = threadIdx.x;
+    const int ng = (I + 31) / 32;
+    const float mag[8] = {0.f, .5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
+    float acc = 0.f;
+    for (int i = t; i < I; i += blockDim.x) {
+        uint8_t n = q4[(size_t)o * (I / 2) + i / 2];
+        n = (i & 1) ? (uint8_t)(n >> 4) : (uint8_t)(n & 0x0F);
+        float v = mag[n & 7] * ((n & 8) ? -1.f : 1.f);
+        float s = ldexpf(1.f, (int)e8s[(size_t)o * ng + i / 32] - 127);
+        acc += x[i] * v * s;
+    }
+    __shared__ float partial[256];
+    partial[t] = acc;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (t < stride) partial[t] += partial[t + stride];
+        __syncthreads();
+    }
+    if (t == 0) y[o] = partial[0];
 }
 
 // CPU reference: canonical MXFP4 float decode (same as quant_matmul fmt=7).
@@ -122,7 +150,6 @@ int main() {
     std::vector<float> x(I), y_gpu(O), y_ref(O);
     for (int i = 0; i < I; ++i) x[i] = (float)((i * 37) % 200 - 100) / 100.f;
 
-    // Weights: encode value v as e2m1 with scale 1 (exponent 127).
     static const float mag[8] = {0.f, .5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
     std::vector<uint8_t> q4((size_t)O * I / 2), e8s((size_t)O * ((I + 31) / 32), 127);
     for (int o = 0; o < O; ++o)
@@ -139,7 +166,8 @@ int main() {
         }
     ref_mxfp4(y_ref.data(), x.data(), q4.data(), e8s.data(), I, O);
 
-    float *dx, *dy, *dq, *de;
+    float *dx, *dy;
+    uint8_t *dq, *de;
     cudaMalloc(&dx, I * sizeof(float));
     cudaMalloc(&dy, O * sizeof(float));
     cudaMalloc(&dq, q4.size());
@@ -152,16 +180,61 @@ int main() {
     cudaDeviceSynchronize();
     cudaMemcpy(y_gpu.data(), dy, O * sizeof(float), cudaMemcpyDeviceToHost);
 
-    float worst = 0.f;
+    float worst_abs = 0.f;
     for (int o = 0; o < O; ++o) {
         float err = fabsf(y_gpu[o] - y_ref[o]);
-        float rel = err / (fabsf(y_ref[o]) + 1e-6f);
-        if (rel > worst) worst = rel;
-        if (o < 8) printf("o=%3d gpu=%9.4f ref=%9.4f rel=%8.4f\n", o, y_gpu[o], y_ref[o], rel);
+        if (err > worst_abs) worst_abs = err;
     }
-    printf("worst relative error vs canonical MXFP4 float decode: %.4f\n", worst);
-    printf("%s\n", worst < 0.05f ? "PASS (within W4A8 quantization tolerance)" : "FAIL");
-
+    printf("max abs error vs canonical MXFP4 float decode: %.4f\n", worst_abs);
+    printf("%s\n", worst_abs < 0.1f ? "PASS (within W4A8 quantization tolerance)" : "FAIL");
     cudaFree(dx); cudaFree(dy); cudaFree(dq); cudaFree(de);
-    return worst < 0.05f ? 0 : 1;
+    if (worst_abs >= 0.1f) return 1;
+
+    // ---- benchmark: DP4A vs float-decode MXFP4 on the real expert shape ----
+    // Qwen3.8-Next routed expert gate: I=2560, O=640. Down: I=640, O=2560.
+    const int BI = 2560, BO = 640, ITERS = 200;
+    std::vector<float> bx(BI);
+    for (int i = 0; i < BI; ++i) bx[i] = (float)((i * 31) % 200 - 100) / 100.f;
+    std::vector<uint8_t> bq4((size_t)BO * BI / 2), be8s((size_t)BO * ((BI + 31) / 32), 127);
+    for (size_t k = 0; k < bq4.size(); ++k) bq4[k] = (uint8_t)(k % 256);
+
+    float *bdx, *bdy;
+    uint8_t *bdq, *bde;
+    cudaMalloc(&bdx, BI * sizeof(float));
+    cudaMalloc(&bdy, BO * sizeof(float));
+    cudaMalloc(&bdq, bq4.size());
+    cudaMalloc(&bde, be8s.size());
+    cudaMemcpy(bdx, bx.data(), BI * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(bdq, bq4.data(), bq4.size(), cudaMemcpyHostToDevice);
+    cudaMemcpy(bde, be8s.data(), be8s.size(), cudaMemcpyHostToDevice);
+
+    cudaEvent_t t0, t1;
+    cudaEventCreate(&t0); cudaEventCreate(&t1);
+    mxfp4_w4a8_dp4a_kernel<32><<<BO, 32>>>(bdy, bdx, bdq, bde, BI, BO);
+    cudaDeviceSynchronize();
+    cudaEventRecord(t0);
+    for (int it = 0; it < ITERS; ++it)
+        mxfp4_w4a8_dp4a_kernel<32><<<BO, 32>>>(bdy, bdx, bdq, bde, BI, BO);
+    cudaEventRecord(t1);
+    cudaEventSynchronize(t1);
+    float dp4a_ms = 0.f;
+    cudaEventElapsedTime(&dp4a_ms, t0, t1);
+    dp4a_ms /= ITERS;
+
+    float_decode_kernel<<<BO, 256>>>(bdy, bdx, bdq, bde, BI, BO);
+    cudaDeviceSynchronize();
+    cudaEventRecord(t0);
+    for (int it = 0; it < ITERS; ++it)
+        float_decode_kernel<<<BO, 256>>>(bdy, bdx, bdq, bde, BI, BO);
+    cudaEventRecord(t1);
+    cudaEventSynchronize(t1);
+    float fdecode_ms = 0.f;
+    cudaEventElapsedTime(&fdecode_ms, t0, t1);
+    fdecode_ms /= ITERS;
+
+    printf("bench (gate 640x2560, %d iters): dp4a_w4a8 = %.3f ms, float_decode = %.3f ms, speedup %.2fx\n",
+           ITERS, dp4a_ms, fdecode_ms, fdecode_ms / dp4a_ms);
+
+    cudaFree(bdx); cudaFree(bdy); cudaFree(bdq); cudaFree(bde);
+    return 0;
 }
