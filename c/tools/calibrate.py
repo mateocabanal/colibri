@@ -131,11 +131,13 @@ def metrics(orig, dec):
     return {"nrmse": round(nrmse, 4), "cosine_err": round(cosine_err, 6), "outlier_frac": round(outliers, 4)}
 
 
-def read_tensor(f, hdr, name, data_start):
+def read_tensor(f, hdr, name, data_start, scale_hdr=None, scale_data_start=0):
     """Return list[float] dequantized to f32 for a tensor (BF16 or F8_E4M3).
 
     safetensors data_offsets are relative to the DATA section start (right
     after the 8-byte length prefix + JSON header), not the file start.
+    F8_E4M3 tensors may carry a sibling `weight_scale_inv` BF16 block-scale
+    tensor (per 128x128 block); pass its header/data_start to apply it.
     """
     info = hdr[name]
     dtype, shape = info["dtype"], info["shape"]
@@ -146,7 +148,22 @@ def read_tensor(f, hdr, name, data_start):
     if dtype in ("BF16",):
         return [bf16_to_f32(int.from_bytes(raw[i : i + 2], "little")) for i in range(0, len(raw), 2)][:n]
     if dtype in ("F8_E4M3", "F8_E4M3FN"):
-        return [e4m3_to_f32(b) for b in raw][:n]
+        values = [e4m3_to_f32(b) for b in raw][:n]
+        if scale_hdr is not None:
+            sinfo = scale_hdr
+            f.seek(scale_data_start + sinfo["data_offsets"][0])
+            sraw = f.read(sinfo["data_offsets"][1] - sinfo["data_offsets"][0])
+            block_rows = (shape[0] + FP8_BLOCK - 1) // FP8_BLOCK
+            block_cols = (shape[1] + FP8_BLOCK - 1) // FP8_BLOCK
+            scales = [
+                bf16_to_f32(int.from_bytes(sraw[i : i + 2], "little"))
+                for i in range(0, len(sraw), 2)
+            ]
+            for i in range(n):
+                r, c = divmod(i, shape[1])
+                br, bc = r // FP8_BLOCK, c // FP8_BLOCK
+                values[i] *= scales[br * block_cols + bc]
+        return values
     if dtype == "F32":
         return [struct.unpack("<f", raw[i : i + 4])[0] for i in range(0, len(raw), 4)][:n]
     raise ValueError(f"unsupported dtype {dtype} for {name}")
@@ -243,7 +260,14 @@ def main():
             # data section start = 8 (length prefix) + header length
             header_len = struct.unpack("<Q", f.read(8))[0]
             data_start = 8 + header_len
-            values = read_tensor(f, hdr, name, data_start)
+            # F8 experts carry a sibling BF16 block-scale tensor; attach it.
+            scale_hdr, scale_data_start = None, 0
+            if hdr[name]["dtype"] in ("F8_E4M3", "F8_E4M3FN"):
+                scale_name = name.replace(".weight", ".weight_scale_inv")
+                if scale_name in hdr:
+                    scale_hdr = hdr[scale_name]
+                    scale_data_start = data_start
+            values = read_tensor(f, hdr, name, data_start, scale_hdr, scale_data_start)
         if len(values) < 64:
             continue
         sample = values[: args.rows * min(args.cols, len(values))]
