@@ -1,0 +1,10 @@
+[package]
+name = "colibri-abi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Stable ABI identities shared by colic and the colibri runtime: target registry, semantic IDs, representation contracts"
+publish = false
+
+[dependencies]

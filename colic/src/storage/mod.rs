@@ -11,10 +11,9 @@ use crate::{
     target::TargetProfile,
 };
 
-pub const DATA_SHARD_HEADER_BYTES: u64 = 128;
-pub const MANIFEST_HEADER_BYTES: usize = 256;
-pub const DATA_MAGIC: &[u8; 8] = b"COLIDAT\0";
-pub const MANIFEST_MAGIC: &[u8; 8] = b"COLI\r\n\x1a\n";
+pub use colibri_format::{
+    DATA_MAGIC, DATA_SHARD_HEADER_BYTES, MANIFEST_HEADER_BYTES, MANIFEST_MAGIC, align_up, crc32c,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoweredRecord {
@@ -139,28 +138,6 @@ pub fn plan_records(
         });
     }
     Ok(plan)
-}
-
-pub fn align_up(value: u64, alignment: u64) -> Result<u64> {
-    if !alignment.is_power_of_two() {
-        return Err(ColicError::Usage("alignment must be a power of two".into()));
-    }
-    value
-        .checked_add(alignment - 1)
-        .map(|value| value & !(alignment - 1))
-        .ok_or_else(|| ColicError::Usage("alignment calculation overflows u64".into()))
-}
-
-/// Castagnoli CRC32C used by all COLI v1 integrity fields.
-pub fn crc32c(bytes: &[u8]) -> u32 {
-    let mut crc = !0_u32;
-    for byte in bytes {
-        crc ^= *byte as u32;
-        for _ in 0..8 {
-            crc = (crc >> 1) ^ (0x82f6_3b78 & (0_u32.wrapping_sub(crc & 1)));
-        }
-    }
-    !crc
 }
 
 pub fn encode_data_shard_header(

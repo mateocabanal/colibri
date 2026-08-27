@@ -249,10 +249,13 @@ fn record_inventory(
         }
     }
     for expert in model.routed_experts.values() {
-        let (stored_bytes, decoded_bytes) = if target_profile == target::MACOS_ARM64_METAL_APPLE8_V1 {
+        let (stored_bytes, decoded_bytes) = if target_profile == target::MACOS_ARM64_METAL_APPLE8_V1
+        {
             match expert_quantization {
                 ExpertQuantization::Exact => target::validate_apple8_exact_mxfp4_expert(expert)?,
-                ExpertQuantization::Mxfp4 => target::validate_apple8_quantized_mxfp4_expert(expert)?,
+                ExpertQuantization::Mxfp4 => {
+                    target::validate_apple8_quantized_mxfp4_expert(expert)?
+                }
             }
             (
                 target::apple8_expert_stored_bytes(expert)?,
@@ -446,7 +449,10 @@ enum ExactSource {
     },
 }
 
-fn exact_sources(model: &SemanticModel, expert_quantization: ExpertQuantization) -> Vec<ExactSource> {
+fn exact_sources(
+    model: &SemanticModel,
+    expert_quantization: ExpertQuantization,
+) -> Vec<ExactSource> {
     let mut sources = Vec::new();
     sources.extend(
         model
@@ -465,12 +471,16 @@ fn exact_sources(model: &SemanticModel, expert_quantization: ExpertQuantization)
             tensor: tensor.clone(),
         }));
     }
-    sources.extend(model.routed_experts.values().cloned().map(|expert| {
-        ExactSource::Expert {
-            expert: Box::new(expert),
-            quantization: expert_quantization,
-        }
-    }));
+    sources.extend(
+        model
+            .routed_experts
+            .values()
+            .cloned()
+            .map(|expert| ExactSource::Expert {
+                expert: Box::new(expert),
+                quantization: expert_quantization,
+            }),
+    );
     sources.extend(
         model
             .resident_tensors
@@ -524,7 +534,9 @@ fn stream_payload(
             let crc = if target_profile == target::MACOS_ARM64_METAL_APPLE8_V1 {
                 let bytes = match quantization {
                     ExpertQuantization::Exact => target::lower_apple8_exact_mxfp4_expert(expert)?,
-                    ExpertQuantization::Mxfp4 => target::lower_apple8_quantized_mxfp4_expert(expert)?,
+                    ExpertQuantization::Mxfp4 => {
+                        target::lower_apple8_quantized_mxfp4_expert(expert)?
+                    }
                 };
                 if bytes.len() as u64 != planned.record.stored_bytes {
                     return Err(ColicError::Usage(
@@ -1160,10 +1172,8 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "colic-apple8-e2e-{}-{nonce}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("colic-apple8-e2e-{}-{nonce}", std::process::id()));
         let source = root.join("source");
         synthetic_v4_source(&source);
         let output = root.join("compiled.coli");

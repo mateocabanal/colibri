@@ -83,12 +83,18 @@ fn lower_packed_expert(
     put_u16(&mut payload, 8, 1);
     put_u16(&mut payload, 10, 0);
     put_u32(&mut payload, 12, HEADER_BYTES as u32);
-    put_i32(&mut payload, 16, i32::try_from(layer).map_err(|_| {
-        ColicError::Usage("MXFP4 expert layer exceeds COLI i32 range".into())
-    })?);
-    put_i32(&mut payload, 20, i32::try_from(expert).map_err(|_| {
-        ColicError::Usage("MXFP4 expert id exceeds COLI i32 range".into())
-    })?);
+    put_i32(
+        &mut payload,
+        16,
+        i32::try_from(layer)
+            .map_err(|_| ColicError::Usage("MXFP4 expert layer exceeds COLI i32 range".into()))?,
+    );
+    put_i32(
+        &mut payload,
+        20,
+        i32::try_from(expert)
+            .map_err(|_| ColicError::Usage("MXFP4 expert id exceeds COLI i32 range".into()))?,
+    );
     put_u16(&mut payload, 24, MATRIX_COUNT as u16);
     put_u32(&mut payload, 28, DESC_BYTES as u32);
     put_u64(&mut payload, 32, HEADER_BYTES as u64);
@@ -180,10 +186,8 @@ mod tests {
 
     #[test]
     fn lowers_qwen_expert_into_existing_mxfp4_descriptor_contract() {
-        let path = std::env::temp_dir().join(format!(
-            "colic-qwen-mxfp4-record-{}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("colic-qwen-mxfp4-record-{}", std::process::id()));
         let gate_values = vec![1.0_f32; 64];
         let up_values = vec![2.0_f32; 64];
         let down_values = vec![3.0_f32; 64];
@@ -209,15 +213,42 @@ mod tests {
 
         for index in 0..3 {
             let desc = HEADER_BYTES + index * DESC_BYTES;
-            assert_eq!(u16::from_le_bytes(bytes[desc..desc + 2].try_into().unwrap()), (index + 1) as u16);
-            assert_eq!(u16::from_le_bytes(bytes[desc + 4..desc + 6].try_into().unwrap()), MATH_FORMAT_MXFP4);
-            assert_eq!(u16::from_le_bytes(bytes[desc + 6..desc + 8].try_into().unwrap()), SCALE_FORMAT_E8M0);
-            assert_eq!(u64::from_le_bytes(bytes[desc + 16..desc + 24].try_into().unwrap()), 2);
-            assert_eq!(u64::from_le_bytes(bytes[desc + 24..desc + 32].try_into().unwrap()), 32);
-            assert_eq!(u32::from_le_bytes(bytes[desc + 32..desc + 36].try_into().unwrap()), BLOCK_AXIS_COLUMNS);
-            assert_eq!(u32::from_le_bytes(bytes[desc + 36..desc + 40].try_into().unwrap()), BLOCK_SIZE);
-            assert_eq!(u64::from_le_bytes(bytes[desc + 56..desc + 64].try_into().unwrap()), 32);
-            assert_eq!(u64::from_le_bytes(bytes[desc + 80..desc + 88].try_into().unwrap()), 2);
+            assert_eq!(
+                u16::from_le_bytes(bytes[desc..desc + 2].try_into().unwrap()),
+                (index + 1) as u16
+            );
+            assert_eq!(
+                u16::from_le_bytes(bytes[desc + 4..desc + 6].try_into().unwrap()),
+                MATH_FORMAT_MXFP4
+            );
+            assert_eq!(
+                u16::from_le_bytes(bytes[desc + 6..desc + 8].try_into().unwrap()),
+                SCALE_FORMAT_E8M0
+            );
+            assert_eq!(
+                u64::from_le_bytes(bytes[desc + 16..desc + 24].try_into().unwrap()),
+                2
+            );
+            assert_eq!(
+                u64::from_le_bytes(bytes[desc + 24..desc + 32].try_into().unwrap()),
+                32
+            );
+            assert_eq!(
+                u32::from_le_bytes(bytes[desc + 32..desc + 36].try_into().unwrap()),
+                BLOCK_AXIS_COLUMNS
+            );
+            assert_eq!(
+                u32::from_le_bytes(bytes[desc + 36..desc + 40].try_into().unwrap()),
+                BLOCK_SIZE
+            );
+            assert_eq!(
+                u64::from_le_bytes(bytes[desc + 56..desc + 64].try_into().unwrap()),
+                32
+            );
+            assert_eq!(
+                u64::from_le_bytes(bytes[desc + 80..desc + 88].try_into().unwrap()),
+                2
+            );
         }
         assert_eq!(stored_bytes(&expert).unwrap(), bytes.len() as u64);
         assert_eq!(resident_bytes(&expert).unwrap(), 102);

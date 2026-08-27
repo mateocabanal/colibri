@@ -152,9 +152,15 @@ fn classifies_native_mtp_and_keeps_experts_pageable() {
     assert_eq!(stage.expert_gate_up.shape, vec![2, 6, 4]);
     assert_eq!(stage.expert_down.shape, vec![2, 4, 3]);
     assert!(stage.static_tensors.contains_key("self_attn.q_proj.weight"));
-    assert!(stage.static_tensors.contains_key("mlp.shared_expert.gate_proj.weight"));
     assert!(
-        !stage.static_tensors.contains_key("mlp.experts.gate_up_proj"),
+        stage
+            .static_tensors
+            .contains_key("mlp.shared_expert.gate_proj.weight")
+    );
+    assert!(
+        !stage
+            .static_tensors
+            .contains_key("mlp.experts.gate_up_proj"),
         "routed MTP expert payload must not become static residency"
     );
     assert!(

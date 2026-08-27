@@ -312,7 +312,10 @@ fn lowers_hybrid_qwen_roles_without_collisions() {
         "linear_attn.out_proj.weight",
         "attn_norm.weight",
     ] {
-        assert!(linear.contains_key(role), "missing canonical GDN role {role}");
+        assert!(
+            linear.contains_key(role),
+            "missing canonical GDN role {role}"
+        );
     }
     assert_eq!(linear["attn_norm.weight"].shape, vec![3]);
 
@@ -354,5 +357,8 @@ fn rejects_truncated_fused_expert_payload() {
 
     let error = QwenMoeFrontend::build(&fixture.inventory).unwrap_err();
     let message = error.to_string();
-    assert!(message.contains("gate_up_proj len"), "unexpected error: {message}");
+    assert!(
+        message.contains("gate_up_proj len"),
+        "unexpected error: {message}"
+    );
 }

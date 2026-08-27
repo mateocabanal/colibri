@@ -42,10 +42,11 @@ pub fn inspect(source: &SourceInventory) -> Result<Option<QwenMtpInventory>> {
         path: config_path.clone(),
         source: source_error,
     })?;
-    let config: Value = serde_json::from_slice(&bytes).map_err(|error| ColicError::InvalidSource {
-        path: config_path.clone(),
-        detail: format!("invalid config.json: {error}"),
-    })?;
+    let config: Value =
+        serde_json::from_slice(&bytes).map_err(|error| ColicError::InvalidSource {
+            path: config_path.clone(),
+            detail: format!("invalid config.json: {error}"),
+        })?;
     let text_config = config
         .get("text_config")
         .and_then(Value::as_object)
@@ -54,9 +55,12 @@ pub fn inspect(source: &SourceInventory) -> Result<Option<QwenMtpInventory>> {
             detail: "Qwen MoE config is missing `text_config`".into(),
         })?;
 
-    let hidden_layers = optional_u32(&source.root, text_config.get("mtp_num_hidden_layers"),
-                                     "mtp_num_hidden_layers")?
-        .unwrap_or(0);
+    let hidden_layers = optional_u32(
+        &source.root,
+        text_config.get("mtp_num_hidden_layers"),
+        "mtp_num_hidden_layers",
+    )?
+    .unwrap_or(0);
     let has_mtp_tensors = source.tensors.keys().any(|name| name.starts_with("mtp."));
     if hidden_layers == 0 {
         if has_mtp_tensors {
@@ -99,12 +103,13 @@ pub fn inspect(source: &SourceInventory) -> Result<Option<QwenMtpInventory>> {
             path: source.root.clone(),
             detail: "MTP fc input width overflows u32".into(),
         })?;
-    let two_intermediate = moe_intermediate_size
-        .checked_mul(2)
-        .ok_or_else(|| ColicError::InvalidSource {
-            path: source.root.clone(),
-            detail: "MTP fused gate/up width overflows u32".into(),
-        })?;
+    let two_intermediate =
+        moe_intermediate_size
+            .checked_mul(2)
+            .ok_or_else(|| ColicError::InvalidSource {
+                path: source.root.clone(),
+                detail: "MTP fused gate/up width overflows u32".into(),
+            })?;
 
     for (name, expected) in [
         ("mtp.fc.weight", vec![hidden_size as u64, two_hidden as u64]),
@@ -136,7 +141,11 @@ pub fn inspect(source: &SourceInventory) -> Result<Option<QwenMtpInventory>> {
         let expert_down = require_shape(
             source,
             &down_name,
-            &[experts as u64, hidden_size as u64, moe_intermediate_size as u64],
+            &[
+                experts as u64,
+                hidden_size as u64,
+                moe_intermediate_size as u64,
+            ],
         )?
         .clone();
 
@@ -176,7 +185,11 @@ pub fn inspect(source: &SourceInventory) -> Result<Option<QwenMtpInventory>> {
         });
     }
 
-    for name in source.tensors.keys().filter(|name| name.starts_with("mtp.layers.")) {
+    for name in source
+        .tensors
+        .keys()
+        .filter(|name| name.starts_with("mtp.layers."))
+    {
         let rest = &name["mtp.layers.".len()..];
         let Some((stage, _)) = rest.split_once('.') else {
             return invalid(source, format!("invalid MTP layer tensor name `{name}`"));
@@ -206,11 +219,7 @@ pub fn inspect(source: &SourceInventory) -> Result<Option<QwenMtpInventory>> {
     }))
 }
 
-fn optional_u32(
-    root: &std::path::Path,
-    value: Option<&Value>,
-    key: &str,
-) -> Result<Option<u32>> {
+fn optional_u32(root: &std::path::Path, value: Option<&Value>, key: &str) -> Result<Option<u32>> {
     let Some(value) = value else {
         return Ok(None);
     };
@@ -233,10 +242,13 @@ fn required_u32(source: &SourceInventory, value: Option<&Value>, key: &str) -> R
 }
 
 fn require_tensor<'a>(source: &'a SourceInventory, name: &str) -> Result<&'a TensorRef> {
-    source.tensors.get(name).ok_or_else(|| ColicError::InvalidSource {
-        path: source.root.clone(),
-        detail: format!("MTP checkpoint is missing required tensor `{name}`"),
-    })
+    source
+        .tensors
+        .get(name)
+        .ok_or_else(|| ColicError::InvalidSource {
+            path: source.root.clone(),
+            detail: format!("MTP checkpoint is missing required tensor `{name}`"),
+        })
 }
 
 fn require_shape<'a>(

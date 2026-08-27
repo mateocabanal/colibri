@@ -48,7 +48,8 @@ pub const MACOS_ARM64_METAL_APPLE8_V1: TargetProfile = TargetProfile {
     execution_layout_abi: target_registry::MACOS_ARM64_METAL_APPLE8_V1.execution_layout_abi,
     kernel_abi: target_registry::MACOS_ARM64_METAL_APPLE8_V1.kernel_abi,
     target_class: target_registry::MACOS_ARM64_METAL_APPLE8_V1.target_class,
-    compiler_emission_supported: target_registry::MACOS_ARM64_METAL_APPLE8_V1.compiler_emission_supported,
+    compiler_emission_supported: target_registry::MACOS_ARM64_METAL_APPLE8_V1
+        .compiler_emission_supported,
     record_alignment: target_registry::MACOS_ARM64_METAL_APPLE8_V1.record_alignment,
     preferred_io_granularity: target_registry::MACOS_ARM64_METAL_APPLE8_V1.io_granularity,
 };
@@ -94,7 +95,9 @@ pub fn resolve(request: &TargetRequest, host: HostCapabilities) -> Result<Target
             .iter()
             .find(|profile| profile.name == name)
             .copied()
-            .ok_or_else(|| ColicError::Usage(format!("unknown or unsupported target profile `{name}`")))?,
+            .ok_or_else(|| {
+                ColicError::Usage(format!("unknown or unsupported target profile `{name}`"))
+            })?,
     };
     if !profile.compiler_emission_supported {
         return Err(ColicError::unsupported(

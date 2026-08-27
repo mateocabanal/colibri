@@ -6,7 +6,7 @@ use std::{
 };
 
 use colic::{
-    pipeline::{compile, CompileRequest, NoProgress, TargetRequest},
+    pipeline::{CompileRequest, NoProgress, TargetRequest, compile},
     verify,
 };
 
@@ -62,12 +62,36 @@ fn synthetic_v4_source(root: &Path) {
         ("hc_head_scale", "F32", vec![1]),
         ("layers.0.ffn.gate.weight", "BF16", vec![2, 2]),
         ("layers.0.ffn.gate.tid2eid", "I64", vec![4, 1]),
-        ("layers.0.ffn.shared_experts.w1.weight", "F8_E4M3FN", vec![3, 2]),
-        ("layers.0.ffn.shared_experts.w2.weight", "F8_E4M3FN", vec![2, 3]),
-        ("layers.0.ffn.shared_experts.w3.weight", "F8_E4M3FN", vec![3, 2]),
-        ("layers.0.ffn.shared_experts.w1.scale", "F8_E8M0", vec![1, 1]),
-        ("layers.0.ffn.shared_experts.w2.scale", "F8_E8M0", vec![1, 1]),
-        ("layers.0.ffn.shared_experts.w3.scale", "F8_E8M0", vec![1, 1]),
+        (
+            "layers.0.ffn.shared_experts.w1.weight",
+            "F8_E4M3FN",
+            vec![3, 2],
+        ),
+        (
+            "layers.0.ffn.shared_experts.w2.weight",
+            "F8_E4M3FN",
+            vec![2, 3],
+        ),
+        (
+            "layers.0.ffn.shared_experts.w3.weight",
+            "F8_E4M3FN",
+            vec![3, 2],
+        ),
+        (
+            "layers.0.ffn.shared_experts.w1.scale",
+            "F8_E8M0",
+            vec![1, 1],
+        ),
+        (
+            "layers.0.ffn.shared_experts.w2.scale",
+            "F8_E8M0",
+            vec![1, 1],
+        ),
+        (
+            "layers.0.ffn.shared_experts.w3.scale",
+            "F8_E8M0",
+            vec![1, 1],
+        ),
         ("layers.0.ffn_norm.weight", "BF16", vec![2]),
         ("layers.0.attn.attn_sink", "F32", vec![1]),
         ("layers.0.attn.kv_norm.weight", "BF16", vec![2]),

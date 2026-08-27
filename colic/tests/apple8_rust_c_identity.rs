@@ -104,10 +104,7 @@ fn rust_and_c_apple8_packers_are_byte_identical() {
             .unwrap();
         assert!(status.success(), "C oracle failed for {rows}x{columns}");
         let c = fs::read(&output).unwrap();
-        assert_eq!(
-            rust, c,
-            "Rust/C Apple8 mismatch for {rows}x{columns}"
-        );
+        assert_eq!(rust, c, "Rust/C Apple8 mismatch for {rows}x{columns}");
     }
 
     fs::remove_dir_all(root).unwrap();
