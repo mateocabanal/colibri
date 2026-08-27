@@ -209,7 +209,14 @@ fn human_bytes(bytes: u64) -> String {
 }
 
 fn main() {
-    if let Err(error) = run() {
+    // Windows main threads get 1 MiB; colic's source discovery recurses over
+    // 131-shard checkpoints and overflows it. Run the CLI body on a worker
+    // thread with an explicit 64 MiB stack (portable, no editbin needed).
+    let worker = std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(run)
+        .expect("spawn colic worker thread");
+    if let Err(error) = worker.join().expect("colic worker panicked") {
         eprintln!("colic: {error}");
         eprintln!("{USAGE}");
         std::process::exit(2);
