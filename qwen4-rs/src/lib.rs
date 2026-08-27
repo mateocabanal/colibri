@@ -9,6 +9,9 @@
 
 use std::path::Path;
 
+pub mod coliload;
+pub mod colisource;
+
 // ---------------------------------------------------------------------------
 // safetensors reader (same minimal F32 adapter as qwen-rs)
 // ---------------------------------------------------------------------------
