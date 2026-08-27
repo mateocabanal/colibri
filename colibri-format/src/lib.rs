@@ -3,6 +3,7 @@
 //! package reader. No unsafe code, no dependency on compiler internals.
 #![forbid(unsafe_code)]
 
+pub mod codecs;
 pub mod package;
 pub mod verify;
 

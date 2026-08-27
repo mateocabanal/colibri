@@ -44,6 +44,7 @@ pub struct RecordInfo {
 #[derive(Debug)]
 pub struct Package {
     root: PathBuf,
+    manifest: Vec<u8>,
     alignment: u64,
     profile: String,
     compiler: String,
@@ -212,6 +213,7 @@ impl Package {
         }
         Ok(Package {
             root: root.to_owned(),
+            manifest: manifest.clone(),
             alignment,
             profile,
             compiler,
@@ -221,6 +223,11 @@ impl Package {
             by_name,
             by_expert,
         })
+    }
+
+    /// The raw manifest bytes (needed for rANS codec-table lookups).
+    pub fn manifest_ref(&self) -> &[u8] {
+        &self.manifest
     }
 
     pub fn profile(&self) -> &str {
@@ -262,10 +269,102 @@ impl Package {
         Ok(bytes)
     }
 
+    /// Reads an expert record (kind 2) and returns each matrix's RESIDENT
+    /// payload (plan 5.2: decoded execution record + representation; kernels
+    /// and model crates convert to numeric tensors).
+    ///
+    /// - BF16 canonical (math 0x0003): f32 little-endian bytes
+    /// - INT4-G32 (math 0x0022): packed weights ++ LE f32 scales (row-major)
+    /// - Apple8 (layout 0x0103, math 0x0020): rANS-decoded tile execution bytes
+    pub fn read_expert_matrices(&self, record: &RecordInfo) -> Result<Vec<Vec<u8>>> {
+        if record.kind != 2 {
+            return invalid("record is not an expert record");
+        }
+        let bytes = self.read_record(record)?;
+        if &bytes[..8] != b"COLIEXPT"
+            || u16_at(&bytes, 8)? != 1
+            || u32_at(&bytes, 12)? != 64
+            || u16_at(&bytes, 24)? != 3
+        {
+            return invalid("expert envelope header is invalid");
+        }
+        let desc_size = u32_at(&bytes, 28)? as usize;
+        let mut matrices = Vec::with_capacity(3);
+        for i in 0..3 {
+            let d = 64 + i * desc_size;
+            let role = u16_at(&bytes, d)?;
+            let math = u16_at(&bytes, d + 4)?;
+            let scale = u16_at(&bytes, d + 6)?;
+            let rows = u64_at(&bytes, d + 16)?;
+            let cols = u64_at(&bytes, d + 24)?;
+            let wc = u16_at(&bytes, d + 8)?;
+            let wt = u32_at(&bytes, d + 40)?;
+            let w_off = u64_at(&bytes, d + 48)?;
+            let w_stored = u64_at(&bytes, d + 56)?;
+            let w_decoded = u64_at(&bytes, d + 64)?;
+            let s_off = u64_at(&bytes, d + 72)?;
+            let s_stored = u64_at(&bytes, d + 80)?;
+            let w_start =
+                usize::try_from(w_off).map_err(|_| usage("matrix offset exceeds usize"))?;
+            let w_end = w_start
+                .checked_add(
+                    usize::try_from(w_stored).map_err(|_| usage("matrix size exceeds usize"))?,
+                )
+                .ok_or_else(|| usage("matrix span overflows"))?;
+            let s_start =
+                usize::try_from(s_off).map_err(|_| usage("scale offset exceeds usize"))?;
+            let s_end = s_start
+                .checked_add(
+                    usize::try_from(s_stored).map_err(|_| usage("scale size exceeds usize"))?,
+                )
+                .ok_or_else(|| usage("scale span overflows"))?;
+            let weights = bytes
+                .get(w_start..w_end)
+                .ok_or_else(|| usage("matrix data outside record"))?;
+            let scales = bytes
+                .get(s_start..s_end)
+                .ok_or_else(|| usage("scale data outside record"))?;
+            // Descriptor layout (C coli_format.h / int4_record.rs):
+            // role@0 math@4 scale@6 wc@8; verified on real packages.
+            let decoded = match (math, scale) {
+                (0x0003, 0x0000) => {
+                    // BF16 canonical: resident = raw bytes
+                    weights.to_vec()
+                }
+                (crate::codecs::INT4_MATH_FORMAT, crate::codecs::INT4_SCALE_FORMAT) => {
+                    // INT4-G32 (0x22, 0x1): resident = weights ++ LE f32 scales
+                    let mut resident = weights.to_vec();
+                    resident.extend_from_slice(scales);
+                    resident
+                }
+                (0x0020, 0x0004) => {
+                    // Apple8 MXFP4 tile8x32: weight codec rANS -> execution bytes
+                    if wc != crate::codecs::RANS_CODEC_ID {
+                        return Err(usage("Apple8 matrix weight codec is not rANS"));
+                    }
+                    let table = crate::codecs::RansTable::from_manifest(&self.manifest, wt, wc)?;
+                    let tiles = crate::codecs::apple8_decode(weights, &table, rows, cols)?;
+                    if tiles.len() as u64 != w_decoded {
+                        return Err(usage("Apple8 decoded size disagrees with descriptor"));
+                    }
+                    tiles
+                }
+                _ => {
+                    return Err(usage(format!(
+                        "expert matrix {i} (role {role}) uses unsupported math 0x{math:04x} scale 0x{scale:04x}"
+                    )));
+                }
+            };
+            let _ = (w_decoded, s_stored);
+            matrices.push(decoded);
+        }
+        Ok(matrices)
+    }
+
     /// Reads a tensor record (kind 1) and returns its payload bytes with the
     /// envelope validated and the logical CRC checked when the record carries
-    /// one. Fails if the record is not a codec-none tensor (rANS decode is
-    /// plan RW-014).
+    /// one. Fails if the record is not a codec-none tensor (rANS decode lands
+    /// with RW-014).
     pub fn read_tensor_payload(&self, record: &RecordInfo) -> Result<Vec<u8>> {
         if record.kind != 1 {
             return invalid("record is not a tensor record");

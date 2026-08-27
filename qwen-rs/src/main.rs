@@ -28,10 +28,9 @@ fn main() {
     });
 
     // ref.json gate: short case greedy_new_ids
-    let ref_json: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(dir.join("ref.json")).expect("ref.json"),
-    )
-    .expect("ref.json parse");
+    let ref_json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("ref.json")).expect("ref.json"))
+            .expect("ref.json parse");
     let cases = ref_json["cases"].as_object().expect("cases");
     let short = cases["short"].as_object().expect("short case");
     let prompt: Vec<u32> = short["prompt_ids"]

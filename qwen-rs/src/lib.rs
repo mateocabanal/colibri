@@ -46,7 +46,10 @@ impl StFile {
             }
             tensors.insert(name.clone(), (shape, data_start + offset, len));
         }
-        Ok(StFile { data: bytes, tensors })
+        Ok(StFile {
+            data: bytes,
+            tensors,
+        })
     }
 
     fn f32(&self, name: &str, expect: &[u64]) -> Result<Vec<f32>, String> {
@@ -434,7 +437,14 @@ impl Model {
         matmul(out, &normed, &layer.gdn_out);
     }
 
-    fn attention_token(&mut self, layer: &Layer, li: usize, x: &[f32], pos: usize, out: &mut [f32]) {
+    fn attention_token(
+        &mut self,
+        layer: &Layer,
+        li: usize,
+        x: &[f32],
+        pos: usize,
+        out: &mut [f32],
+    ) {
         let c = self.cfg.clone();
         let h = c.heads;
         let hd = c.head_dim;
@@ -623,7 +633,11 @@ impl Model {
 // ---------------------------------------------------------------------------
 
 fn load_wt(st: &StFile, name: &str, o: usize, i: usize) -> Result<Wt, String> {
-    Ok(Wt { f: st.f32(name, &[o as u64, i as u64])?, o, i })
+    Ok(Wt {
+        f: st.f32(name, &[o as u64, i as u64])?,
+        o,
+        i,
+    })
 }
 
 impl Model {
@@ -638,67 +652,240 @@ impl Model {
             let hd = cfg.head_dim;
             let layer = if is_gdn {
                 Layer {
-                    in_ln: st.f32(&format!("{lp}.input_layernorm.weight"), &[cfg.hidden as u64])?,
-                    post_ln: st.f32(&format!("{lp}.post_attention_layernorm.weight"), &[cfg.hidden as u64])?,
+                    in_ln: st.f32(
+                        &format!("{lp}.input_layernorm.weight"),
+                        &[cfg.hidden as u64],
+                    )?,
+                    post_ln: st.f32(
+                        &format!("{lp}.post_attention_layernorm.weight"),
+                        &[cfg.hidden as u64],
+                    )?,
                     is_gdn: true,
-                    gdn_a_log: st.f32(&format!("{lp}.linear_attn.A_log"), &[cfg.lin_v_heads as u64])?,
-                    gdn_dt_bias: st.f32(&format!("{lp}.linear_attn.dt_bias"), &[cfg.lin_v_heads as u64])?,
-                    gdn_conv1d: st.f32(&format!("{lp}.linear_attn.conv1d.weight"), &[(cdim * cfg.conv_kernel) as u64])?,
-                    gdn_in_a: load_wt(st, &format!("{lp}.linear_attn.in_proj_a.weight"), cfg.lin_v_heads, cfg.hidden)?,
-                    gdn_in_b: load_wt(st, &format!("{lp}.linear_attn.in_proj_b.weight"), cfg.lin_v_heads, cfg.hidden)?,
-                    gdn_in_qkv: load_wt(st, &format!("{lp}.linear_attn.in_proj_qkv.weight"), cdim, cfg.hidden)?,
-                    gdn_in_z: load_wt(st, &format!("{lp}.linear_attn.in_proj_z.weight"), vdim, cfg.hidden)?,
-                    gdn_norm: st.f32(&format!("{lp}.linear_attn.norm.weight"), &[cfg.lin_v_dim as u64])?,
-                    gdn_out: load_wt(st, &format!("{lp}.linear_attn.out_proj.weight"), cfg.hidden, vdim)?,
-                    attn_q: Wt { f: vec![], o: 0, i: 0 },
-                    attn_k: Wt { f: vec![], o: 0, i: 0 },
-                    attn_v: Wt { f: vec![], o: 0, i: 0 },
-                    attn_o: Wt { f: vec![], o: 0, i: 0 },
+                    gdn_a_log: st.f32(
+                        &format!("{lp}.linear_attn.A_log"),
+                        &[cfg.lin_v_heads as u64],
+                    )?,
+                    gdn_dt_bias: st.f32(
+                        &format!("{lp}.linear_attn.dt_bias"),
+                        &[cfg.lin_v_heads as u64],
+                    )?,
+                    gdn_conv1d: st.f32(
+                        &format!("{lp}.linear_attn.conv1d.weight"),
+                        &[(cdim * cfg.conv_kernel) as u64],
+                    )?,
+                    gdn_in_a: load_wt(
+                        st,
+                        &format!("{lp}.linear_attn.in_proj_a.weight"),
+                        cfg.lin_v_heads,
+                        cfg.hidden,
+                    )?,
+                    gdn_in_b: load_wt(
+                        st,
+                        &format!("{lp}.linear_attn.in_proj_b.weight"),
+                        cfg.lin_v_heads,
+                        cfg.hidden,
+                    )?,
+                    gdn_in_qkv: load_wt(
+                        st,
+                        &format!("{lp}.linear_attn.in_proj_qkv.weight"),
+                        cdim,
+                        cfg.hidden,
+                    )?,
+                    gdn_in_z: load_wt(
+                        st,
+                        &format!("{lp}.linear_attn.in_proj_z.weight"),
+                        vdim,
+                        cfg.hidden,
+                    )?,
+                    gdn_norm: st.f32(
+                        &format!("{lp}.linear_attn.norm.weight"),
+                        &[cfg.lin_v_dim as u64],
+                    )?,
+                    gdn_out: load_wt(
+                        st,
+                        &format!("{lp}.linear_attn.out_proj.weight"),
+                        cfg.hidden,
+                        vdim,
+                    )?,
+                    attn_q: Wt {
+                        f: vec![],
+                        o: 0,
+                        i: 0,
+                    },
+                    attn_k: Wt {
+                        f: vec![],
+                        o: 0,
+                        i: 0,
+                    },
+                    attn_v: Wt {
+                        f: vec![],
+                        o: 0,
+                        i: 0,
+                    },
+                    attn_o: Wt {
+                        f: vec![],
+                        o: 0,
+                        i: 0,
+                    },
                     attn_qn: vec![],
                     attn_kn: vec![],
-                    router: load_wt(st, &format!("{lp}.mlp.gate.weight"), cfg.experts, cfg.hidden)?,
-                    se_gate: load_wt(st, &format!("{lp}.mlp.shared_expert.gate_proj.weight"), cfg.shared_inter, cfg.hidden)?,
-                    se_up: load_wt(st, &format!("{lp}.mlp.shared_expert.up_proj.weight"), cfg.shared_inter, cfg.hidden)?,
-                    se_down: load_wt(st, &format!("{lp}.mlp.shared_expert.down_proj.weight"), cfg.hidden, cfg.shared_inter)?,
-                    se_g: load_wt(st, &format!("{lp}.mlp.shared_expert_gate.weight"), 1, cfg.hidden)?,
+                    router: load_wt(
+                        st,
+                        &format!("{lp}.mlp.gate.weight"),
+                        cfg.experts,
+                        cfg.hidden,
+                    )?,
+                    se_gate: load_wt(
+                        st,
+                        &format!("{lp}.mlp.shared_expert.gate_proj.weight"),
+                        cfg.shared_inter,
+                        cfg.hidden,
+                    )?,
+                    se_up: load_wt(
+                        st,
+                        &format!("{lp}.mlp.shared_expert.up_proj.weight"),
+                        cfg.shared_inter,
+                        cfg.hidden,
+                    )?,
+                    se_down: load_wt(
+                        st,
+                        &format!("{lp}.mlp.shared_expert.down_proj.weight"),
+                        cfg.hidden,
+                        cfg.shared_inter,
+                    )?,
+                    se_g: load_wt(
+                        st,
+                        &format!("{lp}.mlp.shared_expert_gate.weight"),
+                        1,
+                        cfg.hidden,
+                    )?,
                 }
             } else {
                 Layer {
-                    in_ln: st.f32(&format!("{lp}.input_layernorm.weight"), &[cfg.hidden as u64])?,
-                    post_ln: st.f32(&format!("{lp}.post_attention_layernorm.weight"), &[cfg.hidden as u64])?,
+                    in_ln: st.f32(
+                        &format!("{lp}.input_layernorm.weight"),
+                        &[cfg.hidden as u64],
+                    )?,
+                    post_ln: st.f32(
+                        &format!("{lp}.post_attention_layernorm.weight"),
+                        &[cfg.hidden as u64],
+                    )?,
                     is_gdn: false,
                     gdn_a_log: vec![],
                     gdn_dt_bias: vec![],
                     gdn_conv1d: vec![],
-                    gdn_in_a: Wt { f: vec![], o: 0, i: 0 },
-                    gdn_in_b: Wt { f: vec![], o: 0, i: 0 },
-                    gdn_in_qkv: Wt { f: vec![], o: 0, i: 0 },
-                    gdn_in_z: Wt { f: vec![], o: 0, i: 0 },
+                    gdn_in_a: Wt {
+                        f: vec![],
+                        o: 0,
+                        i: 0,
+                    },
+                    gdn_in_b: Wt {
+                        f: vec![],
+                        o: 0,
+                        i: 0,
+                    },
+                    gdn_in_qkv: Wt {
+                        f: vec![],
+                        o: 0,
+                        i: 0,
+                    },
+                    gdn_in_z: Wt {
+                        f: vec![],
+                        o: 0,
+                        i: 0,
+                    },
                     gdn_norm: vec![],
-                    gdn_out: Wt { f: vec![], o: 0, i: 0 },
-                    attn_q: load_wt(st, &format!("{lp}.self_attn.q_proj.weight"), 2 * cfg.heads * hd, cfg.hidden)?,
-                    attn_k: load_wt(st, &format!("{lp}.self_attn.k_proj.weight"), cfg.kv_heads * hd, cfg.hidden)?,
-                    attn_v: load_wt(st, &format!("{lp}.self_attn.v_proj.weight"), cfg.kv_heads * hd, cfg.hidden)?,
-                    attn_o: load_wt(st, &format!("{lp}.self_attn.o_proj.weight"), cfg.hidden, cfg.heads * hd)?,
+                    gdn_out: Wt {
+                        f: vec![],
+                        o: 0,
+                        i: 0,
+                    },
+                    attn_q: load_wt(
+                        st,
+                        &format!("{lp}.self_attn.q_proj.weight"),
+                        2 * cfg.heads * hd,
+                        cfg.hidden,
+                    )?,
+                    attn_k: load_wt(
+                        st,
+                        &format!("{lp}.self_attn.k_proj.weight"),
+                        cfg.kv_heads * hd,
+                        cfg.hidden,
+                    )?,
+                    attn_v: load_wt(
+                        st,
+                        &format!("{lp}.self_attn.v_proj.weight"),
+                        cfg.kv_heads * hd,
+                        cfg.hidden,
+                    )?,
+                    attn_o: load_wt(
+                        st,
+                        &format!("{lp}.self_attn.o_proj.weight"),
+                        cfg.hidden,
+                        cfg.heads * hd,
+                    )?,
                     attn_qn: st.f32(&format!("{lp}.self_attn.q_norm.weight"), &[hd as u64])?,
                     attn_kn: st.f32(&format!("{lp}.self_attn.k_norm.weight"), &[hd as u64])?,
-                    router: load_wt(st, &format!("{lp}.mlp.gate.weight"), cfg.experts, cfg.hidden)?,
-                    se_gate: load_wt(st, &format!("{lp}.mlp.shared_expert.gate_proj.weight"), cfg.shared_inter, cfg.hidden)?,
-                    se_up: load_wt(st, &format!("{lp}.mlp.shared_expert.up_proj.weight"), cfg.shared_inter, cfg.hidden)?,
-                    se_down: load_wt(st, &format!("{lp}.mlp.shared_expert.down_proj.weight"), cfg.hidden, cfg.shared_inter)?,
-                    se_g: load_wt(st, &format!("{lp}.mlp.shared_expert_gate.weight"), 1, cfg.hidden)?,
+                    router: load_wt(
+                        st,
+                        &format!("{lp}.mlp.gate.weight"),
+                        cfg.experts,
+                        cfg.hidden,
+                    )?,
+                    se_gate: load_wt(
+                        st,
+                        &format!("{lp}.mlp.shared_expert.gate_proj.weight"),
+                        cfg.shared_inter,
+                        cfg.hidden,
+                    )?,
+                    se_up: load_wt(
+                        st,
+                        &format!("{lp}.mlp.shared_expert.up_proj.weight"),
+                        cfg.shared_inter,
+                        cfg.hidden,
+                    )?,
+                    se_down: load_wt(
+                        st,
+                        &format!("{lp}.mlp.shared_expert.down_proj.weight"),
+                        cfg.hidden,
+                        cfg.shared_inter,
+                    )?,
+                    se_g: load_wt(
+                        st,
+                        &format!("{lp}.mlp.shared_expert_gate.weight"),
+                        1,
+                        cfg.hidden,
+                    )?,
                 }
             };
             // per-expert matrices: gate_up_proj [2I,H] fused -> gate [I,H], up [I,H]; down [H,I]
             let mut layer_experts = Vec::new();
             for e in 0..cfg.experts {
                 let elp = format!("{lp}.mlp.experts.{e}");
-                let gu = st.f32(&format!("{elp}.gate_up_proj"), &[(2 * cfg.moe_inter) as u64, cfg.hidden as u64])?;
-                let dn = st.f32(&format!("{elp}.down_proj"), &[cfg.hidden as u64, cfg.moe_inter as u64])?;
+                let gu = st.f32(
+                    &format!("{elp}.gate_up_proj"),
+                    &[(2 * cfg.moe_inter) as u64, cfg.hidden as u64],
+                )?;
+                let dn = st.f32(
+                    &format!("{elp}.down_proj"),
+                    &[cfg.hidden as u64, cfg.moe_inter as u64],
+                )?;
                 let half = cfg.moe_inter * cfg.hidden;
-                let gate = Wt { f: gu[..half].to_vec(), o: cfg.moe_inter, i: cfg.hidden };
-                let up = Wt { f: gu[half..].to_vec(), o: cfg.moe_inter, i: cfg.hidden };
-                let down = Wt { f: dn, o: cfg.hidden, i: cfg.moe_inter };
+                let gate = Wt {
+                    f: gu[..half].to_vec(),
+                    o: cfg.moe_inter,
+                    i: cfg.hidden,
+                };
+                let up = Wt {
+                    f: gu[half..].to_vec(),
+                    o: cfg.moe_inter,
+                    i: cfg.hidden,
+                };
+                let down = Wt {
+                    f: dn,
+                    o: cfg.hidden,
+                    i: cfg.moe_inter,
+                };
                 layer_experts.push([gate, up, down]);
             }
             experts.push(layer_experts);
