@@ -1,0 +1,11 @@
+[package]
+name = "colibri-format"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "COLI CSF artifact framing shared by colic and the runtime: checksums, manifest/data-shard constants, package reader"
+publish = false
+
+[dependencies]
+colibri-abi = { path = "../colibri-abi" }
