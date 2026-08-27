@@ -89,6 +89,18 @@ pub fn choose_candidate(
     let avx2 = machine.has_avx2();
 
     // ---- routed experts: the big pageable family; quantize aggressively ----
+    // Pascal DP4A only wins when the expert working set fits VRAM (measured
+    // on the 5600X/1080 box: per-call weight uploads made CUDA mxfp4 slower
+    // than CPU when experts streamed from disk — 2243 vs 1931 ms/tok).
+    let expert_stored_bytes = bytes_at(MathFormat::Mxfp4);
+    let vram_headroom: u64 = machine
+        .cuda_gpus()
+        .map(|gpu| match gpu {
+            crate::plan::machine::GpuProfile::Cuda { vram_bytes, .. } => *vram_bytes,
+            _ => 0,
+        })
+        .sum();
+    let experts_fit_vram = expert_stored_bytes > 0 && expert_stored_bytes <= vram_headroom * 9 / 10;
     if role == TensorRole::RoutedExpert {
         if avx2 {
             candidates.push(Candidate {
@@ -106,13 +118,13 @@ pub fn choose_candidate(
                 reason: "avx2 cpu: mxfp4 canonical decode (slower detile than int4-g32 rows16)".into(),
             });
         }
-        if has_cuda_dp4a {
+        if has_cuda_dp4a && experts_fit_vram {
             candidates.push(Candidate {
                 math: MathFormat::Mxfp4,
                 layout: PhysicalLayout::PascalDp4aTile,
                 backend: BackendKind::Cuda,
                 score: 5.0 + size_penalty(bytes_at(MathFormat::Mxfp4), objective),
-                reason: "sm61 dp4a: mxfp4 w4a8 dp4a matvec; vram cache for the hot set".into(),
+                reason: "sm61 dp4a: mxfp4 w4a8 dp4a matvec; expert set fits VRAM".into(),
             });
         }
         if has_cuda_any && !has_cuda_dp4a {
@@ -254,7 +266,9 @@ mod tests {
     }
 
     #[test]
-    fn avx2_plus_dp4a_prefers_pascal_experts_but_records_cpu_alternative() {
+    fn avx2_plus_dp4a_keeps_experts_on_cpu_when_vram_is_too_small() {
+        // 30 GiB of experts vs 8 GB VRAM: DP4A is offered but streaming cost
+        // dominates (measured 2243 vs 1931 ms/tok), so CPU rows16 wins.
         let decision = choose(
             TensorRole::RoutedExpert,
             &box64_avx2_cuda(),
@@ -262,11 +276,25 @@ mod tests {
             |_| 30 * 1024 * 1024 * 1024,
         )
         .unwrap();
-        assert_eq!(decision.chosen, "mxfp4 pascal_dp4a_tile");
+        assert_eq!(decision.chosen, "int4_g32 rows16");
+        // DP4A was not even offered: the expert set does not fit VRAM.
         assert!(decision
             .rejected
             .iter()
-            .any(|(candidate, _)| candidate == "int4_g32 rows16"));
+            .any(|(candidate, _)| candidate == "mxfp4 canonical"));
+    }
+
+    #[test]
+    fn dp4a_wins_when_expert_set_fits_vram() {
+        // ~5 GiB of experts vs 8 GB VRAM: the GPU path wins.
+        let decision = choose(
+            TensorRole::RoutedExpert,
+            &box64_avx2_cuda(),
+            Objective::Balanced,
+            |_| 5 * 1024 * 1024 * 1024,
+        )
+        .unwrap();
+        assert_eq!(decision.chosen, "mxfp4 pascal_dp4a_tile");
     }
 
     #[test]
@@ -306,7 +334,7 @@ mod tests {
             |_| 30 * 1024 * 1024 * 1024,
         )
         .unwrap();
-        assert_eq!(decision.chosen, "mxfp4 pascal_dp4a_tile");
+        assert_eq!(decision.chosen, "int4_g32 rows16");
         assert!(decision
             .rejected
             .iter()
