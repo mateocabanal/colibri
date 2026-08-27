@@ -22,10 +22,18 @@ name = "colibri-abi"
 version = "0.1.0"
 
 [[package]]
+name = "colibri-format"
+version = "0.1.0"
+dependencies = [
+ "colibri-abi",
+]
+
+[[package]]
 name = "colic"
 version = "0.1.0"
 dependencies = [
  "colibri-abi",
+ "colibri-format",
  "serde_json",
  "sha2",
 ]

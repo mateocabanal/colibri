@@ -44,3 +44,12 @@ impl std::error::Error for ColicError {
         }
     }
 }
+
+impl From<colibri_format::FormatError> for ColicError {
+    fn from(error: colibri_format::FormatError) -> Self {
+        match error {
+            colibri_format::FormatError::Invalid(message) => ColicError::Usage(message),
+            colibri_format::FormatError::Io { path, source } => ColicError::Io { path, source },
+        }
+    }
+}

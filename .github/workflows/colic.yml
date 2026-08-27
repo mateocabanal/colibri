@@ -5,6 +5,7 @@ on:
     paths:
       - 'colic/**'
       - 'colibri-abi/**'
+      - 'colibri-format/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'abi/coli-target-registry.toml'
@@ -16,6 +17,7 @@ on:
     paths:
       - 'colic/**'
       - 'colibri-abi/**'
+      - 'colibri-format/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'abi/coli-target-registry.toml'
