@@ -6,7 +6,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "abi" / "coli-target-registry.toml"
 C_OUT = ROOT / "c" / "generated" / "coli_target_registry.h"
-RUST_OUT = ROOT / "colic" / "src" / "generated" / "target_registry.rs"
+RUST_OUT = ROOT / "colibri-abi" / "src" / "generated" / "target_registry.rs"
 
 
 def load():

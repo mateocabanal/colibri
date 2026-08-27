@@ -150,9 +150,8 @@ impl QwenMoeFrontend {
             let guz = tensor_by_name(source, &gu_name)?;
             let dz = tensor_by_name(source, &dn_name)?;
             // gate_up_proj is [E, 2·I, H] and down_proj is [E, H, I], both BF16.
-            let expected_gu_bytes = geometry.routed_experts_per_layer as u64 * 2 * inter as u64
-                * hidden as u64
-                * 2;
+            let expected_gu_bytes =
+                geometry.routed_experts_per_layer as u64 * 2 * inter as u64 * hidden as u64 * 2;
             let expected_d_bytes =
                 geometry.routed_experts_per_layer as u64 * hidden as u64 * inter as u64 * 2;
             if guz.len != expected_gu_bytes {
@@ -198,12 +197,20 @@ impl QwenMoeFrontend {
             for (stage, st) in mtp.stages.iter().enumerate() {
                 let layer = geometry.layers + stage as u32;
                 for expert in 0..mtp.experts {
-                    let gate = slice_fused(&st.expert_gate_up, expert, 2 * inter, hidden, 0, inter)?;
-                    let up = slice_fused(&st.expert_gate_up, expert, 2 * inter, hidden, inter, inter)?;
+                    let gate =
+                        slice_fused(&st.expert_gate_up, expert, 2 * inter, hidden, 0, inter)?;
+                    let up =
+                        slice_fused(&st.expert_gate_up, expert, 2 * inter, hidden, inter, inter)?;
                     let down = slice_fused(&st.expert_down, expert, hidden, inter, 0, hidden)?;
                     routed_experts.insert(
                         (layer, expert),
-                        RoutedExpert { layer, expert, gate, up, down },
+                        RoutedExpert {
+                            layer,
+                            expert,
+                            gate,
+                            up,
+                            down,
+                        },
                     );
                 }
             }
@@ -292,11 +299,17 @@ impl QwenMoeFrontend {
                     ),
                     (
                         "in_proj_a.weight",
-                        vec![u64::from(linear_num_value_heads), u64::from(geometry.hidden_size)],
+                        vec![
+                            u64::from(linear_num_value_heads),
+                            u64::from(geometry.hidden_size),
+                        ],
                     ),
                     (
                         "in_proj_b.weight",
-                        vec![u64::from(linear_num_value_heads), u64::from(geometry.hidden_size)],
+                        vec![
+                            u64::from(linear_num_value_heads),
+                            u64::from(geometry.hidden_size),
+                        ],
                     ),
                     (
                         "in_proj_qkv.weight",
@@ -564,7 +577,9 @@ fn validate_tensor(
     })?;
     let shape_matches = shape.is_empty()
         || tensor.shape == shape
-        || (shape.len() == 1 && tensor.shape.len() == 2 && tensor.shape[0] == 1
+        || (shape.len() == 1
+            && tensor.shape.len() == 2
+            && tensor.shape[0] == 1
             && tensor.shape[1] == shape[0]);
     if tensor.dtype != dtype || !shape_matches {
         return invalid(

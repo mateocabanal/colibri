@@ -219,9 +219,7 @@ fn quantize_value(value: f32, scale: f32) -> u8 {
         // E2M1's positive code parity tracks the low mantissa bit for the
         // adjacent representable values. Prefer even codes on an exact tie,
         // matching round-to-nearest-even at midpoint values.
-        if error < best_error
-            || (error == best_error && (code & 1) == 0 && (best_code & 1) != 0)
-        {
+        if error < best_error || (error == best_error && (code & 1) == 0 && (best_code & 1) != 0) {
             best_error = error;
             best_code = code as u8;
         }
@@ -242,7 +240,11 @@ pub fn runtime_e8m0_to_f32(code: u8) -> f32 {
 #[cfg(test)]
 fn decode_nibble(code: u8, scale: u8) -> f32 {
     let magnitude = E2M1_MAGNITUDES[(code & 0x7) as usize];
-    let signed = if code & 0x8 != 0 { -magnitude } else { magnitude };
+    let signed = if code & 0x8 != 0 {
+        -magnitude
+    } else {
+        magnitude
+    };
     signed * runtime_e8m0_to_f32(scale)
 }
 
@@ -265,14 +267,16 @@ mod tests {
     #[test]
     fn packs_all_e2m1_codes_low_nibble_first() {
         let values = [
-            0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-            -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+            0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
         ];
         let mut weights = Vec::new();
         let mut scales = Vec::new();
         quantize_bf16_row(&bf16_bytes(&values), &mut weights, &mut scales).unwrap();
         assert_eq!(scales, vec![127]);
-        assert_eq!(weights, vec![0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe]);
+        assert_eq!(
+            weights,
+            vec![0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe]
+        );
     }
 
     #[test]
