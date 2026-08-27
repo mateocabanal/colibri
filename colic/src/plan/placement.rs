@@ -65,6 +65,7 @@ pub fn place(tensors: &mut [TensorPlan], budgets: &MemoryBudgets) -> PlacementOu
             for tensor in tensors.iter_mut().filter(|t| t.role == TensorRole::NgramPle) {
                 tensor.placement = Placement::Pageable;
             }
+            outcome.pageable_bytes += ple_bytes;
             outcome.notes.push(format!(
                 "ple does NOT fit ram cache budget ({ple_bytes} B) — pageable"
             ));
@@ -81,7 +82,11 @@ pub fn place(tensors: &mut [TensorPlan], budgets: &MemoryBudgets) -> PlacementOu
     } else {
         0
     };
-    let mut ram_budget = budgets.ram_expert_cache_bytes.saturating_sub(ple_bytes);
+    let mut ram_budget = if ple_bytes <= budgets.ram_expert_cache_bytes {
+        budgets.ram_expert_cache_bytes - ple_bytes
+    } else {
+        budgets.ram_expert_cache_bytes
+    };
     for tensor in tensors.iter_mut().filter(|t| t.role == TensorRole::RoutedExpert) {
         if vram_budget >= tensor.stored_bytes {
             tensor.placement = Placement::VramCache;
