@@ -1011,6 +1011,41 @@ mod tests {
     }
 
     #[test]
+    fn plan_replay_validates_fingerprint_and_math() {
+        let fingerprint = "0123456789abcdef".repeat(4);
+        let plan = serde_json::json!({
+            "plan_schema_version": 1,
+            "source_fingerprint": fingerprint,
+            "tensors": [{"role": "routed_expert", "math": "int4_g32"}],
+        });
+        let path = std::env::temp_dir().join(format!("colic-replay-{}.json", std::process::id()));
+        std::fs::write(&path, plan.to_string()).unwrap();
+        let inventory = source::SourceInventory {
+            root: "fixture".into(),
+            files: vec![],
+            tensors: BTreeMap::new(),
+            source_stored_bytes: 0,
+            dtype_counts: BTreeMap::new(),
+            source_fingerprint: fingerprint,
+            config_fingerprint: None,
+            architecture_hint: None,
+        };
+        let mut request = CompileRequest::new("fixture".into());
+        request.plan = Some(path.clone());
+        request.quant = QuantRequest::Profile("int4".into());
+        // Matching fingerprint + matching expert math: accepted.
+        validate_plan_replay(&path, &inventory, &request).unwrap();
+        // Mismatched fingerprint: rejected before emission.
+        let mut other = inventory.clone();
+        other.source_fingerprint = "f".repeat(64);
+        assert!(validate_plan_replay(&path, &other, &request).is_err());
+        // Mismatched quant: rejected.
+        request.quant = QuantRequest::Exact;
+        assert!(validate_plan_replay(&path, &inventory, &request).is_err());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn source_index_detection_is_unchanged() {
         for name in [
             "model.safetensors.index.json",
