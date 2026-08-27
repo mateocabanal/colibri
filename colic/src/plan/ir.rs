@@ -52,7 +52,7 @@ impl MathFormat {
             Self::Bf16 => 16.0,
             Self::Fp8E4m3 => 8.0,
             Self::Mxfp4 => 4.25,
-            Self::Int4G32 => 4.25, // 4 bits + f32 scale per 32
+            Self::Int4G32 => 5.0,  // 4 bits + f32 scale per 32 = 5 bits/weight
             Self::Nvfp4 => 4.5,    // 4 bits + e4m3 scale per 16
         }
     }
