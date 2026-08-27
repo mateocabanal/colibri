@@ -252,6 +252,15 @@ fn run() -> colic::Result<()> {
             }
             Ok(())
         }
+        Command::Probe { json } => {
+            let profile = colic::plan::machine::MachineProfile::probe();
+            if json {
+                println!("{}", profile.to_json());
+            } else {
+                print!("{}", profile.summary_text());
+            }
+            Ok(())
+        }
         Command::Verify { package } => {
             eprintln!("colic: verification...");
             let mut progress = ConsoleProgress::new();

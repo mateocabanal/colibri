@@ -11,6 +11,7 @@ pub mod ir;
 pub mod model;
 pub mod passes;
 pub mod pipeline;
+pub mod plan;
 pub mod quant;
 pub mod source;
 pub mod storage;

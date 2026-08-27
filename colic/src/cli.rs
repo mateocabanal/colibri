@@ -9,11 +9,12 @@ use crate::{
 pub enum Command {
     InspectSource { source: PathBuf },
     Verify { package: PathBuf },
+    Probe { json: bool },
     Compile(CompileRequest),
     Help,
 }
 
-pub const USAGE: &str = "Usage:\n  colic inspect-source MODEL_DIR\n  colic verify PACKAGE_DIR\n  colic compile MODEL_DIR --target native|PROFILE --quant exact|PROFILE --codec none|auto|PROFILE --opt default|size|latency -o OUTPUT [--dry-run] [--verify] [--force]";
+pub const USAGE: &str = "Usage:\n  colic inspect-source MODEL_DIR\n  colic verify PACKAGE_DIR\n  colic probe [--json]\n  colic compile MODEL_DIR --target native|PROFILE --quant exact|PROFILE --codec none|auto|PROFILE --opt default|size|latency -o OUTPUT [--dry-run] [--verify] [--force]";
 
 pub fn parse<I>(args: I) -> Result<Command>
 where
@@ -39,6 +40,23 @@ where
             })
         }
         "compile" => parse_compile(args),
+        "probe" => {
+            let mut json = false;
+            if let Some(flag) = args.next() {
+                match flag.as_str() {
+                    "--json" => json = true,
+                    other => {
+                        return Err(ColicError::Usage(format!(
+                            "unknown probe option `{other}` (expected --json)"
+                        )))
+                    }
+                }
+            }
+            if args.next().is_some() {
+                return Err(ColicError::Usage("probe accepts no positional arguments".into()));
+            }
+            Ok(Command::Probe { json })
+        }
         "verify" => {
             let package = args
                 .next()
