@@ -10,3 +10,5 @@ pub mod machine;
 pub mod cost;
 pub mod memory;
 pub mod placement;
+pub mod planner;
+pub mod plan_cli;

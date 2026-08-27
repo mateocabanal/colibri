@@ -59,6 +59,16 @@ pub fn choose(
     objective: Objective,
     bytes_at: impl Fn(MathFormat) -> u64,
 ) -> Option<Decision> {
+    choose_candidate(role, machine, objective, bytes_at).map(|(decision, _)| decision)
+}
+
+/// Structured winner + recorded decision (planner consumes the Candidate).
+pub fn choose_candidate(
+    role: TensorRole,
+    machine: &crate::plan::machine::MachineProfile,
+    objective: Objective,
+    bytes_at: impl Fn(MathFormat) -> u64,
+) -> Option<(Decision, Candidate)> {
     let mut candidates = Vec::new();
 
     let has_cuda_dp4a = machine.cuda_gpus().any(|gpu| match gpu {
@@ -160,11 +170,12 @@ pub fn choose(
             )
         })
         .collect();
-    Some(Decision {
+    let decision = Decision {
         subject: role.as_str().to_string(),
         chosen: format_candidate(&winner.math, &winner.layout),
         rejected,
-    })
+    };
+    Some((decision, winner))
 }
 
 fn format_candidate(math: &MathFormat, layout: &PhysicalLayout) -> String {
