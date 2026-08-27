@@ -261,6 +261,11 @@ fn run() -> colic::Result<()> {
             }
             Ok(())
         }
+        Command::Plan(options) => {
+            let text = colic::plan::plan_cli::run(&options)?;
+            println!("{text}");
+            Ok(())
+        }
         Command::Verify { package } => {
             eprintln!("colic: verification...");
             let mut progress = ConsoleProgress::new();

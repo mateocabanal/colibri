@@ -10,11 +10,13 @@ pub enum Command {
     InspectSource { source: PathBuf },
     Verify { package: PathBuf },
     Probe { json: bool },
+    Plan(Box<crate::plan::plan_cli::PlanOptions>),
     Compile(CompileRequest),
     Help,
 }
 
-pub const USAGE: &str = "Usage:\n  colic inspect-source MODEL_DIR\n  colic verify PACKAGE_DIR\n  colic probe [--json]\n  colic compile MODEL_DIR --target native|PROFILE --quant exact|PROFILE --codec none|auto|PROFILE --opt default|size|latency -o OUTPUT [--dry-run] [--verify] [--force]";
+pub const USAGE: &str = "Usage:\n  colic inspect-source MODEL_DIR\n  colic verify PACKAGE_DIR\n  colic probe [--json]
+  colic plan MODEL_DIR [--objective O] [--context N] [--machine-profile F] [--json] [-o FILE]\n  colic compile MODEL_DIR --target native|PROFILE --quant exact|PROFILE --codec none|auto|PROFILE --opt default|size|latency -o OUTPUT [--dry-run] [--verify] [--force]";
 
 pub fn parse<I>(args: I) -> Result<Command>
 where
@@ -57,6 +59,7 @@ where
             }
             Ok(Command::Probe { json })
         }
+        "plan" => parse_plan(args),
         "verify" => {
             let package = args
                 .next()
@@ -72,6 +75,62 @@ where
         }
         other => Err(ColicError::Usage(format!("unknown command `{other}`"))),
     }
+}
+
+fn parse_plan<I>(mut args: I) -> Result<Command>
+where
+    I: Iterator<Item = String>,
+{
+    let source = PathBuf::from(
+        args.next()
+            .ok_or_else(|| ColicError::Usage("plan requires MODEL_DIR".into()))?,
+    );
+    let mut options = crate::plan::plan_cli::PlanOptions {
+        source,
+        objective: crate::plan::cost::Objective::Balanced,
+        context_tokens: 8192,
+        batch: 1,
+        machine_profile: None,
+        json: false,
+        output: None,
+    };
+    while let Some(flag) = args.next() {
+        let value = |args: &mut I, flag: &str| {
+            args.next()
+                .ok_or_else(|| ColicError::Usage(format!("{flag} requires a value")))
+        };
+        match flag.as_str() {
+            "--objective" => {
+                let raw = value(&mut args, "--objective")?;
+                options.objective = crate::plan::cost::Objective::parse(&raw).ok_or_else(|| {
+                    ColicError::Usage(format!(
+                        "unknown objective `{raw}` (expected quality|balanced|throughput|latency|minimum-size)"
+                    ))
+                })?;
+            }
+            "--context" => {
+                let raw = value(&mut args, "--context")?;
+                options.context_tokens = raw.parse().map_err(|_| {
+                    ColicError::Usage(format!("--context expects a token count, got `{raw}`"))
+                })?;
+            }
+            "--batch" => {
+                let raw = value(&mut args, "--batch")?;
+                options.batch = raw
+                    .parse()
+                    .map_err(|_| ColicError::Usage(format!("--batch expects a count, got `{raw}`")))?;
+            }
+            "--machine-profile" => {
+                options.machine_profile = Some(PathBuf::from(value(&mut args, "--machine-profile")?));
+            }
+            "--json" => options.json = true,
+            "-o" | "--output" => options.output = Some(PathBuf::from(value(&mut args, "--output")?)),
+            other => {
+                return Err(ColicError::Usage(format!("unknown plan option `{other}`")));
+            }
+        }
+    }
+    Ok(Command::Plan(Box::new(options)))
 }
 
 fn parse_compile<I>(args: I) -> Result<Command>
