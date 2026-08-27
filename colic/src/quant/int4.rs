@@ -142,28 +142,31 @@ fn quantize_fp8_matrix(
 
     let fp8_row_bytes = matrix.columns as usize; // 1 byte per element
     let bf16_row_bytes = matrix.columns as usize * 2;
-    let scale_row_bytes = block_columns as usize * 2;
+    // The block-scale tensor is [block_rows, block_cols] — read it whole once.
+    let scale_bytes = usize::try_from(scale_ref.len)
+        .map_err(|_| ColicError::Usage("weight_scale_inv too large for this host".into()))?;
+    let mut scale_data = vec![0_u8; scale_bytes];
+    scale_file
+        .read_exact(&mut scale_data)
+        .map_err(|source| ColicError::Io {
+            path: scale_ref.source.clone(),
+            source,
+        })?;
     let mut fp8_row = vec![0_u8; fp8_row_bytes];
     let mut bf16_row = vec![0_u8; bf16_row_bytes];
-    let mut scale_row = vec![0_u8; scale_row_bytes];
     for row in 0..matrix.rows {
         file.read_exact(&mut fp8_row)
             .map_err(|source| ColicError::Io {
                 path: matrix.source.source.clone(),
                 source,
             })?;
-        scale_file
-            .read_exact(&mut scale_row)
-            .map_err(|source| ColicError::Io {
-                path: scale_ref.source.clone(),
-                source,
-            })?;
         let block_row = row / super::fp8::FP8_BLOCK as u32;
         for column in 0..matrix.columns as usize {
             let block_col = column / super::fp8::FP8_BLOCK;
+            let scale_index = (block_row as usize * block_columns as usize + block_col) * 2;
             let scale_bits = u16::from_le_bytes([
-                scale_row[block_col * 2],
-                scale_row[block_col * 2 + 1],
+                scale_data[scale_index],
+                scale_data[scale_index + 1],
             ]);
             let scale = f32::from_bits(u32::from(scale_bits) << 16);
             let value = super::fp8::decode_e4m3(fp8_row[column]) * scale;

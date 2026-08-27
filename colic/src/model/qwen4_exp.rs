@@ -34,7 +34,7 @@ impl Qwen4ExpFrontend {
                     .and_then(|tc| tc.get("model_type"))
                     .and_then(Value::as_str)
             });
-        Ok(model_type == Some("qwen4_exp"))
+        Ok(matches!(model_type, Some("qwen4_exp" | "qwen4_exp_text")))
     }
 
     pub fn build(source: &SourceInventory) -> Result<SemanticModel> {
@@ -42,21 +42,17 @@ impl Qwen4ExpFrontend {
             path: source.root.clone(),
             detail: "Qwen4-Exp source is missing config.json".into(),
         })?;
-        let tc = config
-            .get("text_config")
-            .and_then(Value::as_object)
-            .ok_or_else(|| ColicError::InvalidSource {
-                path: source.root.clone(),
-                detail: "Qwen4-Exp config is missing `text_config`".into(),
-            })?;
-        let tc = Value::Object(tc.clone());
-        if tc.get("model_type").and_then(Value::as_str) != Some("qwen4_exp_text") {
+        // Bare text checkpoint (model_type = qwen4_exp_text) OR vision wrapper
+        // (model_type = qwen4_exp with text_config) — both are supported.
+        let tc = match config.get("text_config").and_then(Value::as_object) {
+            Some(text_config) => Value::Object(text_config.clone()),
+            None => config.clone(),
+        };
+        let model_type = tc.get("model_type").and_then(Value::as_str);
+        if !matches!(model_type, Some("qwen4_exp" | "qwen4_exp_text")) {
             return invalid(
                 &source.root,
-                format!(
-                    "text_config model_type is not `qwen4_exp_text` (got {:?})",
-                    tc.get("model_type").and_then(Value::as_str)
-                ),
+                format!("model_type is not `qwen4_exp`/`qwen4_exp_text` (got {model_type:?})"),
             );
         }
 
@@ -258,12 +254,6 @@ fn is_expert_tensor_name(name: &str) -> bool {
         return name.contains(".mlp.experts.");
     }
     name.contains(".mlp.experts.")
-}
-
-/// Map a canonical global key to its source tensor name for exclusion.
-fn t_key(tensor: &TensorRef) -> String {
-    // TensorRef carries no name; exclusion is done via global_sources below.
-    String::new()
 }
 
 /// Build an expert Matrix (F8 payload) + verify its 128×128 block scale ref.

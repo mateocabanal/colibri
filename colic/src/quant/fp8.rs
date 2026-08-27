@@ -78,7 +78,6 @@ impl Fp8Matrix {
     pub fn dequantize_to_bf16(&self) -> Result<Vec<u8>> {
         let rows = self.rows as usize;
         let columns = self.columns as usize;
-        let block_rows = self.block_rows as usize;
         let block_columns = self.block_columns as usize;
         let mut out = Vec::with_capacity(rows * columns * 2);
         for row in 0..rows {

@@ -249,7 +249,7 @@ fn reject_incompatible_target(
 /// machine and translate its routed-expert decision into the concrete target
 /// profile + quantization for emission.
 fn resolve_auto_target(
-    request: &CompileRequest,
+    _request: &CompileRequest,
     model: &SemanticModel,
     inventory: &source::SourceInventory,
 ) -> Result<(target::TargetProfile, ExpertQuantization)> {
