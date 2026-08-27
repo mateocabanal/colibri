@@ -146,9 +146,14 @@ pub fn build_plan(
     }
 
     // ---- memory budgets ----
+    // Mandatory-resident = everything except routed experts and the PLE
+    // n-gram table (PLE competes for cache capacity in placement: it prefers
+    // RAM residency but degrades to pageable rather than failing the plan).
     let dense_resident_bytes: u64 = tensors
         .iter()
-        .filter(|tensor| !matches!(tensor.role, TensorRole::RoutedExpert))
+        .filter(|tensor| {
+            !matches!(tensor.role, TensorRole::RoutedExpert | TensorRole::NgramPle)
+        })
         .map(|tensor| tensor.stored_bytes)
         .sum();
     let memory_config = MemoryPlannerConfig {
