@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["colibri-abi", "colibri-format", "colic", "qwen-rs"]
+members = ["colibri-abi", "colibri-format", "colic", "qwen-rs", "qwen4-rs"]
 
 [workspace.package]
 version = "0.1.0"
