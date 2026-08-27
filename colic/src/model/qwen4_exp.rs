@@ -162,16 +162,11 @@ impl Qwen4ExpFrontend {
                 &[u64::from(geometry.vocab_size), u64::from(geometry.hidden_size)],
             )?,
         );
-        global_tensors.insert(
-            "norm.weight".into(),
-            validate_tensor(
-                &source.root,
-                &source.tensors,
-                "model.language_model.norm.weight",
-                "BF16",
-                &[u64::from(geometry.hidden_size)],
-            )?,
-        );
+        // Qwen3.8-Next has no final rmsnorm (the hyper-connection mixer
+        // replaces it); carry it only when present.
+        if let Some(norm) = source.tensors.get("model.language_model.norm.weight") {
+            global_tensors.insert("norm.weight".into(), norm.clone());
+        }
         global_tensors.insert(
             "head.weight".into(),
             validate_tensor(
