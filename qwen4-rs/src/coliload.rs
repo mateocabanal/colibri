@@ -139,6 +139,16 @@ impl Model {
             vec_f32(src, "norm.weight", cfg.hidden)?
         };
 
+        // C-style one-line status (QWEN-APPLE8 / metalio parity with the C
+        // engine's startup banner): makes silent-fallback visible.
+        if crate::ffi::direct_available() {
+            eprintln!(
+                "[qwen4-rs] direct raw Apple8 + MetalIO execution enabled{}",
+                if crate::ffi::metal_available() { "" } else { " (compute backend unavailable)" }
+            );
+        } else {
+            eprintln!("[qwen4-rs] direct path unavailable; using canonical fallback");
+        }
         Ok(Model {
             cfg: cfg.clone(),
             coli: Some(src.clone()),
@@ -177,6 +187,14 @@ impl Model {
             ],
             expert_cache: std::collections::VecDeque::new(),
             expert_cache_cap: 256,
+            metal_direct: crate::ffi::direct_init()
+                && std::env::var("QWEN_APPLE8_DIRECT")
+                    .map(|v| v != "0")
+                    .unwrap_or(true),
+            metal_overlap: std::env::var("QWEN_APPLE8_OVERLAP")
+                .map(|v| v != "0")
+                .unwrap_or(true),
+            gdn_metal: (0..cfg.layers).map(|_| None).collect(),
         })
     }
 }

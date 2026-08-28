@@ -30,21 +30,65 @@ pub struct RawExpert {
     pub fmt: i32,
 }
 
-/// One cached expert: raw tiles + the Metal tensor handles the C backend
-/// bound to those exact weight buffers (handles are pointer-keyed; eviction
-/// must free them before the tiles drop).
-pub struct CachedExpert {
-    pub mats: [RawExpert; 3],
-    pub metal: [*mut crate::ffi::ColiMetalTensor; 3],
+/// One cached expert whose three matrices live CONTIGUOUSLY in a MetalIO
+/// slot (gate at 0, up at align16(gate_bytes), down at align16(up_end) — the
+/// C engine's slot layout). The slot is the cache unit: the fused Apple8
+/// moe_topk / swiglu kernels consume the slot bytes in native tile order, no
+/// host copy, no per-matrix GPU handles. CPU fallback preads the slot bytes
+/// (shared storage is CPU-visible).
+pub struct SlotExpert {
+    pub slot: i32,
+    pub gate_bytes: usize,
+    pub up_offset: usize,
+    pub up_bytes: usize,
+    pub down_offset: usize,
+    pub down_bytes: usize,
+    /// CPU-visible pointer to the slot's shared-storage MTLBuffer contents
+    /// (valid while the slot is allocated).
+    pub ptr: *mut u8,
+    /// CPU fallback weights: decoded BF16 bytes (filled lazily on first CPU
+    /// use; Metal users never pay for this).
+    pub bf16_cache: std::cell::RefCell<Option<[Vec<u8>; 3]>>,
+    pub rows: [usize; 3],
+    pub cols: [usize; 3],
 }
 
-impl Drop for CachedExpert {
+/// Borrowed view of a cached slot expert: offsets + raw pointer only, NO
+/// Drop (must never free the slot — the cache-owned SlotExpert owns it).
+pub struct SlotRef {
+    pub slot: i32,
+    pub gate_bytes: usize,
+    pub up_offset: usize,
+    pub up_bytes: usize,
+    pub down_offset: usize,
+    pub down_bytes: usize,
+    pub ptr: *mut u8,
+    pub rows: [usize; 3],
+    pub cols: [usize; 3],
+}
+
+impl SlotExpert {
+    /// Shared view without ownership of the slot.
+    pub fn ref_view(&self) -> SlotRef {
+        SlotRef {
+            slot: self.slot,
+            gate_bytes: self.gate_bytes,
+            up_offset: self.up_offset,
+            up_bytes: self.up_bytes,
+            down_offset: self.down_offset,
+            down_bytes: self.down_bytes,
+            ptr: self.ptr,
+            rows: self.rows,
+            cols: self.cols,
+        }
+    }
+}
+
+impl Drop for SlotExpert {
     fn drop(&mut self) {
-        for h in self.metal.iter_mut() {
-            if !h.is_null() {
-                unsafe { crate::ffi::coli_metal_tensor_free(*h) };
-                *h = std::ptr::null_mut();
-            }
+        if self.slot >= 0 {
+            unsafe { crate::ffi::metalio_slot_free(self.slot) };
+            self.slot = -1;
         }
     }
 }
@@ -61,6 +105,11 @@ impl ColiSource {
         Ok(ColiSource {
             pkg: Package::open(dir).map_err(|e| e.to_string())?,
         })
+    }
+
+    /// The underlying package (for MetalIO region math).
+    pub fn pkg_ref(&self) -> &colibri_format::package::Package {
+        &self.pkg
     }
 
     /// Dual-probe record lookup: prefixed (resident HF) then bare canonical.

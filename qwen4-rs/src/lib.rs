@@ -291,6 +291,49 @@ struct HcGlobal {
     mix_up: Wt,
 }
 
+impl Layer {
+    /// Placeholder for the per-token mem::replace swap in forward_token
+    /// (zero-sized weights; never used for compute).
+    fn empty() -> Layer {
+        Layer {
+            in_ln: vec![],
+            is_gdn: false,
+            is_qsa: false,
+            gdn_a_log: vec![],
+            gdn_dt_bias: vec![],
+            gdn_conv1d: vec![],
+            gdn_in_a: Wt { f: vec![], bytes: None, o: 0, i: 0 },
+            gdn_in_b: Wt { f: vec![], bytes: None, o: 0, i: 0 },
+            gdn_in_qkv: Wt { f: vec![], bytes: None, o: 0, i: 0 },
+            gdn_in_z: Wt { f: vec![], bytes: None, o: 0, i: 0 },
+            gdn_norm: vec![],
+            gdn_out: Wt { f: vec![], bytes: None, o: 0, i: 0 },
+            attn_q: Wt { f: vec![], bytes: None, o: 0, i: 0 },
+            attn_k: Wt { f: vec![], bytes: None, o: 0, i: 0 },
+            attn_v: Wt { f: vec![], bytes: None, o: 0, i: 0 },
+            attn_o: Wt { f: vec![], bytes: None, o: 0, i: 0 },
+            attn_qn: vec![],
+            attn_kn: vec![],
+            index_qk: Wt { f: vec![], bytes: None, o: 0, i: 0 },
+            idx_qn: vec![],
+            idx_kn: vec![],
+            hc_norm: vec![],
+            hc_mix_down: Wt { f: vec![], bytes: None, o: 0, i: 0 },
+            hc_mix_up: Wt { f: vec![], bytes: None, o: 0, i: 0 },
+            hc_inject: Wt { f: vec![], bytes: None, o: 0, i: 0 },
+            hc_mlp_norm: vec![],
+            hc_mlp_mix_down: Wt { f: vec![], bytes: None, o: 0, i: 0 },
+            hc_mlp_mix_up: Wt { f: vec![], bytes: None, o: 0, i: 0 },
+            hc_mlp_inject: Wt { f: vec![], bytes: None, o: 0, i: 0 },
+            router: Wt { f: vec![], bytes: None, o: 0, i: 0 },
+            se_gate: Wt { f: vec![], bytes: None, o: 0, i: 0 },
+            se_up: Wt { f: vec![], bytes: None, o: 0, i: 0 },
+            se_down: Wt { f: vec![], bytes: None, o: 0, i: 0 },
+            se_g: Wt { f: vec![], bytes: None, o: 0, i: 0 },
+        }
+    }
+}
+
 pub struct Model {
     cfg: Cfg,
     /// .coli package for on-demand expert/ngram fetches (None in safetensors
@@ -326,8 +369,95 @@ pub struct Model {
     // 280->173 ms/tok; LRU upgrade if hit-rate plateaus low). Entries own
     // their Metal tensor handles — the C backend keys handles by weight
     // pointer, so stale handles would serve wrong weights.
-    expert_cache: std::collections::VecDeque<((i32, i32), crate::colisource::CachedExpert)>,
+    expert_cache: std::collections::VecDeque<((i32, i32), crate::colisource::SlotExpert)>,
     expert_cache_cap: usize,
+    /// Metal direct path (fused Apple8 moe_topk + coalesced GDN kernels).
+    /// Brought up lazily on the first decode token; failures leave it off and
+    /// every caller falls back to the CPU reference (C contract).
+    metal_direct: bool,
+    /// C QWEN_APPLE8_OVERLAP: split-phase moe_topk (submit -> CPU shared
+    /// expert -> wait). Default ON (measured +2.5% loss only when OFF).
+    metal_overlap: bool,
+    /// Per-GDN-layer 16 KiB page-aligned re-home of the BF16 weights the
+    /// Metal GDN kernels wrap zero-copy (C qwen_moe.c contract: wqkv/wz/wa/
+    /// wb/wout + recurrent state + conv state must be page-aligned, weights
+    /// live for the model lifetime, state is MUTATED BY THE GPU). Backed by
+    /// one aligned alloc per layer; CPU fallback reads the same memory, so
+    /// there is exactly ONE copy of the GDN weights (moved, not duplicated —
+    /// the 16 GB M2 budget).
+    gdn_metal: Vec<Option<GdnMetalLayer>>,
+}
+
+/// 16 KiB page-aligned allocation (Metal zero-copy wrap contract).
+struct AlignedBuf {
+    ptr: *mut u8,
+    len: usize, // allocated (page-rounded) length
+}
+
+// SAFETY: the raw allocation is owned exclusively by this struct; it is
+// created and freed on the host thread that owns the Model (decode is a
+// single-threaded per-token pipeline; the GPU reads the memory but Metal
+// shared-storage buffers are explicitly designed for host+device access).
+unsafe impl Send for AlignedBuf {}
+
+impl AlignedBuf {
+    fn zeroed(len: usize) -> Option<AlignedBuf> {
+        if len == 0 {
+            return None;
+        }
+        let rounded = (len + 16383) & !16383usize;
+        let mut ptr: *mut u8 = std::ptr::null_mut();
+        let rc = unsafe { libc::posix_memalign(&mut ptr as *mut *mut u8 as *mut *mut libc::c_void, 16384, rounded) };
+        if rc != 0 || ptr.is_null() {
+            return None;
+        }
+        unsafe { std::ptr::write_bytes(ptr, 0, rounded) };
+        Some(AlignedBuf { ptr, len: rounded })
+    }
+    fn as_mut_f32(&mut self) -> &mut [f32] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr as *mut f32, self.len / 4) }
+    }
+    fn as_mut_u8(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+
+impl Drop for AlignedBuf {
+    fn drop(&mut self) {
+        unsafe { libc::free(self.ptr as *mut libc::c_void) };
+    }
+}
+
+/// Page-aligned GDN weights + state for one layer (Metal zero-copy source of
+/// truth). The CPU scalar path reads the same memory, so both paths see
+/// identical state; layouts are [O, I] row-major to match the Rust `Wt`.
+struct GdnMetalLayer {
+    /// [cdim, hidden] BF16 in_proj_qkv (16 KiB-aligned, zero-copy wrapped)
+    wqkv: *mut u8,
+    /// [vdim, hidden] BF16 in_proj_z
+    wz: *mut u8,
+    /// [vheads, hidden] BF16 in_proj_a
+    wa: *mut u8,
+    /// [vheads, hidden] BF16 in_proj_b
+    wb: *mut u8,
+    /// [hidden, vdim] BF16 out_proj
+    wout: *mut u8,
+    /// [vheads * kd * vd] recurrent state (f32, GPU-mutated in place)
+    state: *mut f32,
+    /// [cdim * (kk-1)] conv state (f32, GPU-mutated in place)
+    conv_state: *mut f32,
+    /// Keeps every allocation alive for the model lifetime.
+    _bufs: Vec<AlignedBuf>,
+}
+
+/// Per-token scratch, allocated once at load (hidden/vocab sized).
+struct TokScratch {
+    mixed: Vec<f32>,
+    attn: Vec<f32>,
+    m2: Vec<f32>,
+    moe: Vec<f32>,
+    inj: Vec<f32>,
+    inj2: Vec<f32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -631,6 +761,47 @@ impl Model {
         }
     }
 
+    /// Move one GDN layer's BF16 weights into page-aligned buffers (C
+    /// contract: newBufferWithBytesNoCopy requires 16 KiB-aligned pointers,
+    /// length page-rounded). Returns None if any alloc fails (Metal GDN then
+    /// stays off for that layer; CPU path unaffected).
+    fn build_gdn_metal(layer: &Layer, cfg: &Cfg) -> Option<GdnMetalLayer> {
+        if !layer.is_gdn || !crate::ffi::direct_available() {
+            return None;
+        }
+        let kd = cfg.lin_k_dim;
+        let kheads = cfg.lin_k_heads;
+        let vd = cfg.lin_v_dim;
+        let vheads = cfg.lin_v_heads;
+        let cdim = kd * kheads * 2 + vd * vheads;
+        let kk = cfg.conv_kernel;
+        let move_bf16 = |w: &Wt| -> Option<AlignedBuf> {
+            let bytes = w.bytes.as_ref()?;
+            let mut buf = AlignedBuf::zeroed(bytes.len())?;
+            buf.as_mut_u8()[..bytes.len()].copy_from_slice(bytes);
+            Some(buf)
+        };
+        let state_elems = vheads * kd * vd;
+        let conv_elems = cdim * kk.saturating_sub(1);
+        let state = AlignedBuf::zeroed(state_elems * 4)?;
+        let conv_state = AlignedBuf::zeroed(conv_elems * 4)?;
+        let wqkv = move_bf16(&layer.gdn_in_qkv)?;
+        let wz = move_bf16(&layer.gdn_in_z)?;
+        let wa = move_bf16(&layer.gdn_in_a)?;
+        let wb = move_bf16(&layer.gdn_in_b)?;
+        let wout = move_bf16(&layer.gdn_out)?;
+        Some(GdnMetalLayer {
+            wqkv: wqkv.ptr,
+            wz: wz.ptr,
+            wa: wa.ptr,
+            wb: wb.ptr,
+            wout: wout.ptr,
+            state: state.ptr as *mut f32,
+            conv_state: conv_state.ptr as *mut f32,
+            _bufs: vec![wqkv, wz, wa, wb, wout, state, conv_state],
+        })
+    }
+
     fn gdn_token(&mut self, layer: &Layer, li: usize, x: &[f32], out: &mut [f32]) {
         let c = self.cfg.clone();
         let kd = c.lin_k_dim;
@@ -641,6 +812,74 @@ impl Model {
         let vdim = vd * vheads;
         let cdim = kdim * 2 + vdim;
         let kk = c.conv_kernel;
+
+        // One-time aligned re-home (C calloc_checked/coli_wt intercept): move
+        // the five BF16 GDN matrices into 16 KiB-aligned buffers so Metal can
+        // wrap them zero-copy. State lives in the same aligned blocks; the
+        // CPU fallback reads the SAME memory (single source of truth).
+        if self.gdn_metal[li].is_none() {
+            self.gdn_metal[li] = Self::build_gdn_metal(layer, &self.cfg);
+        }
+        // Metal direct path (C QWEN_GDN_METAL default ON): the coalesced
+        // kernels consume the page-aligned re-home above; rc semantics per
+        // C contract (0=decline pre-submit, <0 = fatal post-submit).
+        let gdn_enabled = std::env::var("QWEN_GDN_METAL")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+        if let Some(gm) = &self.gdn_metal[li] {
+            if gdn_enabled {
+                // SAFETY: exact-length views over the layer's aligned blocks
+                // (kept alive by gm._bufs for the model lifetime). The GPU
+                // mutates state/conv_state in place; the CPU fallback syncs
+                // (below) so both paths share one source of truth.
+                let (n_state, n_conv) = (vheads * kd * vd, cdim * (kk - 1));
+                let rc = unsafe {
+                    crate::ffi::gdn_token(
+                        li,
+                        x,
+                        out,
+                        std::slice::from_raw_parts(gm.wqkv, cdim * c.hidden * 2),
+                        std::slice::from_raw_parts(gm.wz, vdim * c.hidden * 2),
+                        std::slice::from_raw_parts(gm.wa, vheads * c.hidden * 2),
+                        std::slice::from_raw_parts(gm.wb, vheads * c.hidden * 2),
+                        std::slice::from_raw_parts(gm.wout, c.hidden * vdim * 2),
+                        &layer.gdn_a_log,
+                        &layer.gdn_dt_bias,
+                        &layer.gdn_conv1d,
+                        &layer.gdn_norm,
+                        std::slice::from_raw_parts_mut(gm.state, n_state),
+                        std::slice::from_raw_parts_mut(gm.conv_state, n_conv),
+                        c.hidden,
+                        kheads,
+                        kd,
+                        vheads,
+                        vd,
+                        kk,
+                        c.eps,
+                    )
+                };
+                if rc > 0 {
+                    return;
+                }
+                if rc < 0 {
+                    eprintln!("qwen4-rs: Metal GDN failed after submission (layer {li})");
+                    std::process::exit(1);
+                }
+                // rc == 0: declined pre-submit. GPU state is the truth from
+                // any earlier Metal tokens -> pull it into the CPU state
+                // before the scalar reference below runs.
+                let n_state = vheads * kd * vd;
+                let n_conv = cdim * (kk - 1);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(gm.state, self.gdn_s[li].as_mut_ptr(), n_state);
+                    std::ptr::copy_nonoverlapping(
+                        gm.conv_state,
+                        self.gdn_conv[li].as_mut_ptr(),
+                        n_conv,
+                    );
+                }
+            }
+        }
 
         let mut qkv = vec![0.0; cdim];
         matmul(&mut qkv, x, &layer.gdn_in_qkv);
@@ -745,6 +984,23 @@ impl Model {
             }
         }
         self.gdn_s[li].copy_from_slice(&snew);
+        // Keep the aligned (GPU-visible) state in sync after a CPU token so
+        // the next Metal token starts from the same recurrence (C has ONE
+        // state; here we sync on the CPU path only).
+        if let Some(gm) = &self.gdn_metal[li] {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    self.gdn_s[li].as_ptr(),
+                    gm.state,
+                    vheads * kd * vd,
+                );
+                std::ptr::copy_nonoverlapping(
+                    self.gdn_conv[li].as_ptr(),
+                    gm.conv_state,
+                    cdim * (kk - 1),
+                );
+            }
+        }
 
         let mut normed = vec![0.0; vdim];
         for h in 0..vheads {
@@ -967,91 +1223,124 @@ impl Model {
         self.attention_common(layer, li, x, pos, Some(&sel), out);
     }
 
-    /// FIFO expert cache: cached (tiles + Metal handles) for (layer, expert);
-    /// fetch + bind handles on miss, evict oldest (frees its handles).
+    /// FIFO expert cache. On miss, stream the expert's three raw Apple8
+    /// matrices async (MetalIO) into ONE slot with the C engine's layout
+    /// (gate at 0, up at align16, down at align16(up_end)); the slot IS the
+    /// cache unit — the fused moe_topk consumes it in native tile order, the
+    /// CPU fallback preads its shared-storage bytes. One MTLIOFileHandle per
+    /// shard (cached process-wide; the C table caps at 64). Eviction frees
+    /// the slot (its Drop waits + releases).
     fn cached_expert(
         &mut self,
         li: i32,
         ei: i32,
-    ) -> Option<std::rc::Rc<crate::colisource::CachedExpert>> {
+    ) -> Option<std::rc::Rc<crate::colisource::SlotRef>> {
         for (k, v) in self.expert_cache.iter() {
             if *k == (li, ei) {
-                return Some(std::rc::Rc::new(crate::colisource::CachedExpert {
-                    mats: v.mats.clone(),
-                    metal: v.metal,
-                }));
+                return Some(std::rc::Rc::new(v.ref_view()));
             }
         }
         let coli = self.coli.as_ref()?;
-        // MetalIO first: stream the 3 matrices async into one MTLBuffer slot,
-        // wait, use the slot bytes directly (fmt 7 raw, no decode). Falls back
-        // to pread+decode on any failure (never mandatory).
-        let mats: Option<[crate::colisource::RawExpert; 3]> = (|| {
+        let se: Option<crate::colisource::SlotExpert> = (|| {
             let recs = coli.pkg_ref().expert_records(li, ei);
             let rec = recs.first()?;
             let shard = coli.pkg_ref().shard_path(rec.shard_id)?;
             let (regions, dims) = coli.pkg_ref().expert_matrix_regions(rec)?;
-            let (slot, ev) = crate::ffi::mio_load_expert(&shard, &regions)?;
+            let fid = crate::ffi::mio_file(&shard)?;
+            let (slot, ev) = crate::ffi::mio_load_expert(fid, &regions)?;
             if unsafe { crate::ffi::metalio_wait(ev) } != 0 {
                 unsafe { crate::ffi::metalio_slot_free(slot) };
                 return None;
             }
-            let ptr = unsafe { crate::ffi::metalio_slot_ptr(slot) };
+            let ptr = unsafe { crate::ffi::metalio_slot_ptr(slot) } as *mut u8;
             if ptr.is_null() {
                 unsafe { crate::ffi::metalio_slot_free(slot) };
                 return None;
             }
-            let total: usize = regions.iter().map(|r| r.1).sum();
-            let raw = unsafe { std::slice::from_raw_parts(ptr as *const u8, total) };
-            let mut out = Vec::with_capacity(3);
-            let mut base = 0usize;
-            for ((m, (_, len))) in dims.iter().zip(&regions) {
-                out.push(crate::colisource::RawExpert {
-                    tiles: raw[base..base + len].to_vec(),
-                    scales: vec![],
-                    rows: m.0,
-                    cols: m.1,
-                    fmt: 7,
-                });
-                base += len;
-            }
-            Some([out.remove(0), out.remove(0), out.remove(0)])
+            let gb = regions[0].1;
+            let ub = regions[1].1;
+            let db = regions[2].1;
+            let up_off = (gb + 15) & !15usize;
+            let down_off = (up_off + ub + 15) & !15usize;
+            Some(crate::colisource::SlotExpert {
+                slot,
+                gate_bytes: gb,
+                up_offset: up_off,
+                up_bytes: ub,
+                down_offset: down_off,
+                down_bytes: db,
+                ptr,
+                bf16_cache: std::cell::RefCell::new(None),
+                rows: [dims[0].0, dims[1].0, dims[2].0],
+                cols: [dims[0].1, dims[1].1, dims[2].1],
+            })
         })();
-        let mats = if let Some(m) = mats {
-            m
-        } else {
-            coli.expert_tiles(li, ei).ok()?
-        };
-        let mut metal = [std::ptr::null_mut(); 3];
-        if crate::ffi::metal_available() {
-            for j in 0..3 {
-                let m = &mats[j];
-                let mut handle = std::ptr::null_mut();
-                let mut y = vec![0.0_f32; m.rows];
-                let xz = vec![0.0_f32; m.cols];
-                if crate::ffi::metal_matmul(
-                    &mut handle, &mut y, &xz, &m.tiles, &m.scales, m.fmt, m.cols, m.rows,
-                ) {
-                    metal[j] = handle;
-                } else if !handle.is_null() {
-                    unsafe { crate::ffi::coli_metal_tensor_free(handle) };
-                }
-            }
-        }
-        let entry = crate::colisource::CachedExpert { mats, metal };
+        let se = se?;
+        let entry = se;
         if self.expert_cache.len() >= self.expert_cache_cap {
-            self.expert_cache.pop_front();
+            if let Some((_, old)) = self.expert_cache.pop_front() {
+                drop(old); // SlotExpert::drop frees the MetalIO slot
+            }
         }
         self.expert_cache.push_back(((li, ei), entry));
         for (k, v) in self.expert_cache.iter() {
             if *k == (li, ei) {
-                return Some(std::rc::Rc::new(crate::colisource::CachedExpert {
-                    mats: v.mats.clone(),
-                    metal: v.metal,
-                }));
+                return Some(std::rc::Rc::new(v.ref_view()));
             }
         }
         None
+    }
+
+    /// Direct-path expert descriptor for the fused moe_topk (slot + offsets).
+    fn slot_descriptor(se: &crate::colisource::SlotRef) -> crate::ffi::ColiApple8MetalioExpert {
+        crate::ffi::ColiApple8MetalioExpert {
+            slot: se.slot,
+            gate_offset: 0,
+            gate_bytes: se.gate_bytes,
+            up_offset: se.up_offset,
+            up_bytes: se.up_bytes,
+            down_offset: se.down_offset,
+            down_bytes: se.down_bytes,
+        }
+    }
+
+    /// CPU fallback for one slot-resident expert: decode the shared-storage
+    /// tile bytes (lazily cached per expert) and run the BF16 matmuls.
+    fn slot_expert_cpu(
+        se: &crate::colisource::SlotRef,
+        x: &[f32],
+        gate: &mut [f32],
+        up: &mut [f32],
+        y: &mut [f32],
+    ) {
+        // SAFETY: slot bytes are CPU-visible shared storage, valid while the
+        // cache entry owns the slot (ref_view borrows a live entry; eviction
+        // only happens inside cached_expert while no ref is outstanding).
+        let total = se.down_offset + se.down_bytes;
+        let raw = unsafe { std::slice::from_raw_parts(se.ptr, total) };
+        let parts = [
+            &raw[0..se.gate_bytes],
+            &raw[se.up_offset..se.up_offset + se.up_bytes],
+            &raw[se.down_offset..se.down_offset + se.down_bytes],
+        ];
+        let mut cb: [Vec<u8>; 3] = Default::default();
+        for (pi, p) in parts.iter().enumerate() {
+            let f = colibri_format::codecs::apple8_mxfp4_decode(
+                p,
+                se.rows[pi] as u64,
+                se.cols[pi] as u64,
+            )
+            .unwrap_or_default();
+            cb[pi] = f.into_iter().flat_map(crate::colisource::bf16_bytes).collect();
+        }
+        let [gb, ub, db] = cb;
+        let g = Wt { f: vec![], bytes: Some(gb), o: se.rows[0], i: se.cols[0] };
+        let u = Wt { f: vec![], bytes: Some(ub), o: se.rows[1], i: se.cols[1] };
+        let dw = Wt { f: vec![], bytes: Some(db), o: se.rows[2], i: se.cols[2] };
+        matmul(gate, x, &g);
+        matmul(up, x, &u);
+        let h: Vec<f32> = (0..gate.len()).map(|ii| silu(gate[ii]) * up[ii]).collect();
+        matmul(y, &h, &dw);
     }
 
     fn moe_token(&mut self, layer: &Layer, li: usize, x: &[f32], out: &mut [f32]) {
@@ -1078,60 +1367,101 @@ impl Model {
         }
         let wsum: f32 = val[..k].iter().sum();
         let mut acc = vec![0.0; d];
+
+        // Direct fused path (C QWEN_APPLE8_DIRECT): all K slot-resident
+        // experts in ONE command buffer (gate+up+swiglu -> down -> weighted
+        // reduce), consumed in top-k order with pre-renormalized weights.
+        // Split-phase by default (C QWEN_APPLE8_OVERLAP=1): submit first, run
+        // the CPU shared expert while the GPU works, then wait.
+        let direct = self.metal_direct
+            && crate::ffi::direct_available()
+            && k <= 64
+            && self.coli.is_some();
+        let mut pending: Option<*mut std::ffi::c_void> = None;
+        let mut pending_acc: Option<Vec<f32>> = None;
+        if direct {
+            let mut ex: Vec<crate::ffi::ColiApple8MetalioExpert> = Vec::with_capacity(k);
+            let mut ws: Vec<f32> = Vec::with_capacity(k);
+            let mut all_ok = true;
+            for i in 0..k {
+                match self.cached_expert(li as i32, idx[i] as i32) {
+                    Some(ce) => {
+                        ex.push(Self::slot_descriptor(&ce));
+                        ws.push(val[i] / wsum);
+                    }
+                    None => {
+                        all_ok = false;
+                        break;
+                    }
+                }
+            }
+            if all_ok {
+                if self.metal_overlap {
+                    pending = crate::ffi::moe_topk_begin(&ex, &ws, x, d, c.moe_inter);
+                } else if !crate::ffi::moe_topk(&ex, &ws, x, &mut acc, d, c.moe_inter) {
+                    pending = None; // decline -> CPU per-expert loop below
+                }
+            }
+            if pending.is_none() && self.metal_overlap && all_ok {
+                // begin() declined mid-run: fall through to the CPU loop
+                // (weights unchanged; nothing was submitted).
+            }
+        }
+
+        if pending.is_some() {
+            // CPU shared expert overlaps the routed-GPU wait (C order: shared
+            // expert runs BETWEEN submit and finish).
+            let mut sg = vec![0.0; 1];
+            matmul(&mut sg, x, &layer.se_g);
+            let gs = 1.0 / (1.0 + (-sg[0]).exp());
+            let mut gv = vec![0.0; c.shared_inter];
+            let mut h = vec![0.0; c.shared_inter];
+            matmul(&mut gv, x, &layer.se_gate);
+            matmul(&mut h, x, &layer.se_up);
+            for i in 0..c.shared_inter {
+                h[i] = silu(gv[i]) * h[i];
+            }
+            let mut sy = vec![0.0; d];
+            matmul(&mut sy, &h, &layer.se_down);
+            let p = pending.unwrap();
+            if !crate::ffi::moe_topk_finish(p, &mut acc, d) {
+                // GPU fault AFTER submit: C contract = redo those experts on
+                // CPU. acc was scratch for the GPU result; recompute routed
+                // experts on CPU into a fresh accumulator.
+                acc = vec![0.0; d];
+                for i in 0..k {
+                    let w = val[i] / wsum;
+                    if let Some(ce) = self.cached_expert(li as i32, idx[i] as i32) {
+                        let mut gate = vec![0.0; c.moe_inter];
+                        let mut up = vec![0.0; c.moe_inter];
+                        let mut y = vec![0.0; d];
+                        Self::slot_expert_cpu(&ce, x, &mut gate, &mut up, &mut y);
+                        for dd in 0..d {
+                            acc[dd] += y[dd] * w;
+                        }
+                    }
+                }
+            }
+            for dd in 0..d {
+                out[dd] = acc[dd] + sy[dd] * gs;
+            }
+            return;
+        }
+
         for i in 0..k {
             let w = val[i] / wsum;
-            // .coli mode: cached raw tiles -> Metal (fmt 7 MXFP4, no host
-            // decode) with CPU BF16 fallback. safetensors mode: preloaded.
+            // .coli mode: slot-resident expert. The Metal fused path ran
+            // above (returned early on success); this loop is the CPU
+            // fallback (decodes the slot's shared-storage tiles lazily) or
+            // the canonical decode path for non-Apple8 packages.
+            // safetensors mode: preloaded experts.
             let mats: [Wt; 3] = if self.coli.is_some() {
                 match self.cached_expert(li as i32, idx[i] as i32) {
                     Some(ce) => {
-                        let (g, u, dwn) = (&ce.mats[0], &ce.mats[1], &ce.mats[2]);
-                        let mut gate = vec![0.0; g.rows];
-                        let mut up = vec![0.0; u.rows];
-                        let mut h = vec![0.0; c.moe_inter];
+                        let mut gate = vec![0.0; c.moe_inter];
+                        let mut up = vec![0.0; c.moe_inter];
                         let mut y = vec![0.0; d];
-                        let mut metal_ok = false;
-                        if crate::ffi::metal_available()
-                            && !ce.metal[0].is_null()
-                            && !ce.metal[1].is_null()
-                            && !ce.metal[2].is_null()
-                        {
-                            let mut t0 = ce.metal[0] as *mut crate::ffi::ColiMetalTensor;
-                            let mut t1 = ce.metal[1] as *mut crate::ffi::ColiMetalTensor;
-                            let mut t2 = ce.metal[2] as *mut crate::ffi::ColiMetalTensor;
-                            let ok_g = crate::ffi::metal_matmul(
-                                &mut t0, &mut gate, x, &g.tiles, &g.scales, g.fmt, g.cols, g.rows,
-                            );
-                            let ok_u = crate::ffi::metal_matmul(
-                                &mut t1, &mut up, x, &u.tiles, &u.scales, u.fmt, u.cols, u.rows,
-                            );
-                            for ii in 0..c.moe_inter {
-                                h[ii] = silu(gate[ii]) * up[ii];
-                            }
-                            let ok_d = crate::ffi::metal_matmul(
-                                &mut t2, &mut y, &h, &dwn.tiles, &dwn.scales, dwn.fmt, dwn.cols, dwn.rows,
-                            );
-                            metal_ok = ok_g && ok_u && ok_d;
-                        }
-                        if !metal_ok {
-                            // CPU fallback: decode tiles -> BF16 once, matmul
-                            let dec = |r: &crate::colisource::RawExpert| -> Vec<u8> {
-                                let f = colibri_format::codecs::apple8_mxfp4_decode(
-                                    &r.tiles, r.rows as u64, r.cols as u64,
-                                )
-                                .unwrap_or_default();
-                                f.into_iter().flat_map(crate::colisource::bf16_bytes).collect()
-                            };
-                            let gb = dec(g);
-                            let ub = dec(u);
-                            matmul(&mut gate, x, &Wt { f: vec![], bytes: Some(gb), o: g.rows, i: g.cols });
-                            matmul(&mut up, x, &Wt { f: vec![], bytes: Some(ub), o: u.rows, i: u.cols });
-                            for ii in 0..c.moe_inter {
-                                h[ii] = silu(gate[ii]) * up[ii];
-                            }
-                            let db = dec(dwn);
-                            matmul(&mut y, &h, &Wt { f: vec![], bytes: Some(db), o: dwn.rows, i: dwn.cols });
-                        }
+                        Self::slot_expert_cpu(&ce, x, &mut gate, &mut up, &mut y);
                         for dd in 0..d {
                             acc[dd] += y[dd] * w;
                         }
@@ -1144,7 +1474,9 @@ impl Model {
                             .as_ref()
                             .unwrap()
                             .expert_matrices(li as i32, idx[i] as i32)
-                            .unwrap_or_else(|e| panic!("expert ({li},{}) fetch failed: {e}", idx[i]));
+                            .unwrap_or_else(|e| {
+                                panic!("expert ({li},{}) fetch failed: {e}", idx[i])
+                            });
                         [
                             Wt { f: vec![], bytes: Some(m[0].bytes.clone()), o: m[0].o, i: m[0].i },
                             Wt { f: vec![], bytes: Some(m[1].bytes.clone()), o: m[1].o, i: m[1].i },
@@ -1343,7 +1675,11 @@ impl Model {
         self.ple_ring[c.ngram_size - 1] = token as i64;
 
         for l in 0..c.layers {
-            let layer = self.layers[l].clone();
+            // Share-on-read: `self.layers[l].clone()` deep-copied EVERY weight
+            // per token (~3.7 GB memcpy/token on the real model — it would
+            // dominate any Metal win). Split-borrow: methods take &Layer, so
+            // pull the layer out, run both sub-phases, put it back.
+            let mut layer = std::mem::replace(&mut self.layers[l], Layer::empty());
             let mut mixed = vec![0.0; d];
             let mut attn = vec![0.0; d];
             if c.ple_layer == l as i64 {
@@ -1388,6 +1724,7 @@ impl Model {
                     stream[g * d + dd] += inj[g] * moe[dd];
                 }
             }
+            self.layers[l] = layer;
         }
         // final global hc_mix (no inject)
         let mut out = vec![0.0; d];
@@ -1591,6 +1928,14 @@ impl Model {
             ],
             expert_cache: std::collections::VecDeque::new(),
             expert_cache_cap: 256,
+            metal_direct: crate::ffi::direct_init()
+                && std::env::var("QWEN_APPLE8_DIRECT")
+                    .map(|v| v != "0")
+                    .unwrap_or(true),
+            metal_overlap: std::env::var("QWEN_APPLE8_OVERLAP")
+                .map(|v| v != "0")
+                .unwrap_or(true),
+            gdn_metal: (0..cfg.layers).map(|_| None).collect(),
         })
     }
 }

@@ -34,6 +34,7 @@ version = "0.1.0"
 dependencies = [
  "colibri-abi",
  "colibri-format",
+ "qwen4-rs",
  "serde_json",
  "sha2",
 ]
@@ -124,6 +125,8 @@ dependencies = [
 name = "qwen4-rs"
 version = "0.1.0"
 dependencies = [
+ "colibri-format",
+ "libc",
  "serde_json",
 ]
 

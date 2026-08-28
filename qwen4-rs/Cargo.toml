@@ -6,3 +6,4 @@ edition = "2021"
 [dependencies]
 serde_json = "1.0"
 colibri-format = { path = "../colibri-format" }
+libc = "0.2"
