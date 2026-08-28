@@ -20,6 +20,35 @@ pub struct ColiSource {
     pkg: Package,
 }
 
+/// Raw GPU-ready expert matrix (Apple8 MXFP4 tiles + E8M0 scales).
+#[derive(Clone)]
+pub struct RawExpert {
+    pub tiles: Vec<u8>,
+    pub scales: Vec<u8>,
+    pub rows: usize,
+    pub cols: usize,
+    pub fmt: i32,
+}
+
+/// One cached expert: raw tiles + the Metal tensor handles the C backend
+/// bound to those exact weight buffers (handles are pointer-keyed; eviction
+/// must free them before the tiles drop).
+pub struct CachedExpert {
+    pub mats: [RawExpert; 3],
+    pub metal: [*mut crate::ffi::ColiMetalTensor; 3],
+}
+
+impl Drop for CachedExpert {
+    fn drop(&mut self) {
+        for h in self.metal.iter_mut() {
+            if !h.is_null() {
+                unsafe { crate::ffi::coli_metal_tensor_free(*h) };
+                *h = std::ptr::null_mut();
+            }
+        }
+    }
+}
+
 /// Resident weight: BF16 bytes + shape. matmul decodes on the fly.
 pub struct ColiWt {
     pub bytes: Vec<u8>, // BF16 little-endian
@@ -161,6 +190,70 @@ impl ColiSource {
                 None
             }
         })
+    }
+
+    /// Raw resident expert tiles for (layer, expert): [gate, up, down],
+    /// each as {tiles, scales, rows, cols, fmt}. Apple8 = fmt 7 (MXFP4:
+    /// nibble bytes + raw E8M0 scale bytes) — the GPU consumes these
+    /// directly, NO host decode. BF16 canonical = fmt 16 (CPU-only).
+    pub fn expert_tiles(&self, layer: i32, expert: i32) -> Result<[RawExpert; 3], String> {
+        let recs = self.pkg.expert_records(layer, expert);
+        let rec = recs
+            .first()
+            .ok_or_else(|| format!("missing expert ({layer},{expert})"))?;
+        let raw = self.pkg.read_record(rec).map_err(|e| e.to_string())?;
+        assert_eq!(&raw[..8], b"COLIEXPT");
+        let desc_size = u32::from_le_bytes(raw[28..32].try_into().unwrap()) as usize;
+        let mut out: Vec<RawExpert> = Vec::with_capacity(3);
+        for i in 0..3 {
+            let d = 64 + i * desc_size;
+            let math = u16::from_le_bytes(raw[d + 4..d + 6].try_into().unwrap());
+            let scale = u16::from_le_bytes(raw[d + 6..d + 8].try_into().unwrap());
+            let wc = u16::from_le_bytes(raw[d + 8..d + 10].try_into().unwrap());
+            let rows = u64::from_le_bytes(raw[d + 16..d + 24].try_into().unwrap());
+            let cols = u64::from_le_bytes(raw[d + 24..d + 32].try_into().unwrap());
+            let w_off = u64::from_le_bytes(raw[d + 48..d + 56].try_into().unwrap());
+            let w_stored = u64::from_le_bytes(raw[d + 56..d + 64].try_into().unwrap());
+            let w_decoded = u64::from_le_bytes(raw[d + 64..d + 72].try_into().unwrap());
+            let s_off = u64::from_le_bytes(raw[d + 72..d + 80].try_into().unwrap());
+            let s_stored = u64::from_le_bytes(raw[d + 80..d + 88].try_into().unwrap());
+            let w = &raw[w_off as usize..(w_off + w_stored) as usize];
+            let s = &raw[s_off as usize..(s_off + s_stored) as usize];
+            match (math, scale) {
+                // Apple8 MXFP4: raw tiles are GPU-ready (fmt 7). rANS-compressed
+                // tiles must be host-decoded first (wc == RANS_CODEC_ID).
+                (0x0020, 0x0004) if wc != RANS_CODEC_ID => {
+                    out.push(RawExpert {
+                        tiles: w.to_vec(),
+                        scales: s.to_vec(),
+                        rows: rows as usize,
+                        cols: cols as usize,
+                        fmt: 7,
+                    });
+                }
+                (0x0020, 0x0004) => {
+                    let table = RansTable::from_manifest(&self.pkg.manifest_ref(), wc as u32, wc)
+                        .map_err(|e| e.to_string())?;
+                    let tiles = colibri_format::codecs::apple8_decode(w, &table, rows, cols)
+                        .map_err(|e| e.to_string())?;
+                    out.push(RawExpert {
+                        tiles,
+                        scales: s.to_vec(),
+                        rows: rows as usize,
+                        cols: cols as usize,
+                        fmt: 7,
+                    });
+                }
+                _ => {
+                    // BF16 canonical / INT4: no raw GPU form — the caller
+                    // falls back to the decode path.
+                    return Err(format!(
+                        "expert {layer}/{expert} m{i} math=0x{math:04x} scale=0x{scale:04x} not raw-GPU"
+                    ));
+                }
+            }
+        }
+        Ok([out.remove(0), out.remove(0), out.remove(0)])
     }
 
     /// PLE metadata from the package (ground truth, i64 records): per-head

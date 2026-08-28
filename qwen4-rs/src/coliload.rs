@@ -173,6 +173,8 @@ impl Model {
                 0.0;
                 hcd * ((cfg.ple_conv_kernel - 1) * cfg.ngram_size + 1).max(1)
             ],
+            expert_cache: std::collections::VecDeque::new(),
+            expert_cache_cap: 256,
         })
     }
 }

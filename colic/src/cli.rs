@@ -10,10 +10,11 @@ pub enum Command {
     InspectSource { source: PathBuf },
     Verify { package: PathBuf },
     Compile(CompileRequest),
+    Run { package: std::path::PathBuf, prompt: String, max_new: usize },
     Help,
 }
 
-pub const USAGE: &str = "Usage:\n  colic inspect-source MODEL_DIR\n  colic verify PACKAGE_DIR\n  colic compile MODEL_DIR --target native|PROFILE --quant exact|PROFILE --codec none|auto|PROFILE --opt default|size|latency -o OUTPUT [--dry-run] [--verify] [--force]";
+pub const USAGE: &str = "Usage:\n  coli inspect-source MODEL_DIR\n  coli verify PACKAGE_DIR\n  coli compile MODEL_DIR --target native|PROFILE --quant exact|PROFILE --codec none|auto|PROFILE --opt default|size|latency -o OUTPUT [--dry-run] [--verify] [--force]";
 
 pub fn parse<I>(args: I) -> Result<Command>
 where
@@ -39,6 +40,22 @@ where
             })
         }
         "compile" => parse_compile(args),
+        "run" => {
+            let package = std::path::PathBuf::from(
+                args.next().ok_or_else(|| ColicError::Usage("run requires PACKAGE_DIR".into()))?,
+            );
+            let mut prompt = String::from("1 2 3 4 5");
+            let mut max_new = 16;
+            let mut it = args;
+            while let Some(flag) = it.next() {
+                match flag.as_str() {
+                    "--prompt" => prompt = it.next().ok_or_else(|| ColicError::Usage("--prompt needs a value".into()))?,
+                    "--max-new" => max_new = it.next().ok_or_else(|| ColicError::Usage("--max-new needs a value".into()))?.parse().map_err(|_| ColicError::Usage("--max-new must be a number".into()))?,
+                    other => return Err(ColicError::Usage(format!("unknown run flag {other}"))),
+                }
+            }
+            Ok(Command::Run { package, prompt, max_new })
+        }
         "verify" => {
             let package = args
                 .next()

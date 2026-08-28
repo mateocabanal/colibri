@@ -11,6 +11,7 @@ use std::path::Path;
 
 pub mod coliload;
 pub mod colisource;
+pub mod ffi;
 
 // ---------------------------------------------------------------------------
 // safetensors reader (same minimal F32 adapter as qwen-rs)
@@ -321,6 +322,12 @@ pub struct Model {
     idx_cache: Vec<Vec<f32>>, // [layer][pos*nk]
     ple_ring: Vec<i64>,
     ple_conv_state: Vec<f32>,
+    // ponytail: FIFO expert cache (the C engine's CACHE 0->256 win was
+    // 280->173 ms/tok; LRU upgrade if hit-rate plateaus low). Entries own
+    // their Metal tensor handles — the C backend keys handles by weight
+    // pointer, so stale handles would serve wrong weights.
+    expert_cache: std::collections::VecDeque<((i32, i32), crate::colisource::CachedExpert)>,
+    expert_cache_cap: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -857,6 +864,55 @@ impl Model {
         self.attention_common(layer, li, x, pos, Some(&sel), out);
     }
 
+    /// FIFO expert cache: cached (tiles + Metal handles) for (layer, expert);
+    /// fetch + bind handles on miss, evict oldest (frees its handles).
+    fn cached_expert(
+        &mut self,
+        li: i32,
+        ei: i32,
+    ) -> Option<std::rc::Rc<crate::colisource::CachedExpert>> {
+        for (k, v) in self.expert_cache.iter() {
+            if *k == (li, ei) {
+                return Some(std::rc::Rc::new(crate::colisource::CachedExpert {
+                    mats: v.mats.clone(),
+                    metal: v.metal,
+                }));
+            }
+        }
+        let coli = self.coli.as_ref()?;
+        let mats = coli.expert_tiles(li, ei).ok()?;
+        let mut metal = [std::ptr::null_mut(); 3];
+        if crate::ffi::metal_available() {
+            for j in 0..3 {
+                let m = &mats[j];
+                let mut handle = std::ptr::null_mut();
+                let mut y = vec![0.0_f32; m.rows];
+                let xz = vec![0.0_f32; m.cols];
+                if crate::ffi::metal_matmul(
+                    &mut handle, &mut y, &xz, &m.tiles, &m.scales, m.fmt, m.cols, m.rows,
+                ) {
+                    metal[j] = handle;
+                } else if !handle.is_null() {
+                    unsafe { crate::ffi::coli_metal_tensor_free(handle) };
+                }
+            }
+        }
+        let entry = crate::colisource::CachedExpert { mats, metal };
+        if self.expert_cache.len() >= self.expert_cache_cap {
+            self.expert_cache.pop_front();
+        }
+        self.expert_cache.push_back(((li, ei), entry));
+        for (k, v) in self.expert_cache.iter() {
+            if *k == (li, ei) {
+                return Some(std::rc::Rc::new(crate::colisource::CachedExpert {
+                    mats: v.mats.clone(),
+                    metal: v.metal,
+                }));
+            }
+        }
+        None
+    }
+
     fn moe_token(&mut self, layer: &Layer, li: usize, x: &[f32], out: &mut [f32]) {
         let c = self.cfg.clone();
         let e = c.experts;
@@ -883,17 +939,78 @@ impl Model {
         let mut acc = vec![0.0; d];
         for i in 0..k {
             let w = val[i] / wsum;
-            // .coli mode: fetch this expert's matrices on demand (BF16 bytes,
-            // decoded by matmul). safetensors mode: preloaded.
-            let mats = if let Some(coli) = &self.coli {
-                let m = coli
-                    .expert_matrices(li as i32, idx[i] as i32)
-                    .unwrap_or_else(|e| panic!("expert ({li},{}) fetch failed: {e}", idx[i]));
-                [
-                    Wt { f: vec![], bytes: Some(m[0].bytes.clone()), o: m[0].o, i: m[0].i },
-                    Wt { f: vec![], bytes: Some(m[1].bytes.clone()), o: m[1].o, i: m[1].i },
-                    Wt { f: vec![], bytes: Some(m[2].bytes.clone()), o: m[2].o, i: m[2].i },
-                ]
+            // .coli mode: cached raw tiles -> Metal (fmt 7 MXFP4, no host
+            // decode) with CPU BF16 fallback. safetensors mode: preloaded.
+            let mats: [Wt; 3] = if self.coli.is_some() {
+                match self.cached_expert(li as i32, idx[i] as i32) {
+                    Some(ce) => {
+                        let (g, u, dwn) = (&ce.mats[0], &ce.mats[1], &ce.mats[2]);
+                        let mut gate = vec![0.0; g.rows];
+                        let mut up = vec![0.0; u.rows];
+                        let mut h = vec![0.0; c.moe_inter];
+                        let mut y = vec![0.0; d];
+                        let mut metal_ok = false;
+                        if crate::ffi::metal_available()
+                            && !ce.metal[0].is_null()
+                            && !ce.metal[1].is_null()
+                            && !ce.metal[2].is_null()
+                        {
+                            let mut t0 = ce.metal[0] as *mut crate::ffi::ColiMetalTensor;
+                            let mut t1 = ce.metal[1] as *mut crate::ffi::ColiMetalTensor;
+                            let mut t2 = ce.metal[2] as *mut crate::ffi::ColiMetalTensor;
+                            let ok_g = crate::ffi::metal_matmul(
+                                &mut t0, &mut gate, x, &g.tiles, &g.scales, g.fmt, g.cols, g.rows,
+                            );
+                            let ok_u = crate::ffi::metal_matmul(
+                                &mut t1, &mut up, x, &u.tiles, &u.scales, u.fmt, u.cols, u.rows,
+                            );
+                            for ii in 0..c.moe_inter {
+                                h[ii] = silu(gate[ii]) * up[ii];
+                            }
+                            let ok_d = crate::ffi::metal_matmul(
+                                &mut t2, &mut y, &h, &dwn.tiles, &dwn.scales, dwn.fmt, dwn.cols, dwn.rows,
+                            );
+                            metal_ok = ok_g && ok_u && ok_d;
+                        }
+                        if !metal_ok {
+                            // CPU fallback: decode tiles -> BF16 once, matmul
+                            let dec = |r: &crate::colisource::RawExpert| -> Vec<u8> {
+                                let f = colibri_format::codecs::apple8_mxfp4_decode(
+                                    &r.tiles, r.rows as u64, r.cols as u64,
+                                )
+                                .unwrap_or_default();
+                                f.into_iter().flat_map(crate::colisource::bf16_bytes).collect()
+                            };
+                            let gb = dec(g);
+                            let ub = dec(u);
+                            matmul(&mut gate, x, &Wt { f: vec![], bytes: Some(gb), o: g.rows, i: g.cols });
+                            matmul(&mut up, x, &Wt { f: vec![], bytes: Some(ub), o: u.rows, i: u.cols });
+                            for ii in 0..c.moe_inter {
+                                h[ii] = silu(gate[ii]) * up[ii];
+                            }
+                            let db = dec(dwn);
+                            matmul(&mut y, &h, &Wt { f: vec![], bytes: Some(db), o: dwn.rows, i: dwn.cols });
+                        }
+                        for dd in 0..d {
+                            acc[dd] += y[dd] * w;
+                        }
+                        continue; // acc updated; skip the common tail
+                    }
+                    None => {
+                        // BF16/INT4 canonical experts: decode path
+                        let m = self
+                            .coli
+                            .as_ref()
+                            .unwrap()
+                            .expert_matrices(li as i32, idx[i] as i32)
+                            .unwrap_or_else(|e| panic!("expert ({li},{}) fetch failed: {e}", idx[i]));
+                        [
+                            Wt { f: vec![], bytes: Some(m[0].bytes.clone()), o: m[0].o, i: m[0].i },
+                            Wt { f: vec![], bytes: Some(m[1].bytes.clone()), o: m[1].o, i: m[1].i },
+                            Wt { f: vec![], bytes: Some(m[2].bytes.clone()), o: m[2].o, i: m[2].i },
+                        ]
+                    }
+                }
             } else {
                 self.experts[li][idx[i]].clone()
             };
@@ -1331,6 +1448,8 @@ impl Model {
                 0.0;
                 hcd * ((cfg.ple_conv_kernel - 1) * cfg.ngram_size + 1).max(1)
             ],
+            expert_cache: std::collections::VecDeque::new(),
+            expert_cache_cap: 256,
         })
     }
 }
@@ -1338,3 +1457,41 @@ impl Model {
 fn cdim_total(cfg: &Cfg) -> usize {
     cfg.lin_k_dim * cfg.lin_k_heads * 2 + cfg.lin_v_dim * cfg.lin_v_heads
 }
+
+/// Standalone runner for `coli run`: loads a .coli package (or safetensors
+/// fixture dir) and greedy-decodes `max_new` tokens from `prompt`.
+/// Returns the generated token ids (prompt excluded).
+pub fn run_greedy(package_dir: &std::path::Path, prompt: &[u32], max_new: usize) -> Result<Vec<u32>, String> {
+    let cfg = load_cfg(&package_dir.join("config.json"))?;
+    let model = if package_dir.join("model.safetensors").exists() {
+        let st = StFile::open(&package_dir.join("model.safetensors"))?;
+        Model::load(&st, &cfg)?
+    } else {
+        let src = colisource::ColiSource::open(package_dir)?;
+        Model::load_coli(&src, &cfg)?
+    };
+    Ok(run_greedy_with(model, cfg, prompt, max_new))
+}
+
+/// Greedy decode against an already-loaded model.
+pub fn run_greedy_with(mut model: Model, cfg: Cfg, prompt: &[u32], max_new: usize) -> Vec<u32> {
+    for (i, &t) in prompt.iter().enumerate() {
+        model.forward_token(t as usize, i);
+    }
+    let mut out = Vec::with_capacity(max_new);
+    let mut last = *prompt.last().unwrap_or(&0);
+    let start = prompt.len();
+    for pos in start..start + max_new {
+        let logits = model.forward_token(last as usize, pos);
+        let next = logits
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .map(|(i, _)| i as u32)
+            .unwrap();
+        out.push(next);
+        last = next;
+    }
+    out
+}
+

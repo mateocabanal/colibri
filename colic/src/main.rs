@@ -265,6 +265,19 @@ fn run() -> colic::Result<()> {
             println!("records={}", summary.records);
             Ok(())
         }
+        Command::Run { package, prompt, max_new } => {
+            let prompt_ids: Vec<u32> = prompt
+                .split_whitespace()
+                .map(|t| t.parse().unwrap_or_else(|_| {
+                    eprintln!("colic: invalid token id: {t}");
+                    std::process::exit(2);
+                }))
+                .collect();
+            let out = qwen4_rs::run_greedy(&package, &prompt_ids, max_new)
+                .map_err(|e| colic::ColicError::Unsupported { stage: "run", detail: e })?;
+            println!("generated: {out:?}");
+            Ok(())
+        }
         Command::Compile(request) if request.dry_run => {
             let summary = if colic::codec::compile::handles(&request) {
                 colic::codec::compile::dry_run(&request)?
