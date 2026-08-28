@@ -36,6 +36,38 @@ fn main() {
         .status()
         .expect("ar must be available");
     assert!(ar.success(), "ar failed");
+
+    // metalio.mm — async NVMe→MTLBuffer expert streaming (also a colibri C file)
+    let mio_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("metal")
+        .join("metalio.mm");
+    if mio_src.exists() {
+        let mio_obj = std::path::Path::new(&out).join("metalio.o");
+        let status = std::process::Command::new("clang++")
+            .args([
+                "-x",
+                "objective-c++",
+                "-std=gnu++17",
+                "-fobjc-arc",
+                "-O3",
+                "-fobjc-exceptions",
+                "-I",
+                src.parent().unwrap().to_str().unwrap(),
+                "-c",
+                mio_src.to_str().unwrap(),
+                "-o",
+                mio_obj.to_str().unwrap(),
+            ])
+            .status()
+            .expect("clang++ must be available on macOS");
+        assert!(status.success(), "metalio.mm failed to compile");
+        let ar = std::process::Command::new("ar")
+            .args(["rcs", lib.to_str().unwrap(), mio_obj.to_str().unwrap()])
+            .status()
+            .expect("ar must be available");
+        assert!(ar.success(), "ar failed for metalio.o");
+        println!("cargo:rerun-if-changed=metal/metalio.mm");
+    }
     println!("cargo:rustc-link-search=native={out}");
     println!("cargo:rustc-link-lib=static=backend_metal");
     println!("cargo:rustc-link-lib=c++");

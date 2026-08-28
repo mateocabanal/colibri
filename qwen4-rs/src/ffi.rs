@@ -109,3 +109,100 @@ pub fn metal_silu_mul(g: &mut [f32], u: &[f32]) -> bool {
     }
     unsafe { coli_metal_silu_mul(g.as_mut_ptr(), u.as_ptr(), g.len() as i32) == 1 }
 }
+
+// ---------------------------------------------------------------------------
+// MetalIO: async NVMe -> MTLBuffer expert streaming (from metalio.mm)
+// Never mandatory: every fn returns an error/0 and the caller falls back to
+// the pread path.
+// ---------------------------------------------------------------------------
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ColiMetalioRegion {
+    pub file: i32,
+    pub src_off: u64,
+    pub bytes: usize,
+    pub dst_off: u64,
+}
+
+extern "C" {
+    pub fn metalio_init() -> i32;
+    pub fn metalio_active() -> i32;
+    pub fn metalio_shutdown();
+    pub fn metalio_file_add(path: *const std::os::raw::c_char) -> i32;
+    pub fn metalio_slot_alloc(max_bytes: usize) -> i32;
+    pub fn metalio_slot_free(slot: i32);
+    pub fn metalio_slot_ptr(slot: i32) -> *mut std::os::raw::c_void;
+    pub fn metalio_slot_bytes(slot: i32) -> usize;
+    pub fn metalio_loadv(
+        slot: i32,
+        regions: *const ColiMetalioRegion,
+        count: i32,
+        kind: i32,
+    ) -> i64;
+    pub fn metalio_wait(event_value: i64) -> i32;
+    pub fn metalio_slot_consumed(slot: i32);
+}
+
+pub fn mio_init() -> bool {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    static mut ACTIVE: bool = false;
+    INIT.call_once(|| {
+        let ok = unsafe { metalio_init() } == 1;
+        unsafe { ACTIVE = ok };
+    });
+    mio_active()
+}
+
+pub fn mio_active() -> bool {
+    unsafe { metalio_active() == 1 }
+}
+
+/// One region per matrix: stream all 3 matrices of an expert into the slot.
+/// Returns (slot, event) on success, None if MetalIO is unavailable or any
+/// step fails (caller falls back to pread + decode).
+pub fn mio_load_expert(
+    shard_path: &str,
+    regions: &[(u64, usize)], // (file_offset, bytes) per matrix
+) -> Option<(i32, i64)> {
+    if !mio_init() || regions.is_empty() {
+        return None;
+    }
+    let cpath = std::ffi::CString::new(shard_path).ok()?;
+    let file = unsafe { metalio_file_add(cpath.as_ptr()) };
+    if file < 0 {
+        return None;
+    }
+    let total: usize = regions.iter().map(|r| r.1).sum();
+    let slot = unsafe { metalio_slot_alloc(total) };
+    if slot < 0 {
+        return None;
+    }
+    let mut dst = 0usize;
+    let mut cr: Vec<ColiMetalioRegion> = regions
+        .iter()
+        .map(|(off, len)| {
+            let r = ColiMetalioRegion {
+                file,
+                src_off: *off,
+                bytes: *len,
+                dst_off: dst as u64,
+            };
+            dst += len;
+            r
+        })
+        .collect();
+    let ev = unsafe {
+        metalio_loadv(
+            slot,
+            cr.as_mut_ptr(),
+            cr.len() as i32,
+            1, // MIO_LOAD_ASYNC
+        )
+    };
+    if ev < 0 {
+        unsafe { metalio_slot_free(slot) };
+        return None;
+    }
+    Some((slot, ev))
+}

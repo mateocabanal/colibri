@@ -259,6 +259,41 @@ impl Package {
             .unwrap_or_default()
     }
 
+    /// Absolute path of a shard file.
+    pub fn shard_path(&self, shard_id: u32) -> Option<String> {
+        Some(self.root.join(format!("data-{shard_id:05}.coli")).to_string_lossy().into_owned())
+    }
+
+    /// (file_offset, bytes) of each matrix payload in an expert record, plus
+    /// the 3 (rows, cols) pairs. The record must be a raw (wc=0) Apple8
+    /// expert so MetalIO can stream the resident tiles straight into a
+    /// buffer. Returns None for anything else (caller falls back to pread).
+    pub fn expert_matrix_regions(&self, rec: &RecordInfo) -> Option<(Vec<(u64, usize)>, Vec<(usize, usize)>)> {
+        let raw = self.read_record(rec).ok()?;
+        if &raw[..8] != b"COLIEXPT" {
+            return None;
+        }
+        let desc_size = u32::from_le_bytes(raw[28..32].try_into().ok()?) as usize;
+        let mut regions = Vec::with_capacity(3);
+        let mut dims = Vec::with_capacity(3);
+        for i in 0..3 {
+            let d = 64 + i * desc_size;
+            let math = u16::from_le_bytes(raw.get(d + 4..d + 6)?.try_into().ok()?);
+            let wc = u16::from_le_bytes(raw.get(d + 8..d + 10)?.try_into().ok()?);
+            let rows = u64::from_le_bytes(raw.get(d + 16..d + 24)?.try_into().ok()?);
+            let cols = u64::from_le_bytes(raw.get(d + 24..d + 32)?.try_into().ok()?);
+            let w_off = u64::from_le_bytes(raw.get(d + 48..d + 56)?.try_into().ok()?);
+            let w_stored = u64::from_le_bytes(raw.get(d + 56..d + 64)?.try_into().ok()?);
+            // raw Apple8 tiles only (math 0x20, wc 0)
+            if math != 0x20 || wc != 0 {
+                return None;
+            }
+            regions.push((rec.offset + w_off, w_stored as usize));
+            dims.push((rows as usize, cols as usize));
+        }
+        Some((regions, dims))
+    }
+
     /// Streams a byte range from inside a record's payload WITHOUT loading
     /// the whole record (ponytail: no CRC on the streaming path — the C
     /// engine's PLE streaming reads the same way; add per-range CRC only if

@@ -334,6 +334,45 @@ pub struct Model {
 // math helpers (C-identical, same as qwen-rs)
 // ---------------------------------------------------------------------------
 
+/// NEON BF16 dot: y[o] = x[.] · w[o,.], weights BF16 (u16<<16 = f32).
+/// 4-lane fma; fp-order differs from scalar (the gate decides).
+#[cfg(target_arch = "aarch64")]
+fn matmul_bf16_neon(y: &mut [f32], x: &[f32], w: &[u8], o: usize, i: usize) {
+    use std::arch::aarch64::*;
+    for oo in 0..o {
+        let wr = &w[oo * i * 2..(oo + 1) * i * 2];
+        let mut acc = unsafe { vdupq_n_f32(0.0) };
+        let mut ii = 0;
+        while ii + 8 <= i {
+            // 8 bf16 -> 4 f32 (u16<<16), 4 x-f32
+            unsafe {
+                let wv = vld1q_u16(wr[ii * 2..].as_ptr() as *const u16);
+                let w0 = vshlq_n_u32(vmovl_u16(vget_low_u16(wv)), 16);
+                let w1 = vshlq_n_u32(vmovl_u16(vget_high_u16(wv)), 16);
+                let wf0 = vreinterpretq_f32_u32(w0);
+                let wf1 = vreinterpretq_f32_u32(w1);
+                let x0 = vld1q_f32(x[ii..].as_ptr());
+                let x1 = vld1q_f32(x[ii + 4..].as_ptr());
+                acc = vfmaq_f32(acc, wf0, x0);
+                acc = vfmaq_f32(acc, wf1, x1);
+            }
+            ii += 8;
+        }
+        let mut a = unsafe { vaddvq_f32(acc) };
+        while ii < i {
+            let u = u16::from_le_bytes([wr[ii * 2], wr[ii * 2 + 1]]);
+            a += x[ii] * f32::from_bits((u as u32) << 16);
+            ii += 1;
+        }
+        y[oo] = a;
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn matmul_bf16_neon(_y: &mut [f32], _x: &[f32], _w: &[u8], _o: usize, _i: usize) {
+    unreachable!();
+}
+
 fn matmul(y: &mut [f32], x: &[f32], w: &Wt) {
     let (o, i) = (w.o, w.i);
     // ponytail: thread::scope per call costs ~50-100us of spawn; only
@@ -342,6 +381,18 @@ fn matmul(y: &mut [f32], x: &[f32], w: &Wt) {
     // ceiling — add when the dense path is the measured bottleneck again.
     let parallel = o * i >= 16_000_000 && std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) > 1;
     if let Some(bytes) = &w.bytes {
+        // NEON BF16: 4 f32 lanes, bf16 weights widened by (u16<<16).
+        // fp-order differs from scalar (grouped fma) — the token-identity
+        // gate decides; QWEN_NEON_BF16=0 opts out.
+        let neon = std::env::var("QWEN_NEON_BF16").map(|v| v != "0").unwrap_or(true);
+        #[cfg(target_arch = "aarch64")]
+        let neon = neon && o * i >= 1 << 18;
+        #[cfg(not(target_arch = "aarch64"))]
+        let neon = false;
+        if neon {
+            matmul_bf16_neon(y, x, bytes, o, i);
+            return;
+        }
         if parallel {
             std::thread::scope(|s| {
                 let nthreads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
@@ -932,7 +983,45 @@ impl Model {
             }
         }
         let coli = self.coli.as_ref()?;
-        let mats = coli.expert_tiles(li, ei).ok()?;
+        // MetalIO first: stream the 3 matrices async into one MTLBuffer slot,
+        // wait, use the slot bytes directly (fmt 7 raw, no decode). Falls back
+        // to pread+decode on any failure (never mandatory).
+        let mats: Option<[crate::colisource::RawExpert; 3]> = (|| {
+            let recs = coli.pkg_ref().expert_records(li, ei);
+            let rec = recs.first()?;
+            let shard = coli.pkg_ref().shard_path(rec.shard_id)?;
+            let (regions, dims) = coli.pkg_ref().expert_matrix_regions(rec)?;
+            let (slot, ev) = crate::ffi::mio_load_expert(&shard, &regions)?;
+            if unsafe { crate::ffi::metalio_wait(ev) } != 0 {
+                unsafe { crate::ffi::metalio_slot_free(slot) };
+                return None;
+            }
+            let ptr = unsafe { crate::ffi::metalio_slot_ptr(slot) };
+            if ptr.is_null() {
+                unsafe { crate::ffi::metalio_slot_free(slot) };
+                return None;
+            }
+            let total: usize = regions.iter().map(|r| r.1).sum();
+            let raw = unsafe { std::slice::from_raw_parts(ptr as *const u8, total) };
+            let mut out = Vec::with_capacity(3);
+            let mut base = 0usize;
+            for ((m, (_, len))) in dims.iter().zip(&regions) {
+                out.push(crate::colisource::RawExpert {
+                    tiles: raw[base..base + len].to_vec(),
+                    scales: vec![],
+                    rows: m.0,
+                    cols: m.1,
+                    fmt: 7,
+                });
+                base += len;
+            }
+            Some([out.remove(0), out.remove(0), out.remove(0)])
+        })();
+        let mats = if let Some(m) = mats {
+            m
+        } else {
+            coli.expert_tiles(li, ei).ok()?
+        };
         let mut metal = [std::ptr::null_mut(); 3];
         if crate::ffi::metal_available() {
             for j in 0..3 {
