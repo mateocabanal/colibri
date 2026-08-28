@@ -32,6 +32,8 @@ impl Model {
     /// experts + ngram fetched on demand (16 GB M2 budget).
     pub fn load_coli(src: &ColiSource, cfg: &Cfg) -> Result<Model, String> {
         let mut cfg = cfg.clone();
+        // Bring up the Metal backend once (experts GEMV via FFI).
+        crate::ffi::metal_init();
         // Package is ground truth for the PLE layer (frontend resolution can
         // differ from config ple_layer_ids; live: config says 2, package has
         // layers.1.ple.*).

@@ -336,25 +336,77 @@ pub struct Model {
 
 fn matmul(y: &mut [f32], x: &[f32], w: &Wt) {
     let (o, i) = (w.o, w.i);
+    // ponytail: thread::scope per call costs ~50-100us of spawn; only
+    // parallelize matmuls big enough to amortize it (>= 16M MACs ≈ 2ms of
+    // work at ~8 GFLOPs scalar). A persistent pool (rayon) would lower this
+    // ceiling — add when the dense path is the measured bottleneck again.
+    let parallel = o * i >= 16_000_000 && std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) > 1;
     if let Some(bytes) = &w.bytes {
-        // BF16 resident: decode each row on the fly (ponytail: no SIMD yet;
-        // add NEON/AVX2 when decode shows in profiles).
-        for oo in 0..o {
-            let mut acc = 0.0_f32;
-            for ii in 0..i {
-                let u = u16::from_le_bytes([bytes[(oo * i + ii) * 2], bytes[(oo * i + ii) * 2 + 1]]);
-                acc += x[ii] * f32::from_bits((u as u32) << 16);
+        if parallel {
+            std::thread::scope(|s| {
+                let nthreads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+                let chunk = o.div_ceil(nthreads);
+                for (c, yslice) in y.chunks_mut(chunk).enumerate() {
+                    let rows = c * chunk;
+                    let (x, bytes) = (&*x, &*bytes);
+                    s.spawn(move || {
+                        for (oo, yv) in yslice.iter_mut().enumerate() {
+                            let oo = rows + oo;
+                            let mut acc = 0.0_f32;
+                            for ii in 0..i {
+                                let u = u16::from_le_bytes([
+                                    bytes[(oo * i + ii) * 2],
+                                    bytes[(oo * i + ii) * 2 + 1],
+                                ]);
+                                acc += x[ii] * f32::from_bits((u as u32) << 16);
+                            }
+                            *yv = acc;
+                        }
+                    });
+                }
+            });
+        } else {
+            for oo in 0..o {
+                let mut acc = 0.0_f32;
+                for ii in 0..i {
+                    let u = u16::from_le_bytes([
+                        bytes[(oo * i + ii) * 2],
+                        bytes[(oo * i + ii) * 2 + 1],
+                    ]);
+                    acc += x[ii] * f32::from_bits((u as u32) << 16);
+                }
+                y[oo] = acc;
             }
-            y[oo] = acc;
         }
         return;
     }
-    for oo in 0..o {
-        let mut acc = 0.0_f32;
-        for ii in 0..i {
-            acc += x[ii] * w.f[oo * i + ii];
+    if parallel {
+        std::thread::scope(|s| {
+            let nthreads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+            let chunk = o.div_ceil(nthreads);
+            for (c, yslice) in y.chunks_mut(chunk).enumerate() {
+                let rows = c * chunk;
+                let (x, w) = (&*x, &*w);
+                s.spawn(move || {
+                    for (oo, yv) in yslice.iter_mut().enumerate() {
+                        let oo = rows + oo;
+                        let mut acc = 0.0_f32;
+                        for ii in 0..i {
+                            acc += x[ii] * w.f[oo * i + ii];
+                        }
+                        *yv = acc;
+                    }
+                });
+            }
+        });
+    } else {
+        for oo in 0..o {
+            let mut acc = 0.0_f32;
+            for ii in 0..i {
+                acc += x[ii] * w.f[oo * i + ii];
+            }
+            y[oo] = acc;
         }
-        y[oo] = acc;
     }
 }
 
