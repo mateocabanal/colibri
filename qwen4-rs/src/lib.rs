@@ -118,8 +118,13 @@ pub struct Cfg {
 }
 
 pub fn load_cfg(path: &Path) -> Result<Cfg, String> {
-    let v: serde_json::Value =
+    let mut v: serde_json::Value =
         serde_json::from_slice(&std::fs::read(path).map_err(|e| e.to_string())?).unwrap();
+    // Real checkpoints wrap the text backbone under `text_config`; the tiny
+    // fixture has it top-level. Read from text_config when present.
+    if let Some(tc) = v.get("text_config").and_then(|x| x.as_object()) {
+        v = serde_json::Value::Object(tc.clone());
+    }
     let get = |k: &str| v.get(k).and_then(|x| x.as_u64()).unwrap_or(0) as usize;
     let num = |k: &str| v.get(k).and_then(|x| x.as_f64()).unwrap_or(0.0) as f32;
     let rope = v.get("rope_parameters");
@@ -229,6 +234,9 @@ pub fn load_cfg(path: &Path) -> Result<Cfg, String> {
 #[derive(Clone)]
 pub struct Wt {
     f: Vec<f32>,
+    /// BF16 bytes when loaded from a .coli package (decoded per-row in
+    /// matmul to keep resident memory at package size).
+    bytes: Option<Vec<u8>>,
     o: usize,
     i: usize,
 }
@@ -284,6 +292,10 @@ struct HcGlobal {
 
 pub struct Model {
     cfg: Cfg,
+    /// .coli package for on-demand expert/ngram fetches (None in safetensors
+    /// mode). ponytail: no cache yet — each fetch re-reads the record; add a
+    /// per-layer FIFO when disk shows in profiles.
+    coli: Option<colisource::ColiSource>,
     embed: Wt,
     lm_head: Wt,
     final_norm: Vec<f32>,
@@ -317,6 +329,19 @@ pub struct Model {
 
 fn matmul(y: &mut [f32], x: &[f32], w: &Wt) {
     let (o, i) = (w.o, w.i);
+    if let Some(bytes) = &w.bytes {
+        // BF16 resident: decode each row on the fly (ponytail: no SIMD yet;
+        // add NEON/AVX2 when decode shows in profiles).
+        for oo in 0..o {
+            let mut acc = 0.0_f32;
+            for ii in 0..i {
+                let u = u16::from_le_bytes([bytes[(oo * i + ii) * 2], bytes[(oo * i + ii) * 2 + 1]]);
+                acc += x[ii] * f32::from_bits((u as u32) << 16);
+            }
+            y[oo] = acc;
+        }
+        return;
+    }
     for oo in 0..o {
         let mut acc = 0.0_f32;
         for ii in 0..i {
@@ -858,7 +883,20 @@ impl Model {
         let mut acc = vec![0.0; d];
         for i in 0..k {
             let w = val[i] / wsum;
-            let mats = &self.experts[li][idx[i]];
+            // .coli mode: fetch this expert's matrices on demand (BF16 bytes,
+            // decoded by matmul). safetensors mode: preloaded.
+            let mats = if let Some(coli) = &self.coli {
+                let m = coli
+                    .expert_matrices(li as i32, idx[i] as i32)
+                    .unwrap_or_else(|e| panic!("expert ({li},{}) fetch failed: {e}", idx[i]));
+                [
+                    Wt { f: vec![], bytes: Some(m[0].bytes.clone()), o: m[0].o, i: m[0].i },
+                    Wt { f: vec![], bytes: Some(m[1].bytes.clone()), o: m[1].o, i: m[1].i },
+                    Wt { f: vec![], bytes: Some(m[2].bytes.clone()), o: m[2].o, i: m[2].i },
+                ]
+            } else {
+                self.experts[li][idx[i]].clone()
+            };
             let mut gate = vec![0.0; c.moe_inter];
             let mut up = vec![0.0; c.moe_inter];
             matmul(&mut gate, x, &mats[0]);
@@ -944,11 +982,28 @@ impl Model {
             }
         }
 
-        let mut emb = vec![0.0_f32; 256];
+        // ponytail: sized from config — the tiny fixture's 256 hides this;
+        // the real model's ple_embed_dim is 20480.
+        let mut emb = vec![0.0_f32; c.ple_embed_dim.max(256)];
         for h in 0..heads {
             let r = rows[h] as usize;
-            let row = &self.ple_ngram.f[r * hd_per..(r + 1) * hd_per];
-            emb[h * hd_per..(h + 1) * hd_per].copy_from_slice(row);
+            // .coli mode: fetch the ngram row on demand (F8 E4M3 shards, one
+            // pread per row — the 51 GB table is never resident).
+            // safetensors mode: read the resident table.
+            if let Some(coli) = &self.coli {
+                let row_bytes = coli
+                    .ple_ngram_row_f8(c.ple_layer as i32, r as u64, hd_per)
+                    .unwrap_or_else(|e| panic!("ple ngram row {r} fetch failed: {e}"));
+                let scale = coli
+                    .ple_ngram_scale(c.ple_layer as i32)
+                    .unwrap_or(1.0);
+                for d in 0..hd_per {
+                    emb[h * hd_per + d] = colisource::ColiSource::e4m3_decode(row_bytes[d]) * scale;
+                }
+            } else {
+                let row = &self.ple_ngram.f[r * hd_per..(r + 1) * hd_per];
+                emb[h * hd_per..(h + 1) * hd_per].copy_from_slice(row);
+            }
         }
 
         let mut key = vec![0.0; hcd];
@@ -1006,11 +1061,21 @@ impl Model {
         let hc = c.hc_count;
         let hcd = hc * d;
 
-        // embed row repeated hc times
+        // embed row repeated hc times (BF16 bytes in .coli mode, f32 in
+        // safetensors mode)
         let mut stream = vec![0.0; hcd];
-        let row = &self.embed.f[token * d..(token + 1) * d];
+        let row: Vec<f32> = if let Some(eb) = &self.embed.bytes {
+            (0..d)
+                .map(|j| {
+                    let u = u16::from_le_bytes([eb[(token * d + j) * 2], eb[(token * d + j) * 2 + 1]]);
+                    f32::from_bits((u as u32) << 16)
+                })
+                .collect()
+        } else {
+            self.embed.f[token * d..(token + 1) * d].to_vec()
+        };
         for g in 0..hc {
-            stream[g * d..(g + 1) * d].copy_from_slice(row);
+            stream[g * d..(g + 1) * d].copy_from_slice(&row);
         }
 
         // PLE ring push
@@ -1097,7 +1162,7 @@ impl Model {
 // ---------------------------------------------------------------------------
 
 fn load_wt(st: &StFile, name: &str, o: usize, i: usize) -> Result<Wt, String> {
-    Ok(Wt { f: st.f32(name, &[o as u64, i as u64])?, o, i })
+    Ok(Wt { f: st.f32(name, &[o as u64, i as u64])?, bytes: None, o, i })
 }
 
 impl Model {
@@ -1125,22 +1190,22 @@ impl Model {
                 gdn_a_log: if is_gdn { st.f32(&format!("{lp}.linear_attn.A_log"), &[cfg.lin_v_heads as u64])? } else { vec![] },
                 gdn_dt_bias: if is_gdn { st.f32(&format!("{lp}.linear_attn.dt_bias"), &[cfg.lin_v_heads as u64])? } else { vec![] },
                 gdn_conv1d: if is_gdn { st.f32(&format!("{lp}.linear_attn.conv1d.weight"), &[(cdim * cfg.conv_kernel) as u64])? } else { vec![] },
-                gdn_in_a: if is_gdn { load_wt(st, &format!("{lp}.linear_attn.in_proj_a.weight"), cfg.lin_v_heads, cfg.hidden)? } else { Wt { f: vec![], o: 0, i: 0 } },
-                gdn_in_b: if is_gdn { load_wt(st, &format!("{lp}.linear_attn.in_proj_b.weight"), cfg.lin_v_heads, cfg.hidden)? } else { Wt { f: vec![], o: 0, i: 0 } },
-                gdn_in_qkv: if is_gdn { load_wt(st, &format!("{lp}.linear_attn.in_proj_qkv.weight"), cdim, cfg.hidden)? } else { Wt { f: vec![], o: 0, i: 0 } },
-                gdn_in_z: if is_gdn { load_wt(st, &format!("{lp}.linear_attn.in_proj_z.weight"), vdim, cfg.hidden)? } else { Wt { f: vec![], o: 0, i: 0 } },
+                gdn_in_a: if is_gdn { load_wt(st, &format!("{lp}.linear_attn.in_proj_a.weight"), cfg.lin_v_heads, cfg.hidden)? } else { Wt { f: vec![], bytes: None, o: 0, i: 0  } },
+                gdn_in_b: if is_gdn { load_wt(st, &format!("{lp}.linear_attn.in_proj_b.weight"), cfg.lin_v_heads, cfg.hidden)? } else { Wt { f: vec![], bytes: None, o: 0, i: 0  } },
+                gdn_in_qkv: if is_gdn { load_wt(st, &format!("{lp}.linear_attn.in_proj_qkv.weight"), cdim, cfg.hidden)? } else { Wt { f: vec![], bytes: None, o: 0, i: 0  } },
+                gdn_in_z: if is_gdn { load_wt(st, &format!("{lp}.linear_attn.in_proj_z.weight"), vdim, cfg.hidden)? } else { Wt { f: vec![], bytes: None, o: 0, i: 0  } },
                 gdn_norm: if is_gdn { st.f32(&format!("{lp}.linear_attn.norm.weight"), &[cfg.lin_v_dim as u64])? } else { vec![] },
-                gdn_out: if is_gdn { load_wt(st, &format!("{lp}.linear_attn.out_proj.weight"), cfg.hidden, vdim)? } else { Wt { f: vec![], o: 0, i: 0 } },
-                attn_q: if !is_gdn { load_wt(st, &format!("{lp}.self_attn.q_proj.weight"), 2 * cfg.heads * hd, cfg.hidden)? } else { Wt { f: vec![], o: 0, i: 0 } },
-                attn_k: if !is_gdn { load_wt(st, &format!("{lp}.self_attn.k_proj.weight"), cfg.kv_heads * hd, cfg.hidden)? } else { Wt { f: vec![], o: 0, i: 0 } },
-                attn_v: if !is_gdn { load_wt(st, &format!("{lp}.self_attn.v_proj.weight"), cfg.kv_heads * hd, cfg.hidden)? } else { Wt { f: vec![], o: 0, i: 0 } },
-                attn_o: if !is_gdn { load_wt(st, &format!("{lp}.self_attn.o_proj.weight"), cfg.hidden, cfg.heads * hd)? } else { Wt { f: vec![], o: 0, i: 0 } },
+                gdn_out: if is_gdn { load_wt(st, &format!("{lp}.linear_attn.out_proj.weight"), cfg.hidden, vdim)? } else { Wt { f: vec![], bytes: None, o: 0, i: 0  } },
+                attn_q: if !is_gdn { load_wt(st, &format!("{lp}.self_attn.q_proj.weight"), 2 * cfg.heads * hd, cfg.hidden)? } else { Wt { f: vec![], bytes: None, o: 0, i: 0  } },
+                attn_k: if !is_gdn { load_wt(st, &format!("{lp}.self_attn.k_proj.weight"), cfg.kv_heads * hd, cfg.hidden)? } else { Wt { f: vec![], bytes: None, o: 0, i: 0  } },
+                attn_v: if !is_gdn { load_wt(st, &format!("{lp}.self_attn.v_proj.weight"), cfg.kv_heads * hd, cfg.hidden)? } else { Wt { f: vec![], bytes: None, o: 0, i: 0  } },
+                attn_o: if !is_gdn { load_wt(st, &format!("{lp}.self_attn.o_proj.weight"), cfg.hidden, cfg.heads * hd)? } else { Wt { f: vec![], bytes: None, o: 0, i: 0  } },
                 attn_qn: if !is_gdn { st.f32(&format!("{lp}.self_attn.q_norm.weight"), &[hd as u64])? } else { vec![] },
                 attn_kn: if !is_gdn { st.f32(&format!("{lp}.self_attn.k_norm.weight"), &[hd as u64])? } else { vec![] },
                 index_qk: if is_qsa {
                     load_wt(st, &format!("{lp}.self_attn.indexer.index_qk_proj.weight"), cfg.idx_n_heads * cfg.idx_head_dim + cfg.idx_kv_heads * cfg.idx_head_dim, cfg.hidden)?
                 } else {
-                    Wt { f: vec![], o: 0, i: 0 }
+                    Wt { f: vec![], bytes: None, o: 0, i: 0  }
                 },
                 idx_qn: if is_qsa { st.f32(&format!("{lp}.self_attn.indexer.q_layernorm.weight"), &[cfg.idx_head_dim as u64])? } else { vec![] },
                 idx_kn: if is_qsa { st.f32(&format!("{lp}.self_attn.indexer.k_layernorm.weight"), &[cfg.idx_head_dim as u64])? } else { vec![] },
@@ -1164,9 +1229,9 @@ impl Model {
                 let gu = st.f32(&format!("{elp}.gate_up_proj"), &[(2 * cfg.moe_inter) as u64, cfg.hidden as u64])?;
                 let dn = st.f32(&format!("{elp}.down_proj"), &[cfg.hidden as u64, cfg.moe_inter as u64])?;
                 let half = cfg.moe_inter * cfg.hidden;
-                let gate = Wt { f: gu[..half].to_vec(), o: cfg.moe_inter, i: cfg.hidden };
-                let up = Wt { f: gu[half..].to_vec(), o: cfg.moe_inter, i: cfg.hidden };
-                let down = Wt { f: dn, o: cfg.hidden, i: cfg.moe_inter };
+                let gate = Wt { f: gu[..half].to_vec(), bytes: None, o: cfg.moe_inter, i: cfg.hidden };
+                let up = Wt { f: gu[half..].to_vec(), bytes: None, o: cfg.moe_inter, i: cfg.hidden };
+                let down = Wt { f: dn, bytes: None, o: cfg.hidden, i: cfg.moe_inter };
                 layer_experts.push([gate, up, down]);
             }
             experts.push(layer_experts);
@@ -1191,17 +1256,17 @@ impl Model {
             let hd_per = cfg.ple_embed_dim / cfg.ngram_heads;
             load_wt(st, "model.ple.ple_embedding.ngram_embedding.weight", padded as usize, hd_per)?
         } else {
-            Wt { f: vec![], o: 0, i: 0 }
+            Wt { f: vec![], bytes: None, o: 0, i: 0  }
         };
         let ple_key_proj = if cfg.ple_layer >= 0 {
             load_wt(st, "model.ple.key_proj.weight", cfg.hc_count * cfg.hidden, cfg.ple_embed_dim)?
         } else {
-            Wt { f: vec![], o: 0, i: 0 }
+            Wt { f: vec![], bytes: None, o: 0, i: 0  }
         };
         let ple_value_proj = if cfg.ple_layer >= 0 {
             load_wt(st, "model.ple.value_proj.weight", cfg.hidden, cfg.ple_embed_dim)?
         } else {
-            Wt { f: vec![], o: 0, i: 0 }
+            Wt { f: vec![], bytes: None, o: 0, i: 0  }
         };
         let hcd = cfg.hc_count * cfg.hidden;
         let ple_norm_key = if cfg.ple_layer >= 0 { st.f32("model.ple.norm_key.weight", &[hcd as u64])? } else { vec![] };
@@ -1227,6 +1292,7 @@ impl Model {
 
         Ok(Model {
             cfg: cfg.clone(),
+            coli: None,
             embed: load_wt(st, "model.embed_tokens.weight", cfg.vocab, cfg.hidden)?,
             lm_head: load_wt(st, "lm_head.weight", cfg.vocab, cfg.hidden)?,
             // qwen4 drops norm.weight when hyper connections are active

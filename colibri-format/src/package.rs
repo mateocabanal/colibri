@@ -11,11 +11,11 @@ use std::{
 };
 
 use crate::{
-    MANIFEST_HEADER_BYTES, MANIFEST_MAGIC,
     verify::{
-        FormatError, LAYOUT_NONE, Result, i32_at, invalid, read_file_range, region, string_at,
-        u16_at, u32_at, u64_at, usage, validate_string_id, variable_region,
+        i32_at, invalid, read_file_range, region, string_at, u16_at, u32_at, u64_at, usage,
+        validate_string_id, variable_region, FormatError, Result, LAYOUT_NONE,
     },
+    MANIFEST_HEADER_BYTES, MANIFEST_MAGIC,
 };
 
 /// One entry of the manifest record table (96 bytes on disk).
@@ -41,7 +41,7 @@ pub struct RecordInfo {
 
 /// An opened COLI package: validated manifest, shard table, and record index.
 /// No record bytes are read until a payload is requested.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Package {
     root: PathBuf,
     manifest: Vec<u8>,
@@ -101,10 +101,10 @@ impl Package {
         if string_desc_bytes > string_table.len() {
             return invalid("string table is shorter than its descriptor array");
         }
-        let profile =
-            string_at(&manifest, &string_table, strings, u32_at(&manifest, 148)?)?.to_owned();
-        let compiler =
-            string_at(&manifest, &string_table, strings, u32_at(&manifest, 152)?)?.to_owned();
+        let profile = string_at(&manifest, &string_table, strings, u32_at(&manifest, 148)?)?
+            .to_owned();
+        let compiler = string_at(&manifest, &string_table, strings, u32_at(&manifest, 152)?)?
+            .to_owned();
         let fingerprint: [u8; 32] = manifest[112..144].try_into().unwrap();
         if (flags & 1 != 0) != fingerprint.iter().any(|byte| *byte != 0) {
             return invalid("manifest source fingerprint validity flag disagrees with bytes");
@@ -259,6 +259,21 @@ impl Package {
             .unwrap_or_default()
     }
 
+    /// Streams a byte range from inside a record's payload WITHOUT loading
+    /// the whole record (ponytail: no CRC on the streaming path — the C
+    /// engine's PLE streaming reads the same way; add per-range CRC only if
+    /// corruption is ever observed).
+    pub fn read_payload_range(
+        &self,
+        record: &RecordInfo,
+        within_off: u64,
+        len: usize,
+    ) -> Result<Vec<u8>> {
+        let path = self.root.join(format!("data-{:05}.coli", record.shard_id));
+        let bytes = read_file_range(&path, record.offset + within_off, len as u64)?;
+        Ok(bytes)
+    }
+
     /// Reads a record's raw stored bytes and verifies the stored CRC32C.
     pub fn read_record(&self, record: &RecordInfo) -> Result<Vec<u8>> {
         let path = self.root.join(format!("data-{:05}.coli", record.shard_id));
@@ -304,26 +319,16 @@ impl Package {
             let w_decoded = u64_at(&bytes, d + 64)?;
             let s_off = u64_at(&bytes, d + 72)?;
             let s_stored = u64_at(&bytes, d + 80)?;
-            let w_start =
-                usize::try_from(w_off).map_err(|_| usage("matrix offset exceeds usize"))?;
+            let w_start = usize::try_from(w_off).map_err(|_| usage("matrix offset exceeds usize"))?;
             let w_end = w_start
-                .checked_add(
-                    usize::try_from(w_stored).map_err(|_| usage("matrix size exceeds usize"))?,
-                )
+                .checked_add(usize::try_from(w_stored).map_err(|_| usage("matrix size exceeds usize"))?)
                 .ok_or_else(|| usage("matrix span overflows"))?;
-            let s_start =
-                usize::try_from(s_off).map_err(|_| usage("scale offset exceeds usize"))?;
+            let s_start = usize::try_from(s_off).map_err(|_| usage("scale offset exceeds usize"))?;
             let s_end = s_start
-                .checked_add(
-                    usize::try_from(s_stored).map_err(|_| usage("scale size exceeds usize"))?,
-                )
+                .checked_add(usize::try_from(s_stored).map_err(|_| usage("scale size exceeds usize"))?)
                 .ok_or_else(|| usage("scale span overflows"))?;
-            let weights = bytes
-                .get(w_start..w_end)
-                .ok_or_else(|| usage("matrix data outside record"))?;
-            let scales = bytes
-                .get(s_start..s_end)
-                .ok_or_else(|| usage("scale data outside record"))?;
+            let weights = bytes.get(w_start..w_end).ok_or_else(|| usage("matrix data outside record"))?;
+            let scales = bytes.get(s_start..s_end).ok_or_else(|| usage("scale data outside record"))?;
             // Descriptor layout (C coli_format.h / int4_record.rs):
             // role@0 math@4 scale@6 wc@8; verified on real packages.
             let decoded = match (math, scale) {
@@ -352,7 +357,7 @@ impl Package {
                 _ => {
                     return Err(usage(format!(
                         "expert matrix {i} (role {role}) uses unsupported math 0x{math:04x} scale 0x{scale:04x}"
-                    )));
+                    )))
                 }
             };
             let _ = (w_decoded, s_stored);
@@ -370,9 +375,7 @@ impl Package {
             return invalid("record is not a tensor record");
         }
         if record.codec != 0 {
-            return invalid(
-                "tensor record uses an unsupported codec (rANS decode lands with RW-014)",
-            );
+            return invalid("tensor record uses an unsupported codec (rANS decode lands with RW-014)");
         }
         let bytes = self.read_record(record)?;
         if &bytes[..8] != b"COLITENS" || u32_at(&bytes, 12)? != 128 || u16_at(&bytes, 16)? > 8 {
